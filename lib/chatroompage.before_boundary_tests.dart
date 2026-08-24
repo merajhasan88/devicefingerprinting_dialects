@@ -585,29 +585,6 @@ class ReinstallHintReader {
   }
 }
 
-
-class AccessProofFixture {
-  const AccessProofFixture({
-    required this.bearerToken,
-    required this.signedMethod,
-    required this.signedPath,
-    required this.encodedBody,
-    required this.proofPayload,
-    required this.signature,
-    required this.timestamp,
-    required this.nonce,
-  });
-
-  final String bearerToken;
-  final String signedMethod;
-  final String signedPath;
-  final String encodedBody;
-  final String proofPayload;
-  final String signature;
-  final int timestamp;
-  final String nonce;
-}
-
 class DeviceApi {
   DeviceApi({http.Client? client}) : _client = client ?? http.Client();
 
@@ -695,15 +672,13 @@ class DeviceApi {
     return List<int>.generate(32, (_) => random.nextInt(256));
   }
 
-  Future<AccessProofFixture> buildAccessProofFixture(
+  Future<Map<String, dynamic>> _protectedRequest(
     String method,
     String path, {
     Map<String, dynamic>? body,
     required String bearerToken,
     required InstallationIdentity signingIdentity,
     String? proofInstallationId,
-    int? timestampSeconds,
-    List<int>? nonceBytes,
   }) async {
     final String normalizedMethod = method.toUpperCase();
     final String encodedBody = normalizedMethod == 'GET'
@@ -713,80 +688,35 @@ class DeviceApi {
         crypto.sha256.convert(utf8.encode(encodedBody)).toString();
     final String tokenHash =
         crypto.sha256.convert(utf8.encode(bearerToken)).toString();
-    final List<int> actualNonce = nonceBytes ?? _freshNonce();
-    final String nonce = _b64UrlNoPadding(actualNonce);
-    final int timestamp = timestampSeconds ??
-        DateTime.now().toUtc().millisecondsSinceEpoch ~/ 1000;
 
     final Map<String, dynamic> proof = <String, dynamic>{
       'access_token_sha256': tokenHash,
       'body_sha256': bodyHash,
       'installation_id': proofInstallationId ?? signingIdentity.installationId,
       'method': normalizedMethod,
-      'nonce': nonce,
+      'nonce': _b64UrlNoPadding(_freshNonce()),
       'path': path,
-      'timestamp': timestamp,
+      'timestamp': DateTime.now().toUtc().millisecondsSinceEpoch ~/ 1000,
       'version': 1,
     };
 
-    // The native private key signs the exact JSON bytes represented by this
-    // base64url value. The private key never leaves Android Keystore/iOS.
+    // The server verifies the exact signed bytes and separately checks every
+    // field against the HTTP request that actually arrived.
     final String proofPayload =
         _b64UrlNoPadding(utf8.encode(jsonEncode(proof)));
     final String signature = await signingIdentity.signPayload(proofPayload);
 
-    return AccessProofFixture(
-      bearerToken: bearerToken,
-      signedMethod: normalizedMethod,
-      signedPath: path,
-      encodedBody: encodedBody,
-      proofPayload: proofPayload,
-      signature: signature,
-      timestamp: timestamp,
-      nonce: nonce,
-    );
-  }
-
-  Future<Map<String, dynamic>> sendAccessProofFixture(
-    AccessProofFixture fixture, {
-    String? actualMethod,
-    String? actualPath,
-    String? actualEncodedBody,
-  }) {
-    final String method = (actualMethod ?? fixture.signedMethod).toUpperCase();
-    final String path = actualPath ?? fixture.signedPath;
-
     return _request(
-      method,
-      path,
-      bearerToken: fixture.bearerToken,
-      encodedBody: method == 'GET'
-          ? null
-          : (actualEncodedBody ?? fixture.encodedBody),
-      extraHeaders: <String, String>{
-        'X-Access-Proof': fixture.proofPayload,
-        'X-Access-Signature': fixture.signature,
-      },
-    );
-  }
-
-  Future<Map<String, dynamic>> _protectedRequest(
-    String method,
-    String path, {
-    Map<String, dynamic>? body,
-    required String bearerToken,
-    required InstallationIdentity signingIdentity,
-    String? proofInstallationId,
-  }) async {
-    final AccessProofFixture fixture = await buildAccessProofFixture(
-      method,
+      normalizedMethod,
       path,
       body: body,
       bearerToken: bearerToken,
-      signingIdentity: signingIdentity,
-      proofInstallationId: proofInstallationId,
+      encodedBody: normalizedMethod == 'GET' ? null : encodedBody,
+      extraHeaders: <String, String>{
+        'X-Access-Proof': proofPayload,
+        'X-Access-Signature': signature,
+      },
     );
-    return sendAccessProofFixture(fixture);
   }
 
   Future<RegistrationState> registerInstallation(
@@ -967,10 +897,6 @@ class DeviceRecognitionController extends ChangeNotifier {
   String? stolenRefreshTestResult;
   String? boundAccessTestResult;
   String? stolenAccessTestResult;
-  String? replayAttackTestResult;
-  String? bodyTamperTestResult;
-  String? pathMethodTamperTestResult;
-  String? timestampExpiryTestResult;
   String status = 'Not started';
   bool busy = false;
 
@@ -1505,322 +1431,6 @@ class DeviceRecognitionController extends ChangeNotifier {
     );
   }
 
-  Future<void> testAccessProofReplay() {
-    replayAttackTestResult = null;
-    return _run('Testing exact signed-request replay protection…', () async {
-      final AccountSession? session = accountSession;
-      final InstallationIdentity? currentIdentity = identity;
-      if (session == null || currentIdentity == null) {
-        throw ApiException('Create or log in to an account first.');
-      }
-
-      final String probeId = Uuid().v4();
-      final AccessProofFixture fixture = await _api.buildAccessProofFixture(
-        'POST',
-        '/v1/account/protected-echo',
-        bearerToken: session.accessToken,
-        signingIdentity: currentIdentity,
-        body: <String, dynamic>{
-          'probe_id': probeId,
-          'message': 'replay protection test',
-        },
-      );
-
-      final Map<String, dynamic> first =
-          await _api.sendAccessProofFixture(fixture);
-      if (first['access_proof'] != 'accepted') {
-        throw ApiException(
-          'The control request was not accepted.',
-          code: 'replay_control_failed',
-        );
-      }
-
-      try {
-        await _api.sendAccessProofFixture(fixture);
-        final String result = <String>[
-          'FAIL: exact signed request was replayed successfully',
-          'First request: 200',
-          'Replay request: 200',
-          'Expected server error: access_proof_replay',
-        ].join('\n');
-        replayAttackTestResult = result;
-        debugPrint(result);
-        throw ApiException(
-          'SECURITY TEST FAILED: replayed proof was accepted.',
-          statusCode: 200,
-          code: 'access_proof_replay_accepted',
-        );
-      } on ApiException catch (error) {
-        if (error.code == 'access_proof_replay_accepted') {
-          rethrow;
-        }
-        if (error.statusCode == 401 && error.code == 'access_proof_replay') {
-          final String result = <String>[
-            'PASS: exact signed-request replay rejected',
-            'First request: 200',
-            'Replay request: 401',
-            'Server error: access_proof_replay',
-            'Same proof: reused',
-            'Same native signature: reused',
-            'Same nonce: reused and rejected',
-          ].join('\n');
-          replayAttackTestResult = result;
-          status = 'PASS: replay protection accepted first request and rejected replay';
-          debugPrint(result);
-          return;
-        }
-        final String result = <String>[
-          'INCONCLUSIVE: replay request failed for another reason',
-          'First request: 200',
-          'Replay request: ${error.statusCode ?? 'no response'}',
-          'Server error: ${error.code ?? 'unknown'}',
-        ].join('\n');
-        replayAttackTestResult = result;
-        debugPrint(result);
-        rethrow;
-      }
-    });
-  }
-
-  Future<void> testAccessProofBodyTampering() {
-    bodyTamperTestResult = null;
-    return _run('Testing request-body tampering protection…', () async {
-      final AccountSession? session = accountSession;
-      final InstallationIdentity? currentIdentity = identity;
-      if (session == null || currentIdentity == null) {
-        throw ApiException('Create or log in to an account first.');
-      }
-
-      final String probeId = Uuid().v4();
-      final Map<String, dynamic> signedBody = <String, dynamic>{
-        'probe_id': probeId,
-        'message': 'ORIGINAL body signed by the native key',
-      };
-      final Map<String, dynamic> tamperedBody = <String, dynamic>{
-        'probe_id': probeId,
-        'message': 'TAMPERED after the proof was signed',
-      };
-
-      final AccessProofFixture fixture = await _api.buildAccessProofFixture(
-        'POST',
-        '/v1/account/protected-echo',
-        bearerToken: session.accessToken,
-        signingIdentity: currentIdentity,
-        body: signedBody,
-      );
-
-      try {
-        await _api.sendAccessProofFixture(
-          fixture,
-          actualEncodedBody: jsonEncode(tamperedBody),
-        );
-        final String result = <String>[
-          'FAIL: tampered request body was accepted',
-          'Protected request: 200',
-          'Expected server error: access_proof_body_mismatch',
-        ].join('\n');
-        bodyTamperTestResult = result;
-        debugPrint(result);
-        throw ApiException(
-          'SECURITY TEST FAILED: changed body was accepted.',
-          statusCode: 200,
-          code: 'tampered_body_accepted',
-        );
-      } on ApiException catch (error) {
-        if (error.code == 'tampered_body_accepted') {
-          rethrow;
-        }
-        if (error.statusCode == 401 &&
-            error.code == 'access_proof_body_mismatch') {
-          final String result = <String>[
-            'PASS: body tampering rejected',
-            'Protected request: 401',
-            'Server error: access_proof_body_mismatch',
-            'Proof signed hash: original body',
-            'HTTP body sent: modified after signing',
-          ].join('\n');
-          bodyTamperTestResult = result;
-          status = 'PASS: request-body tampering rejected';
-          debugPrint(result);
-          return;
-        }
-        final String result = <String>[
-          'INCONCLUSIVE: body-tampering request failed for another reason',
-          'Protected request: ${error.statusCode ?? 'no response'}',
-          'Server error: ${error.code ?? 'unknown'}',
-        ].join('\n');
-        bodyTamperTestResult = result;
-        debugPrint(result);
-        rethrow;
-      }
-    });
-  }
-
-  Future<void> testAccessProofPathAndMethodTampering() {
-    pathMethodTamperTestResult = null;
-    return _run('Testing HTTP path and method binding…', () async {
-      final AccountSession? session = accountSession;
-      final InstallationIdentity? currentIdentity = identity;
-      if (session == null || currentIdentity == null) {
-        throw ApiException('Create or log in to an account first.');
-      }
-
-      int? pathStatus;
-      String? pathCode;
-      int? methodStatus;
-      String? methodCode;
-
-      // PATH TEST: sign a proof naming another path, then send that exact proof
-      // to the real GET /v1/account/me endpoint.
-      final AccessProofFixture wrongPathFixture =
-          await _api.buildAccessProofFixture(
-        'GET',
-        '/v1/account/not-the-requested-route',
-        bearerToken: session.accessToken,
-        signingIdentity: currentIdentity,
-      );
-      try {
-        await _api.sendAccessProofFixture(
-          wrongPathFixture,
-          actualMethod: 'GET',
-          actualPath: '/v1/account/me',
-        );
-        pathStatus = 200;
-        pathCode = 'accepted';
-      } on ApiException catch (error) {
-        pathStatus = error.statusCode;
-        pathCode = error.code;
-      }
-
-      // METHOD TEST: sign a GET proof for the real protected-echo path, then
-      // actually POST to that path. Method mismatch is checked before body hash.
-      final AccessProofFixture wrongMethodFixture =
-          await _api.buildAccessProofFixture(
-        'GET',
-        '/v1/account/protected-echo',
-        bearerToken: session.accessToken,
-        signingIdentity: currentIdentity,
-      );
-      try {
-        await _api.sendAccessProofFixture(
-          wrongMethodFixture,
-          actualMethod: 'POST',
-          actualPath: '/v1/account/protected-echo',
-          actualEncodedBody: jsonEncode(<String, dynamic>{
-            'message': 'actual POST while proof says GET',
-          }),
-        );
-        methodStatus = 200;
-        methodCode = 'accepted';
-      } on ApiException catch (error) {
-        methodStatus = error.statusCode;
-        methodCode = error.code;
-      }
-
-      final bool pathPassed = pathStatus == 401 &&
-          pathCode == 'access_proof_path_mismatch';
-      final bool methodPassed = methodStatus == 401 &&
-          methodCode == 'access_proof_method_mismatch';
-
-      if (pathPassed && methodPassed) {
-        final String result = <String>[
-          'PASS: HTTP path and method tampering rejected',
-          'Path-tampered request: 401',
-          'Path server error: access_proof_path_mismatch',
-          'Method-tampered request: 401',
-          'Method server error: access_proof_method_mismatch',
-        ].join('\n');
-        pathMethodTamperTestResult = result;
-        status = 'PASS: HTTP path and method are cryptographically bound';
-        debugPrint(result);
-        return;
-      }
-
-      final String result = <String>[
-        'FAIL/INCONCLUSIVE: path or method binding did not return the expected result',
-        'Path request: ${pathStatus ?? 'no response'}',
-        'Path server error: ${pathCode ?? 'unknown'}',
-        'Method request: ${methodStatus ?? 'no response'}',
-        'Method server error: ${methodCode ?? 'unknown'}',
-      ].join('\n');
-      pathMethodTamperTestResult = result;
-      debugPrint(result);
-      throw ApiException(
-        'Path/method tampering test did not produce both expected rejections.',
-        code: 'path_method_test_failed',
-      );
-    });
-  }
-
-  Future<void> testExpiredAccessProofTimestamp() {
-    timestampExpiryTestResult = null;
-    return _run('Testing the access-proof timestamp window…', () async {
-      final AccountSession? session = accountSession;
-      final InstallationIdentity? currentIdentity = identity;
-      if (session == null || currentIdentity == null) {
-        throw ApiException('Create or log in to an account first.');
-      }
-
-      final int nowSeconds =
-          DateTime.now().toUtc().millisecondsSinceEpoch ~/ 1000;
-      // Server permits at most 120 seconds of skew. A proof timestamped 180
-      // seconds ago is equivalent to replaying a captured proof after expiry,
-      // without making this UI sit idle for two minutes.
-      const int simulatedAgeSeconds = 180;
-      final AccessProofFixture staleFixture =
-          await _api.buildAccessProofFixture(
-        'GET',
-        '/v1/account/me',
-        bearerToken: session.accessToken,
-        signingIdentity: currentIdentity,
-        timestampSeconds: nowSeconds - simulatedAgeSeconds,
-      );
-
-      try {
-        await _api.sendAccessProofFixture(staleFixture);
-        final String result = <String>[
-          'FAIL: stale access proof was accepted',
-          'Protected request: 200',
-          'Proof age: $simulatedAgeSeconds seconds',
-          'Server window: 120 seconds',
-        ].join('\n');
-        timestampExpiryTestResult = result;
-        debugPrint(result);
-        throw ApiException(
-          'SECURITY TEST FAILED: stale proof was accepted.',
-          statusCode: 200,
-          code: 'stale_access_proof_accepted',
-        );
-      } on ApiException catch (error) {
-        if (error.code == 'stale_access_proof_accepted') {
-          rethrow;
-        }
-        if (error.statusCode == 401 &&
-            error.code == 'access_proof_timestamp_outside_window') {
-          final String result = <String>[
-            'PASS: stale access proof rejected',
-            'Protected request: 401',
-            'Server error: access_proof_timestamp_outside_window',
-            'Proof age: $simulatedAgeSeconds seconds',
-            'Server allowed skew: 120 seconds',
-          ].join('\n');
-          timestampExpiryTestResult = result;
-          status = 'PASS: stale access proof rejected';
-          debugPrint(result);
-          return;
-        }
-        final String result = <String>[
-          'INCONCLUSIVE: stale-proof request failed for another reason',
-          'Protected request: ${error.statusCode ?? 'no response'}',
-          'Server error: ${error.code ?? 'unknown'}',
-        ].join('\n');
-        timestampExpiryTestResult = result;
-        debugPrint(result);
-        rethrow;
-      }
-    });
-  }
-
   Future<void> clearAccountSession() {
     return _run('Clearing local account tokens…', () async {
       await _store.clearAccountSession();
@@ -2220,80 +1830,6 @@ class _DeviceRecognitionPageState extends State<DeviceRecognitionPage> {
               _testResultPanel(
                 'Stolen access-token attack result',
                 _controller.stolenAccessTestResult!,
-              ),
-            ],
-            const Divider(height: 36),
-            Text(
-              'Access-proof boundary tests (1-4)',
-              style: Theme.of(context).textTheme.titleMedium,
-            ),
-            const SizedBox(height: 8),
-            const Text(
-              'These deliberately reuse or alter a signed request after the native '
-              'key has signed it. Each test must be rejected for the specific '
-              'reason shown below.',
-            ),
-            const SizedBox(height: 12),
-            Wrap(
-              spacing: 10,
-              runSpacing: 10,
-              children: <Widget>[
-                OutlinedButton(
-                  onPressed: _controller.busy ||
-                          _controller.accountSession == null
-                      ? null
-                      : _controller.testAccessProofReplay,
-                  child: const Text('1. Test replay'),
-                ),
-                OutlinedButton(
-                  onPressed: _controller.busy ||
-                          _controller.accountSession == null
-                      ? null
-                      : _controller.testAccessProofBodyTampering,
-                  child: const Text('2. Test body tampering'),
-                ),
-                OutlinedButton(
-                  onPressed: _controller.busy ||
-                          _controller.accountSession == null
-                      ? null
-                      : _controller.testAccessProofPathAndMethodTampering,
-                  child: const Text('3. Test path + method'),
-                ),
-                OutlinedButton(
-                  onPressed: _controller.busy ||
-                          _controller.accountSession == null
-                      ? null
-                      : _controller.testExpiredAccessProofTimestamp,
-                  child: const Text('4. Test stale timestamp'),
-                ),
-              ],
-            ),
-            if (_controller.replayAttackTestResult != null) ...<Widget>[
-              const SizedBox(height: 16),
-              _testResultPanel(
-                '1. Replay result',
-                _controller.replayAttackTestResult!,
-              ),
-            ],
-            if (_controller.bodyTamperTestResult != null) ...<Widget>[
-              const SizedBox(height: 12),
-              _testResultPanel(
-                '2. Body-tampering result',
-                _controller.bodyTamperTestResult!,
-              ),
-            ],
-            if (_controller.pathMethodTamperTestResult != null) ...<Widget>[
-              const SizedBox(height: 12),
-              _testResultPanel(
-                '3. Path/method result',
-                _controller.pathMethodTamperTestResult!,
-              ),
-            ],
-            if (_controller.timestampExpiryTestResult != null) ...<Widget>[
-              const SizedBox(height: 12),
-              _testResultPanel(
-                '4. Timestamp-window result',
-                _controller.timestampExpiryTestResult!,
               ),
             ],
             const SizedBox(height: 16),
