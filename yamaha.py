@@ -84,6 +84,8 @@ ACCESS_TOKEN_LIFETIME = timedelta(minutes=10)
 DEVICE_TOKEN_LIFETIME = timedelta(minutes=10)
 REFRESH_TOKEN_LIFETIME = timedelta(days=30)
 CHALLENGE_LIFETIME = timedelta(minutes=2)
+ACCESS_PROOF_MAX_SKEW_SECONDS = 120
+ACCESS_PROOF_NONCE_RETENTION = timedelta(minutes=10)
 
 REQUIRE_HTTPS = os.environ.get("REQUIRE_HTTPS", "0") == "1"
 MAX_OPEN_CHALLENGES_PER_INSTALLATION = 5
@@ -385,6 +387,17 @@ CREATE TABLE IF NOT EXISTS refresh_sessions (
 
 CREATE INDEX IF NOT EXISTS refresh_sessions_family_idx
     ON refresh_sessions(family_id);
+
+CREATE TABLE IF NOT EXISTS access_proof_nonces (
+    nonce_hash CHAR(64) PRIMARY KEY,
+    installation_id UUID NOT NULL REFERENCES app_installations(installation_id),
+    access_token_jti VARCHAR(128) NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    expires_at TIMESTAMPTZ NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS access_proof_nonces_installation_idx
+    ON access_proof_nonces(installation_id, expires_at);
 """
 
 _schema_lock = threading.Lock()
@@ -900,6 +913,244 @@ def _require_role(required_role):
     return claims
 
 
+def _bearer_token_from_request():
+    header = request.headers.get("Authorization", "")
+    if not header.startswith("Bearer "):
+        raise ApiProblem(
+            "A Bearer access token is required.",
+            401,
+            "missing_access_token",
+        )
+    token = header[7:].strip()
+    if not token:
+        raise ApiProblem(
+            "A Bearer access token is required.",
+            401,
+            "missing_access_token",
+        )
+    return token
+
+
+def _require_access_proof(required_role="account"):
+    """Verify a one-request proof of possession for the current access token.
+
+    The client signs the exact base64url-decoded proof JSON bytes. The server
+    then verifies that those signed fields describe this exact HTTP request:
+    token hash, installation id, method, path, body hash, timestamp and nonce.
+    The nonce is committed only after the signature verifies, making a captured
+    proof unusable a second time.
+    """
+    claims = _require_role(required_role)
+
+    installation_id = claims.get("iid")
+    device_id = claims.get("did")
+    token_jti = claims.get("jti")
+    if not installation_id or not device_id or not token_jti:
+        raise ApiProblem(
+            "The access token is missing proof-of-possession binding claims.",
+            401,
+            "invalid_access_binding",
+        )
+
+    proof_b64 = request.headers.get("X-Access-Proof")
+    signature_b64 = request.headers.get("X-Access-Signature")
+    if not proof_b64 or not signature_b64:
+        raise ApiProblem(
+            "This endpoint requires an installation-key access proof.",
+            401,
+            "missing_access_proof",
+        )
+
+    proof_bytes = _b64url_decode(proof_b64, "access_proof", 4096)
+    signature = _b64url_decode(signature_b64, "access_signature", 1024)
+
+    try:
+        proof = json.loads(proof_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise ApiProblem(
+            "The access proof is not valid JSON.",
+            400,
+            "invalid_access_proof",
+        )
+    if not isinstance(proof, dict):
+        raise ApiProblem(
+            "The access proof must be a JSON object.",
+            400,
+            "invalid_access_proof",
+        )
+
+    if proof.get("version") != 1:
+        raise ApiProblem(
+            "The access proof version is unsupported.",
+            400,
+            "unsupported_access_proof_version",
+        )
+
+    if proof.get("installation_id") != installation_id:
+        raise ApiProblem(
+            "The access proof installation does not match the access token.",
+            401,
+            "access_proof_installation_mismatch",
+        )
+
+    expected_method = request.method.upper()
+    if proof.get("method") != expected_method:
+        raise ApiProblem(
+            "The access proof HTTP method does not match the request.",
+            401,
+            "access_proof_method_mismatch",
+        )
+
+    if proof.get("path") != request.path:
+        raise ApiProblem(
+            "The access proof path does not match the request.",
+            401,
+            "access_proof_path_mismatch",
+        )
+
+    raw_body = request.get_data(cache=True) or b""
+    expected_body_hash = hashlib.sha256(raw_body).hexdigest()
+    body_hash = proof.get("body_sha256")
+    if not isinstance(body_hash, str) or not hmac.compare_digest(
+        body_hash, expected_body_hash
+    ):
+        raise ApiProblem(
+            "The access proof body hash does not match the request body.",
+            401,
+            "access_proof_body_mismatch",
+        )
+
+    raw_access_token = _bearer_token_from_request()
+    expected_token_hash = hashlib.sha256(
+        raw_access_token.encode("utf-8")
+    ).hexdigest()
+    token_hash = proof.get("access_token_sha256")
+    if not isinstance(token_hash, str) or not hmac.compare_digest(
+        token_hash, expected_token_hash
+    ):
+        raise ApiProblem(
+            "The access proof is bound to a different access token.",
+            401,
+            "access_proof_token_mismatch",
+        )
+
+    timestamp = proof.get("timestamp")
+    if isinstance(timestamp, bool) or not isinstance(timestamp, int):
+        raise ApiProblem(
+            "The access proof timestamp is invalid.",
+            400,
+            "invalid_access_proof_timestamp",
+        )
+    now_seconds = int(_utc_now().timestamp())
+    if abs(now_seconds - timestamp) > ACCESS_PROOF_MAX_SKEW_SECONDS:
+        raise ApiProblem(
+            "The access proof timestamp is outside the allowed clock window.",
+            401,
+            "access_proof_timestamp_outside_window",
+        )
+
+    nonce_text = proof.get("nonce")
+    nonce_bytes = _b64url_decode(nonce_text, "access_proof_nonce", 64)
+    if len(nonce_bytes) != 32:
+        raise ApiProblem(
+            "The access proof nonce must contain exactly 32 random bytes.",
+            400,
+            "invalid_access_proof_nonce",
+        )
+    nonce_hash = hashlib.sha256(nonce_bytes).hexdigest()
+
+    with _cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT key_algorithm, public_key_jwk, device_id, status
+            FROM app_installations
+            WHERE installation_id = %s
+            """,
+            (installation_id,),
+        )
+        row = cursor.fetchone()
+
+    if row is None:
+        raise ApiProblem(
+            "The access token installation no longer exists.",
+            401,
+            "installation_not_found",
+        )
+
+    key_algorithm, public_key_jwk, stored_device_id, installation_status = row
+    if str(stored_device_id) != device_id:
+        raise ApiProblem(
+            "The access token device binding does not match the installation.",
+            401,
+            "access_device_binding_mismatch",
+        )
+    if installation_status != "active":
+        raise ApiProblem(
+            "The installation is not active.",
+            403,
+            "installation_inactive",
+        )
+
+    # This is the cryptographic possession check. A copied access token from
+    # Phone A, signed by Phone B's non-exportable key, fails here.
+    _verify_installation_signature(
+        key_algorithm,
+        public_key_jwk,
+        proof_bytes,
+        signature,
+    )
+
+    # Consume the client nonce after signature verification. ON CONFLICT gives
+    # us an atomic replay check even if the same captured request arrives twice.
+    with _cursor(commit=True) as cursor:
+        cursor.execute(
+            """
+            DELETE FROM access_proof_nonces
+            WHERE expires_at < NOW() - INTERVAL '1 day'
+            """
+        )
+        cursor.execute(
+            """
+            INSERT INTO access_proof_nonces
+                (nonce_hash, installation_id, access_token_jti, expires_at)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (nonce_hash) DO NOTHING
+            RETURNING nonce_hash
+            """,
+            (
+                nonce_hash,
+                installation_id,
+                token_jti,
+                _utc_now() + ACCESS_PROOF_NONCE_RETENTION,
+            ),
+        )
+        if cursor.fetchone() is None:
+            raise ApiProblem(
+                "This signed access proof has already been used.",
+                401,
+                "access_proof_replay",
+            )
+
+        cursor.execute(
+            """
+            UPDATE app_installations
+            SET last_seen_at = NOW()
+            WHERE installation_id = %s
+            """,
+            (installation_id,),
+        )
+        cursor.execute(
+            """
+            UPDATE recognized_devices
+            SET last_seen_at = NOW()
+            WHERE device_id = %s
+            """,
+            (device_id,),
+        )
+
+    return claims
+
+
 def _issue_device_token(installation_id, device_id, key_thumbprint):
     claims = {
         "role": "device",
@@ -1253,8 +1504,10 @@ def installation_verify():
 @jwt_required()
 def device_me():
     claims = get_jwt()
-    if claims.get("role") not in ("device", "account"):
+    role = claims.get("role")
+    if role not in ("device", "account"):
         raise ApiProblem("Unsupported token role.", 403, "wrong_token_role")
+    claims = _require_access_proof(role)
     installation_id = claims.get("iid")
     device_id = claims.get("did")
     if not installation_id or not device_id:
@@ -1317,7 +1570,7 @@ def device_me():
 @app.post("/v1/accounts/register")
 @jwt_required()
 def account_register():
-    claims = _require_role("device")
+    claims = _require_access_proof("device")
     body = _json_body()
     lookup = _handle_lookup(body.get("handle"))
     password = _password_bytes(body.get("password"))
@@ -1353,7 +1606,7 @@ def account_register():
 @app.post("/v1/accounts/login")
 @jwt_required()
 def account_login():
-    claims = _require_role("device")
+    claims = _require_access_proof("device")
     body = _json_body()
     lookup = _handle_lookup(body.get("handle"))
     password = _password_bytes(body.get("password"))
@@ -1388,13 +1641,31 @@ def account_login():
 @app.get("/v1/account/me")
 @jwt_required()
 def account_me():
-    claims = _require_role("account")
+    claims = _require_access_proof("account")
     return jsonify(
         {
             "account_id": str(get_jwt_identity()),
             "device_id": claims.get("did"),
             "installation_id": claims.get("iid"),
             "session_id": claims.get("sid"),
+            "access_proof": "accepted",
+        }
+    )
+
+
+@app.post("/v1/account/protected-echo")
+@jwt_required()
+def account_protected_echo():
+    claims = _require_access_proof("account")
+    body = _json_body()
+    return jsonify(
+        {
+            "account_id": str(get_jwt_identity()),
+            "device_id": claims.get("did"),
+            "installation_id": claims.get("iid"),
+            "access_proof": "accepted",
+            "body_sha256": hashlib.sha256(request.get_data(cache=True) or b"").hexdigest(),
+            "echo": body,
         }
     )
 
