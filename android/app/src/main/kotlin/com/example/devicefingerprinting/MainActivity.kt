@@ -1,3 +1,4 @@
+// IMPORTANT: Keep this package line identical to your existing MainActivity package.
 package com.example.devicefingerprinting
 
 import android.os.Handler
@@ -11,21 +12,23 @@ import java.util.concurrent.Executors
 
 class MainActivity : FlutterActivity() {
     companion object {
-        private const val CHANNEL =
-            "devicefingerprinting/installation_key_v2"
+        private const val KEY_CHANNEL = "devicefingerprinting/installation_key_v2"
+        private const val INTEGRITY_CHANNEL = "devicefingerprinting/integrity_v1"
     }
 
     private val worker: ExecutorService = Executors.newSingleThreadExecutor()
     private val mainHandler = Handler(Looper.getMainLooper())
     private lateinit var installationKeys: InstallationKeyManager
+    private lateinit var integrityProbes: IntegrityProbeManager
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
         installationKeys = InstallationKeyManager(applicationContext)
+        integrityProbes = IntegrityProbeManager(applicationContext)
 
         MethodChannel(
             flutterEngine.dartExecutor.binaryMessenger,
-            CHANNEL,
+            KEY_CHANNEL,
         ).setMethodCallHandler { call, result ->
             when (call.method) {
                 "getOrCreateKey" -> runOffMainThread(result) {
@@ -39,6 +42,26 @@ class MainActivity : FlutterActivity() {
 
                 "deleteKey" -> runOffMainThread(result) {
                     installationKeys.deleteKey()
+                }
+
+                else -> result.notImplemented()
+            }
+        }
+
+        MethodChannel(
+            flutterEngine.dartExecutor.binaryMessenger,
+            INTEGRITY_CHANNEL,
+        ).setMethodCallHandler { call, result ->
+            when (call.method) {
+                "collect" -> runOffMainThread(result) {
+                    val nonce = requiredString(call, "challenge_nonce")
+                    val required = call.argument<List<String>>("required_probes")
+                        ?: throw InstallationKeyFailure(
+                            "INVALID_ARGUMENT",
+                            "required_probes must be a list of strings.",
+                        )
+                    val testFixture = call.argument<String>("integrity_test_fixture")
+                    integrityProbes.collect(required, nonce, testFixture)
                 }
 
                 else -> result.notImplemented()
@@ -74,8 +97,8 @@ class MainActivity : FlutterActivity() {
             } catch (error: Throwable) {
                 mainHandler.post {
                     result.error(
-                        "NATIVE_KEY_ERROR",
-                        error.message ?: "The Android installation-key operation failed.",
+                        "NATIVE_INTEGRITY_ERROR",
+                        error.message ?: "The Android native operation failed.",
                         null,
                     )
                 }

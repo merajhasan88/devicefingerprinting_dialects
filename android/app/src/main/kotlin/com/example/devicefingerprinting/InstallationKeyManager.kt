@@ -36,7 +36,7 @@ class InstallationKeyManager(private val context: Context) {
         private const val ANDROID_KEY_STORE = "AndroidKeyStore"
         private const val CURVE_NAME = "secp256r1"
         private const val CHANNEL_KEY_VERSION = 2
-        private const val MAX_PAYLOAD_BYTES = 8192
+        private const val MAX_PAYLOAD_BYTES = 65536
     }
 
     private val keyAlias: String =
