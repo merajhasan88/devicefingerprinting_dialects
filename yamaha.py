@@ -14,6 +14,10 @@ The private installation key stays inside Android Keystore or the iOS Secure
 Enclave/Keychain. The server stores only public JWKs, opaque IDs, password
 hashes, and HMACed reinstall hints. Existing RS256 rows remain verifiable while
 new native keys use P-256 ECDSA (ES256 with DER-encoded signatures).
+
+This version also adds a server-side device/account risk-policy layer. Risk is
+computed from opaque device/account relationships only; no PII or device
+hardware fingerprint is added.
 """
 
 import base64
@@ -87,6 +91,76 @@ CHALLENGE_LIFETIME = timedelta(minutes=2)
 ACCESS_PROOF_MAX_SKEW_SECONDS = 120
 ACCESS_PROOF_NONCE_RETENTION = timedelta(minutes=10)
 
+# ---------------------------------------------------------------------------
+# Device/account risk policy
+# ---------------------------------------------------------------------------
+# Keep observe mode while tuning thresholds. In observe mode the recommended
+# action is calculated and logged but soft decisions do not block authentication.
+# Switching to "enforce" makes step_up/review/block decisions reject the
+# account registration, login, refresh, or policy-gated operation with HTTP 403.
+DEVICE_POLICY_MODE = os.environ.get("DEVICE_POLICY_MODE", "observe").strip().lower()
+if DEVICE_POLICY_MODE not in ("observe", "enforce"):
+    raise RuntimeError("DEVICE_POLICY_MODE must be 'observe' or 'enforce'.")
+
+POLICY_STEP_UP_SCORE = int(os.environ.get("POLICY_STEP_UP_SCORE", "30"))
+POLICY_REVIEW_SCORE = int(os.environ.get("POLICY_REVIEW_SCORE", "60"))
+POLICY_BLOCK_SCORE = int(os.environ.get("POLICY_BLOCK_SCORE", "90"))
+POLICY_REINSTALL_WINDOW_HOURS = int(
+    os.environ.get("POLICY_REINSTALL_WINDOW_HOURS", "24")
+)
+POLICY_DEVICE_ACCOUNT_BLOCK_COUNT = int(
+    os.environ.get("POLICY_DEVICE_ACCOUNT_BLOCK_COUNT", "5")
+)
+POLICY_ACCOUNT_DEVICE_BLOCK_COUNT = int(
+    os.environ.get("POLICY_ACCOUNT_DEVICE_BLOCK_COUNT", "5")
+)
+POLICY_REINSTALL_BLOCK_COUNT = int(
+    os.environ.get("POLICY_REINSTALL_BLOCK_COUNT", "5")
+)
+
+# ---------------------------------------------------------------------------
+# Local integrity / tamper measurement policy
+# ---------------------------------------------------------------------------
+# No Google Play Integrity, SafetyNet, App Attest, DeviceCheck, or Apple/Google
+# remote attestation service is used. The device reports local measurements,
+# signs the complete report with its registered installation key, and this
+# server owns all scoring and allow/review/block decisions.
+INTEGRITY_MODE = os.environ.get("INTEGRITY_MODE", "observe").strip().lower()
+if INTEGRITY_MODE not in ("observe", "enforce"):
+    raise RuntimeError("INTEGRITY_MODE must be 'observe' or 'enforce'.")
+
+INTEGRITY_CHALLENGE_LIFETIME = timedelta(
+    seconds=int(os.environ.get("INTEGRITY_CHALLENGE_LIFETIME_SECONDS", "60"))
+)
+INTEGRITY_REPORT_MAX_SKEW_SECONDS = int(
+    os.environ.get("INTEGRITY_REPORT_MAX_SKEW_SECONDS", "90")
+)
+INTEGRITY_FRESHNESS_SECONDS = int(
+    os.environ.get("INTEGRITY_FRESHNESS_SECONDS", "600")
+)
+INTEGRITY_RANDOM_OPTIONAL_PROBES = int(
+    os.environ.get("INTEGRITY_RANDOM_OPTIONAL_PROBES", "4")
+)
+INTEGRITY_ALLOW_DEBUG = os.environ.get("INTEGRITY_ALLOW_DEBUG", "0") == "1"
+INTEGRITY_ALLOW_EMULATOR = os.environ.get("INTEGRITY_ALLOW_EMULATOR", "0") == "1"
+
+def _env_values(name):
+    raw = os.environ.get(name, "").replace(";", ",")
+    values = set()
+    for item in raw.split(","):
+        normalized = item.strip().lower().replace(":", "").replace(" ", "")
+        if normalized:
+            values.add(normalized)
+    return values
+
+EXPECTED_ANDROID_PACKAGE = os.environ.get("INTEGRITY_ANDROID_PACKAGE", "").strip()
+EXPECTED_ANDROID_CERT_SHA256 = _env_values("INTEGRITY_ANDROID_CERT_SHA256")
+EXPECTED_ANDROID_APK_SHA256 = _env_values("INTEGRITY_ANDROID_APK_SHA256")
+EXPECTED_IOS_BUNDLE_ID = os.environ.get("INTEGRITY_IOS_BUNDLE_ID", "").strip()
+EXPECTED_IOS_SIGNING_ID = os.environ.get("INTEGRITY_IOS_SIGNING_ID", "").strip()
+EXPECTED_IOS_TEAM_ID = os.environ.get("INTEGRITY_IOS_TEAM_ID", "").strip()
+EXPECTED_IOS_EXECUTABLE_SHA256 = _env_values("INTEGRITY_IOS_EXECUTABLE_SHA256")
+
 REQUIRE_HTTPS = os.environ.get("REQUIRE_HTTPS", "0") == "1"
 MAX_OPEN_CHALLENGES_PER_INSTALLATION = 5
 
@@ -111,16 +185,20 @@ logger = logging.getLogger("device-recognition")
 
 
 class ApiProblem(Exception):
-    def __init__(self, message, status=400, code="bad_request"):
+    def __init__(self, message, status=400, code="bad_request", details=None):
         super().__init__(message)
         self.message = message
         self.status = status
         self.code = code
+        self.details = details
 
 
 @app.errorhandler(ApiProblem)
 def handle_api_problem(error):
-    return jsonify({"error": {"code": error.code, "message": error.message}}), error.status
+    payload = {"error": {"code": error.code, "message": error.message}}
+    if error.details is not None:
+        payload["error"]["details"] = error.details
+    return jsonify(payload), error.status
 
 
 @app.errorhandler(HTTPException)
@@ -286,11 +364,15 @@ CREATE TABLE IF NOT EXISTS recognized_devices (
     device_id UUID PRIMARY KEY,
     platform VARCHAR(16) NOT NULL,
     reinstall_hint_hash CHAR(64),
+    status VARCHAR(16) NOT NULL DEFAULT 'active',
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     CONSTRAINT recognized_devices_platform_hint_unique
         UNIQUE (platform, reinstall_hint_hash)
 );
+
+ALTER TABLE recognized_devices
+    ADD COLUMN IF NOT EXISTS status VARCHAR(16) NOT NULL DEFAULT 'active';
 
 CREATE TABLE IF NOT EXISTS app_installations (
     installation_id UUID PRIMARY KEY,
@@ -398,6 +480,63 @@ CREATE TABLE IF NOT EXISTS access_proof_nonces (
 
 CREATE INDEX IF NOT EXISTS access_proof_nonces_installation_idx
     ON access_proof_nonces(installation_id, expires_at);
+
+CREATE TABLE IF NOT EXISTS risk_policy_decisions (
+    decision_id UUID PRIMARY KEY,
+    event_type VARCHAR(32) NOT NULL,
+    account_id UUID,
+    device_id UUID NOT NULL REFERENCES recognized_devices(device_id),
+    installation_id UUID NOT NULL REFERENCES app_installations(installation_id),
+    policy_mode VARCHAR(16) NOT NULL,
+    recommended_action VARCHAR(16) NOT NULL,
+    effective_action VARCHAR(16) NOT NULL,
+    score INTEGER NOT NULL,
+    reasons JSONB NOT NULL,
+    context JSONB NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS risk_policy_decisions_device_idx
+    ON risk_policy_decisions(device_id, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS risk_policy_decisions_account_idx
+    ON risk_policy_decisions(account_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS integrity_challenges (
+    challenge_id UUID PRIMARY KEY,
+    installation_id UUID NOT NULL REFERENCES app_installations(installation_id),
+    device_id UUID NOT NULL REFERENCES recognized_devices(device_id),
+    platform VARCHAR(16) NOT NULL,
+    nonce_sha256 CHAR(64) NOT NULL,
+    required_probes JSONB NOT NULL,
+    expires_at TIMESTAMPTZ NOT NULL,
+    used_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS integrity_challenges_installation_idx
+    ON integrity_challenges(installation_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS integrity_reports (
+    report_id UUID PRIMARY KEY,
+    challenge_id UUID NOT NULL UNIQUE REFERENCES integrity_challenges(challenge_id),
+    installation_id UUID NOT NULL REFERENCES app_installations(installation_id),
+    device_id UUID NOT NULL REFERENCES recognized_devices(device_id),
+    platform VARCHAR(16) NOT NULL,
+    collector_version INTEGER NOT NULL,
+    score INTEGER NOT NULL,
+    verdict VARCHAR(16) NOT NULL,
+    hard_block BOOLEAN NOT NULL DEFAULT FALSE,
+    reasons JSONB NOT NULL,
+    probe_results JSONB NOT NULL,
+    report_sha256 CHAR(64) NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS integrity_reports_installation_idx
+    ON integrity_reports(installation_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS integrity_reports_device_idx
+    ON integrity_reports(device_id, created_at DESC);
 """
 
 _schema_lock = threading.Lock()
@@ -680,6 +819,799 @@ def _bcrypt_db_bytes(value):
 
 
 # ---------------------------------------------------------------------------
+# Native integrity challenge, scoring, and freshness helpers
+# ---------------------------------------------------------------------------
+
+
+def _integrity_probe_plan(platform):
+    if platform == "android":
+        mandatory = [
+            "app_identity",
+            "debug_state",
+            "root_files",
+            "system_properties",
+            "runtime_maps",
+            "tracer",
+        ]
+        optional = [
+            "root_shell",
+            "selinux",
+            "mounts",
+            "frida_ports",
+            "emulator",
+            "developer_settings",
+        ]
+    elif platform == "ios":
+        mandatory = [
+            "app_identity",
+            "code_signing",
+            "debugger",
+            "jailbreak_files",
+            "sandbox",
+            "dyld_images",
+        ]
+        optional = ["environment", "simulator"]
+    else:
+        raise ApiProblem("Unsupported integrity platform.", 400, "unsupported_platform")
+
+    pool = list(optional)
+    chosen = []
+    target = min(max(INTEGRITY_RANDOM_OPTIONAL_PROBES, 0), len(pool))
+    while pool and len(chosen) < target:
+        chosen.append(pool.pop(secrets.randbelow(len(pool))))
+    return mandatory + chosen
+
+
+def _integrity_reason(reasons, code, points, message, hard=False):
+    reasons.append(
+        {
+            "code": code,
+            "points": int(points),
+            "message": message,
+            "hard": bool(hard),
+        }
+    )
+
+
+def _probe(probes, name):
+    value = probes.get(name)
+    return value if isinstance(value, dict) else {}
+
+
+def _as_bool(value):
+    return value is True
+
+
+def _as_text(value):
+    return value.strip() if isinstance(value, str) else ""
+
+
+def _as_list(value):
+    return value if isinstance(value, list) else []
+
+
+def _integrity_verdict(score, hard_block=False):
+    if hard_block or score >= 90:
+        return "block"
+    if score >= 60:
+        return "review"
+    if score >= 30:
+        return "elevated"
+    return "trusted"
+
+
+def _score_android_integrity(probes):
+    reasons = []
+    score = 0
+    hard_block = False
+
+    app_identity = _probe(probes, "app_identity")
+    package_name = _as_text(app_identity.get("package_name"))
+    certs = {str(x).strip().lower() for x in _as_list(app_identity.get("cert_sha256"))}
+    apk_hash = _as_text(app_identity.get("apk_sha256")).lower()
+
+    if EXPECTED_ANDROID_PACKAGE and package_name != EXPECTED_ANDROID_PACKAGE:
+        _integrity_reason(reasons, "android_package_mismatch", 100, "Installed package name does not match the server baseline.", True)
+        hard_block = True
+    if EXPECTED_ANDROID_CERT_SHA256 and not (certs & EXPECTED_ANDROID_CERT_SHA256):
+        _integrity_reason(reasons, "android_signing_certificate_mismatch", 100, "APK signing certificate is not in the server allow-list.", True)
+        hard_block = True
+    if EXPECTED_ANDROID_APK_SHA256 and apk_hash not in EXPECTED_ANDROID_APK_SHA256:
+        _integrity_reason(reasons, "android_apk_hash_mismatch", 100, "Installed base APK hash does not match the configured build baseline.", True)
+        hard_block = True
+    if _as_bool(app_identity.get("debuggable")) and not INTEGRITY_ALLOW_DEBUG:
+        _integrity_reason(reasons, "android_app_debuggable", 35, "The installed application is debuggable.")
+        score += 35
+    if _as_bool(app_identity.get("allow_backup")):
+        _integrity_reason(reasons, "android_backup_enabled", 5, "The application permits OS backup/transfer.")
+        score += 5
+
+    debug_state = _probe(probes, "debug_state")
+    if (_as_bool(debug_state.get("debugger_connected")) or _as_bool(debug_state.get("waiting_for_debugger"))) and not INTEGRITY_ALLOW_DEBUG:
+        _integrity_reason(reasons, "android_debugger_attached", 50, "A debugger is attached to the application process.")
+        score += 50
+
+    tracer = _probe(probes, "tracer")
+    tracer_pid = tracer.get("tracer_pid")
+    if isinstance(tracer_pid, int) and tracer_pid > 0 and not INTEGRITY_ALLOW_DEBUG:
+        _integrity_reason(reasons, "android_process_traced", 55, "TracerPid indicates that another process is tracing the app.")
+        score += 55
+
+    root_files = _probe(probes, "root_files")
+    found_paths = [str(x).lower() for x in _as_list(root_files.get("found_paths"))]
+    if any("magisk" in x or "kernelsu" in x or "/data/adb/ksu" in x or "/data/adb/ap" in x for x in found_paths):
+        _integrity_reason(reasons, "android_root_framework_artifact", 75, "Root-management framework artifacts were visible.")
+        score += 75
+    elif found_paths:
+        _integrity_reason(reasons, "android_root_artifact", 50, "Root/su artifacts were visible.")
+        score += 50
+    if _as_bool(root_files.get("test_keys")):
+        _integrity_reason(reasons, "android_test_keys", 25, "Build tags contain test-keys.")
+        score += 25
+
+    root_shell = _probe(probes, "root_shell")
+    if _as_bool(root_shell.get("su_found")):
+        _integrity_reason(reasons, "android_su_on_path", 50, "The su command is discoverable from the application process.")
+        score += 50
+
+    props = _probe(probes, "system_properties").get("properties")
+    props = props if isinstance(props, dict) else {}
+    verified = _as_text(props.get("ro.boot.verifiedbootstate")).lower()
+    flash_locked = _as_text(props.get("ro.boot.flash.locked")).lower()
+    vbmeta_state = _as_text(props.get("ro.boot.vbmeta.device_state")).lower()
+    ro_secure = _as_text(props.get("ro.secure")).lower()
+    ro_debuggable = _as_text(props.get("ro.debuggable")).lower()
+    if verified and verified not in ("green",):
+        _integrity_reason(reasons, "android_verified_boot_not_green", 60, "Verified Boot state is not green.")
+        score += 60
+    if flash_locked and flash_locked not in ("1", "true", "locked"):
+        _integrity_reason(reasons, "android_bootloader_not_locked", 60, "Bootloader/flash lock property is not locked.")
+        score += 60
+    if vbmeta_state and vbmeta_state not in ("locked",):
+        _integrity_reason(reasons, "android_vbmeta_not_locked", 60, "VBMeta device state is not locked.")
+        score += 60
+    if ro_secure == "0":
+        _integrity_reason(reasons, "android_ro_secure_disabled", 50, "ro.secure is disabled.")
+        score += 50
+    if ro_debuggable == "1" and not INTEGRITY_ALLOW_DEBUG:
+        _integrity_reason(reasons, "android_system_debuggable", 35, "ro.debuggable is enabled.")
+        score += 35
+
+    selinux_probe = _probe(probes, "selinux")
+    selinux_mode = _as_text(selinux_probe.get("mode")).strip().lower()
+    selinux_getenforce = _as_text(selinux_probe.get("getenforce")).strip().lower()
+    selinux_enforce_value = _as_text(selinux_probe.get("enforce_value")).strip()
+
+    # Accept either independent signal as proof of an enforcing local state.
+    # Do not classify arbitrary OEM/error text as "not enforcing".
+    selinux_enforcing = (
+        selinux_mode == "enforcing"
+        or selinux_getenforce == "enforcing"
+        or selinux_enforce_value == "1"
+    )
+    selinux_permissive = (
+        selinux_mode == "permissive"
+        or selinux_getenforce == "permissive"
+        or selinux_enforce_value == "0"
+    )
+    selinux_disabled = (
+        selinux_mode == "disabled"
+        or selinux_getenforce == "disabled"
+    )
+
+    if selinux_disabled:
+        _integrity_reason(
+            reasons,
+            "android_selinux_disabled",
+            70,
+            "SELinux reports disabled.",
+        )
+        score += 70
+    elif selinux_permissive and not selinux_enforcing:
+        _integrity_reason(
+            reasons,
+            "android_selinux_permissive",
+            45,
+            "SELinux reports permissive mode.",
+        )
+        score += 45
+    elif not selinux_enforcing:
+        # Some OEMs intentionally prevent an ordinary sandboxed app from
+        # reading getenforce or /sys/fs/selinux/enforce. An unavailable local
+        # measurement is telemetry, not evidence of compromise. Only explicit
+        # permissive/disabled states receive risk points.
+        pass
+
+    writable_mounts = _as_list(_probe(probes, "mounts").get("protected_rw_mounts"))
+    if writable_mounts:
+        _integrity_reason(reasons, "android_protected_mount_writable", 55, "A protected system mount appears writable.")
+        score += 55
+
+    runtime = _probe(probes, "runtime_maps")
+    tokens = {str(x).lower() for x in _as_list(runtime.get("suspicious_tokens"))}
+    if "frida" in tokens or "gadget" in tokens or "objection" in tokens:
+        _integrity_reason(reasons, "android_frida_runtime_artifact", 90, "Frida/Gadget/Objection artifacts were mapped into the process.")
+        score += 90
+    if tokens & {"xposed", "lsposed", "substrate", "zygisk", "riru", "magisk", "kernelsu", "apatch"}:
+        _integrity_reason(reasons, "android_hook_framework_artifact", 80, "Hook/root framework artifacts were mapped into the process.")
+        score += 80
+
+    open_ports = _as_list(_probe(probes, "frida_ports").get("open_ports"))
+    if 27042 in open_ports or 27043 in open_ports:
+        _integrity_reason(reasons, "android_frida_port_open", 75, "A common local Frida server port is accepting connections.")
+        score += 75
+
+    emulator = _probe(probes, "emulator")
+    if _as_bool(emulator.get("suspected")) and not INTEGRITY_ALLOW_EMULATOR:
+        _integrity_reason(reasons, "android_emulator", 25, "The runtime resembles an Android emulator.")
+        score += 25
+
+    dev = _probe(probes, "developer_settings")
+    if _as_bool(dev.get("developer_options_enabled")):
+        _integrity_reason(reasons, "android_developer_options", 8, "Developer options are enabled.")
+        score += 8
+    if _as_bool(dev.get("adb_enabled")):
+        _integrity_reason(reasons, "android_adb_enabled", 10, "ADB is enabled.")
+        score += 10
+
+    return score, hard_block, reasons
+
+
+def _score_ios_integrity(probes):
+    reasons = []
+    score = 0
+    hard_block = False
+
+    app_identity = _probe(probes, "app_identity")
+    bundle_id = _as_text(app_identity.get("bundle_id"))
+    executable_hash = _as_text(app_identity.get("executable_sha256")).lower()
+    if EXPECTED_IOS_BUNDLE_ID and bundle_id != EXPECTED_IOS_BUNDLE_ID:
+        _integrity_reason(reasons, "ios_bundle_id_mismatch", 100, "Bundle identifier does not match the server baseline.", True)
+        hard_block = True
+    if EXPECTED_IOS_EXECUTABLE_SHA256 and executable_hash not in EXPECTED_IOS_EXECUTABLE_SHA256:
+        _integrity_reason(reasons, "ios_executable_hash_mismatch", 100, "Executable hash does not match the configured build baseline.", True)
+        hard_block = True
+
+    signing = _probe(probes, "code_signing")
+    signing_id = _as_text(signing.get("signing_identifier"))
+    team_id = _as_text(signing.get("team_identifier"))
+    if EXPECTED_IOS_SIGNING_ID and signing_id != EXPECTED_IOS_SIGNING_ID:
+        _integrity_reason(reasons, "ios_signing_identifier_mismatch", 100, "Code-signing identifier does not match the server baseline.", True)
+        hard_block = True
+    if EXPECTED_IOS_TEAM_ID and team_id != EXPECTED_IOS_TEAM_ID:
+        _integrity_reason(reasons, "ios_team_identifier_mismatch", 100, "Team identifier does not match the server baseline.", True)
+        hard_block = True
+    if _as_bool(signing.get("get_task_allow")) and not INTEGRITY_ALLOW_DEBUG:
+        _integrity_reason(reasons, "ios_get_task_allow", 35, "get-task-allow is enabled for this application.")
+        score += 35
+
+    debugger = _probe(probes, "debugger")
+    if _as_bool(debugger.get("traced")) and not INTEGRITY_ALLOW_DEBUG:
+        _integrity_reason(reasons, "ios_process_traced", 50, "The process is being traced/debugged.")
+        score += 50
+
+    jailbreak_paths = _as_list(_probe(probes, "jailbreak_files").get("found_paths"))
+    if jailbreak_paths:
+        _integrity_reason(reasons, "ios_jailbreak_artifact", 75, "Jailbreak filesystem artifacts were visible.")
+        score += 75
+
+    sandbox = _probe(probes, "sandbox")
+    if _as_bool(sandbox.get("write_outside_sandbox_succeeded")):
+        _integrity_reason(reasons, "ios_sandbox_escape_signal", 100, "The app successfully wrote outside its sandbox.", True)
+        hard_block = True
+
+    dyld = _probe(probes, "dyld_images")
+    dyld_tokens = {str(x).lower() for x in _as_list(dyld.get("suspicious_tokens"))}
+    if dyld_tokens & {"frida", "gadget", "objection"}:
+        _integrity_reason(reasons, "ios_frida_runtime_artifact", 90, "Frida/Gadget/Objection images were loaded into the process.")
+        score += 90
+    if dyld_tokens & {"substrate", "mobilesubstrate", "substitute", "libhooker", "ellekit", "cydia"}:
+        _integrity_reason(reasons, "ios_hook_framework_artifact", 85, "Jailbreak/hooking framework images were loaded into the process.")
+        score += 85
+
+    inserted = _as_text(_probe(probes, "environment").get("dyld_insert_libraries"))
+    if inserted:
+        _integrity_reason(reasons, "ios_dyld_injection_environment", 90, "DYLD_INSERT_LIBRARIES is set.")
+        score += 90
+
+    simulator = _probe(probes, "simulator")
+    if _as_bool(simulator.get("is_simulator")) and not INTEGRITY_ALLOW_EMULATOR:
+        _integrity_reason(reasons, "ios_simulator", 25, "The app is running in the iOS simulator.")
+        score += 25
+
+    return score, hard_block, reasons
+
+
+def _score_integrity(platform, probes):
+    if platform == "android":
+        score, hard_block, reasons = _score_android_integrity(probes)
+    elif platform == "ios":
+        score, hard_block, reasons = _score_ios_integrity(probes)
+    else:
+        raise ApiProblem("Unsupported integrity platform.", 400, "unsupported_platform")
+    # Derive the displayed integrity score from the same reasons returned to
+    # callers. This keeps hard-block findings such as a signing-certificate
+    # mismatch numerically consistent with their advertised +100 points.
+    # The score remains capped at 100, while hard_block stays an independent
+    # fail-closed control.
+    score = min(
+        sum(max(0, int(reason.get("points", 0))) for reason in reasons),
+        100,
+    )
+    return {
+        "score": score,
+        "hard_block": bool(hard_block),
+        "verdict": _integrity_verdict(score, hard_block=hard_block),
+        "reasons": reasons,
+    }
+
+
+def _latest_integrity_state(installation_id):
+    with _cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT report_id, score, verdict, hard_block, reasons, created_at
+            FROM integrity_reports
+            WHERE installation_id = %s
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (installation_id,),
+        )
+        row = cursor.fetchone()
+    if row is None:
+        return None
+    age_seconds = max(0, int((_utc_now() - row[5]).total_seconds()))
+    return {
+        "report_id": str(row[0]),
+        "score": int(row[1]),
+        "verdict": row[2],
+        "hard_block": bool(row[3]),
+        "reasons": row[4] if isinstance(row[4], list) else [],
+        "created_at": _iso_z(row[5]),
+        "age_seconds": age_seconds,
+        "fresh": age_seconds <= INTEGRITY_FRESHNESS_SECONDS,
+    }
+
+
+def _enforce_integrity_gate(device_id, installation_id):
+    state = _latest_integrity_state(installation_id)
+    if INTEGRITY_MODE != "enforce":
+        return state
+    if state is None or not state.get("fresh"):
+        raise ApiProblem(
+            "A fresh native integrity scan is required before this operation.",
+            403,
+            "integrity_scan_required",
+            details={"integrity": state},
+        )
+    verdict = state.get("verdict")
+    if verdict == "block":
+        raise ApiProblem(
+            "The latest device-integrity verdict is blocked.",
+            403,
+            "integrity_blocked",
+            details={"integrity": state},
+        )
+    if verdict == "review":
+        raise ApiProblem(
+            "The latest device-integrity verdict requires review.",
+            403,
+            "integrity_review_required",
+            details={"integrity": state},
+        )
+    if verdict == "elevated":
+        raise ApiProblem(
+            "The latest device-integrity verdict requires step-up verification.",
+            403,
+            "integrity_step_up_required",
+            details={"integrity": state},
+        )
+    return state
+
+
+# ---------------------------------------------------------------------------
+# Risk/device policy helpers
+# ---------------------------------------------------------------------------
+
+
+def _policy_reason(reasons, code, points, message):
+    reasons.append(
+        {
+            "code": code,
+            "points": int(points),
+            "message": message,
+        }
+    )
+
+
+def _policy_action(score, hard_block=False):
+    if hard_block or score >= POLICY_BLOCK_SCORE:
+        return "block"
+    if score >= POLICY_REVIEW_SCORE:
+        return "review"
+    if score >= POLICY_STEP_UP_SCORE:
+        return "step_up"
+    return "allow"
+
+
+def _evaluate_risk_policy(
+    event_type,
+    device_id,
+    installation_id,
+    account_id=None,
+    account_link_pending=False,
+    persist=True,
+):
+    """Calculate an opaque relationship-based risk decision.
+
+    No device hardware attributes or PII are used. The decision is based on
+    server-side relationships already established by the cryptographic device
+    identity: recognition method, installation velocity, accounts per device,
+    and devices per account.
+    """
+    device_id = str(device_id)
+    installation_id = str(installation_id)
+    account_id = str(account_id) if account_id is not None else None
+
+    with _cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT i.status,
+                   i.registration_method,
+                   i.registration_confidence,
+                   i.created_at,
+                   d.status,
+                   d.platform,
+                   d.created_at
+            FROM app_installations i
+            JOIN recognized_devices d ON d.device_id = i.device_id
+            WHERE i.installation_id = %s AND i.device_id = %s
+            """,
+            (installation_id, device_id),
+        )
+        installation_row = cursor.fetchone()
+        if installation_row is None:
+            raise ApiProblem(
+                "The policy engine could not find the installation.",
+                401,
+                "policy_installation_not_found",
+            )
+
+        (
+            installation_status,
+            registration_method,
+            registration_confidence,
+            installation_created_at,
+            device_status,
+            platform,
+            device_created_at,
+        ) = installation_row
+
+        cursor.execute(
+            "SELECT COUNT(*) FROM device_account_links WHERE device_id = %s",
+            (device_id,),
+        )
+        device_account_count = int(cursor.fetchone()[0])
+
+        cursor.execute(
+            "SELECT COUNT(*) FROM app_installations WHERE device_id = %s",
+            (device_id,),
+        )
+        device_installation_count = int(cursor.fetchone()[0])
+
+        reinstall_cutoff = _utc_now() - timedelta(
+            hours=POLICY_REINSTALL_WINDOW_HOURS
+        )
+        cursor.execute(
+            """
+            SELECT COUNT(*)
+            FROM app_installations
+            WHERE device_id = %s
+              AND registration_method = 'reinstall_hint'
+              AND created_at >= %s
+            """,
+            (device_id, reinstall_cutoff),
+        )
+        recent_reinstall_count = int(cursor.fetchone()[0])
+
+        link_exists = False
+        account_device_count = 0
+        if account_id is not None:
+            cursor.execute(
+                """
+                SELECT 1
+                FROM device_account_links
+                WHERE device_id = %s AND account_id = %s
+                """,
+                (device_id, account_id),
+            )
+            link_exists = cursor.fetchone() is not None
+
+            cursor.execute(
+                """
+                SELECT COUNT(DISTINCT device_id)
+                FROM device_account_links
+                WHERE account_id = %s
+                """,
+                (account_id,),
+            )
+            account_device_count = int(cursor.fetchone()[0])
+
+    add_link = bool(account_id is not None and account_link_pending and not link_exists)
+    projected_device_account_count = device_account_count + (1 if add_link else 0)
+    projected_account_device_count = account_device_count + (1 if add_link else 0)
+    integrity_state = _latest_integrity_state(installation_id)
+
+    reasons = []
+    score = 0
+    hard_block = False
+
+    if installation_status != "active":
+        _policy_reason(
+            reasons,
+            "installation_not_active",
+            100,
+            "The cryptographic installation is not active.",
+        )
+        hard_block = True
+
+    if device_status != "active":
+        _policy_reason(
+            reasons,
+            "device_not_active",
+            100,
+            "The recognized device has been administratively blocked.",
+        )
+        hard_block = True
+
+    device_age = _utc_now() - device_created_at
+    if registration_method == "new_device" and device_age <= timedelta(hours=24):
+        _policy_reason(
+            reasons,
+            "new_device",
+            10,
+            "This recognized device was first seen less than 24 hours ago.",
+        )
+        score += 10
+    elif registration_method == "reinstall_hint":
+        _policy_reason(
+            reasons,
+            "known_device_new_installation",
+            15,
+            "A new installation was correlated to a previously recognized device.",
+        )
+        score += 15
+
+    # Accounts sharing one recognized physical device.
+    if projected_device_account_count >= POLICY_DEVICE_ACCOUNT_BLOCK_COUNT:
+        _policy_reason(
+            reasons,
+            "device_account_count_block_threshold",
+            100,
+            "This device is linked to too many unique accounts for the configured policy.",
+        )
+        hard_block = True
+    elif projected_device_account_count >= 3:
+        _policy_reason(
+            reasons,
+            "device_has_many_accounts",
+            60,
+            "This device is linked to three or more unique accounts.",
+        )
+        score += 60
+    elif projected_device_account_count == 2:
+        _policy_reason(
+            reasons,
+            "device_has_multiple_accounts",
+            35,
+            "This device is linked to a second unique account.",
+        )
+        score += 35
+
+    # One account appearing on several recognized physical devices.
+    if account_id is not None:
+        if projected_account_device_count >= POLICY_ACCOUNT_DEVICE_BLOCK_COUNT:
+            _policy_reason(
+                reasons,
+                "account_device_count_block_threshold",
+                100,
+                "This account is linked to too many recognized devices for the configured policy.",
+            )
+            hard_block = True
+        elif projected_account_device_count >= 3:
+            _policy_reason(
+                reasons,
+                "account_has_many_devices",
+                60,
+                "This account is linked to three or more recognized devices.",
+            )
+            score += 60
+        elif projected_account_device_count == 2:
+            _policy_reason(
+                reasons,
+                "account_has_multiple_devices",
+                35,
+                "This account is being used on a second recognized device.",
+            )
+            score += 35
+
+    # Reinstall velocity on one server-recognized device.
+    if recent_reinstall_count >= POLICY_REINSTALL_BLOCK_COUNT:
+        _policy_reason(
+            reasons,
+            "rapid_reinstall_block_threshold",
+            100,
+            "The device exceeded the configured reinstall count in the policy window.",
+        )
+        hard_block = True
+    elif recent_reinstall_count >= 4:
+        _policy_reason(
+            reasons,
+            "rapid_reinstall_high",
+            60,
+            "Four or more correlated reinstalls occurred inside the policy window.",
+        )
+        score += 60
+    elif recent_reinstall_count >= 3:
+        _policy_reason(
+            reasons,
+            "rapid_reinstall_elevated",
+            35,
+            "Three correlated reinstalls occurred inside the policy window.",
+        )
+        score += 35
+
+    # Latest server-scored native integrity result. Missing/stale measurements
+    # are themselves risk, while a fresh report contributes its server-owned score.
+    if integrity_state is None:
+        _policy_reason(
+            reasons,
+            "integrity_report_missing",
+            40,
+            "No signed native integrity report exists for this installation.",
+        )
+        score += 40
+    elif not integrity_state.get("fresh"):
+        _policy_reason(
+            reasons,
+            "integrity_report_stale",
+            35,
+            "The latest native integrity report is older than the freshness window.",
+        )
+        score += 35
+    else:
+        integrity_score = min(int(integrity_state.get("score", 0)), 100)
+        if integrity_score > 0:
+            _policy_reason(
+                reasons,
+                "native_integrity_risk",
+                integrity_score,
+                "The latest native integrity report contributed server-scored risk.",
+            )
+            score += integrity_score
+        if integrity_state.get("verdict") == "block" or integrity_state.get("hard_block"):
+            hard_block = True
+
+    recommended_action = _policy_action(score, hard_block=hard_block)
+    effective_action = (
+        recommended_action if DEVICE_POLICY_MODE == "enforce" else "allow"
+    )
+    decision_id = str(uuid.uuid4())
+    context = {
+        "platform": platform,
+        "registration_method": registration_method,
+        "registration_confidence": registration_confidence,
+        "installation_created_at": _iso_z(installation_created_at),
+        "installation_status": installation_status,
+        "device_status": device_status,
+        "device_created_at": _iso_z(device_created_at),
+        "device_age_hours": round(device_age.total_seconds() / 3600.0, 2),
+        "device_installation_count": device_installation_count,
+        "device_account_count": device_account_count,
+        "projected_device_account_count": projected_device_account_count,
+        "account_device_count": account_device_count if account_id is not None else None,
+        "projected_account_device_count": (
+            projected_account_device_count if account_id is not None else None
+        ),
+        "account_already_linked_to_device": link_exists if account_id is not None else None,
+        "recent_reinstall_count": recent_reinstall_count,
+        "reinstall_window_hours": POLICY_REINSTALL_WINDOW_HOURS,
+        "integrity": integrity_state,
+        "integrity_mode": INTEGRITY_MODE,
+        "integrity_freshness_seconds": INTEGRITY_FRESHNESS_SECONDS,
+    }
+    decision = {
+        "decision_id": decision_id,
+        "event_type": event_type,
+        "mode": DEVICE_POLICY_MODE,
+        "score": int(score),
+        "recommended_action": recommended_action,
+        "effective_action": effective_action,
+        "enforced": DEVICE_POLICY_MODE == "enforce" and recommended_action != "allow",
+        "reasons": reasons,
+        "context": context,
+        "thresholds": {
+            "step_up": POLICY_STEP_UP_SCORE,
+            "review": POLICY_REVIEW_SCORE,
+            "block": POLICY_BLOCK_SCORE,
+        },
+        "created_at": _iso_z(_utc_now()),
+    }
+
+    if persist:
+        with _cursor(commit=True) as cursor:
+            cursor.execute(
+                """
+                INSERT INTO risk_policy_decisions
+                    (decision_id, event_type, account_id, device_id,
+                     installation_id, policy_mode, recommended_action,
+                     effective_action, score, reasons, context)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    decision_id,
+                    event_type,
+                    account_id,
+                    device_id,
+                    installation_id,
+                    DEVICE_POLICY_MODE,
+                    recommended_action,
+                    effective_action,
+                    int(score),
+                    Json(reasons),
+                    Json(context),
+                ),
+            )
+
+    return decision
+
+
+def _enforce_risk_policy(decision):
+    action = decision.get("effective_action")
+    if action == "allow":
+        return
+
+    if action == "step_up":
+        code = "risk_step_up_required"
+        message = "The current device/account risk requires additional verification."
+    elif action == "review":
+        code = "risk_review_required"
+        message = "The current device/account risk requires review."
+    else:
+        code = "risk_policy_blocked"
+        message = "The current device/account risk is blocked by policy."
+
+    raise ApiProblem(
+        message,
+        403,
+        code,
+        details={"policy": decision},
+    )
+
+
+def _require_trusted_account_request(event_type="protected_request"):
+    """One server-owned gate for normal authenticated Payactiv-style APIs.
+
+    Order matters: first prove possession of the installation key for this exact
+    HTTP request, then require a fresh integrity report, then calculate the
+    server-side device/account policy and enforce its effective action.
+    """
+    claims = _require_access_proof("account")
+    integrity = _enforce_integrity_gate(claims.get("did"), claims.get("iid"))
+    policy = _evaluate_risk_policy(
+        event_type,
+        claims.get("did"),
+        claims.get("iid"),
+        account_id=str(get_jwt_identity()),
+        account_link_pending=False,
+        persist=True,
+    )
+    _enforce_risk_policy(policy)
+    return claims, policy, integrity
+
+
+# ---------------------------------------------------------------------------
 # Challenge and token helpers
 # ---------------------------------------------------------------------------
 
@@ -704,9 +1636,10 @@ def _create_challenge(installation_id, purpose):
     with _cursor(commit=True) as cursor:
         cursor.execute(
             """
-            SELECT status
-            FROM app_installations
-            WHERE installation_id = %s
+            SELECT i.status, d.status
+            FROM app_installations i
+            JOIN recognized_devices d ON d.device_id = i.device_id
+            WHERE i.installation_id = %s
             """,
             (installation_id,),
         )
@@ -718,6 +1651,10 @@ def _create_challenge(installation_id, purpose):
         if row[0] != "active":
             raise ApiProblem(
                 "The installation is not active.", 403, "installation_inactive"
+            )
+        if row[1] != "active":
+            raise ApiProblem(
+                "The recognized device is not active.", 403, "device_inactive"
             )
 
         cursor.execute(
@@ -778,10 +1715,13 @@ def _verify_challenge(
                    i.public_key_jwk,
                    i.device_id,
                    i.key_thumbprint,
-                   i.status
+                   i.status,
+                   d.status
             FROM installation_challenges c
             JOIN app_installations i
               ON i.installation_id = c.installation_id
+            JOIN recognized_devices d
+              ON d.device_id = i.device_id
             WHERE c.challenge_id = %s
             """,
             (challenge_id,),
@@ -802,6 +1742,7 @@ def _verify_challenge(
         device_id,
         key_thumbprint,
         installation_status,
+        device_status,
     ) = row
     stored_installation_id = str(stored_installation_id)
     device_id = str(device_id)
@@ -821,6 +1762,10 @@ def _verify_challenge(
     if installation_status != "active":
         raise ApiProblem(
             "The installation is not active.", 403, "installation_inactive"
+        )
+    if device_status != "active":
+        raise ApiProblem(
+            "The recognized device is not active.", 403, "device_inactive"
         )
     if used_at is not None:
         raise ApiProblem("The challenge has already been used.", 401, "challenge_used")
@@ -1062,9 +2007,11 @@ def _require_access_proof(required_role="account"):
     with _cursor() as cursor:
         cursor.execute(
             """
-            SELECT key_algorithm, public_key_jwk, device_id, status
-            FROM app_installations
-            WHERE installation_id = %s
+            SELECT i.key_algorithm, i.public_key_jwk, i.device_id,
+                   i.status, d.status
+            FROM app_installations i
+            JOIN recognized_devices d ON d.device_id = i.device_id
+            WHERE i.installation_id = %s
             """,
             (installation_id,),
         )
@@ -1077,7 +2024,13 @@ def _require_access_proof(required_role="account"):
             "installation_not_found",
         )
 
-    key_algorithm, public_key_jwk, stored_device_id, installation_status = row
+    (
+        key_algorithm,
+        public_key_jwk,
+        stored_device_id,
+        installation_status,
+        device_status,
+    ) = row
     if str(stored_device_id) != device_id:
         raise ApiProblem(
             "The access token device binding does not match the installation.",
@@ -1089,6 +2042,12 @@ def _require_access_proof(required_role="account"):
             "The installation is not active.",
             403,
             "installation_inactive",
+        )
+    if device_status != "active":
+        raise ApiProblem(
+            "The recognized device is not active.",
+            403,
+            "device_inactive",
         )
 
     # This is the cryptographic possession check. A copied access token from
@@ -1179,7 +2138,7 @@ def _link_device_account(cursor, device_id, account_id, installation_id):
 
 
 def _issue_account_tokens(
-    cursor, account_id, device_id, installation_id, family_id=None
+    cursor, account_id, device_id, installation_id, family_id=None, policy=None
 ):
     family_id = family_id or str(uuid.uuid4())
     session_id = str(uuid.uuid4())
@@ -1222,6 +2181,7 @@ def _issue_account_tokens(
         "account_id": account_id,
         "device_id": device_id,
         "installation_id": installation_id,
+        "policy": policy,
     }
 
 
@@ -1300,6 +2260,10 @@ def health_ready():
         {
             "status": "ready",
             "installation_key_algorithms": ["ES256", "RS256"],
+            "device_policy_mode": DEVICE_POLICY_MODE,
+            "integrity_mode": INTEGRITY_MODE,
+            "integrity_freshness_seconds": INTEGRITY_FRESHNESS_SECONDS,
+            "remote_attestation": "not_used",
         }
     )
 
@@ -1519,6 +2483,7 @@ def device_me():
             SELECT i.installation_id,
                    i.device_id,
                    d.platform,
+                   d.status,
                    i.key_thumbprint,
                    i.key_algorithm,
                    i.registration_method,
@@ -1543,23 +2508,292 @@ def device_me():
             "installation_not_found",
         )
 
+    device_policy = _evaluate_risk_policy(
+        "device_check",
+        device_id,
+        installation_id,
+        account_id=(str(get_jwt_identity()) if role == "account" else None),
+        account_link_pending=False,
+        persist=False,
+    )
+
     return jsonify(
         {
             "installation_id": str(row[0]),
             "device_id": str(row[1]),
             "platform": row[2],
-            "key_thumbprint": row[3],
-            "key_algorithm": row[4],
+            "device_status": row[3],
+            "key_thumbprint": row[4],
+            "key_algorithm": row[5],
             "recognition": {
-                "method": row[5],
-                "confidence": row[6],
+                "method": row[6],
+                "confidence": row[7],
             },
-            "created_at": _iso_z(row[7]),
-            "last_seen_at": _iso_z(row[8]),
-            "installation_count": row[9],
-            "linked_account_count": row[10],
+            "created_at": _iso_z(row[8]),
+            "last_seen_at": _iso_z(row[9]),
+            "installation_count": row[10],
+            "linked_account_count": row[11],
+            "policy": device_policy,
         }
     )
+
+
+# ---------------------------------------------------------------------------
+# Routes: challenge-driven native integrity measurement
+# ---------------------------------------------------------------------------
+
+
+@app.post("/v1/integrity/challenge")
+@jwt_required()
+def integrity_challenge():
+    claims = get_jwt()
+    role = claims.get("role")
+    if role not in ("device", "account"):
+        raise ApiProblem("Unsupported token role.", 403, "wrong_token_role")
+    claims = _require_access_proof(role)
+    installation_id = claims.get("iid")
+    device_id = claims.get("did")
+
+    with _cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT d.platform, i.status, d.status
+            FROM app_installations i
+            JOIN recognized_devices d ON d.device_id = i.device_id
+            WHERE i.installation_id = %s AND i.device_id = %s
+            """,
+            (installation_id, device_id),
+        )
+        row = cursor.fetchone()
+    if row is None:
+        raise ApiProblem("Installation not found.", 404, "installation_not_found")
+    platform, installation_status, device_status = row
+    if installation_status != "active":
+        raise ApiProblem("Installation is not active.", 403, "installation_inactive")
+    if device_status != "active":
+        raise ApiProblem("Recognized device is not active.", 403, "device_inactive")
+
+    challenge_id = str(uuid.uuid4())
+    nonce = secrets.token_bytes(32)
+    expires_at = _utc_now() + INTEGRITY_CHALLENGE_LIFETIME
+    probes = _integrity_probe_plan(platform)
+
+    with _cursor(commit=True) as cursor:
+        cursor.execute(
+            "DELETE FROM integrity_challenges WHERE expires_at < NOW() - INTERVAL '1 day'"
+        )
+        cursor.execute(
+            """
+            INSERT INTO integrity_challenges
+                (challenge_id, installation_id, device_id, platform,
+                 nonce_sha256, required_probes, expires_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            """,
+            (
+                challenge_id,
+                installation_id,
+                device_id,
+                platform,
+                hashlib.sha256(nonce).hexdigest(),
+                Json(probes),
+                expires_at,
+            ),
+        )
+
+    return jsonify(
+        {
+            "challenge_id": challenge_id,
+            "nonce": _b64url_encode(nonce),
+            "platform": platform,
+            "required_probes": probes,
+            "expires_at": _iso_z(expires_at),
+            "server_time": _iso_z(_utc_now()),
+            "collector_policy_version": 1,
+        }
+    )
+
+
+@app.post("/v1/integrity/report")
+@jwt_required()
+def integrity_report():
+    claims = get_jwt()
+    role = claims.get("role")
+    if role not in ("device", "account"):
+        raise ApiProblem("Unsupported token role.", 403, "wrong_token_role")
+    claims = _require_access_proof(role)
+    outer_body = _json_body()
+    report_payload = _required_text(outer_body, "report_payload", 16, 131072)
+    report_signature_text = _required_text(outer_body, "report_signature", 16, 4096)
+    report_bytes = _b64url_decode(report_payload, "report_payload", 65536)
+    report_signature = _b64url_decode(report_signature_text, "report_signature", 2048)
+
+    try:
+        report = json.loads(report_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise ApiProblem("Integrity report is not valid JSON.", 400, "invalid_integrity_report")
+    if not isinstance(report, dict) or report.get("version") != 1:
+        raise ApiProblem("Unsupported integrity report.", 400, "invalid_integrity_report")
+
+    installation_id = claims.get("iid")
+    device_id = claims.get("did")
+    if report.get("installation_id") != installation_id:
+        raise ApiProblem("Integrity report installation mismatch.", 401, "integrity_installation_mismatch")
+    challenge_id = _uuid_text(report.get("challenge_id"), "challenge_id")
+    platform = report.get("platform")
+    challenge_nonce_text = report.get("challenge_nonce")
+    nonce = _b64url_decode(challenge_nonce_text, "challenge_nonce", 64)
+    if len(nonce) != 32:
+        raise ApiProblem("Integrity challenge nonce must be 32 bytes.", 400, "invalid_integrity_nonce")
+    collected_at = report.get("collected_at")
+    if isinstance(collected_at, bool) or not isinstance(collected_at, int):
+        raise ApiProblem("Integrity collection timestamp is invalid.", 400, "invalid_integrity_timestamp")
+    now_seconds = int(_utc_now().timestamp())
+    if abs(now_seconds - collected_at) > INTEGRITY_REPORT_MAX_SKEW_SECONDS:
+        raise ApiProblem("Integrity report timestamp is outside the allowed window.", 401, "integrity_report_stale")
+    collector_version = report.get("collector_version")
+    if isinstance(collector_version, bool) or not isinstance(collector_version, int):
+        raise ApiProblem("Integrity collector version is invalid.", 400, "invalid_integrity_collector")
+    probes = report.get("probe_results")
+    if not isinstance(probes, dict):
+        raise ApiProblem("probe_results must be an object.", 400, "invalid_integrity_report")
+
+    report_id = str(uuid.uuid4())
+    with _cursor(commit=True) as cursor:
+        cursor.execute(
+            """
+            SELECT c.installation_id, c.device_id, c.platform, c.nonce_sha256,
+                   c.required_probes, c.expires_at, c.used_at,
+                   i.key_algorithm, i.public_key_jwk, i.status, d.status
+            FROM integrity_challenges c
+            JOIN app_installations i ON i.installation_id = c.installation_id
+            JOIN recognized_devices d ON d.device_id = c.device_id
+            WHERE c.challenge_id = %s
+            FOR UPDATE
+            """,
+            (challenge_id,),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            raise ApiProblem("Integrity challenge not found.", 404, "integrity_challenge_not_found")
+        (
+            stored_installation_id,
+            stored_device_id,
+            stored_platform,
+            nonce_sha256,
+            required_probes,
+            expires_at,
+            used_at,
+            key_algorithm,
+            public_key_jwk,
+            installation_status,
+            device_status,
+        ) = row
+        if str(stored_installation_id) != installation_id or str(stored_device_id) != device_id:
+            raise ApiProblem("Integrity challenge binding mismatch.", 401, "integrity_challenge_binding_mismatch")
+        if stored_platform != platform:
+            raise ApiProblem("Integrity platform mismatch.", 401, "integrity_platform_mismatch")
+        if used_at is not None:
+            raise ApiProblem("Integrity challenge has already been used.", 401, "integrity_challenge_replay")
+        if expires_at < _utc_now():
+            raise ApiProblem("Integrity challenge expired.", 401, "integrity_challenge_expired")
+        if installation_status != "active":
+            raise ApiProblem("Installation is not active.", 403, "installation_inactive")
+        if device_status != "active":
+            raise ApiProblem("Recognized device is not active.", 403, "device_inactive")
+        if not hmac.compare_digest(nonce_sha256, hashlib.sha256(nonce).hexdigest()):
+            raise ApiProblem("Integrity challenge nonce mismatch.", 401, "integrity_nonce_mismatch")
+
+        if not isinstance(required_probes, list):
+            required_probes = []
+        missing = [name for name in required_probes if name not in probes]
+        if missing:
+            raise ApiProblem(
+                "The client omitted server-requested integrity probes.",
+                400,
+                "integrity_probe_missing",
+                details={"missing_probes": missing},
+            )
+        if report.get("challenge_nonce") != challenge_nonce_text:
+            raise ApiProblem("Integrity nonce encoding mismatch.", 400, "integrity_nonce_mismatch")
+
+        _verify_installation_signature(
+            key_algorithm,
+            public_key_jwk,
+            report_bytes,
+            report_signature,
+        )
+
+        scored = _score_integrity(platform, probes)
+        failed_required = []
+        for probe_name in required_probes:
+            probe_value = probes.get(probe_name)
+            if not isinstance(probe_value, dict) or probe_value.get("status") != "ok":
+                failed_required.append(probe_name)
+        if failed_required:
+            for probe_name in failed_required:
+                _integrity_reason(
+                    scored["reasons"],
+                    "integrity_probe_failed:%s" % probe_name,
+                    30,
+                    "A server-requested native integrity probe did not complete successfully.",
+                )
+                scored["score"] = min(100, int(scored["score"]) + 30)
+            scored["verdict"] = _integrity_verdict(
+                scored["score"],
+                hard_block=scored["hard_block"],
+            )
+
+        cursor.execute(
+            "UPDATE integrity_challenges SET used_at = NOW() WHERE challenge_id = %s",
+            (challenge_id,),
+        )
+        cursor.execute(
+            """
+            INSERT INTO integrity_reports
+                (report_id, challenge_id, installation_id, device_id, platform,
+                 collector_version, score, verdict, hard_block, reasons,
+                 probe_results, report_sha256)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """,
+            (
+                report_id,
+                challenge_id,
+                installation_id,
+                device_id,
+                platform,
+                collector_version,
+                scored["score"],
+                scored["verdict"],
+                scored["hard_block"],
+                Json(scored["reasons"]),
+                Json(probes),
+                hashlib.sha256(report_bytes).hexdigest(),
+            ),
+        )
+
+    response = {
+        "report_id": report_id,
+        "score": scored["score"],
+        "verdict": scored["verdict"],
+        "hard_block": scored["hard_block"],
+        "reasons": scored["reasons"],
+        "mode": INTEGRITY_MODE,
+        "fresh_for_seconds": INTEGRITY_FRESHNESS_SECONDS,
+        "remote_attestation": "not_used",
+        "created_at": _iso_z(_utc_now()),
+    }
+    return jsonify({"integrity": response})
+
+
+@app.get("/v1/integrity/me")
+@jwt_required()
+def integrity_me():
+    claims = get_jwt()
+    role = claims.get("role")
+    if role not in ("device", "account"):
+        raise ApiProblem("Unsupported token role.", 403, "wrong_token_role")
+    claims = _require_access_proof(role)
+    return jsonify({"integrity": _latest_integrity_state(claims.get("iid"))})
 
 
 # ---------------------------------------------------------------------------
@@ -1577,8 +2811,19 @@ def account_register():
     account_id = str(uuid.uuid4())
     device_id = claims.get("did")
     installation_id = claims.get("iid")
+    _enforce_integrity_gate(device_id, installation_id)
 
     password_hash = _bcrypt_hash_bytes(password)
+
+    policy = _evaluate_risk_policy(
+        "account_register",
+        device_id,
+        installation_id,
+        account_id=account_id,
+        account_link_pending=True,
+        persist=True,
+    )
+    _enforce_risk_policy(policy)
 
     try:
         with _cursor(commit=True) as cursor:
@@ -1591,7 +2836,11 @@ def account_register():
             )
             _link_device_account(cursor, device_id, account_id, installation_id)
             tokens = _issue_account_tokens(
-                cursor, account_id, device_id, installation_id
+                cursor,
+                account_id,
+                device_id,
+                installation_id,
+                policy=policy,
             )
     except psycopg2.errors.UniqueViolation:
         raise ApiProblem(
@@ -1630,9 +2879,26 @@ def account_login():
                 "invalid_credentials",
             )
         account_id = str(row[0])
+
+    _enforce_integrity_gate(device_id, installation_id)
+    policy = _evaluate_risk_policy(
+        "account_login",
+        device_id,
+        installation_id,
+        account_id=account_id,
+        account_link_pending=True,
+        persist=True,
+    )
+    _enforce_risk_policy(policy)
+
+    with _cursor(commit=True) as cursor:
         _link_device_account(cursor, device_id, account_id, installation_id)
         tokens = _issue_account_tokens(
-            cursor, account_id, device_id, installation_id
+            cursor,
+            account_id,
+            device_id,
+            installation_id,
+            policy=policy,
         )
 
     return jsonify(tokens)
@@ -1641,7 +2907,7 @@ def account_login():
 @app.get("/v1/account/me")
 @jwt_required()
 def account_me():
-    claims = _require_access_proof("account")
+    claims, policy, integrity = _require_trusted_account_request("account_me")
     return jsonify(
         {
             "account_id": str(get_jwt_identity()),
@@ -1649,14 +2915,32 @@ def account_me():
             "installation_id": claims.get("iid"),
             "session_id": claims.get("sid"),
             "access_proof": "accepted",
+            "trust_policy": policy,
+            "integrity": integrity,
         }
     )
+
+
+@app.get("/v1/policy/me")
+@jwt_required()
+def policy_me():
+    claims = _require_access_proof("account")
+    _enforce_integrity_gate(claims.get("did"), claims.get("iid"))
+    decision = _evaluate_risk_policy(
+        "policy_check",
+        claims.get("did"),
+        claims.get("iid"),
+        account_id=str(get_jwt_identity()),
+        account_link_pending=False,
+        persist=True,
+    )
+    return jsonify({"policy": decision})
 
 
 @app.post("/v1/account/protected-echo")
 @jwt_required()
 def account_protected_echo():
-    claims = _require_access_proof("account")
+    claims, policy, integrity = _require_trusted_account_request("protected_echo")
     body = _json_body()
     return jsonify(
         {
@@ -1665,6 +2949,8 @@ def account_protected_echo():
             "installation_id": claims.get("iid"),
             "access_proof": "accepted",
             "body_sha256": hashlib.sha256(request.get_data(cache=True) or b"").hexdigest(),
+            "trust_policy": policy,
+            "integrity": integrity,
             "echo": body,
         }
     )
@@ -1727,6 +3013,23 @@ def refresh_account_tokens():
         "refresh:%s" % session_id,
     )
 
+    with _cursor() as cursor:
+        policy_session = _refresh_session(cursor, claims, lock=False)
+
+    _enforce_integrity_gate(
+        policy_session["device_id"],
+        policy_session["installation_id"],
+    )
+    policy = _evaluate_risk_policy(
+        "refresh",
+        policy_session["device_id"],
+        policy_session["installation_id"],
+        account_id=policy_session["account_id"],
+        account_link_pending=False,
+        persist=True,
+    )
+    _enforce_risk_policy(policy)
+
     reused = False
     tokens = None
     with _cursor(commit=True) as cursor:
@@ -1756,6 +3059,7 @@ def refresh_account_tokens():
                 session["device_id"],
                 session["installation_id"],
                 family_id=session["family_id"],
+                policy=policy,
             )
             cursor.execute(
                 """
