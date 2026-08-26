@@ -202,7 +202,6 @@ class NativeIntegrityCollector {
   Future<Map<String, dynamic>> collect({
     required List<String> requiredProbes,
     required String challengeNonce,
-    String? testFixture,
   }) async {
     try {
       final Map<String, dynamic>? value =
@@ -211,8 +210,6 @@ class NativeIntegrityCollector {
         <String, dynamic>{
           'required_probes': requiredProbes,
           'challenge_nonce': challengeNonce,
-          if (testFixture != null && testFixture.isNotEmpty)
-            'integrity_test_fixture': testFixture,
         },
       );
       if (value == null) {
@@ -1284,8 +1281,6 @@ class DeviceRecognitionController extends ChangeNotifier {
   RiskPolicyDecision? latestPolicy;
   IntegrityDecision? latestIntegrity;
   List<String> lastIntegrityProbes = <String>[];
-  String? lastIntegrityTestFixture;
-  String? integrityAttackTestResult;
   String status = 'Not started';
   bool busy = false;
 
@@ -1414,9 +1409,8 @@ class DeviceRecognitionController extends ChangeNotifier {
 
   Future<IntegrityDecision> _collectIntegrityWithToken(
     String token,
-    InstallationIdentity currentIdentity, {
-    String? testFixture,
-  }) async {
+    InstallationIdentity currentIdentity,
+  ) async {
     final Map<String, dynamic> challenge = await _api.integrityChallenge(
       deviceToken: token,
       signingIdentity: currentIdentity,
@@ -1429,11 +1423,9 @@ class DeviceRecognitionController extends ChangeNotifier {
         .toList(growable: false);
     lastIntegrityProbes = requiredProbes;
 
-    lastIntegrityTestFixture = testFixture;
     final Map<String, dynamic> native = await _integrityCollector.collect(
       requiredProbes: requiredProbes,
       challengeNonce: nonce,
-      testFixture: testFixture,
     );
     if (native['probes'] is! Map) {
       throw ApiException(
@@ -1482,171 +1474,6 @@ class DeviceRecognitionController extends ChangeNotifier {
       );
     }
     return decision;
-  }
-
-  Future<void> _runIntegrityAttackFixture({
-    required String fixture,
-    required String testName,
-    required Set<String> expectedReasonCodes,
-  }) {
-    integrityAttackTestResult = null;
-    return _run('Running $testName…', () async {
-      if (!Platform.isAndroid) {
-        throw ApiException(
-          'These controlled integrity fixtures are currently implemented for Android.',
-          code: 'android_test_only',
-        );
-      }
-      identity ??= await _store.loadOrCreateIdentity();
-      final String token = await _freshDeviceToken();
-      deviceToken = token;
-      final IntegrityDecision decision = await _collectIntegrityWithToken(
-        token,
-        identity!,
-        testFixture: fixture,
-      );
-      final Set<String> actualCodes = decision.reasons
-          .map((IntegrityRiskReason reason) => reason.code)
-          .toSet();
-      final Set<String> missing = expectedReasonCodes.difference(actualCodes);
-      if (missing.isNotEmpty) {
-        final String result = <String>[
-          'FAIL: $testName',
-          'Fixture: $fixture',
-          'Missing expected reasons: ${missing.join(', ')}',
-          'Actual reasons: ${actualCodes.join(', ')}',
-          'Score: ${decision.score}',
-          'Verdict: ${decision.verdict}',
-        ].join('\n');
-        integrityAttackTestResult = result;
-        debugPrint(result);
-        throw ApiException(
-          '$testName did not produce the expected server reason(s).',
-          code: 'integrity_fixture_test_failed',
-        );
-      }
-
-      final String result = <String>[
-        'PASS: $testName',
-        'Fixture: $fixture',
-        'Expected reasons: ${expectedReasonCodes.join(', ')}',
-        'Score: ${decision.score}',
-        'Verdict: ${decision.verdict}',
-        'Signed native report: accepted',
-        'Server challenge: accepted',
-      ].join('\n');
-      integrityAttackTestResult = result;
-      status = 'PASS: $testName';
-      debugPrint(result);
-    });
-  }
-
-  Future<void> testFridaRuntimeDetection() {
-    return _runIntegrityAttackFixture(
-      fixture: 'frida_runtime',
-      testName: '1. Frida/runtime-map detection',
-      expectedReasonCodes: <String>{'android_frida_runtime_artifact'},
-    );
-  }
-
-  Future<void> testFridaPortDetection() {
-    return _runIntegrityAttackFixture(
-      fixture: 'frida_port',
-      testName: '2. Local Frida-port detection',
-      expectedReasonCodes: <String>{'android_frida_port_open'},
-    );
-  }
-
-  Future<void> testHookFrameworkDetection() {
-    return _runIntegrityAttackFixture(
-      fixture: 'hook_framework',
-      testName: '3. Xposed/LSPosed/Zygisk artifact detection',
-      expectedReasonCodes: <String>{'android_hook_framework_artifact'},
-    );
-  }
-
-  Future<void> testRootSuDetection() {
-    return _runIntegrityAttackFixture(
-      fixture: 'root_su',
-      testName: '4. Root/su detection',
-      expectedReasonCodes: <String>{
-        'android_root_framework_artifact',
-        'android_su_on_path',
-      },
-    );
-  }
-
-  Future<void> testWritableMountDetection() {
-    return _runIntegrityAttackFixture(
-      fixture: 'writable_mount',
-      testName: '5. Writable protected-mount detection',
-      expectedReasonCodes: <String>{'android_protected_mount_writable'},
-    );
-  }
-
-  Future<void> testIntegrityEnforcement() {
-    integrityAttackTestResult = null;
-    return _run('Running 6. enforced integrity rejection…', () async {
-      final AccountSession? session = accountSession;
-      if (session == null) {
-        throw ApiException(
-          'Create or log in to a test account first; enforcement is tested against an account-protected endpoint.',
-          code: 'account_session_required',
-        );
-      }
-      identity ??= await _store.loadOrCreateIdentity();
-      final InstallationIdentity currentIdentity = identity!;
-      final String token = await _freshDeviceToken();
-      deviceToken = token;
-
-      final IntegrityDecision malicious = await _collectIntegrityWithToken(
-        token,
-        currentIdentity,
-        testFixture: 'frida_runtime',
-      );
-      if (malicious.verdict != 'block') {
-        throw ApiException(
-          'The injected Frida report did not produce a block verdict.',
-          code: 'unexpected_integrity_verdict',
-        );
-      }
-
-      try {
-        await _api.accountMe(
-          accessToken: session.accessToken,
-          signingIdentity: currentIdentity,
-        );
-      } on ApiException catch (error) {
-        if (error.statusCode == 403 && error.code == 'integrity_blocked') {
-          final String result = <String>[
-            'PASS: 6. INTEGRITY_MODE=enforce rejected a protected request',
-            'Injected integrity verdict: ${malicious.verdict}',
-            'Injected integrity score: ${malicious.score}',
-            'GET /v1/account/me: 403',
-            'Server error: integrity_blocked',
-            'Access PoP reached server: yes',
-            'Business request allowed through: no',
-          ].join('\n');
-          integrityAttackTestResult = result;
-          status = 'PASS: enforced integrity rejection';
-          debugPrint(result);
-          return;
-        }
-        rethrow;
-      }
-
-      final String result = <String>[
-        'FAIL: 6. INTEGRITY_MODE=enforce did not reject the request',
-        'Injected integrity verdict: ${malicious.verdict}',
-        'GET /v1/account/me: unexpectedly accepted',
-      ].join('\n');
-      integrityAttackTestResult = result;
-      debugPrint(result);
-      throw ApiException(
-        'Protected request was accepted after a block integrity verdict. Is INTEGRITY_MODE=enforce on the server?',
-        code: 'integrity_enforcement_test_failed',
-      );
-    });
   }
 
   Future<void> runIntegrityScan() {
@@ -2669,10 +2496,6 @@ class _DeviceRecognitionPageState extends State<DeviceRecognitionPage> {
                     ? null
                     : _controller.lastIntegrityProbes.join(', '),
               ),
-              _field(
-                'Debug test fixture',
-                _controller.lastIntegrityTestFixture,
-              ),
               const SizedBox(height: 8),
               const Text(
                 'Integrity reasons',
@@ -2698,70 +2521,6 @@ class _DeviceRecognitionPageState extends State<DeviceRecognitionPage> {
               icon: const Icon(Icons.security),
               label: const Text('Run native integrity scan'),
             ),
-            const SizedBox(height: 16),
-            const Divider(),
-            const SizedBox(height: 8),
-            const Text(
-              'Controlled Android compromise tests',
-              style: TextStyle(fontWeight: FontWeight.w700),
-            ),
-            const SizedBox(height: 6),
-            const Text(
-              'DEBUG APK ONLY. These buttons inject deterministic native measurements '
-              'into the same signed integrity report so the server scoring and gate can '
-              'be tested without rooting this known-good phone. Release APKs reject the fixtures.',
-            ),
-            const SizedBox(height: 10),
-            Wrap(
-              spacing: 8,
-              runSpacing: 8,
-              children: <Widget>[
-                OutlinedButton(
-                  onPressed: _controller.busy
-                      ? null
-                      : _controller.testFridaRuntimeDetection,
-                  child: const Text('1. Frida runtime'),
-                ),
-                OutlinedButton(
-                  onPressed: _controller.busy
-                      ? null
-                      : _controller.testFridaPortDetection,
-                  child: const Text('2. Frida port'),
-                ),
-                OutlinedButton(
-                  onPressed: _controller.busy
-                      ? null
-                      : _controller.testHookFrameworkDetection,
-                  child: const Text('3. Hook framework'),
-                ),
-                OutlinedButton(
-                  onPressed: _controller.busy
-                      ? null
-                      : _controller.testRootSuDetection,
-                  child: const Text('4. Root + su'),
-                ),
-                OutlinedButton(
-                  onPressed: _controller.busy
-                      ? null
-                      : _controller.testWritableMountDetection,
-                  child: const Text('5. Writable mount'),
-                ),
-                FilledButton.tonal(
-                  onPressed: _controller.busy ||
-                          _controller.accountSession == null
-                      ? null
-                      : _controller.testIntegrityEnforcement,
-                  child: const Text('6. Enforce rejection'),
-                ),
-              ],
-            ),
-            if (_controller.integrityAttackTestResult != null) ...<Widget>[
-              const SizedBox(height: 10),
-              SelectableText(
-                _controller.integrityAttackTestResult!,
-                style: const TextStyle(fontFamily: 'monospace'),
-              ),
-            ],
             const SizedBox(height: 8),
             const Text(
               'Boundary: on a fully compromised OS these local measurements can '
