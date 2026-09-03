@@ -224,22 +224,26 @@ INCONCLUSIVE. After that: real `frida-server` on the emulator, checking whether
 
 ## Delivering changes
 
-**`yamaha.py`** — edit the repo copy in place, verify it parses under the 3.9 grammar, commit it as
-its own revert point, then deploy it yourself:
+**`yamaha.py`** — the server (192.168.100.13, "dbserver", Debian 11 / Python 3.9.2) runs it as a
+**systemd service**, `yamaha.service`, as user `john`, `WorkingDirectory=/home/john`, config from
+`/etc/yamaha.env` (root:root 600 — never print its values). `john` has passwordless sudo for only
+`systemctl <verb> yamaha.service` (`/etc/sudoers.d/yamaha`); `journalctl -u yamaha` needs no sudo.
+The one-time converter that created all this is `/home/john/claude-root-setup.sh` on the server.
+Deploy and restart are fully passwordless:
 
 ```bash
 python3 -c "import ast,io; ast.parse(io.open('yamaha.py',encoding='utf-8').read(), feature_version=(3,9)); print('3.9 syntax OK')"
-git add yamaha.py && git commit -m "<one change>"
+git add yamaha.py && git commit -m "<one change>"          # own revert point
 ssh john@192.168.100.13 'cp /home/john/yamaha.py /home/john/yamaha.py.bak-$(date +%Y%m%d-%H%M)'
-scp yamaha.py john@192.168.100.13:/home/john/yamaha.py.new
-ssh john@192.168.100.13 'diff -u /home/john/yamaha.py /home/john/yamaha.py.new; mv /home/john/yamaha.py.new /home/john/yamaha.py && ./run-yamaha.sh'
+scp yamaha.py john@192.168.100.13:/home/john/yamaha.py       # john owns the file
+ssh john@192.168.100.13 'sudo systemctl restart yamaha.service && sleep 2 && systemctl is-active yamaha.service'
 curl -s http://192.168.100.13:5000/health/ready
 ```
 
-Always look at that `diff -u` — the server copy may carry a hand-edit the repo copy lacks, and a
-wholesale replace would silently drop it. `run-yamaha.sh` on the server sources `~/yamaha.env`
-(mode 600, holds the export lines; never print its values) and restarts the process under `nohup`
-with output in `~/yamaha.log`.
+Confirm `md5sum` server vs repo after copying; if they differ before you start, the server copy may
+carry a hand-edit — `diff -u` it rather than clobbering. Editing `/etc/yamaha.env`, the unit, or the
+sudoers file needs root, which only the user has (john is not a sudoer beyond that one grant) — hand
+those over as a script the user runs, since the harness blocks pushing sudoers-editing scripts.
 
 **Dart, Kotlin, config** — edit in the repo, commit, and `flutter run -d <device>` yourself once the
 user has connected the device.

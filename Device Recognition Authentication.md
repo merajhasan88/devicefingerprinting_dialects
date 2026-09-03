@@ -1310,3 +1310,7 @@ All four proposals in §21.4 approved, each to land as its own revertable commit
 ## 21.7 Open items
 
 - Next test: **Frida Gadget embedded in the APK on the OPPO** (`user` build, no root, `INTEGRITY_MODE=enforce`). Expect `android_frida_runtime_artifact` via the `gadget` token in `runtime_maps`, then 403 `integrity_blocked` on a protected request. This is the first enforcement-against-real-compromise test on production-class hardware.
+
+## 21.8 Server run model (2026-09-04)
+
+The backend was moved off a hand-started root process to a **systemd service** to make deploys and restarts unattended. `yamaha.service` runs `python3.9 /home/john/yamaha.py` as user `john` (`WorkingDirectory=/home/john`, so `jwtkey.txt` and the file-based JWT secret still resolve), config from `/etc/yamaha.env` (root:root, mode 600, captured verbatim from the previously running process so DB credentials, integrity mode and the JWT secret are unchanged). `john` — who is not otherwise a sudoer — was granted passwordless sudo for only `systemctl <verb> yamaha.service` via `/etc/sudoers.d/yamaha`, and added to `systemd-journal` for log reads. The one-time converter is `/home/john/claude-root-setup.sh`. Deploy is now `scp yamaha.py` (john owns the file) + `sudo systemctl restart yamaha.service`; logs are `journalctl -u yamaha`. The service is enabled, so it also survives reboot.
