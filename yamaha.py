@@ -832,12 +832,17 @@ def _integrity_probe_plan(platform):
             "system_properties",
             "runtime_maps",
             "tracer",
-        ]
-        optional = [
+            # Block-weight probes run on every scan. While they sat in the
+            # random pool, a compromised client could simply rescan until the
+            # probe that would catch it was not drawn; the challenge nonce
+            # already prevents precomputed reports, so randomness buys nothing
+            # here. Only low-weight telemetry stays optional.
             "root_shell",
             "selinux",
             "mounts",
             "frida_ports",
+        ]
+        optional = [
             "emulator",
             "developer_settings",
         ]
