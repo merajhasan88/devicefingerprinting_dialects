@@ -1328,7 +1328,17 @@ The backend was moved off a hand-started root process to a **systemd service** t
 
 ## 21.10 Change (b)+(c) — absent AVB scored; lab switch added (2026-09-04)
 
-(b) verified with the lab switch OFF, no Frida, emulator: two scans, both `score=95 verdict=block`, new reason `android_boot_state_unavailable +15` alongside `android_test_keys +25`, `android_build_type_not_user +45`, `android_adb_enabled +10`. Emulator baseline moved 80 review -> 95 block; the OPPO (green/locked AVB, user build) is unaffected. **PASS.** (c) `INTEGRITY_ALLOW_USERDEBUG` verification pending a passwordless lab-override env file.
+(b) verified with the lab switch OFF, no Frida, emulator: two scans, both `score=95 verdict=block`, new reason `android_boot_state_unavailable +15` alongside `android_test_keys +25`, `android_build_type_not_user +45`, `android_adb_enabled +10`. Emulator baseline moved 80 review -> 95 block; the OPPO (green/locked AVB, user build) is unaffected. **PASS.**
+
+(c) verified in two parts with `INTEGRITY_ALLOW_USERDEBUG=1`, identical server configuration in both:
+
+```text
+part 1  no Frida:        score=10  verdict=trusted   only android_adb_enabled +10
+part 2  Frida attached:  score=100 verdict=block     android_frida_runtime_artifact +90,
+                                                     android_frida_port_open +75, adb +10
+```
+
+The switch suppresses only the development-image signals (build type, test-keys, absent AVB) and never suppresses compromise evidence, so a userdebug emulator can hold a `trusted` baseline for enforce-mode testing while a genuinely compromised one still blocks. **PASS.** Must remain 0 in production.
 
 ## 21.11 Passwordless lab toggling (2026-09-04)
 
