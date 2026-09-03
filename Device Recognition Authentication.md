@@ -1343,3 +1343,34 @@ The switch suppresses only the development-image signals (build type, test-keys,
 ## 21.11 Passwordless lab toggling (2026-09-04)
 
 To toggle lab-only settings without root each time, `yamaha.service` gains a second, optional, john-writable `EnvironmentFile=-/home/john/yamaha.lab.env` that overrides `/etc/yamaha.env`. It holds no secrets — only lab switches such as `INTEGRITY_ALLOW_USERDEBUG=1` or `INTEGRITY_MODE=enforce`. Toggling is then entirely passwordless: write the file as john, `sudo systemctl restart yamaha.service`. Keep it empty (or absent) for a production-representative run.
+
+## 21.12 Change (d) — device-level integrity memory: DEPLOYED, TEST PENDING (2026-09-04)
+
+Commit `5d80e34`. `_device_integrity_memory(device_id)` returns the worst integrity report recorded against the canonical `device_id` within `INTEGRITY_DEVICE_MEMORY_HOURS` (default 24, `0` disables). `_enforce_integrity_gate` consults it **after** the current installation's own verdict passes and rejects with `integrity_device_blocked_recently`; `_evaluate_risk_policy` adds `device_integrity_history_block +50` when a *different* installation on the same device was blocked in the window, and both the memory and the window are recorded in the decision context. Deployed and live, but **not yet exercised**.
+
+### Server state left running
+
+```text
+INTEGRITY_MODE=enforce                 (in /home/john/yamaha.lab.env)
+INTEGRITY_ALLOW_USERDEBUG=1            (in /home/john/yamaha.lab.env)
+INTEGRITY_DEVICE_MEMORY_HOURS=24       (default, not overridden)
+DEVICE_POLICY_MODE=observe             (unchanged, /etc/yamaha.env)
+```
+
+Emulator is clean: frida-server stopped, agent unloaded, logcat cleared. The device carries a `block` report from the §21.10 (c) part-2 Frida test, recorded ~01:45 local on 2026-09-04 against the installation that was current at that time.
+
+### Resume here — the (d) test
+
+Two presses in the app, in order:
+
+1. **Simulate fresh installation** — deletes the Keystore key and registers a new `installation_id` against the same `device_id` via the ANDROID_ID hint (a genuine reinstall), then auto-scans. Expect `score=10 verdict=trusted`.
+2. **Create account** (handle `dtest1`, password `Passw0rd123`) — `/v1/accounts/register` is integrity-gated. Expect **403 `integrity_device_blocked_recently`**: the new installation's own scan is clean, but the device was blocked inside the memory window.
+
+Then the counterfactual, to prove the rejection came from (d) and nothing else: set `INTEGRITY_DEVICE_MEMORY_HOURS=0` in `yamaha.lab.env`, `sudo systemctl restart yamaha.service`, press **Create account** again — expect success. Restore the value afterwards.
+
+**If more than 24 hours have passed**, the stored block has aged out of the window: re-create it first (start frida-server, attach, scan to `block`, detach) before step 1, or the test is vacuous.
+
+### Still open after (d)
+
+- Frida Gadget on the OPPO (`user` build, no root) with `INTEGRITY_MODE=enforce` — enforcement against real compromise on production-class hardware. Requires an APK change (gadget `.so` in `jniLibs/arm64-v8a/` plus a load line in `MainActivity.kt`) and `flutter run` to the OPPO. Approved by the user; the OPPO is never to be rooted or wiped.
+- Reset `yamaha.lab.env` to empty for any production-representative measurement.
