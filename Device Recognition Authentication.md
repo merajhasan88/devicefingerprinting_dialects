@@ -1325,3 +1325,11 @@ Every scan now carries `android_frida_port_open +75`; `android_adb_enabled +10` 
 ## 21.8 Server run model (2026-09-04)
 
 The backend was moved off a hand-started root process to a **systemd service** to make deploys and restarts unattended. `yamaha.service` runs `python3.9 /home/john/yamaha.py` as user `john` (`WorkingDirectory=/home/john`, so `jwtkey.txt` and the file-based JWT secret still resolve), config from `/etc/yamaha.env` (root:root, mode 600, captured verbatim from the previously running process so DB credentials, integrity mode and the JWT secret are unchanged). `john` — who is not otherwise a sudoer — was granted passwordless sudo for only `systemctl <verb> yamaha.service` via `/etc/sudoers.d/yamaha`, and added to `systemd-journal` for log reads. The one-time converter is `/home/john/claude-root-setup.sh`. Deploy is now `scp yamaha.py` (john owns the file) + `sudo systemctl restart yamaha.service`; logs are `journalctl -u yamaha`. The service is enabled, so it also survives reboot.
+
+## 21.10 Change (b)+(c) — absent AVB scored; lab switch added (2026-09-04)
+
+(b) verified with the lab switch OFF, no Frida, emulator: two scans, both `score=95 verdict=block`, new reason `android_boot_state_unavailable +15` alongside `android_test_keys +25`, `android_build_type_not_user +45`, `android_adb_enabled +10`. Emulator baseline moved 80 review -> 95 block; the OPPO (green/locked AVB, user build) is unaffected. **PASS.** (c) `INTEGRITY_ALLOW_USERDEBUG` verification pending a passwordless lab-override env file.
+
+## 21.11 Passwordless lab toggling (2026-09-04)
+
+To toggle lab-only settings without root each time, `yamaha.service` gains a second, optional, john-writable `EnvironmentFile=-/home/john/yamaha.lab.env` that overrides `/etc/yamaha.env`. It holds no secrets — only lab switches such as `INTEGRITY_ALLOW_USERDEBUG=1` or `INTEGRITY_MODE=enforce`. Toggling is then entirely passwordless: write the file as john, `sudo systemctl restart yamaha.service`. Keep it empty (or absent) for a production-representative run.
