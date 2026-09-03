@@ -1292,7 +1292,21 @@ Phase 3 — after `exit`: runtime artifact gone. After `pkill frida-server`: a s
 3. **Empty verified-boot properties score +0.** A production Android 8+ device with AVB always publishes `ro.boot.verifiedbootstate`; the OPPO publishes all three. Whether "all three absent" deserves a low-weight reason is undecided.
 4. **`INTEGRITY_ALLOW_USERDEBUG` lab switch** — undecided; lab-only, never production.
 
-## 21.5 Open items
+## 21.5 `su` invisibility — CONFIRMED (2026-09-04)
 
-- Verify the `su` invisibility cause: `ls -lZ /system/xbin/su`, `run-as com.example.devicefingerprinting ls -l /system/xbin/su`, `dmesg | grep avc`.
+```text
+ls -lZ /system/xbin/su                 -rwsr-x--- root shell u:object_r:su_exec:s0
+run-as <app> id -Z                     u:r:runas_app:s0:c150,c256,c512,c768
+run-as <app> ls -l /system/xbin/su     ls: /system/xbin/su: Permission denied
+logcat -b all / dmesg | grep su_exec   (no audit record)
+```
+
+Under DAC, `stat()` needs only search permission on the parent directories, which are world-searchable; the file's own mode bits do not apply to `stat()`. `Permission denied` on a bare `ls -l` can therefore only come from SELinux (`untrusted_app` denied `getattr` on `su_exec`). The absent audit line is consistent with AOSP `dontaudit` rules for app probing of system paths. Conclusion: file-presence root detection is a low-confidence signal on any device with a sane policy. Keep `root_files` for sloppy roots; never rely on it.
+
+## 21.6 Decisions taken (2026-09-04)
+
+All four proposals in §21.4 approved, each to land as its own revertable commit, in this order: (a) block-weight probes mandatory; (b)+(c) development-image signals and lab switch; (d) device-level integrity memory. Then the Frida Gadget test on the OPPO. Note for (c): suppressing only the build-type reason would leave the emulator at 35 (`test-keys +25`, `adb +10`) = `elevated`, still 403 in enforce mode, so the lab switch must cover the whole development-image set (build type, test-keys, boot-state-unavailable).
+
+## 21.7 Open items
+
 - Next test: **Frida Gadget embedded in the APK on the OPPO** (`user` build, no root, `INTEGRITY_MODE=enforce`). Expect `android_frida_runtime_artifact` via the `gadget` token in `runtime_maps`, then 403 `integrity_blocked` on a protected request. This is the first enforcement-against-real-compromise test on production-class hardware.
