@@ -1307,7 +1307,18 @@ Under DAC, `stat()` needs only search permission on the parent directories, whic
 
 All four proposals in §21.4 approved, each to land as its own revertable commit, in this order: (a) block-weight probes mandatory; (b)+(c) development-image signals and lab switch; (d) device-level integrity memory. Then the Frida Gadget test on the OPPO. Note for (c): suppressing only the build-type reason would leave the emulator at 35 (`test-keys +25`, `adb +10`) = `elevated`, still 403 in enforce mode, so the lab switch must cover the whole development-image set (build type, test-keys, boot-state-unavailable).
 
-## 21.7 Open items
+## 21.7 Change (a) verified against real Frida (2026-09-04)
+
+`_integrity_probe_plan`: `root_shell`, `selinux`, `mounts`, `frida_ports` moved from the optional pool to mandatory (commit `2fafa33`), deployed via the new systemd service. A/B against §21.3 Phase 1 with frida-server listening and nothing attached:
+
+```text
+before (optional frida_ports):  block / review / block   (2 of 3 — the review scan had not drawn frida_ports)
+after  (mandatory frida_ports): block / block  / block   (3 of 3 — all twelve probes present every scan)
+```
+
+Every scan now carries `android_frida_port_open +75`; `android_adb_enabled +10` also appears every scan because its probe is likewise always drawn. **PASS.** A client can no longer rescan to dodge a block-weight probe.
+
+## 21.9 Open items
 
 - Next test: **Frida Gadget embedded in the APK on the OPPO** (`user` build, no root, `INTEGRITY_MODE=enforce`). Expect `android_frida_runtime_artifact` via the `gadget` token in `runtime_maps`, then 403 `integrity_blocked` on a protected request. This is the first enforcement-against-real-compromise test on production-class hardware.
 
