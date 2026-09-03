@@ -4,23 +4,26 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Hard rules
 
-**Claude never executes anything in this repository.** No `flutter run`, `flutter test`,
-`flutter build`, no starting the server, no `adb`, no database or package-install commands, no
-side-effecting shell at all. Reading and searching files to reason about them is fine and expected —
-it is what makes a correct patch possible — but every action that changes state or produces a test
-result belongs to the user.
+**Claude does the shell work; the user does three things.** Claude runs `adb`, `logcat`, `grep`,
+`scp`/`ssh` to the server laptop, `flutter run`, `git`, and applies its own changes. The user only:
+(1) presses buttons in the running app ("Run native integrity scan" etc.) — say when and how many
+times, then read the result with `adb logcat` yourself; (2) physically connects the OPPO when asked;
+(3) enters credentials. For credentials never ask for the secret in chat — give the user a way to
+enter it themselves, typically `! <command>` typed at the Claude Code prompt (e.g.
+`! ssh-copy-id john@192.168.100.13`), and prefer one-time setups (SSH keys, a `chmod 600` env file
+on the server) so it is entered once. Keep the user's steps minimal, literal and non-redundant.
 
-**Whole replacement files are fine — there are only a couple of files — but every change must be
-revertable.** Before editing a file in place, make sure a revert point exists: a timestamped backup
-copy, or a git commit of the pre-change state, and say in the handover how to get back. `yamaha.py`
-lives on the server laptop, so edit the repo copy at
-`~/flutter_dev/devicefingerprinting/yamaha.py` and give the user that path to copy across. Either
-way, **write the file to disk and give its real path** — never reference a patch or file that only
-appeared inline in a message. See "Delivering changes".
+**Never root, wipe, or modify the OS of the OPPO.** Installing a debug build of the app is fine.
+
+**Every change is its own git commit, so `git revert <sha>` is exact.** `yamaha.py` goes to the
+server as a complete file: back up the server copy to `.bak-<timestamp>`, `diff -u` old vs new
+before replacing, then restart. Never reference a patch or file that only appeared inline in a
+message.
 
 **`yamaha.py` must keep running on the old test laptop: Debian Bullseye, Python 3.9, a curated set of
 system packages.** AWS RDS is a future goal, not a present one. Do not propose anything that assumes
-a newer Python, newer libraries, extra dependencies, or managed-database features.
+a newer Python, newer libraries, extra dependencies, or managed-database features. Verify every
+server change with `ast.parse(src, feature_version=(3, 9))`.
 
 ## Read this first
 
@@ -61,7 +64,7 @@ than overclaiming what a passing test proves.
 `adb root` proving root for `adbd` does **not** prove a sandboxed app can see or execute `su`. Keep
 that distinction when interpreting probe output.
 
-## Commands (for the user to run — hand these over, do not execute them)
+## Commands
 
 ```bash
 # Client
@@ -221,51 +224,29 @@ INCONCLUSIVE. After that: real `frida-server` on the emulator, checking whether
 
 ## Delivering changes
 
-The user applies every change themselves. How a change is handed over depends on which machine the
-file lives on.
-
-**`yamaha.py` — full replacement file.** Edit the repo copy in place, verify it parses under the 3.9
-grammar, then hand over the path and let the user copy it to the server:
+**`yamaha.py`** — edit the repo copy in place, verify it parses under the 3.9 grammar, commit it as
+its own revert point, then deploy it yourself:
 
 ```bash
 python3 -c "import ast,io; ast.parse(io.open('yamaha.py',encoding='utf-8').read(), feature_version=(3,9)); print('3.9 syntax OK')"
-# user then, from the dev machine:
+git add yamaha.py && git commit -m "<one change>"
+ssh john@192.168.100.13 'cp /home/john/yamaha.py /home/john/yamaha.py.bak-$(date +%Y%m%d-%H%M)'
 scp yamaha.py john@192.168.100.13:/home/john/yamaha.py.new
-# and on the server, before replacing:
-diff -u /home/john/yamaha.py /home/john/yamaha.py.new
-cp /home/john/yamaha.py /home/john/yamaha.py.bak-$(date +%Y%m%d-%H%M)
+ssh john@192.168.100.13 'diff -u /home/john/yamaha.py /home/john/yamaha.py.new; mv /home/john/yamaha.py.new /home/john/yamaha.py && ./run-yamaha.sh'
+curl -s http://192.168.100.13:5000/health/ready
 ```
 
-Always give that `diff -u` step: the server copy may carry a hand-edit the repo copy lacks, and a
-wholesale replace would silently drop it. The `.bak-<timestamp>` copy on the server plus a git commit
-of the pre-change repo state are the two revert points — never hand over an in-place edit without at
-least one of them in place.
+Always look at that `diff -u` — the server copy may carry a hand-edit the repo copy lacks, and a
+wholesale replace would silently drop it. `run-yamaha.sh` on the server sources `~/yamaha.env`
+(mode 600, holds the export lines; never print its values) and restarts the process under `nohup`
+with output in `~/yamaha.log`.
 
-A `.bak-<timestamp>` backup for reverting is not the same thing as the forbidden practice of creating
-a differently-named variant of the server (`yamaha_*_fixed.py`) and running it. Backups are good;
-renamed live server files are not.
+**Dart, Kotlin, config** — edit in the repo, commit, and `flutter run -d <device>` yourself once the
+user has connected the device.
 
-**Dart, Kotlin, config — unified diff:**
-
-```bash
-# write the diff to a real file, e.g. /tmp/integrity-selinux.patch, then:
-cd ~/flutter_dev/devicefingerprinting
-patch -p1 --dry-run < /tmp/integrity-selinux.patch     # verify first
-patch -p1 < /tmp/integrity-selinux.patch
-```
-
-- Produce real unified diffs with `---`/`+++` headers, `@@` hunks and at least three lines of
-  context, generated against the current file contents. The user hand-edits source between sessions,
-  so re-read the target region immediately before writing the hunk or it will not apply.
-- The server file is on the other machine. Say plainly which file each patch targets and where it
-  has to be applied — the laptop at 192.168.100.13 for `yamaha.py`, the dev machine for Dart/Kotlin.
-- Several paths in `lib/` contain spaces, so quote them in any command that touches them.
-- One change or one test at a time.
-- Give the exact shell / Flutter / Python / SQL commands to run, state the expected output first when
-  practical, and label every reported result **PASS / FAIL / INCONCLUSIVE**.
-- Always distinguish: environment/tooling issue vs. native collector issue vs. server scoring issue
-  vs. a genuine security finding.
-- Do not redesign the working authentication architecture. Continue from current state.
+**Reading scan results** — `adb -s <device> logcat -c` before asking for button presses, then
+`adb -s <device> logcat -d -s flutter:V | grep -E 'INTEGRITY(:| REASON:)'` afterwards. The user does
+not need a logcat terminal open.
 
 ### Python 3.9 / Bullseye limits for `yamaha.py`
 
