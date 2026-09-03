@@ -1205,3 +1205,94 @@ Please follow these preferences during continuation:
 ## Immediate continuation request
 
 Continue from the real root-emulator test described above. The emulator is already running as root (`uid=0`, `u:r:su:s0`). First interpret the emulator ground-truth commands and then run the ordinary native integrity scan without synthetic fixtures. After that, proceed to real `frida-server` testing.
+
+---
+
+# 21. Emulator Real-Environment Results — 2026-09-03
+
+Recorded from the live Claude Code session. Emulator `emulator-5554`, AOSP x86_64, `userdebug`, adbd running as root. Server modes throughout: `INTEGRITY_MODE=observe`, `DEVICE_POLICY_MODE=observe`, `INTEGRITY_ALLOW_DEBUG=1`, `INTEGRITY_ALLOW_EMULATOR=1`. **No synthetic fixtures were used in any test below.**
+
+## 21.1 Emulator ground truth
+
+```text
+ro.build.type                 userdebug
+ro.debuggable                 1
+ro.secure                     1
+ro.build.tags                 test-keys
+ro.boot.verifiedbootstate     (empty)
+ro.boot.flash.locked          (empty)
+ro.boot.vbmeta.device_state   (empty)
+getenforce                    Enforcing
+su                            /system/xbin/su   -rwsr-x--- root shell
+```
+
+## 21.2 Test A — real root-capable image, unmodified collector: FAIL, then fixed
+
+Three scans with the unchanged collector and server:
+
+```text
+score=35 verdict=elevated   android_test_keys +25, android_adb_enabled +10
+score=25 verdict=trusted    android_test_keys +25
+score=35 verdict=elevated   android_test_keys +25, android_adb_enabled +10
+```
+
+Findings:
+
+- `android_root_artifact` never fired even though `root_files` ran on every scan and `/system/xbin/su` exists. `File.exists()` returns false from the app sandbox. Working hypothesis: SELinux — the binary carries the `su_exec` label and `untrusted_app` is denied `getattr`. Verification is still pending (§21.5).
+- `android_su_on_path` did not fire (`root_shell` was drawn in two scans). Predicted and correct: the app uid is neither root nor in group `shell`, so `su` is not executable from the process. Root `adbd` does not imply an app-visible `su`.
+- The three verified-boot properties are empty on the emulator. The scorer's `if value and ...` guard treats absence as telemetry (+0), consistent with the SELinux "unknown is not compromise" policy.
+- `android_developer_options` did not fire; only `android_adb_enabled` did.
+
+**Classification: FAIL.** A root-capable `userdebug` image scored `trusted` on one scan in three and was indistinguishable from the clean OPPO baseline (18).
+
+**Fix applied to `yamaha.py`** (`_score_android_integrity`): `ro.build.type` was collected by the probe but never scored. Added `android_build_type_not_user +45` for any non-empty build type other than `user`. Not gated by `INTEGRITY_ALLOW_DEBUG`. Python 3.9-safe; no schema or dependency change. Reason: a userdebug/eng image is root-capable by construction, and a property read survives the sandbox where a file stat does not.
+
+Retest, three scans:
+
+```text
+score=70 verdict=review   android_test_keys +25, android_build_type_not_user +45
+score=80 verdict=review   + android_adb_enabled +10   (developer_settings drawn)
+score=70 verdict=review
+```
+
+OPPO after the fix: `ro.build.type=user`, `score=18 verdict=trusted` — unchanged. **PASS.**
+
+Consequence to remember: `_enforce_integrity_gate` rejects `elevated`, `review` **and** `block` — only `trusted` passes. The emulator is therefore permanently 403 in enforce mode. Enforce-mode tests must run on the OPPO unless an `INTEGRITY_ALLOW_USERDEBUG`-style lab switch is added (undecided).
+
+## 21.3 Test B — real frida-server and real attach: PASS (all phases)
+
+frida-server (version matched to frida-tools, `android-x86_64`) pushed to `/data/local/tmp`, started as root, confirmed listening on `127.0.0.1:27042` with `netstat -ltn`.
+
+Phase 1 — server listening, nothing attached:
+
+```text
+score=100 verdict=block   android_frida_port_open +75          (frida_ports drawn)
+score=80  verdict=review  no Frida reason                       (frida_ports NOT drawn)
+score=100 verdict=block   android_frida_port_open +75          (frida_ports drawn)
+```
+
+`android_frida_runtime_artifact` absent on all three — correct; nothing was inside the process yet.
+
+Phase 2 — `frida -U -p <pid>` attached, REPL held open, `frida-agent` confirmed in `/proc/<pid>/maps`:
+
+```text
+score=100 verdict=block   android_frida_runtime_artifact +90 (+ port reason when drawn)
+score=100 verdict=block   android_frida_runtime_artifact +90
+score=100 verdict=block   android_frida_runtime_artifact +90   (frida_ports NOT drawn — still caught)
+```
+
+`runtime_maps` is mandatory, so an attached Frida is caught on every scan regardless of the optional draw.
+
+Phase 3 — after `exit`: runtime artifact gone. After `pkill frida-server`: a scan that drew `frida_ports` fired nothing. Back to 70/80 `review`. No stale state.
+
+## 21.4 Design observations — decisions pending
+
+1. **Optional-probe miss rate.** `frida_ports` (+75), `root_shell` (+50), `mounts` (+55) and `selinux` (+45/+70) all sit in the optional pool with 4 of 6 drawn, so each is skipped in one scan of three. The client chooses when to scan and `_latest_integrity_state` uses only the newest report, so a compromised client can simply rescan until a favourable draw. Proposal: block-weight probes become mandatory; randomness stays only for low-weight telemetry. The challenge nonce already prevents precomputed reports.
+2. **Integrity memory does not cross a reinstall.** `_latest_integrity_state` and `_evaluate_risk_policy` look up integrity by `installation_id` only. A reinstall creates a new installation with no integrity state; a previous `block` verdict on the same `device_id` is not carried over. Only the relationship layer (reinstall velocity) and administrative `recognized_devices.status` persist across reinstalls. Proposal to discuss: device-level integrity memory (worst verdict per `device_id` inside a window).
+3. **Empty verified-boot properties score +0.** A production Android 8+ device with AVB always publishes `ro.boot.verifiedbootstate`; the OPPO publishes all three. Whether "all three absent" deserves a low-weight reason is undecided.
+4. **`INTEGRITY_ALLOW_USERDEBUG` lab switch** — undecided; lab-only, never production.
+
+## 21.5 Open items
+
+- Verify the `su` invisibility cause: `ls -lZ /system/xbin/su`, `run-as com.example.devicefingerprinting ls -l /system/xbin/su`, `dmesg | grep avc`.
+- Next test: **Frida Gadget embedded in the APK on the OPPO** (`user` build, no root, `INTEGRITY_MODE=enforce`). Expect `android_frida_runtime_artifact` via the `gadget` token in `runtime_maps`, then 403 `integrity_blocked` on a protected request. This is the first enforcement-against-real-compromise test on production-class hardware.
