@@ -138,6 +138,12 @@ INTEGRITY_REPORT_MAX_SKEW_SECONDS = int(
 INTEGRITY_FRESHNESS_SECONDS = int(
     os.environ.get("INTEGRITY_FRESHNESS_SECONDS", "600")
 )
+# Integrity reports are keyed to an installation, so reinstalling the app would
+# otherwise erase a block verdict. This window carries the worst recent verdict
+# forward on the canonical device_id instead. 0 disables device-level memory.
+INTEGRITY_DEVICE_MEMORY_HOURS = int(
+    os.environ.get("INTEGRITY_DEVICE_MEMORY_HOURS", "24")
+)
 INTEGRITY_RANDOM_OPTIONAL_PROBES = int(
     os.environ.get("INTEGRITY_RANDOM_OPTIONAL_PROBES", "4")
 )
@@ -1202,6 +1208,44 @@ def _latest_integrity_state(installation_id):
     }
 
 
+def _device_integrity_memory(device_id):
+    """Worst native-integrity outcome for this device across all installations.
+
+    Reports are stored per installation, so a reinstall hands the attacker a
+    clean slate: the new installation_id has no history of its own. Recognition
+    of the physical device survives a reinstall, so the integrity verdict should
+    too. This returns the worst report recorded against the canonical device_id
+    inside the memory window, which is what stops a compromised device from
+    laundering a block by reinstalling the app.
+    """
+    if INTEGRITY_DEVICE_MEMORY_HOURS <= 0:
+        return None
+    cutoff = _utc_now() - timedelta(hours=INTEGRITY_DEVICE_MEMORY_HOURS)
+    with _cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT report_id, installation_id, score, verdict, hard_block, created_at
+            FROM integrity_reports
+            WHERE device_id = %s AND created_at >= %s
+            ORDER BY hard_block DESC, score DESC, created_at DESC
+            LIMIT 1
+            """,
+            (device_id, cutoff),
+        )
+        row = cursor.fetchone()
+    if row is None:
+        return None
+    return {
+        "report_id": str(row[0]),
+        "installation_id": str(row[1]),
+        "score": int(row[2]),
+        "verdict": row[3],
+        "hard_block": bool(row[4]),
+        "created_at": _iso_z(row[5]),
+        "window_hours": INTEGRITY_DEVICE_MEMORY_HOURS,
+    }
+
+
 def _enforce_integrity_gate(device_id, installation_id):
     state = _latest_integrity_state(installation_id)
     if INTEGRITY_MODE != "enforce":
@@ -1234,6 +1278,20 @@ def _enforce_integrity_gate(device_id, installation_id):
             403,
             "integrity_step_up_required",
             details={"integrity": state},
+        )
+    # This installation's own scan is clean. Before allowing the request, check
+    # whether the physical device was blocked recently under any installation:
+    # reinstalling must not clear a compromised device's record.
+    memory = _device_integrity_memory(device_id)
+    if memory is not None and (
+        memory.get("hard_block") or memory.get("verdict") == "block"
+    ):
+        raise ApiProblem(
+            "This device recorded a blocked integrity verdict recently; "
+            "reinstalling the app does not clear it.",
+            403,
+            "integrity_device_blocked_recently",
+            details={"integrity": state, "device_integrity_memory": memory},
         )
     return state
 
@@ -1370,6 +1428,7 @@ def _evaluate_risk_policy(
     projected_device_account_count = device_account_count + (1 if add_link else 0)
     projected_account_device_count = account_device_count + (1 if add_link else 0)
     integrity_state = _latest_integrity_state(installation_id)
+    device_integrity_memory = _device_integrity_memory(device_id)
 
     reasons = []
     score = 0
@@ -1521,6 +1580,24 @@ def _evaluate_risk_policy(
         if integrity_state.get("verdict") == "block" or integrity_state.get("hard_block"):
             hard_block = True
 
+    # Device-level integrity memory. A block recorded against another
+    # installation on this same physical device stays relevant after a
+    # reinstall, which is exactly the case the installation-scoped lookup above
+    # cannot see.
+    if device_integrity_memory is not None and (
+        device_integrity_memory.get("hard_block")
+        or device_integrity_memory.get("verdict") == "block"
+    ):
+        if device_integrity_memory.get("installation_id") != str(installation_id):
+            _policy_reason(
+                reasons,
+                "device_integrity_history_block",
+                50,
+                "Another installation on this device was blocked by native "
+                "integrity inside the device memory window.",
+            )
+            score += 50
+
     recommended_action = _policy_action(score, hard_block=hard_block)
     effective_action = (
         recommended_action if DEVICE_POLICY_MODE == "enforce" else "allow"
@@ -1548,6 +1625,8 @@ def _evaluate_risk_policy(
         "integrity": integrity_state,
         "integrity_mode": INTEGRITY_MODE,
         "integrity_freshness_seconds": INTEGRITY_FRESHNESS_SECONDS,
+        "device_integrity_memory": device_integrity_memory,
+        "device_integrity_memory_hours": INTEGRITY_DEVICE_MEMORY_HOURS,
     }
     decision = {
         "decision_id": decision_id,
