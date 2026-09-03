@@ -961,6 +961,13 @@ def _score_android_integrity(probes):
     vbmeta_state = _as_text(props.get("ro.boot.vbmeta.device_state")).lower()
     ro_secure = _as_text(props.get("ro.secure")).lower()
     ro_debuggable = _as_text(props.get("ro.debuggable")).lower()
+    build_type = _as_text(props.get("ro.build.type")).lower()
+    # A userdebug/eng image is root-capable by construction: adb root succeeds
+    # and the image ships su. This signal survives the app sandbox because it is
+    # a property read, not a file stat, which SELinux denies to untrusted_app.
+    if build_type and build_type not in ("user",):
+        _integrity_reason(reasons, "android_build_type_not_user", 45, "The OS build type is not a production user build.")
+        score += 45
     if verified and verified not in ("green",):
         _integrity_reason(reasons, "android_verified_boot_not_green", 60, "Verified Boot state is not green.")
         score += 60
@@ -2580,7 +2587,15 @@ def integrity_challenge():
 
     with _cursor(commit=True) as cursor:
         cursor.execute(
-            "DELETE FROM integrity_challenges WHERE expires_at < NOW() - INTERVAL '1 day'"
+            """
+            DELETE FROM integrity_challenges AS c
+            WHERE c.expires_at < NOW() - INTERVAL '1 day'
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM integrity_reports AS r
+                  WHERE r.challenge_id = c.challenge_id
+              )
+            """
         )
         cursor.execute(
             """
