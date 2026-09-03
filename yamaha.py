@@ -143,6 +143,13 @@ INTEGRITY_RANDOM_OPTIONAL_PROBES = int(
 )
 INTEGRITY_ALLOW_DEBUG = os.environ.get("INTEGRITY_ALLOW_DEBUG", "0") == "1"
 INTEGRITY_ALLOW_EMULATOR = os.environ.get("INTEGRITY_ALLOW_EMULATOR", "0") == "1"
+# Lab-only. When set, the signals that merely say "this is a development OS
+# image" (non-user build type, test-keys, no Verified Boot data) are not
+# scored, so a userdebug emulator can reach a trusted baseline and be used for
+# enforce-mode testing. It never suppresses evidence of actual compromise
+# (Frida, hooks, root artifacts), so a compromised emulator still blocks.
+# Must stay 0 in production.
+INTEGRITY_ALLOW_USERDEBUG = os.environ.get("INTEGRITY_ALLOW_USERDEBUG", "0") == "1"
 
 def _env_values(name):
     raw = os.environ.get(name, "").replace(";", ",")
@@ -950,7 +957,7 @@ def _score_android_integrity(probes):
     elif found_paths:
         _integrity_reason(reasons, "android_root_artifact", 50, "Root/su artifacts were visible.")
         score += 50
-    if _as_bool(root_files.get("test_keys")):
+    if _as_bool(root_files.get("test_keys")) and not INTEGRITY_ALLOW_USERDEBUG:
         _integrity_reason(reasons, "android_test_keys", 25, "Build tags contain test-keys.")
         score += 25
 
@@ -970,7 +977,7 @@ def _score_android_integrity(probes):
     # A userdebug/eng image is root-capable by construction: adb root succeeds
     # and the image ships su. This signal survives the app sandbox because it is
     # a property read, not a file stat, which SELinux denies to untrusted_app.
-    if build_type and build_type not in ("user",):
+    if build_type and build_type not in ("user",) and not INTEGRITY_ALLOW_USERDEBUG:
         _integrity_reason(reasons, "android_build_type_not_user", 45, "The OS build type is not a production user build.")
         score += 45
     if verified and verified not in ("green",):
@@ -982,6 +989,15 @@ def _score_android_integrity(probes):
     if vbmeta_state and vbmeta_state not in ("locked",):
         _integrity_reason(reasons, "android_vbmeta_not_locked", 60, "VBMeta device state is not locked.")
         score += 60
+    # Full absence of Verified Boot / AVB data is itself a low-confidence signal:
+    # a production Android 8+ device with AVB publishes these, and blanking all
+    # of them is a cheap way to dodge the "not green / not locked" checks above.
+    # Partial blanking is still caught by those checks; this only fires when the
+    # device reports none of the three. Low weight, and treated as a
+    # development-image signal so the lab switch suppresses it.
+    if not any((verified, flash_locked, vbmeta_state)) and not INTEGRITY_ALLOW_USERDEBUG:
+        _integrity_reason(reasons, "android_boot_state_unavailable", 15, "The device reported no Verified Boot / AVB state.")
+        score += 15
     if ro_secure == "0":
         _integrity_reason(reasons, "android_ro_secure_disabled", 50, "ro.secure is disabled.")
         score += 50
