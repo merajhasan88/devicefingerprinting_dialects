@@ -1556,10 +1556,32 @@ Driver: **pyodbc + msodbcsql18** with the RDS CA bundle installed. Never `TrustS
 | Phase | Work | Status |
 |---|---|---|
 | 0 | Conformance suite (`conformance_suite.py`) | **DONE** — 13/13 on PostgreSQL 13.23 |
-| 0b | Extend to integrity scoring and the enforcement gate | pending |
+| 0b | Extend to integrity scoring and the enforcement gate | **DONE** — 26/26 on PostgreSQL 13.23 |
 | 1 | RDS PostgreSQL + Supabase, HTTPS | pending |
 | 2 | Database abstraction, PostgreSQL only, suite stays green | pending |
 | 3 | SQL Server dialect, same suite, diff the results | pending |
 | 4 | Package Dart / .NET / Python SDKs | pending |
 
 Phase 2 precedes 3 deliberately: the abstraction lands while PostgreSQL is still the reference, so a regression is caught against known-good behaviour rather than while also debugging T-SQL.
+
+### 24.1 Conformance suite coverage (phase 0 + 0b complete, 2026-09-05)
+
+`conformance_suite.py` now has **26 checks, all passing against PostgreSQL 13.23**, and runs unchanged in either integrity mode (it scans before account operations, as a real client does; the two enforcement checks SKIP in observe mode).
+
+*Protocol and identity:* enrolment, key-thumbprint authority over the client UUID, signed-challenge device token, account opening.
+
+*Access proof:* happy path, exact replay, body/path/method tampering, stale timestamp, and a proof signed by the wrong key.
+
+*Refresh:* rotation, and reuse revoking the family.
+
+*Integrity scoring* (crafted probe payloads, no phone needed): pristine device scores 0/trusted; **unreadable SELinux stays telemetry** — the regression guard for the OPPO false positive; permissive SELinux; Frida in `/proc/self/maps`; open Frida port; root framework + `su`; writable protected mount; development OS image (build type + test-keys); absent AVB data; signing-certificate mismatch as a capped hard block; failed-probe penalty.
+
+*Enforcement:* a blocked device is refused with `integrity_blocked`, and **reinstalling does not clear a blocked device** (`integrity_device_blocked_recently`) — change (d), keyed on `device_id` across installations.
+
+Five checks are tagged `[db]` as the ones whose behaviour depends on the engine: replay (upsert/duplicate-key), refresh rotation and reuse (row locking), thumbprint identity (JSON round-trip), stale timestamp (timezone round-trip), device memory (cross-installation `device_id` query).
+
+**To run the scoring checks**, start the server with `INTEGRITY_ANDROID_CERT_SHA256` set to the certificate the suite prints (it fails with that instruction otherwise), or empty to disable the allow-list. Restore the real certificate afterwards or the physical phones will hard-block.
+
+### 24.2 Agreed: versioned migration scripts per dialect
+
+The runtime DDL in `schema_guard` will be replaced by **versioned migration scripts per dialect**, run by a DBA, with the application verifying schema version at boot and refusing to start on mismatch. Agreed 2026-09-05. Rationale: enterprise DBAs reject applications that issue `CREATE`/`ALTER` against production, and runtime DDL forces the application's database principal to hold DDL rights permanently. This also shapes the "server file(s) to set up their database" deliverable — those files become the migration set.
