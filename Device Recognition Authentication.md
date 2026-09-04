@@ -1492,3 +1492,74 @@ The Huawei registered as its own server device (device_id `65aeb493…`), distin
 ### Cleanup / device restored
 
 Gadget scaffolding reverted (never committed), clean APK rebuilt (`0` Frida entries) and installed over the compromised one; the Huawei scans `18/trusted` with no listener on 27042. Server left in observe mode (production-representative). Same 24 h device-memory caveat as the OPPO applies to this device's `device_id`. OS never touched.
+
+## 24. Product direction and database portability (2026-09-05)
+
+### What is being built
+
+The proof of concept becomes a reusable framework: **client SDKs in Flutter/Dart, .NET and Python**, one **server implementation** (this Python service), and **database setup scripts** so a customer runs *their app + this server + their database*. Payactiv runs mostly SQL Server with some PostgreSQL.
+
+**.NET is a client SDK, not a second server.** That decision matters: two independent implementations of signature verification, nonce handling and scoring would double the security-review surface and risk a subtle divergence being a vulnerability in one of them. One server, many clients.
+
+### Supported database matrix
+
+| Engine | Floor | Rationale |
+|---|---|---|
+| PostgreSQL | **13+** | The current test server is PostgreSQL 13.23 (Debian 11). Verified. |
+| SQL Server | **2016+** | Payactiv on AWS RDS. 2016 is the first version with `OPENJSON`/`JSON_VALUE`. |
+
+Both floors are 2016-era, so the supported window is roughly a decade. `/health/ready` now reports `database.engine`, `.version`, `.minimum_supported` and `.supported`, and the server logs an error when running below the floor. `DB_ENGINE` (`postgresql` | `sqlserver`) is the dialect selector.
+
+### Compatibility policy — do not use
+
+*PostgreSQL (13 floor):* no `MERGE` (15+), no `JSON_TABLE` (17+), no `NULLS NOT DISTINCT` (15+), no multirange types (14+).
+
+*SQL Server (2016 floor):* no `STRING_AGG` (2017+), no `_UTF8` collations (2019+), no `GENERATE_SERIES` (2022+). There is **no `CREATE TABLE IF NOT EXISTS` in any version** — DDL needs `sys.tables`/`sys.columns` guards.
+
+### Type mapping
+
+| Purpose | PostgreSQL 13+ | SQL Server 2016+ |
+|---|---|---|
+| UUID keys | `uuid` | `char(36) COLLATE Latin1_General_BIN2` |
+| SHA-256 hex digests | `char(64)` | `char(64) COLLATE Latin1_General_BIN2` |
+| Timestamps | `timestamptz` | `datetimeoffset(3)`, always UTC |
+| JSON documents | `jsonb` | **`nvarchar(max)`** + optional `CHECK (ISJSON(col)=1)` |
+| bcrypt hash | `bytea` | `varbinary(255)` |
+| Booleans | `boolean` | `bit` |
+| "now" | `NOW()` | **`SYSUTCDATETIME()`**, never `GETDATE()` |
+| Interval math | `NOW() - INTERVAL '1 day'` | `DATEADD(day, -1, SYSUTCDATETIME())` |
+| Partial/filtered index | `CREATE INDEX ... WHERE used_at IS NULL` | same syntax; SQL Server filtered indexes permit `IS NULL` |
+
+**`nvarchar(max)` for JSON is not cosmetic.** SQL Server 2016/2017 have no UTF-8 collation, and probe output (`build_tags`, `su_path`, OEM error strings) can contain non-ASCII. `varchar` would corrupt it.
+
+**BIN2 collation on key columns is not cosmetic either.** The RDS default `SQL_Latin1_General_CP1_CI_AS` is case-insensitive, so any base64url value used as a unique key would collide (`aB` == `Ab`). Every unique text column is hex today, so we are safe by luck rather than design; BIN2 makes it design.
+
+### The two security-critical dialect differences
+
+1. **Replay defence** (`access_proof_nonces`). Postgres uses `INSERT ... ON CONFLICT DO NOTHING RETURNING`. SQL Server has no equivalent, and both tempting translations are traps: `MERGE` is racy without `HOLDLOCK`, and `IF NOT EXISTS(...) INSERT` under READ COMMITTED lets two concurrent identical proofs both succeed. **Portable fix, simpler than the current code: plain `INSERT`, treat a driver duplicate-key error as the replay signal.** Identical atomicity on both engines.
+2. **Refresh-reuse detection** (`SELECT ... FOR UPDATE`, 2 sites). SQL Server needs `WITH (UPDLOCK, ROWLOCK)`; Postgres is MVCC and SQL Server's READ COMMITTED is not. Getting this wrong lets family revocation be raced.
+
+Driver: **pyodbc + msodbcsql18** with the RDS CA bundle installed. Never `TrustServerCertificate=yes`.
+
+### Client-SDK contract invariants (do not "optimise" these away)
+
+- **The signature covers exactly the bytes the client sent.** `X-Access-Proof` is base64url-decoded, the signature is verified over those bytes, and only then parsed. Therefore Dart, .NET and Python do **not** need byte-identical JSON serialisation — no RFC 8785 canonicalisation. Any server-side re-serialisation before verification would silently break every non-Dart SDK.
+- **Signatures are ASN.1 DER.** In .NET, `ECDsa.SignData()`'s default overload emits IEEE-P1363 (`r||s`) and will fail every verification; the SDK must pass `DSASignatureFormat.Rfc3279DerSequence`.
+- **The error envelope is `{"error": {"code": ..., "message": ...}}`** — nested, not flat. All SDKs read `error.code` from that shape.
+
+### Runtime DDL must become migrations before this ships
+
+`schema_guard` executes `_SCHEMA_SQL` on every request. Acceptable for a PoC, unacceptable for a product: enterprise DBAs will reject an application that issues `CREATE`/`ALTER` against production, and it forces the app's database principal to hold DDL rights permanently — a finding in its own right. Ship versioned migration scripts per dialect; the app should verify schema version at boot and refuse to start on mismatch.
+
+### Phase plan
+
+| Phase | Work | Status |
+|---|---|---|
+| 0 | Conformance suite (`conformance_suite.py`) | **DONE** — 13/13 on PostgreSQL 13.23 |
+| 0b | Extend to integrity scoring and the enforcement gate | pending |
+| 1 | RDS PostgreSQL + Supabase, HTTPS | pending |
+| 2 | Database abstraction, PostgreSQL only, suite stays green | pending |
+| 3 | SQL Server dialect, same suite, diff the results | pending |
+| 4 | Package Dart / .NET / Python SDKs | pending |
+
+Phase 2 precedes 3 deliberately: the abstraction lands while PostgreSQL is still the reference, so a regression is caught against known-good behaviour rather than while also debugging T-SQL.
