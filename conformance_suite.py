@@ -547,9 +547,13 @@ def main():
     if status != 200:
         raise SystemExit("server not ready: %s %s" % (status, health))
     mode = health.get("integrity_mode")
-    backend = health.get("database", "unknown")
+    backend = health.get("database") or {}
+    engine = "%s %s" % (backend.get("engine", "unknown"), backend.get("version", ""))
     print("target   : %s" % arguments.base_url)
-    print("integrity: %s     database: %s" % (mode, backend))
+    print("database : %s   (minimum supported %s, supported=%s)" % (
+        engine.strip(), backend.get("minimum_supported", "?"),
+        backend.get("supported", "?")))
+    print("integrity: %s" % mode)
     if mode != "observe":
         print(
             "WARNING  : this suite expects INTEGRITY_MODE=observe; "
