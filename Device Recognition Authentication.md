@@ -1407,3 +1407,57 @@ Note on scope: the gate rejects on any recent device-level block, including one 
 ### 21.12.2 Emulator input note
 
 The AVD `integrity_root_lab` has `hw.keyboard=no`, so host keystrokes never reach the emulator and text fields cannot be typed into directly. Use `adb -s emulator-5554 shell input text "..."` and `input tap X Y` (screen is 320x640) instead, or set `hw.keyboard=yes` in `~/.android/avd/integrity_root_lab.avd/config.ini` and restart the emulator.
+
+## 22. Frida Gadget on the OPPO (real compromise, production hardware) — PASS (2026-09-04)
+
+The first enforcement-against-real-compromise test on a production-class device, and the strongest result in the project.
+
+### Device (unchanged, never rooted)
+
+```text
+CPH2083, arm64-v8a, API 28, build=user tags=release-keys
+ro.secure=1 ro.debuggable=0
+verifiedbootstate=green flash.locked=1 vbmeta.device_state=locked
+SELinux=Enforcing
+```
+
+Baseline scan on the clean app, enforce mode: `score=18 verdict=trusted` (developer_options +8, adb +10). Today's (a)/(b) changes do not disturb it — no boot_state_unavailable, no dev-image reasons.
+
+### Method
+
+Frida Gadget (`frida-gadget-17.17.0-android-arm64`) bundled inside the app's own APK — `jniLibs/arm64-v8a/libfrida-gadget.so` plus a `libfrida-gadget.config.so` set to `listen` on 127.0.0.1:27042 with `on_load: resume`, `System.loadLibrary("frida-gadget")` in `MainActivity`'s companion `init`, and `packaging { jniLibs.useLegacyPackaging = true }` in the app Gradle so the config is extracted next to the .so. No root, no `adb root`, no OS modification. This instruments the app process the way a repackaged-malware build would.
+
+Gotchas hit and fixed: `android:extractNativeLibs="true"` in the manifest is rejected by AGP — use the Gradle `useLegacyPackaging` instead. `flutter build apk` drops `--dart-define`, so the first rebuild pointed at the default `10.0.2.2:5000` and timed out; rebuild with `--dart-define=API_BASE_URL=http://192.168.100.13:5000`. The gadget adds ~20 s to first launch.
+
+### Result
+
+Ground truth: gadget listening on 127.0.0.1:27042 (that port is opened only by the gadget, inside our process). App-process `/proc/<pid>/maps` is unreadable from `adb shell` on this enforcing device — the same SELinux restriction that hid `su` — but the collector reads its *own* maps, so it is unaffected.
+
+```text
+Bootstrap scan (gadget in process), enforce mode:
+  score=100 verdict=block
+  android_frida_runtime_artifact +90    <- collector found the gadget in its OWN /proc/self/maps
+  android_frida_port_open        +75
+  android_developer_options       +8
+  android_adb_enabled            +10
+```
+
+Enforcement, using account `oppo1` (created earlier while the device was trusted — proving the gate is not simply refusing everything: that registration returned 201):
+
+```text
+POST /v1/accounts/login -> 403   integrity_blocked
+  (login first ran a fresh scan: integrity/challenge 200, integrity/report 200 -> block)
+App: "The latest device-integrity verdict is blocked. [integrity_blocked]"
+```
+
+**PASS.** Correct credentials + a hardware-backed (`secure_hardware`) installation key + a valid access proof were refused on a production, non-rooted device solely because a real Frida Gadget was detected in the process. `android_frida_runtime_artifact` firing is the property `root_files` could not deliver: an in-process compromise is caught despite enforcing SELinux, because it is a self-process read rather than a file stat.
+
+### Cleanup / device restored
+
+All gadget scaffolding was reverted (MainActivity, Gradle, manifest, jniLibs removed — these were never committed). A clean APK was rebuilt (`0` Frida entries verified in the APK) and installed over the compromised one; the OPPO now scans `score=18 verdict=trusted` with no listener on 27042. The server lab overrides were cleared back to empty, so `INTEGRITY_MODE=observe` (production-representative) and enforcement is off. The phone's OS was never touched.
+
+Caveat: the gadget test wrote a `block` report against the OPPO's `device_id`, so device-level integrity memory (change d) holds it for ~24 h. Irrelevant in observe mode; but if someone flips `INTEGRITY_MODE=enforce` within that window the OPPO will be refused with `integrity_device_blocked_recently` until the report ages out (or its `integrity_reports` rows are deleted).
+
+### Emulator input note
+
+The AVD `integrity_root_lab` has `hw.keyboard=no`, so host keystrokes never reach it; drive text with `adb -s emulator-5554 shell input text "..."` / `input tap X Y`. The OPPO accepts `adb input` too.
