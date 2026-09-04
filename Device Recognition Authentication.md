@@ -1344,7 +1344,7 @@ The switch suppresses only the development-image signals (build type, test-keys,
 
 To toggle lab-only settings without root each time, `yamaha.service` gains a second, optional, john-writable `EnvironmentFile=-/home/john/yamaha.lab.env` that overrides `/etc/yamaha.env`. It holds no secrets — only lab switches such as `INTEGRITY_ALLOW_USERDEBUG=1` or `INTEGRITY_MODE=enforce`. Toggling is then entirely passwordless: write the file as john, `sudo systemctl restart yamaha.service`. Keep it empty (or absent) for a production-representative run.
 
-## 21.12 Change (d) — device-level integrity memory: DEPLOYED, TEST PENDING (2026-09-04)
+## 21.12 Change (d) — device-level integrity memory: PASS (2026-09-04)
 
 Commit `5d80e34`. `_device_integrity_memory(device_id)` returns the worst integrity report recorded against the canonical `device_id` within `INTEGRITY_DEVICE_MEMORY_HOURS` (default 24, `0` disables). `_enforce_integrity_gate` consults it **after** the current installation's own verdict passes and rejects with `integrity_device_blocked_recently`; `_evaluate_risk_policy` adds `device_integrity_history_block +50` when a *different* installation on the same device was blocked in the window, and both the memory and the window are recorded in the decision context. Deployed and live, but **not yet exercised**.
 
@@ -1374,3 +1374,36 @@ Then the counterfactual, to prove the rejection came from (d) and nothing else: 
 
 - Frida Gadget on the OPPO (`user` build, no root) with `INTEGRITY_MODE=enforce` — enforcement against real compromise on production-class hardware. Requires an APK change (gadget `.so` in `jniLibs/arm64-v8a/` plus a load line in `MainActivity.kt`) and `flutter run` to the OPPO. Approved by the user; the OPPO is never to be rooted or wiped.
 - Reset `yamaha.lab.env` to empty for any production-representative measurement.
+
+### 21.12.1 (d) test result — PASS (2026-09-04 12:16-12:28)
+
+End-to-end reinstall-laundering test on emulator-5554. Server: `INTEGRITY_MODE=enforce`, `INTEGRITY_ALLOW_USERDEBUG=1`, `DEVICE_POLICY_MODE=observe`. The device carried a `block` from the §21.10 real-Frida test recorded ~10.5 hours earlier, well inside the 24 h window. No Frida was present during this test.
+
+Sequence:
+
+```text
+1. Simulate fresh installation
+   POST /v1/installations/register -> 201 Created      (new installation_id, new Keystore key)
+   Registration method: reinstall_hint                 (correlated to the SAME device_id)
+   auto integrity scan -> score=10 verdict=trusted     (the new installation is spotless)
+
+2. Create account (dtest1)
+   POST /v1/accounts/register -> 403
+   integrity_device_blocked_recently
+   "This device recorded a blocked integrity verdict recently;
+    reinstalling the app does not clear it."
+```
+
+Counterfactual, to prove the rejection came from (d) and not from another gate — `INTEGRITY_DEVICE_MEMORY_HOURS=0`, service restarted, fresh scan (`score=10 verdict=trusted`), same handle, same installation:
+
+```text
+   POST /v1/accounts/register -> 201 Created
+```
+
+Setting restored to the 24 h default afterwards. **PASS.** This is the project goal demonstrated literally: a device compromised by real Frida, then reinstalled with a new cryptographic identity and a clean local measurement, is still refused, because recognition of the physical device carries the integrity verdict across the reinstall.
+
+Note on scope: the gate rejects on any recent device-level block, including one recorded by the *same* installation. The policy reason `device_integrity_history_block` is narrower and fires only when a *different* installation on the device was blocked, which is the specific reinstall-laundering signal. That asymmetry is deliberate but worth revisiting if it proves noisy.
+
+### 21.12.2 Emulator input note
+
+The AVD `integrity_root_lab` has `hw.keyboard=no`, so host keystrokes never reach the emulator and text fields cannot be typed into directly. Use `adb -s emulator-5554 shell input text "..."` and `input tap X Y` (screen is 320x640) instead, or set `hw.keyboard=yes` in `~/.android/avd/integrity_root_lab.avd/config.ini` and restart the emulator.
