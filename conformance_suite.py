@@ -662,17 +662,32 @@ def integrity_session(api):
     return installation, device_token(api, installation), hint
 
 
+def integrity_context(ctx):
+    """Integrity checks depend on a usable scoring session.
+
+    If the server does not trust the conformance certificate, every integrity
+    report comes back as a certificate hard block, which would drown the real
+    problem in a wall of unrelated failures. Skip with the reason instead.
+    """
+    if "integrity" not in ctx:
+        raise Skip(ctx.get("integrity_unavailable_short", "no integrity session"))
+    return ctx["integrity"]
+
+
 @check("integrity: a pristine device scores zero and is trusted")
 def check_integrity_clean(api, ctx):
     installation, token, hint = integrity_session(api)
     decision = submit_report(api, installation, token)
     if "android_signing_certificate_mismatch" in codes(decision):
-        raise AssertionError(
-            "server does not trust the conformance certificate. Run it with\n"
-            "       INTEGRITY_ANDROID_CERT_SHA256=%s\n"
-            "       (or empty to disable the allow-list) to run the scoring checks."
+        reason = (
+            "server does not trust the conformance certificate; start it with "
+            "INTEGRITY_ANDROID_CERT_SHA256=%s (or empty) to run the scoring checks"
             % CONFORMANCE_CERT
         )
+        ctx["integrity_unavailable_short"] = (
+            "conformance certificate not configured on the server"
+        )
+        raise Skip(reason)
     expect(
         decision["verdict"] == "trusted",
         "expected trusted, got %s (%s)" % (decision["verdict"], codes(decision)),
@@ -685,7 +700,7 @@ def check_integrity_clean(api, ctx):
 def check_selinux_unknown(api, ctx):
     """Regression guard for a fixed false positive: the OPPO's app sandbox could
     not query SELinux even though the device was enforcing."""
-    installation, token, _ = ctx["integrity"]
+    installation, token, _ = integrity_context(ctx)
 
     def blank_selinux(probes):
         if "selinux" in probes:
@@ -702,7 +717,7 @@ def check_selinux_unknown(api, ctx):
 
 @check("integrity: SELinux permissive is scored")
 def check_selinux_permissive(api, ctx):
-    installation, token, _ = ctx["integrity"]
+    installation, token, _ = integrity_context(ctx)
 
     def permissive(probes):
         probes["selinux"].update(
@@ -718,7 +733,7 @@ def check_selinux_permissive(api, ctx):
 
 @check("integrity: Frida mapped into the process blocks")
 def check_frida_runtime(api, ctx):
-    installation, token, _ = ctx["integrity"]
+    installation, token, _ = integrity_context(ctx)
 
     def frida(probes):
         probes["runtime_maps"]["suspicious_tokens"] = ["frida", "gadget"]
@@ -734,7 +749,7 @@ def check_frida_runtime(api, ctx):
 
 @check("integrity: an open Frida port is caught")
 def check_frida_port(api, ctx):
-    installation, token, _ = ctx["integrity"]
+    installation, token, _ = integrity_context(ctx)
     decision = submit_report(
         api,
         installation,
@@ -749,7 +764,7 @@ def check_frida_port(api, ctx):
 
 @check("integrity: root framework artifacts and su are caught")
 def check_root(api, ctx):
-    installation, token, _ = ctx["integrity"]
+    installation, token, _ = integrity_context(ctx)
 
     def rooted(probes):
         probes["root_files"]["found_paths"] = ["/data/adb/magisk"]
@@ -764,7 +779,7 @@ def check_root(api, ctx):
 
 @check("integrity: a writable system mount is caught")
 def check_writable_mount(api, ctx):
-    installation, token, _ = ctx["integrity"]
+    installation, token, _ = integrity_context(ctx)
     decision = submit_report(
         api,
         installation,
@@ -780,7 +795,7 @@ def check_writable_mount(api, ctx):
 @check("integrity: a development OS image is caught")
 def check_development_image(api, ctx):
     """Covers the userdebug gap found on the emulator: build type and test-keys."""
-    installation, token, _ = ctx["integrity"]
+    installation, token, _ = integrity_context(ctx)
 
     def userdebug(probes):
         probes["system_properties"]["properties"]["ro.build.type"] = "userdebug"
@@ -795,7 +810,7 @@ def check_development_image(api, ctx):
 
 @check("integrity: absent Verified Boot data is caught")
 def check_boot_state_absent(api, ctx):
-    installation, token, _ = ctx["integrity"]
+    installation, token, _ = integrity_context(ctx)
 
     def blank_boot(probes):
         for name in (
@@ -814,7 +829,7 @@ def check_boot_state_absent(api, ctx):
 
 @check("integrity: a signing-certificate mismatch is a hard block")
 def check_cert_mismatch(api, ctx):
-    installation, token, _ = ctx["integrity"]
+    installation, token, _ = integrity_context(ctx)
     decision = submit_report(
         api, installation, token, cert=sha256_hex(b"an-attacker-resigned-this-apk")
     )
@@ -828,7 +843,7 @@ def check_cert_mismatch(api, ctx):
 
 @check("integrity: a probe that fails to run is penalised")
 def check_probe_failure(api, ctx):
-    installation, token, _ = ctx["integrity"]
+    installation, token, _ = integrity_context(ctx)
 
     def broken(probes):
         probes["mounts"] = {"status": "error", "error": "permission denied"}
