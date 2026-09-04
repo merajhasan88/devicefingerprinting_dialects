@@ -1,6 +1,6 @@
 import 'package:flutter/material.dart';
 
-import 'chatroompage.dart';
+import 'device_trust_client.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();

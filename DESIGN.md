@@ -1,5 +1,16 @@
 # Device Recognition / Authentication / Integrity Project — Complete Handoff
 
+> **File naming.** This repository is the product line and uses descriptive
+> names: the server is `device_trust_server.py` and the client is
+> `lib/device_trust_client.dart`. Sections 1-23 below are the historical record
+> of the proof of concept, where those files were named `yamaha.py` and
+> `lib/chatroompage.dart`; that wording is left as written because it describes
+> what was actually done at the time. The proof of concept is frozen in the
+> original repository at the tag `poc-validated-2026-09-05`. The lab server on
+> 192.168.100.13 still runs the PoC deployment (`/home/john/yamaha.py` under
+> `yamaha.service`), so those infrastructure names are current, not historical.
+
+
 This is an ongoing security POC. Continue from the current state rather than redesigning it.
 
 ## 1. Overall Goal
