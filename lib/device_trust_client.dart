@@ -1,6 +1,7 @@
-// This file keeps the old filename so the project needs the smallest possible
-// structural change. The chat room has intentionally been replaced by a
-// device-recognition laboratory.
+// Device trust client: installation identity, proof of possession, native
+// integrity collection, and the boundary tests that exercise them. This is the
+// reference client implementation that the Dart, .NET and Python SDKs derive
+// from.
 
 import 'dart:async';
 import 'dart:convert';
@@ -17,10 +18,10 @@ import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:http/http.dart' as http;
 import 'package:uuid/uuid.dart';
 
-const String apiBaseUrl = String.fromEnvironment(
-  'API_BASE_URL',
-  defaultValue: 'http://10.0.2.2:5000',
-);
+// The endpoint is supplied at build time and has no default, so a build can
+// never silently point at someone else's environment:
+//   flutter run --dart-define=API_BASE_URL=https://<host>
+const String apiBaseUrl = String.fromEnvironment('API_BASE_URL');
 
 const String injectedStolenRefreshToken = String.fromEnvironment(
   'STOLEN_REFRESH_TOKEN',
@@ -856,9 +857,18 @@ class DeviceApi {
 
   final http.Client _client;
 
-  String get _base => apiBaseUrl.endsWith('/')
-      ? apiBaseUrl.substring(0, apiBaseUrl.length - 1)
-      : apiBaseUrl;
+  String get _base {
+    if (apiBaseUrl.isEmpty) {
+      throw ApiException(
+        'No API_BASE_URL was provided at build time. Rebuild with '
+        '--dart-define=API_BASE_URL=https://<host>',
+        code: 'api_base_url_missing',
+      );
+    }
+    return apiBaseUrl.endsWith('/')
+        ? apiBaseUrl.substring(0, apiBaseUrl.length - 1)
+        : apiBaseUrl;
+  }
 
   Future<Map<String, dynamic>> _request(
     String method,

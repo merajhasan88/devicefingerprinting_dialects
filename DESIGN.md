@@ -3,12 +3,12 @@
 > **File naming.** This repository is the product line and uses descriptive
 > names: the server is `device_trust_server.py` and the client is
 > `lib/device_trust_client.dart`. Sections 1-23 below are the historical record
-> of the proof of concept, where those files were named `yamaha.py` and
-> `lib/chatroompage.dart`; that wording is left as written because it describes
+> of the proof of concept, where those files were named `device_trust.py` and
+> `lib/device_trust_client.dart`; that wording is left as written because it describes
 > what was actually done at the time. The proof of concept is frozen in the
 > original repository at the tag `poc-validated-2026-09-05`. The lab server on
-> 192.168.100.13 still runs the PoC deployment (`/home/john/yamaha.py` under
-> `yamaha.service`), so those infrastructure names are current, not historical.
+> 192.168.100.13 still runs the PoC deployment (`/home/john/device_trust.py` under
+> `device_trust.service`), so those infrastructure names are current, not historical.
 
 
 This is an ongoing security POC. Continue from the current state rather than redesigning it.
@@ -968,7 +968,7 @@ After this fix the 500 disappeared.
 Current latest server file is conceptually:
 
 ```text
-yamaha_integrity_fk_cleanup_fixed.py
+device_trust_integrity_fk_cleanup_fixed.py
 ```
 
 It contains the prior score-consistency and SELinux fixes plus the FK cleanup fix.
@@ -1085,7 +1085,7 @@ export INTEGRITY_ALLOW_DEBUG=1
 export INTEGRITY_ALLOW_EMULATOR=1
 export INTEGRITY_ANDROID_CERT_SHA256='<CURRENT DEBUG CERT>'
 
-python3.9 yamaha_integrity_fk_cleanup_fixed.py
+python3.9 device_trust_integrity_fk_cleanup_fixed.py
 ```
 
 Then run the Flutter application on the emulator:
@@ -1256,7 +1256,7 @@ Findings:
 
 **Classification: FAIL.** A root-capable `userdebug` image scored `trusted` on one scan in three and was indistinguishable from the clean OPPO baseline (18).
 
-**Fix applied to `yamaha.py`** (`_score_android_integrity`): `ro.build.type` was collected by the probe but never scored. Added `android_build_type_not_user +45` for any non-empty build type other than `user`. Not gated by `INTEGRITY_ALLOW_DEBUG`. Python 3.9-safe; no schema or dependency change. Reason: a userdebug/eng image is root-capable by construction, and a property read survives the sandbox where a file stat does not.
+**Fix applied to `device_trust.py`** (`_score_android_integrity`): `ro.build.type` was collected by the probe but never scored. Added `android_build_type_not_user +45` for any non-empty build type other than `user`. Not gated by `INTEGRITY_ALLOW_DEBUG`. Python 3.9-safe; no schema or dependency change. Reason: a userdebug/eng image is root-capable by construction, and a property read survives the sandbox where a file stat does not.
 
 Retest, three scans:
 
@@ -1335,7 +1335,7 @@ Every scan now carries `android_frida_port_open +75`; `android_adb_enabled +10` 
 
 ## 21.8 Server run model (2026-09-04)
 
-The backend was moved off a hand-started root process to a **systemd service** to make deploys and restarts unattended. `yamaha.service` runs `python3.9 /home/john/yamaha.py` as user `john` (`WorkingDirectory=/home/john`, so `jwtkey.txt` and the file-based JWT secret still resolve), config from `/etc/yamaha.env` (root:root, mode 600, captured verbatim from the previously running process so DB credentials, integrity mode and the JWT secret are unchanged). `john` — who is not otherwise a sudoer — was granted passwordless sudo for only `systemctl <verb> yamaha.service` via `/etc/sudoers.d/yamaha`, and added to `systemd-journal` for log reads. The one-time converter is `/home/john/claude-root-setup.sh`. Deploy is now `scp yamaha.py` (john owns the file) + `sudo systemctl restart yamaha.service`; logs are `journalctl -u yamaha`. The service is enabled, so it also survives reboot.
+The backend was moved off a hand-started root process to a **systemd service** to make deploys and restarts unattended. `device_trust.service` runs `python3.9 /home/john/device_trust.py` as user `john` (`WorkingDirectory=/home/john`, so `jwtkey.txt` and the file-based JWT secret still resolve), config from `/etc/device_trust.env` (root:root, mode 600, captured verbatim from the previously running process so DB credentials, integrity mode and the JWT secret are unchanged). `john` — who is not otherwise a sudoer — was granted passwordless sudo for only `systemctl <verb> device_trust.service` via `/etc/sudoers.d/device_trust`, and added to `systemd-journal` for log reads. The one-time converter is `/home/john/claude-root-setup.sh`. Deploy is now `scp device_trust.py` (john owns the file) + `sudo systemctl restart device_trust.service`; logs are `journalctl -u device_trust`. The service is enabled, so it also survives reboot.
 
 ## 21.10 Change (b)+(c) — absent AVB scored; lab switch added (2026-09-04)
 
@@ -1353,7 +1353,7 @@ The switch suppresses only the development-image signals (build type, test-keys,
 
 ## 21.11 Passwordless lab toggling (2026-09-04)
 
-To toggle lab-only settings without root each time, `yamaha.service` gains a second, optional, john-writable `EnvironmentFile=-/home/john/yamaha.lab.env` that overrides `/etc/yamaha.env`. It holds no secrets — only lab switches such as `INTEGRITY_ALLOW_USERDEBUG=1` or `INTEGRITY_MODE=enforce`. Toggling is then entirely passwordless: write the file as john, `sudo systemctl restart yamaha.service`. Keep it empty (or absent) for a production-representative run.
+To toggle lab-only settings without root each time, `device_trust.service` gains a second, optional, john-writable `EnvironmentFile=-/home/john/device_trust.lab.env` that overrides `/etc/device_trust.env`. It holds no secrets — only lab switches such as `INTEGRITY_ALLOW_USERDEBUG=1` or `INTEGRITY_MODE=enforce`. Toggling is then entirely passwordless: write the file as john, `sudo systemctl restart device_trust.service`. Keep it empty (or absent) for a production-representative run.
 
 ## 21.12 Change (d) — device-level integrity memory: PASS (2026-09-04)
 
@@ -1362,10 +1362,10 @@ Commit `5d80e34`. `_device_integrity_memory(device_id)` returns the worst integr
 ### Server state left running
 
 ```text
-INTEGRITY_MODE=enforce                 (in /home/john/yamaha.lab.env)
-INTEGRITY_ALLOW_USERDEBUG=1            (in /home/john/yamaha.lab.env)
+INTEGRITY_MODE=enforce                 (in /home/john/device_trust.lab.env)
+INTEGRITY_ALLOW_USERDEBUG=1            (in /home/john/device_trust.lab.env)
 INTEGRITY_DEVICE_MEMORY_HOURS=24       (default, not overridden)
-DEVICE_POLICY_MODE=observe             (unchanged, /etc/yamaha.env)
+DEVICE_POLICY_MODE=observe             (unchanged, /etc/device_trust.env)
 ```
 
 Emulator is clean: frida-server stopped, agent unloaded, logcat cleared. The device carries a `block` report from the §21.10 (c) part-2 Frida test, recorded ~01:45 local on 2026-09-04 against the installation that was current at that time.
@@ -1377,14 +1377,14 @@ Two presses in the app, in order:
 1. **Simulate fresh installation** — deletes the Keystore key and registers a new `installation_id` against the same `device_id` via the ANDROID_ID hint (a genuine reinstall), then auto-scans. Expect `score=10 verdict=trusted`.
 2. **Create account** (handle `dtest1`, password `Passw0rd123`) — `/v1/accounts/register` is integrity-gated. Expect **403 `integrity_device_blocked_recently`**: the new installation's own scan is clean, but the device was blocked inside the memory window.
 
-Then the counterfactual, to prove the rejection came from (d) and nothing else: set `INTEGRITY_DEVICE_MEMORY_HOURS=0` in `yamaha.lab.env`, `sudo systemctl restart yamaha.service`, press **Create account** again — expect success. Restore the value afterwards.
+Then the counterfactual, to prove the rejection came from (d) and nothing else: set `INTEGRITY_DEVICE_MEMORY_HOURS=0` in `device_trust.lab.env`, `sudo systemctl restart device_trust.service`, press **Create account** again — expect success. Restore the value afterwards.
 
 **If more than 24 hours have passed**, the stored block has aged out of the window: re-create it first (start frida-server, attach, scan to `block`, detach) before step 1, or the test is vacuous.
 
 ### Still open after (d)
 
 - Frida Gadget on the OPPO (`user` build, no root) with `INTEGRITY_MODE=enforce` — enforcement against real compromise on production-class hardware. Requires an APK change (gadget `.so` in `jniLibs/arm64-v8a/` plus a load line in `MainActivity.kt`) and `flutter run` to the OPPO. Approved by the user; the OPPO is never to be rooted or wiped.
-- Reset `yamaha.lab.env` to empty for any production-representative measurement.
+- Reset `device_trust.lab.env` to empty for any production-representative measurement.
 
 ### 21.12.1 (d) test result — PASS (2026-09-04 12:16-12:28)
 
