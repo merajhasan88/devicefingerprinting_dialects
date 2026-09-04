@@ -1461,3 +1461,34 @@ Caveat: the gadget test wrote a `block` report against the OPPO's `device_id`, s
 ### Emulator input note
 
 The AVD `integrity_root_lab` has `hw.keyboard=no`, so host keystrokes never reach it; drive text with `adb -s emulator-5554 shell input text "..."` / `input tap X Y`. The OPPO accepts `adb input` too.
+
+## 23. Frida Gadget on a Huawei (second-vendor confirmation) — PASS (2026-09-04)
+
+Repeated the §22 real-compromise test on a Huawei to confirm it is not OPPO-specific.
+
+### Device (unchanged, never rooted)
+
+```text
+HUAWEI AQM-LX1 (Y6p), arm64-v8a, API 29, build=user tags=release-keys
+ro.secure=1 ro.debuggable=0
+verifiedbootstate=green flash.locked=1 vbmeta.device_state=locked veritymode=enforcing
+SELinux=Enforcing   su=none   GMS packages=0 (no Google Play Services — irrelevant, no Play Integrity is used)
+```
+
+Host setup notes: the P10-class USB descriptor needed the phone switched to Transfer files (MTP) before adb saw it, then a udev rule for Huawei's vendor id `12d1` (`/etc/udev/rules.d/51-android-huawei.rules`, MODE 0666 GROUP plugdev) to clear "no permissions". The pre-existing app was signed with a different debug keystore, so it was uninstalled before installing the current build (signature mismatch is expected across machines — see the ANDROID_ID signing-scope note).
+
+### Result (enforce mode, secure_hardware-backed key)
+
+```text
+clean baseline:              score=18  verdict=trusted   developer_options +8, adb +10
+real gadget in process:      score=100 verdict=block     android_frida_runtime_artifact +90,
+                                                          android_frida_port_open +75, +dev/adb
+POST /v1/accounts/register:  403  integrity_blocked
+counterfactual (observe):    POST /v1/accounts/register -> 201   (same compromised device)
+```
+
+The Huawei registered as its own server device (device_id `65aeb493…`), distinct from the OPPO — expected. `android_frida_runtime_artifact` fired from the collector's own `/proc/self/maps` read despite enforcing SELinux, exactly as on the OPPO. **PASS.** Detection and enforcement are vendor-independent.
+
+### Cleanup / device restored
+
+Gadget scaffolding reverted (never committed), clean APK rebuilt (`0` Frida entries) and installed over the compromised one; the Huawei scans `18/trusted` with no listener on 27042. Server left in observe mode (production-representative). Same 24 h device-memory caveat as the OPPO applies to this device's `device_id`. OS never touched.
