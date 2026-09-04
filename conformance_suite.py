@@ -329,6 +329,10 @@ def check_device_token(api, ctx):
 
 @check("account: a device token opens an account")
 def check_account(api, ctx):
+    # A real client scans before account operations, and in enforce mode the
+    # gate requires a fresh trusted report, so do it unconditionally. This keeps
+    # the whole suite runnable in either integrity mode.
+    submit_report(api, ctx["installation"], ctx["device_token"])
     handle = "conf-%s" % secrets.token_hex(4)
     status, payload = open_account(
         api, ctx["installation"], ctx["device_token"], handle
@@ -529,6 +533,374 @@ def check_refresh_reuse(api, ctx):
     )
 
 
+
+# ---------------------------------------------------------------------------
+# integrity: synthetic probe reports (phase 0b)
+# ---------------------------------------------------------------------------
+# The server scores raw measurements, so a software client can exercise every
+# scoring rule by submitting crafted probe results. That makes the scoring table
+# testable without a phone, and - because the values round-trip through a JSON
+# column - it also exercises the JSONB / nvarchar(max) mapping.
+
+CONFORMANCE_CERT = hashlib.sha256(
+    b"device-recognition conformance signing certificate"
+).hexdigest()
+
+
+class Skip(Exception):
+    """Raised by a check that cannot run under the server's current mode."""
+
+
+def clean_probes(required, cert=None):
+    """A pristine production Android device: every rule should score zero."""
+    everything = {
+        "app_identity": {
+            "status": "ok",
+            "package_name": "com.example.devicefingerprinting",
+            "version_name": "1.0.0",
+            "version_code": 1,
+            "debuggable": False,
+            "allow_backup": False,
+            "cert_sha256": [cert or CONFORMANCE_CERT],
+            "apk_sha256": hashlib.sha256(b"conformance-apk").hexdigest(),
+            "installer_package": "com.android.vending",
+            "source_dir": "/data/app/com.example.devicefingerprinting/base.apk",
+        },
+        "debug_state": {
+            "status": "ok",
+            "debugger_connected": False,
+            "waiting_for_debugger": False,
+        },
+        "root_files": {
+            "status": "ok",
+            "found_paths": [],
+            "build_tags": "release-keys",
+            "test_keys": False,
+        },
+        "system_properties": {
+            "status": "ok",
+            "properties": {
+                "ro.secure": "1",
+                "ro.debuggable": "0",
+                "ro.build.type": "user",
+                "ro.build.tags": "release-keys",
+                "ro.boot.verifiedbootstate": "green",
+                "ro.boot.flash.locked": "1",
+                "ro.boot.vbmeta.device_state": "locked",
+                "ro.boot.veritymode": "enforcing",
+            },
+        },
+        "runtime_maps": {"status": "ok", "suspicious_tokens": [], "suspicious_line_count": 0},
+        "tracer": {"status": "ok", "tracer_pid": 0, "seccomp": 2, "no_new_privs": 1},
+        "root_shell": {"status": "ok", "su_path": "", "su_found": False},
+        "selinux": {
+            "status": "ok",
+            "mode": "enforcing",
+            "getenforce": "Enforcing",
+            "enforce_value": "1",
+        },
+        "mounts": {"status": "ok", "protected_rw_mounts": []},
+        "frida_ports": {"status": "ok", "open_ports": []},
+        "emulator": {"status": "ok", "suspected": False},
+        "developer_settings": {
+            "status": "ok",
+            "developer_options_enabled": False,
+            "adb_enabled": False,
+        },
+    }
+    return {name: everything[name] for name in required if name in everything}
+
+
+def submit_report(api, installation, token, mutate=None, cert=None):
+    """Run one full integrity round trip and return the server's decision."""
+    status, challenge = protected(
+        api, installation, "POST", "/v1/integrity/challenge", token, {}
+    )
+    if status != 200:
+        raise AssertionError("integrity challenge failed: %s %s" % (status, challenge))
+    probes = clean_probes(challenge["required_probes"], cert=cert)
+    if mutate:
+        mutate(probes)
+    report = {
+        "challenge_id": challenge["challenge_id"],
+        "challenge_nonce": challenge["nonce"],
+        "installation_id": installation.installation_id,
+        "platform": challenge["platform"],
+        "collector_version": 1,
+        "collected_at": int(time.time()),
+        "probe_results": probes,
+        "version": 1,
+    }
+    payload_b64 = b64u(json.dumps(report).encode("utf-8"))
+    status, answer = protected(
+        api,
+        installation,
+        "POST",
+        "/v1/integrity/report",
+        token,
+        {
+            "report_payload": payload_b64,
+            "report_signature": installation.sign_b64(payload_b64),
+        },
+    )
+    if status != 200:
+        raise AssertionError("integrity report rejected: %s %s" % (status, answer))
+    return answer["integrity"]
+
+
+def codes(decision):
+    return {reason["code"] for reason in decision.get("reasons", [])}
+
+
+def integrity_session(api):
+    """A fresh installation with a device token, ready to report integrity."""
+    installation = Installation()
+    hint = {"kind": "android_id_sha256", "value": sha256_hex(secrets.token_bytes(16))}
+    status, payload = enrol(api, installation, hint)
+    if status not in (200, 201):
+        raise AssertionError("enrol failed: %s %s" % (status, payload))
+    return installation, device_token(api, installation), hint
+
+
+@check("integrity: a pristine device scores zero and is trusted")
+def check_integrity_clean(api, ctx):
+    installation, token, hint = integrity_session(api)
+    decision = submit_report(api, installation, token)
+    if "android_signing_certificate_mismatch" in codes(decision):
+        raise AssertionError(
+            "server does not trust the conformance certificate. Run it with\n"
+            "       INTEGRITY_ANDROID_CERT_SHA256=%s\n"
+            "       (or empty to disable the allow-list) to run the scoring checks."
+            % CONFORMANCE_CERT
+        )
+    expect(
+        decision["verdict"] == "trusted",
+        "expected trusted, got %s (%s)" % (decision["verdict"], codes(decision)),
+    )
+    expect(decision["score"] == 0, "expected score 0, got %s" % decision["score"])
+    ctx["integrity"] = (installation, token, hint)
+
+
+@check("integrity: unreadable SELinux is telemetry, not evidence")
+def check_selinux_unknown(api, ctx):
+    """Regression guard for a fixed false positive: the OPPO's app sandbox could
+    not query SELinux even though the device was enforcing."""
+    installation, token, _ = ctx["integrity"]
+
+    def blank_selinux(probes):
+        if "selinux" in probes:
+            probes["selinux"].update({"mode": "", "getenforce": "", "enforce_value": ""})
+
+    decision = submit_report(api, installation, token, blank_selinux)
+    found = codes(decision)
+    expect(
+        not {"android_selinux_permissive", "android_selinux_disabled"} & found,
+        "unknown SELinux must not be scored, got %s" % found,
+    )
+    expect(decision["verdict"] == "trusted", "expected trusted, got %s" % decision)
+
+
+@check("integrity: SELinux permissive is scored")
+def check_selinux_permissive(api, ctx):
+    installation, token, _ = ctx["integrity"]
+
+    def permissive(probes):
+        probes["selinux"].update(
+            {"mode": "permissive", "getenforce": "Permissive", "enforce_value": "0"}
+        )
+
+    decision = submit_report(api, installation, token, permissive)
+    expect(
+        "android_selinux_permissive" in codes(decision),
+        "expected android_selinux_permissive, got %s" % codes(decision),
+    )
+
+
+@check("integrity: Frida mapped into the process blocks")
+def check_frida_runtime(api, ctx):
+    installation, token, _ = ctx["integrity"]
+
+    def frida(probes):
+        probes["runtime_maps"]["suspicious_tokens"] = ["frida", "gadget"]
+        probes["runtime_maps"]["suspicious_line_count"] = 3
+
+    decision = submit_report(api, installation, token, frida)
+    expect(
+        "android_frida_runtime_artifact" in codes(decision),
+        "expected android_frida_runtime_artifact, got %s" % codes(decision),
+    )
+    expect(decision["verdict"] == "block", "expected block, got %s" % decision["verdict"])
+
+
+@check("integrity: an open Frida port is caught")
+def check_frida_port(api, ctx):
+    installation, token, _ = ctx["integrity"]
+    decision = submit_report(
+        api,
+        installation,
+        token,
+        lambda probes: probes["frida_ports"].update({"open_ports": [27042]}),
+    )
+    expect(
+        "android_frida_port_open" in codes(decision),
+        "expected android_frida_port_open, got %s" % codes(decision),
+    )
+
+
+@check("integrity: root framework artifacts and su are caught")
+def check_root(api, ctx):
+    installation, token, _ = ctx["integrity"]
+
+    def rooted(probes):
+        probes["root_files"]["found_paths"] = ["/data/adb/magisk"]
+        probes["root_shell"].update({"su_found": True, "su_path": "/system/xbin/su"})
+
+    decision = submit_report(api, installation, token, rooted)
+    found = codes(decision)
+    expect("android_root_framework_artifact" in found, "missing root framework: %s" % found)
+    expect("android_su_on_path" in found, "missing su_on_path: %s" % found)
+    expect(decision["verdict"] == "block", "expected block, got %s" % decision["verdict"])
+
+
+@check("integrity: a writable system mount is caught")
+def check_writable_mount(api, ctx):
+    installation, token, _ = ctx["integrity"]
+    decision = submit_report(
+        api,
+        installation,
+        token,
+        lambda probes: probes["mounts"].update({"protected_rw_mounts": ["/system"]}),
+    )
+    expect(
+        "android_protected_mount_writable" in codes(decision),
+        "expected android_protected_mount_writable, got %s" % codes(decision),
+    )
+
+
+@check("integrity: a development OS image is caught")
+def check_development_image(api, ctx):
+    """Covers the userdebug gap found on the emulator: build type and test-keys."""
+    installation, token, _ = ctx["integrity"]
+
+    def userdebug(probes):
+        probes["system_properties"]["properties"]["ro.build.type"] = "userdebug"
+        probes["system_properties"]["properties"]["ro.build.tags"] = "test-keys"
+        probes["root_files"]["test_keys"] = True
+
+    decision = submit_report(api, installation, token, userdebug)
+    found = codes(decision)
+    expect("android_build_type_not_user" in found, "missing build_type_not_user: %s" % found)
+    expect("android_test_keys" in found, "missing test_keys: %s" % found)
+
+
+@check("integrity: absent Verified Boot data is caught")
+def check_boot_state_absent(api, ctx):
+    installation, token, _ = ctx["integrity"]
+
+    def blank_boot(probes):
+        for name in (
+            "ro.boot.verifiedbootstate",
+            "ro.boot.flash.locked",
+            "ro.boot.vbmeta.device_state",
+        ):
+            probes["system_properties"]["properties"][name] = ""
+
+    decision = submit_report(api, installation, token, blank_boot)
+    expect(
+        "android_boot_state_unavailable" in codes(decision),
+        "expected android_boot_state_unavailable, got %s" % codes(decision),
+    )
+
+
+@check("integrity: a signing-certificate mismatch is a hard block")
+def check_cert_mismatch(api, ctx):
+    installation, token, _ = ctx["integrity"]
+    decision = submit_report(
+        api, installation, token, cert=sha256_hex(b"an-attacker-resigned-this-apk")
+    )
+    expect(
+        "android_signing_certificate_mismatch" in codes(decision),
+        "expected android_signing_certificate_mismatch, got %s" % codes(decision),
+    )
+    expect(decision["verdict"] == "block", "expected block, got %s" % decision["verdict"])
+    expect(decision["score"] == 100, "hard block should cap at 100, got %s" % decision["score"])
+
+
+@check("integrity: a probe that fails to run is penalised")
+def check_probe_failure(api, ctx):
+    installation, token, _ = ctx["integrity"]
+
+    def broken(probes):
+        probes["mounts"] = {"status": "error", "error": "permission denied"}
+
+    decision = submit_report(api, installation, token, broken)
+    expect(
+        any(code.startswith("integrity_probe_failed") for code in codes(decision)),
+        "expected an integrity_probe_failed reason, got %s" % codes(decision),
+    )
+
+
+@check("enforcement: a blocked device cannot reach protected endpoints")
+def check_enforcement(api, ctx):
+    if ctx["mode"] != "enforce":
+        raise Skip("server is in observe mode")
+    installation, token, _ = integrity_session(api)
+    decision = submit_report(
+        api,
+        installation,
+        token,
+        lambda probes: probes["runtime_maps"].update({"suspicious_tokens": ["frida"]}),
+    )
+    expect(decision["verdict"] == "block", "setup failed, expected block: %s" % decision)
+    status, payload = open_account(
+        api, installation, token, "conf-%s" % secrets.token_hex(4)
+    )
+    expect(status == 403, "expected 403, got %s %s" % (status, payload))
+    expect(
+        error_code(payload) == "integrity_blocked",
+        "expected integrity_blocked, got %s" % error_code(payload),
+    )
+
+
+@check("enforcement: reinstalling does not clear a blocked device", db_sensitive=True)
+def check_device_memory(api, ctx):
+    """Change (d): integrity verdicts are remembered per device_id, so a new
+    installation on the same physical device inherits the block. Exercises a
+    query keyed on device_id across installations."""
+    if ctx["mode"] != "enforce":
+        raise Skip("server is in observe mode")
+    first, first_token, hint = integrity_session(api)
+    decision = submit_report(
+        api,
+        first,
+        first_token,
+        lambda probes: probes["runtime_maps"].update({"suspicious_tokens": ["frida"]}),
+    )
+    expect(decision["verdict"] == "block", "setup failed, expected block: %s" % decision)
+
+    reinstalled = Installation()
+    status, payload = enrol(api, reinstalled, hint)
+    expect(status in (200, 201), "reinstall enrol failed: %s %s" % (status, payload))
+    expect(
+        payload["device_id"] == first.device_id,
+        "reinstall should correlate to the same device",
+    )
+    token = device_token(api, reinstalled)
+    clean = submit_report(api, reinstalled, token)
+    expect(
+        clean["verdict"] == "trusted",
+        "the new installation's own scan should be clean, got %s" % clean["verdict"],
+    )
+    status, payload = open_account(
+        api, reinstalled, token, "conf-%s" % secrets.token_hex(4)
+    )
+    expect(status == 403, "expected 403 from device memory, got %s %s" % (status, payload))
+    expect(
+        error_code(payload) == "integrity_device_blocked_recently",
+        "expected integrity_device_blocked_recently, got %s" % error_code(payload),
+    )
+
+
 # ---------------------------------------------------------------------------
 # runner
 # ---------------------------------------------------------------------------
@@ -561,12 +933,15 @@ def main():
         )
     print()
 
-    context = {}
-    passed = failed = 0
+    context = {"mode": mode}
+    passed = failed = skipped = 0
     for name, function, db_sensitive in CHECKS:
         marker = " [db]" if db_sensitive else ""
         try:
             function(api, context)
+        except Skip as reason:
+            skipped += 1
+            print("SKIP %s%s  (%s)" % (name, marker, reason))
         except Exception as error:  # noqa: BLE001 - report every failure
             failed += 1
             print("FAIL %s%s\n       %s" % (name, marker, error))
@@ -574,8 +949,9 @@ def main():
             passed += 1
             print("PASS %s%s" % (name, marker))
 
-    print("\n%d passed, %d failed  (checks marked [db] are the ones whose "
-          "behaviour differs between PostgreSQL and SQL Server)" % (passed, failed))
+    print("\n%d passed, %d failed, %d skipped  (checks marked [db] are the ones "
+          "whose behaviour differs between PostgreSQL and SQL Server)"
+          % (passed, failed, skipped))
     return 1 if failed else 0
 
 
