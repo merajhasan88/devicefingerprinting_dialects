@@ -552,6 +552,67 @@ CREATE INDEX IF NOT EXISTS integrity_reports_device_idx
     ON integrity_reports(device_id, created_at DESC);
 """
 
+# ---------------------------------------------------------------------------
+# Backend identity
+# ---------------------------------------------------------------------------
+# This server is meant to run on a deliberately wide range of databases -
+# PostgreSQL 13+ and SQL Server 2016+ - so the engine and its version are
+# detected and published rather than assumed. /health/ready reports them, which
+# is what lets a conformance run record which engine it actually exercised
+# instead of the operator having to remember.
+
+DB_ENGINE = os.environ.get("DB_ENGINE", "postgresql").strip().lower()
+POSTGRES_MINIMUM_VERSION_NUM = 130000  # PostgreSQL 13
+SQLSERVER_MINIMUM_MAJOR = 13  # SQL Server 2016 (internal major version 13)
+
+_backend_identity = None
+_backend_identity_lock = threading.Lock()
+
+
+def _read_backend_identity(cursor):
+    if DB_ENGINE == "postgresql":
+        cursor.execute("SHOW server_version_num")
+        version_num = int(cursor.fetchone()[0])
+        return {
+            "engine": "postgresql",
+            "version": "%d.%d" % (version_num // 10000, version_num % 100),
+            "minimum_supported": "13",
+            "supported": version_num >= POSTGRES_MINIMUM_VERSION_NUM,
+        }
+    if DB_ENGINE == "sqlserver":
+        cursor.execute(
+            "SELECT CAST(SERVERPROPERTY('ProductVersion') AS varchar(64))"
+        )
+        product = str(cursor.fetchone()[0])
+        return {
+            "engine": "sqlserver",
+            "version": product,
+            "minimum_supported": "2016",
+            "supported": int(product.split(".")[0]) >= SQLSERVER_MINIMUM_MAJOR,
+        }
+    raise RuntimeError("DB_ENGINE must be 'postgresql' or 'sqlserver'.")
+
+
+def _get_backend_identity():
+    global _backend_identity
+    if _backend_identity is not None:
+        return _backend_identity
+    with _backend_identity_lock:
+        if _backend_identity is None:
+            with _cursor() as cursor:
+                identity = _read_backend_identity(cursor)
+            if not identity["supported"]:
+                logger.error(
+                    "Database %s %s is below the supported minimum (%s); "
+                    "behaviour is unverified on this version.",
+                    identity["engine"],
+                    identity["version"],
+                    identity["minimum_supported"],
+                )
+            _backend_identity = identity
+    return _backend_identity
+
+
 _schema_lock = threading.Lock()
 _schema_ready = False
 
@@ -2366,6 +2427,7 @@ def health_ready():
     return jsonify(
         {
             "status": "ready",
+            "database": _get_backend_identity(),
             "installation_key_algorithms": ["ES256", "RS256"],
             "device_policy_mode": DEVICE_POLICY_MODE,
             "integrity_mode": INTEGRITY_MODE,
