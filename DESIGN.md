@@ -2536,6 +2536,11 @@ The flag stays off until the OPPO is baselined, because ext/app were measured cl
 Huawei and a different vendor/Android version could carry a benign in-memory difference in some ext
 library. Procedure, for when the OPPO is free:
 
+0. **The EC2 public IP changes on restart.** The instance was stopped without an Elastic IP, so
+   `54.203.12.110` is gone. On restart: read the new public IP, update the Caddy site block to the
+   new `<a-b-c-d>.nip.io` name (Let's Encrypt re-issues automatically), and **rebuild the APK with
+   the new `--dart-define=API_BASE_URL`** — the old APKs point at the retired hostname. Allocating an
+   Elastic IP would avoid this permanently, at roughly USD 3.60/month if left attached.
 1. Stand up an engine (SQL Server or PostgreSQL) and the EC2 server; server in `enforce`,
    `INTEGRITY_SCORE_EXTENDED_LIBS` **off**.
 2. Install the current clean client (v2 collector) on the OPPO; launch; it auto-scans.
