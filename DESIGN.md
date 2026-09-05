@@ -2130,3 +2130,49 @@ architecture, honestly stated, not a defect in it.
 
 **Not tested, and deliberately so** — the physical handsets are never wiped. This is analysis, and
 is recorded as analysis.
+
+## 27.7 SQL Server 2022 — handset battery on both phones — PASS (2026-09-05)
+
+`sqlserver 16.0.4265.3`, enforce mode, Redis nonces, rate limiting on. Migration clean (11 tables,
+schema v1); conformance suite 24 passed / 0 failed / 2 skipped. All twelve rows of the §27.4 table
+repeated with identical results on both handsets, on the build carrying the §27.5.1 gate fix.
+
+### 27.7.1 New test: pristine device reinstall (the recognition direction)
+
+Added because every reinstall test so far had been run on a device that was **already blocked**, so
+the project had demonstrated the *security* half — a compromised device cannot launder a block —
+while only inferring the *recognition* half, which is the product's primary claim.
+
+Run on the OPPO with no block history on this database, before the gadget step:
+
+```text
+device -> installation map BEFORE wipe     AFTER wipe
+  2e0a5467 | 1                               2e0a5467 | 1
+  640be460 | 1                               640be460 | 1
+  b73cd620 | 1                               b73cd620 | 1
+  dba7ccf3 | 1                    ------>    dba7ccf3 | 2
+```
+
+The device_id set is unchanged and the OPPO's new installation joined its existing device. The
+fresh install scanned `18/trusted` and **`POST /v1/accounts/login` returned 200** —
+"Account authenticated on the recognized device".
+
+That last step is what the earlier tests never showed: a full uninstall, a brand-new
+non-exportable hardware key, and the same physical device is recognised and **still usable**,
+reaching the account created by the previous installation. Correlation works to recognise, not only
+to punish.
+
+The contrast within one session makes the control legible: the same handset, the same wipe
+procedure, returned `200` before the gadget run and `403 integrity_device_blocked_recently` after
+it. The only variable was the device's own recent history.
+
+### 27.7.2 A 400 seen during the run, and why it is not a second oracle
+
+One login returned `400` before the expected `403`. Cause: after a wipe the app's password field is
+empty, and `_password_bytes` enforces a 10–72 byte password before the gate is reached.
+
+This ordering is safe and is *not* the §27.5.1 defect repeated. `_handle_lookup` is a pure HMAC and
+`_password_bytes` is a length check; neither touches the database. A `400` tells the caller only
+that its own request was malformed, and discloses nothing about whether an account exists or a
+password is correct — which is precisely what the fixed oracle did disclose. Input-shape validation
+before the gate is fine; credential *comparison* before the gate is not.
