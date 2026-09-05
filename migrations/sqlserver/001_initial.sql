@@ -25,6 +25,16 @@
 --    platform without a reinstall hint. PostgreSQL permits many. Filtering on
 --    IS NOT NULL restores PostgreSQL's behaviour.
 
+-- REQUIRED, not cosmetic. The filtered unique index below cannot be created
+-- unless QUOTED_IDENTIFIER is ON, and SQL Server also refuses INSERT/UPDATE on
+-- a table carrying a filtered index from any session where it is OFF. SSMS and
+-- the ODBC drivers default it ON, but sqlcmd defaults it OFF, so a migration
+-- that relies on the caller's default fails in some tools and not others.
+-- These persist for the connection, across the GO batches below.
+SET QUOTED_IDENTIFIER ON;
+SET ANSI_NULLS ON;
+GO
+
 IF OBJECT_ID('dbo.schema_migrations', 'U') IS NULL
 CREATE TABLE dbo.schema_migrations (
     version     int NOT NULL PRIMARY KEY,
