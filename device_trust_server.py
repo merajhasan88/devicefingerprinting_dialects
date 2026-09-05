@@ -392,201 +392,18 @@ def _cursor(commit=False):
         connection.close()
 
 
-_SCHEMA_SQL = """
-CREATE TABLE IF NOT EXISTS recognized_devices (
-    device_id UUID PRIMARY KEY,
-    platform VARCHAR(16) NOT NULL,
-    reinstall_hint_hash CHAR(64),
-    status VARCHAR(16) NOT NULL DEFAULT 'active',
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    CONSTRAINT recognized_devices_platform_hint_unique
-        UNIQUE (platform, reinstall_hint_hash)
-);
-
-ALTER TABLE recognized_devices
-    ADD COLUMN IF NOT EXISTS status VARCHAR(16) NOT NULL DEFAULT 'active';
-
-CREATE TABLE IF NOT EXISTS app_installations (
-    installation_id UUID PRIMARY KEY,
-    device_id UUID NOT NULL REFERENCES recognized_devices(device_id),
-    key_algorithm VARCHAR(16) NOT NULL,
-    public_key_jwk JSONB NOT NULL,
-    public_key_n TEXT,
-    public_key_e TEXT,
-    key_thumbprint CHAR(64) NOT NULL UNIQUE,
-    registration_method VARCHAR(32) NOT NULL,
-    registration_confidence VARCHAR(16) NOT NULL,
-    status VARCHAR(16) NOT NULL DEFAULT 'active',
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
--- In-place migration from the first RS256 prototype. Keeping n/e permits a
--- rolling upgrade and makes old installation rows verifiable during testing.
-ALTER TABLE app_installations
-    ADD COLUMN IF NOT EXISTS key_algorithm VARCHAR(16);
-ALTER TABLE app_installations
-    ADD COLUMN IF NOT EXISTS public_key_jwk JSONB;
-ALTER TABLE app_installations
-    ADD COLUMN IF NOT EXISTS public_key_n TEXT;
-ALTER TABLE app_installations
-    ADD COLUMN IF NOT EXISTS public_key_e TEXT;
-ALTER TABLE app_installations
-    ALTER COLUMN public_key_n DROP NOT NULL;
-ALTER TABLE app_installations
-    ALTER COLUMN public_key_e DROP NOT NULL;
-
-UPDATE app_installations
-SET key_algorithm = COALESCE(key_algorithm, 'RS256'),
-    public_key_jwk = COALESCE(
-        public_key_jwk,
-        jsonb_build_object(
-            'kty', 'RSA',
-            'alg', 'RS256',
-            'n', public_key_n,
-            'e', public_key_e
-        )
-    )
-WHERE key_algorithm IS NULL OR public_key_jwk IS NULL;
-
-ALTER TABLE app_installations
-    ALTER COLUMN key_algorithm SET NOT NULL;
-ALTER TABLE app_installations
-    ALTER COLUMN public_key_jwk SET NOT NULL;
-
-CREATE INDEX IF NOT EXISTS app_installations_device_idx
-    ON app_installations(device_id);
-
-CREATE TABLE IF NOT EXISTS installation_challenges (
-    challenge_id UUID PRIMARY KEY,
-    installation_id UUID NOT NULL REFERENCES app_installations(installation_id),
-    purpose VARCHAR(128) NOT NULL,
-    payload_sha256 CHAR(64) NOT NULL,
-    expires_at TIMESTAMPTZ NOT NULL,
-    used_at TIMESTAMPTZ,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
-CREATE INDEX IF NOT EXISTS installation_challenges_open_idx
-    ON installation_challenges(installation_id, expires_at)
-    WHERE used_at IS NULL;
-
-CREATE TABLE IF NOT EXISTS demo_accounts (
-    account_id UUID PRIMARY KEY,
-    handle_lookup CHAR(64) NOT NULL UNIQUE,
-    password_hash BYTEA NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
-CREATE TABLE IF NOT EXISTS device_account_links (
-    device_id UUID NOT NULL REFERENCES recognized_devices(device_id),
-    account_id UUID NOT NULL REFERENCES demo_accounts(account_id),
-    first_installation_id UUID NOT NULL REFERENCES app_installations(installation_id),
-    first_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    PRIMARY KEY (device_id, account_id)
-);
-
-CREATE TABLE IF NOT EXISTS refresh_sessions (
-    session_id UUID PRIMARY KEY,
-    family_id UUID NOT NULL,
-    account_id UUID NOT NULL REFERENCES demo_accounts(account_id),
-    device_id UUID NOT NULL REFERENCES recognized_devices(device_id),
-    installation_id UUID NOT NULL REFERENCES app_installations(installation_id),
-    expires_at TIMESTAMPTZ NOT NULL,
-    revoked_at TIMESTAMPTZ,
-    replaced_by UUID,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
-CREATE INDEX IF NOT EXISTS refresh_sessions_family_idx
-    ON refresh_sessions(family_id);
-
-CREATE TABLE IF NOT EXISTS access_proof_nonces (
-    nonce_hash CHAR(64) PRIMARY KEY,
-    installation_id UUID NOT NULL REFERENCES app_installations(installation_id),
-    access_token_jti VARCHAR(128) NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    expires_at TIMESTAMPTZ NOT NULL
-);
-
-CREATE INDEX IF NOT EXISTS access_proof_nonces_installation_idx
-    ON access_proof_nonces(installation_id, expires_at);
-
-CREATE TABLE IF NOT EXISTS risk_policy_decisions (
-    decision_id UUID PRIMARY KEY,
-    event_type VARCHAR(32) NOT NULL,
-    account_id UUID,
-    device_id UUID NOT NULL REFERENCES recognized_devices(device_id),
-    installation_id UUID NOT NULL REFERENCES app_installations(installation_id),
-    policy_mode VARCHAR(16) NOT NULL,
-    recommended_action VARCHAR(16) NOT NULL,
-    effective_action VARCHAR(16) NOT NULL,
-    score INTEGER NOT NULL,
-    reasons JSONB NOT NULL,
-    context JSONB NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
-CREATE INDEX IF NOT EXISTS risk_policy_decisions_device_idx
-    ON risk_policy_decisions(device_id, created_at DESC);
-
-CREATE INDEX IF NOT EXISTS risk_policy_decisions_account_idx
-    ON risk_policy_decisions(account_id, created_at DESC);
-
-CREATE TABLE IF NOT EXISTS integrity_challenges (
-    challenge_id UUID PRIMARY KEY,
-    installation_id UUID NOT NULL REFERENCES app_installations(installation_id),
-    device_id UUID NOT NULL REFERENCES recognized_devices(device_id),
-    platform VARCHAR(16) NOT NULL,
-    nonce_sha256 CHAR(64) NOT NULL,
-    required_probes JSONB NOT NULL,
-    expires_at TIMESTAMPTZ NOT NULL,
-    used_at TIMESTAMPTZ,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
-CREATE INDEX IF NOT EXISTS integrity_challenges_installation_idx
-    ON integrity_challenges(installation_id, created_at DESC);
-
-CREATE TABLE IF NOT EXISTS integrity_reports (
-    report_id UUID PRIMARY KEY,
-    challenge_id UUID NOT NULL UNIQUE REFERENCES integrity_challenges(challenge_id),
-    installation_id UUID NOT NULL REFERENCES app_installations(installation_id),
-    device_id UUID NOT NULL REFERENCES recognized_devices(device_id),
-    platform VARCHAR(16) NOT NULL,
-    collector_version INTEGER NOT NULL,
-    score INTEGER NOT NULL,
-    verdict VARCHAR(16) NOT NULL,
-    hard_block BOOLEAN NOT NULL DEFAULT FALSE,
-    reasons JSONB NOT NULL,
-    probe_results JSONB NOT NULL,
-    report_sha256 CHAR(64) NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
-CREATE INDEX IF NOT EXISTS integrity_reports_installation_idx
-    ON integrity_reports(installation_id, created_at DESC);
-CREATE INDEX IF NOT EXISTS integrity_reports_device_idx
-    ON integrity_reports(device_id, created_at DESC);
-"""
-
 # ---------------------------------------------------------------------------
 # Backend identity
 # ---------------------------------------------------------------------------
-# This server is meant to run on a deliberately wide range of databases -
-# PostgreSQL 13+ and SQL Server 2016+ - so the engine and its version are
-# detected and published rather than assumed. /health/ready reports them, which
-# is what lets a conformance run record which engine it actually exercised
-# instead of the operator having to remember.
+# This server runs on a deliberately wide range of databases - PostgreSQL 13+
+# and SQL Server 2017+ (written to 2016-compatible T-SQL) - so the engine and
+# its version are detected and published rather than assumed. /health/ready
+# reports them, which is what lets a conformance run record which engine it
+# actually exercised.
 
 DB_ENGINE = os.environ.get("DB_ENGINE", "postgresql").strip().lower()
 POSTGRES_MINIMUM_VERSION_NUM = 130000  # PostgreSQL 13
-SQLSERVER_MINIMUM_MAJOR = 13  # SQL Server 2016 (internal major version 13)
-
-_backend_identity = None
-_backend_identity_lock = threading.Lock()
+SQLSERVER_MINIMUM_MAJOR = 14  # SQL Server 2017 (internal major version 14)
 
 
 def _read_backend_identity(cursor):
@@ -607,10 +424,14 @@ def _read_backend_identity(cursor):
         return {
             "engine": "sqlserver",
             "version": product,
-            "minimum_supported": "2016",
+            "minimum_supported": "2017",
             "supported": int(product.split(".")[0]) >= SQLSERVER_MINIMUM_MAJOR,
         }
     raise RuntimeError("DB_ENGINE must be 'postgresql' or 'sqlserver'.")
+
+
+_backend_identity = None
+_backend_identity_lock = threading.Lock()
 
 
 def _get_backend_identity():
@@ -633,28 +454,86 @@ def _get_backend_identity():
     return _backend_identity
 
 
+# ---------------------------------------------------------------------------
+# Schema version contract
+# ---------------------------------------------------------------------------
+# The application does NOT create or alter schema. Migrations under
+# migrations/<dialect>/ are applied by a database administrator, and this
+# service only verifies what it finds. Runtime DDL would force the application
+# principal to hold DDL rights permanently, which is a finding in its own right
+# and is routinely rejected in enterprise review.
+#
+# On a mismatch the service refuses to serve traffic rather than limping along
+# against a schema it does not understand. /health/* still answers so operators
+# can see why.
+
+REQUIRED_SCHEMA_VERSION = 1
+
+_schema_state = None
 _schema_lock = threading.Lock()
-_schema_ready = False
 
 
-def _ensure_schema():
-    global _schema_ready
-    if _schema_ready:
-        return
+def _read_schema_version(cursor):
+    """Highest applied migration, or None when the table is absent."""
+    if DB_ENGINE == "postgresql":
+        cursor.execute("SELECT to_regclass('public.schema_migrations')")
+        if cursor.fetchone()[0] is None:
+            return None
+    elif DB_ENGINE == "sqlserver":
+        cursor.execute("SELECT OBJECT_ID('dbo.schema_migrations', 'U')")
+        if cursor.fetchone()[0] is None:
+            return None
+    else:
+        raise RuntimeError("DB_ENGINE must be 'postgresql' or 'sqlserver'.")
+    cursor.execute("SELECT MAX(version) FROM schema_migrations")
+    row = cursor.fetchone()
+    return int(row[0]) if row and row[0] is not None else None
+
+
+def _get_schema_state():
+    global _schema_state
+    if _schema_state is not None:
+        return _schema_state
     with _schema_lock:
-        if _schema_ready:
-            return
-        with _cursor(commit=True) as cursor:
-            cursor.execute(_SCHEMA_SQL)
-        _schema_ready = True
-        logger.info("Device-recognition schema is ready")
+        if _schema_state is None:
+            with _cursor() as cursor:
+                found = _read_schema_version(cursor)
+            state = {
+                "required": REQUIRED_SCHEMA_VERSION,
+                "found": found,
+                "ok": found == REQUIRED_SCHEMA_VERSION,
+            }
+            if state["ok"]:
+                logger.info("Database schema version %s verified", found)
+            elif found is None:
+                logger.error(
+                    "No schema_migrations table. Apply migrations/%s/001_initial.sql "
+                    "before starting the service.",
+                    DB_ENGINE,
+                )
+            else:
+                logger.error(
+                    "Database schema is version %s but this build requires %s. "
+                    "Apply the pending migrations, or deploy the matching build.",
+                    found,
+                    REQUIRED_SCHEMA_VERSION,
+                )
+            _schema_state = state
+    return _schema_state
 
 
 @app.before_request
 def schema_guard():
-    if request.path == "/health/live":
+    if request.path.startswith("/health/"):
         return None
-    _ensure_schema()
+    state = _get_schema_state()
+    if not state["ok"]:
+        raise ApiProblem(
+            "The database schema does not match this build.",
+            503,
+            "schema_version_mismatch",
+            details={"schema": state},
+        )
     return None
 
 
@@ -2448,6 +2327,7 @@ def health_ready():
         {
             "status": "ready",
             "database": _get_backend_identity(),
+            "schema": _get_schema_state(),
             "installation_key_algorithms": ["ES256", "RS256"],
             "device_policy_mode": DEVICE_POLICY_MODE,
             "integrity_mode": INTEGRITY_MODE,
@@ -3277,7 +3157,6 @@ def refresh_account_tokens():
 
 
 if __name__ == "__main__":
-    _ensure_schema()
     app.run(
         host=os.environ.get("FLASK_HOST", "0.0.0.0"),
         port=int(os.environ.get("FLASK_PORT", "5000")),
