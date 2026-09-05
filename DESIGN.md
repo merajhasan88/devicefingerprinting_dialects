@@ -2176,3 +2176,57 @@ This ordering is safe and is *not* the §27.5.1 defect repeated. `_handle_lookup
 that its own request was malformed, and discloses nothing about whether an account exists or a
 password is correct — which is precisely what the fixed oracle did disclose. Input-shape validation
 before the gate is fine; credential *comparison* before the gate is not.
+
+## 27.8 SQL Server 2025 — handset battery on both phones — PASS (2026-09-05)
+
+`sqlserver 17.0.4065.4`, enforce mode, Redis nonces, rate limiting on. Migration clean (11 tables,
+schema v1); conformance suite 24 passed / 0 failed / 2 skipped. All twelve rows of the §27.4 table
+repeated with identical results on both handsets. Reinstall correlation held again: two wipes moved
+`installations` 4 → 6 with `devices` unchanged at 4.
+
+## 27.9 SQL Server phase closed — the complete matrix
+
+| Engine version | Migration | Conformance suite | Handset battery, both phones |
+|---|---|---|---|
+| SQL Server 2017 — 14.0.3540.1 | 11 tables, v1 | 24/0/2 | **PASS** (§27.4) |
+| SQL Server 2019 — 15.0.4480.2 | 11 tables, v1 | 24/0/2 | **PASS** (§27.5) |
+| SQL Server 2022 — 16.0.4265.3 | 11 tables, v1 | 24/0/2 | **PASS** (§27.7, plus the pristine-reinstall test) |
+| SQL Server 2025 — 17.0.4065.4 | 11 tables, v1 | 24/0/2 | **PASS** (§27.8) |
+
+Every version was deployed simultaneously and torn down only once its own battery had passed, with
+`--skip-final-snapshot --delete-automated-backups`; the manual and automated snapshot listings were
+verified empty. PostgreSQL 18.1 was re-verified on the final build and then removed.
+
+Four defects were found across this phase, and **none of them were findable by static analysis**:
+`QUOTED_IDENTIFIER` for filtered indexes, pyodbc's missing `datetimeoffset` support, the
+PostgreSQL-only aliased `DELETE`, and the login credential oracle (§27.5.1) — the last of which took
+a human mistyping a password on a genuinely compromised handset.
+
+## 27.10 Known limitation: hook detection is a name denylist
+
+Recorded because it bounds what today's PASS results actually prove.
+
+`IntegrityProbeManager` scores `/proc/self/maps` by matching tokens: `frida`, `gadget`, `objection`,
+`xposed`, `lsposed`, `substrate`, `cydia`, `zygisk`, `riru`, `magisk`. Every real-compromise test so
+far — emulator frida-server, and the Gadget on both handsets — used tooling whose mapped path
+contains one of those strings. So the passing results demonstrate that **in-process instrumentation
+is caught when it identifies itself by name**, which is weaker than "hooking is caught".
+
+Candidate additions, ordered by value, all runnable without rooting the handsets because they are
+repackaged-app vectors:
+
+1. **Gadget in script mode with no listener.** Costs nothing new. Today `android_frida_runtime_artifact`
+   and `android_frida_port_open` always fire together, so it is not yet established that the maps
+   read stands on its own.
+2. **An unnamed inline-hooking library** (Dobby, ShadowHook, And64InlineHook) embedded in the APK.
+   None carries a denylisted token. Expected to **evade** current detection; that is the point of
+   running it.
+3. **App-cloning containers** (VirtualApp derivatives — Parallel Space, Dual Space, VirtualXposed).
+   No root, and a common multi-accounting fraud vector in fintech, so directly relevant to the
+   target deployment. Probably undetected today.
+4. **LSPatch**, which embeds LSPosed into an APK without root.
+
+The durable answer is not a longer denylist but **structural detection**: comparing the prologue
+bytes of critical libc/JNI functions against their on-disk originals, or diffing a loaded library's
+in-memory `.text` against the file on disk. That catches an unnamed hooking library; no name list
+ever will.
