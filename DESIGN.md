@@ -1684,10 +1684,10 @@ Full battery = both phones, six steps each, real Frida Gadget. Conformance = the
 |---|---|---|---|---|
 | PostgreSQL (lab) | 13.23 | 26/26 | n/a | Debian 11 laptop, the supported floor |
 | PostgreSQL (RDS) | 18.1 | 26/26 | OPPO + Huawei, both clean | HTTPS, verify-full TLS, enforce |
-| PostgreSQL (RDS) | 17.11 | 26/26 | covered by 18.1 | |
-| PostgreSQL (RDS) | 16.15 | 26/26 | covered by 18.1 | |
-| PostgreSQL (RDS) | 15.19 | 26/26 | covered by 18.1 | |
-| PostgreSQL (RDS) | 14.24 | 26/26 | covered by 18.1 | |
+| PostgreSQL (RDS) | 17.11 | 26/26 (x2, incl. verify-full) | covered by 18.1 | |
+| PostgreSQL (RDS) | 16.15 | 26/26 (x2, incl. verify-full) | covered by 18.1 | |
+| PostgreSQL (RDS) | 15.19 | 26/26 (x2, incl. verify-full) | covered by 18.1 | |
+| PostgreSQL (RDS) | 14.24 | 26/26 (x2, incl. verify-full) | covered by 18.1 | |
 | PostgreSQL (RDS) | 13.x | not run | | past RDS standard support; needs paid Extended Support, and 13.23 is already proven in the lab |
 | SQL Server (RDS) | 2016-2022 | blocked | | needs the dialect work first |
 | Supabase | - | pending | | |
@@ -1778,3 +1778,19 @@ They are also superseded: fixtures 1, 2 and 6 (Frida runtime, Frida port, enforc
 | Access-proof boundary tests (4) | PASS | PASS |
 
 Note the stolen-token rows: the OPPO was Phone A (victim) and the Huawei Phone B (thief), so the pair is tested once, not once per handset.
+
+### 25.9 PostgreSQL phase closed (2026-09-05)
+
+Second sweep of 17.11, 16.15, 15.19 and 14.24 under `verify-full` database TLS: **26/26 each**, matching the first sweep. Each instance was torn down as it passed.
+
+Decision taken: the full manual handset suite was run once on PostgreSQL 18.1 (both handsets, every test) rather than repeated per version. What differs between these versions is only the PostgreSQL minor version, which the handset cannot observe - the Dart client, the Kotlin collector and the server code are byte-identical across the runs, and the conformance suite is the instrument that detects dialect behaviour. Repeating the manual suite four more times would have cost roughly three hours of hands-on work for no additional signal.
+
+**PostgreSQL support is now evidence-backed across 13 through 18**, with the full handset suite proven on 18.1 and the 26-check suite green on every version.
+
+Teardown verified: no snapshots, no instances, no unattached volumes, no unattached Elastic IPs, no NAT gateways. Only the EC2 host remains, deliberately.
+
+### 25.10 Next: SQL Server dialect
+
+No further database testing is possible until the dialect exists. `DB_ENGINE=sqlserver` currently has a version-detection branch and nothing else: no driver, no T-SQL schema, no dialect-aware queries. See section 24 for the type mapping, the compatibility policy and the two security-critical dialect differences (replay upsert semantics and refresh-reuse row locking).
+
+Supabase needs **no dialect** - it is PostgreSQL. It will be a connection-configuration test (direct connection on 5432 versus the pooler on 6543), not an engineering phase.
