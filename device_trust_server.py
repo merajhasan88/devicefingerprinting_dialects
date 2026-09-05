@@ -361,25 +361,163 @@ if DB_SSLMODE in ("verify-ca", "verify-full") and not DB_SSLROOTCERT:
     )
 
 
+# ---------------------------------------------------------------------------
+# SQL dialect
+# ---------------------------------------------------------------------------
+# Everything that genuinely differs between PostgreSQL and SQL Server lives
+# here. The principle is deliberate: token-level differences (placeholders, the
+# current-time function) are translated automatically at one seam, but anything
+# that changes *semantics* - the replay upsert and row locking above all - gets
+# an explicit per-dialect statement rather than a string rewrite. A silent
+# mistranslation in those two places reopens a real attack, so they must be
+# read and reviewed as SQL, not trusted to a regex.
+
+
+DB_ENGINE = os.environ.get("DB_ENGINE", "postgresql").strip().lower()
+
+
+class Dialect(object):
+    """Base dialect. Subclasses supply the engine-specific behaviour."""
+
+    name = None
+    paramstyle = "format"
+
+    def connect(self):
+        raise NotImplementedError
+
+    def sql(self, text):
+        """Translate a statement written in the canonical (PostgreSQL) form."""
+        return text
+
+    def json_param(self, value):
+        """Adapt a Python object for a JSON column."""
+        raise NotImplementedError
+
+    def json_value(self, raw):
+        """Adapt a JSON column read back from the driver into Python."""
+        if raw is None or isinstance(raw, (dict, list)):
+            return raw
+        try:
+            return json.loads(raw)
+        except (TypeError, ValueError):
+            return raw
+
+    def is_unique_violation(self, error):
+        raise NotImplementedError
+
+
+class PostgresDialect(Dialect):
+    name = "postgresql"
+
+    def connect(self):
+        options = {
+            "host": os.environ.get("DB_HOST", "localhost"),
+            "port": int(os.environ.get("DB_PORT", "5432")),
+            "database": os.environ.get("DB_NAME", "devicetrustdb"),
+            "user": os.environ["DB_USERNAME"],
+            "password": os.environ["DB_PASSWORD"],
+            "connect_timeout": int(os.environ.get("DB_CONNECT_TIMEOUT", "5")),
+            "sslmode": DB_SSLMODE,
+        }
+        if DB_SSLROOTCERT:
+            options["sslrootcert"] = DB_SSLROOTCERT
+        return psycopg2.connect(**options)
+
+    def json_param(self, value):
+        return Json(value)
+
+    def is_unique_violation(self, error):
+        return isinstance(error, psycopg2.errors.UniqueViolation)
+
+
+class SqlServerDialect(Dialect):
+    """SQL Server 2017+ (written to 2016-compatible T-SQL).
+
+    Only the token-level translation lives here; the statements whose shape
+    differs (LIMIT/TOP, FOR UPDATE/UPDLOCK, RETURNING/OUTPUT, ON CONFLICT) are
+    selected explicitly at their call sites.
+    """
+
+    name = "sqlserver"
+    paramstyle = "qmark"
+
+    def connect(self):
+        import pyodbc  # imported lazily so PostgreSQL deployments need no ODBC
+
+        parts = [
+            "DRIVER={ODBC Driver 18 for SQL Server}",
+            "SERVER=%s,%s" % (
+                os.environ.get("DB_HOST", "localhost"),
+                os.environ.get("DB_PORT", "1433"),
+            ),
+            "DATABASE=%s" % os.environ.get("DB_NAME", "devicetrustdb"),
+            "UID=%s" % os.environ["DB_USERNAME"],
+            "PWD=%s" % os.environ["DB_PASSWORD"],
+            "Encrypt=yes",
+            # Never TrustServerCertificate=yes: that is encryption without
+            # authentication, which is what verify-full exists to prevent.
+            "TrustServerCertificate=no",
+            "LoginTimeout=%s" % os.environ.get("DB_CONNECT_TIMEOUT", "5"),
+        ]
+        return pyodbc.connect(";".join(parts))
+
+    def sql(self, text):
+        # SYSUTCDATETIME, never GETDATE: GETDATE is server-local and would
+        # silently shift every expiry window.
+        text = text.replace("NOW()", "SYSUTCDATETIME()")
+        text = text.replace("%s", "?")
+        return text
+
+    def json_param(self, value):
+        return json.dumps(value)
+
+    def is_unique_violation(self, error):
+        # 2627 = unique constraint, 2601 = unique index.
+        return any(code in str(error) for code in ("2627", "2601"))
+
+
+def _make_dialect():
+    if DB_ENGINE == "postgresql":
+        return PostgresDialect()
+    if DB_ENGINE == "sqlserver":
+        return SqlServerDialect()
+    raise RuntimeError("DB_ENGINE must be 'postgresql' or 'sqlserver'.")
+
+
+DIALECT = _make_dialect()
+
+
+class _DialectCursor(object):
+    """Cursor wrapper that translates statements on the way through.
+
+    This is the single seam where canonical SQL becomes dialect SQL, so the
+    48 call sites in this file stay written once.
+    """
+
+    def __init__(self, cursor):
+        self._cursor = cursor
+
+    def execute(self, statement, parameters=None):
+        translated = DIALECT.sql(statement)
+        if parameters is None:
+            return self._cursor.execute(translated)
+        return self._cursor.execute(translated, parameters)
+
+    def __getattr__(self, name):
+        return getattr(self._cursor, name)
+
+    def __iter__(self):
+        return iter(self._cursor)
+
+
 def _connect_db():
-    options = {
-        "host": os.environ.get("DB_HOST", "localhost"),
-        "port": int(os.environ.get("DB_PORT", "5432")),
-        "database": os.environ.get("DB_NAME", "familyappdb"),
-        "user": os.environ["DB_USERNAME"],
-        "password": os.environ["DB_PASSWORD"],
-        "connect_timeout": int(os.environ.get("DB_CONNECT_TIMEOUT", "5")),
-        "sslmode": DB_SSLMODE,
-    }
-    if DB_SSLROOTCERT:
-        options["sslrootcert"] = DB_SSLROOTCERT
-    return psycopg2.connect(**options)
+    return DIALECT.connect()
 
 
 @contextmanager
 def _cursor(commit=False):
     connection = _connect_db()
-    cursor = connection.cursor()
+    cursor = _DialectCursor(connection.cursor())
     try:
         yield cursor
         if commit:
@@ -401,7 +539,6 @@ def _cursor(commit=False):
 # reports them, which is what lets a conformance run record which engine it
 # actually exercised.
 
-DB_ENGINE = os.environ.get("DB_ENGINE", "postgresql").strip().lower()
 POSTGRES_MINIMUM_VERSION_NUM = 130000  # PostgreSQL 13
 SQLSERVER_MINIMUM_MAJOR = 14  # SQL Server 2017 (internal major version 14)
 
@@ -1626,8 +1763,8 @@ def _evaluate_risk_policy(
                     recommended_action,
                     effective_action,
                     int(score),
-                    Json(reasons),
-                    Json(context),
+                    DIALECT.json_param(reasons),
+                    DIALECT.json_param(context),
                 ),
             )
 
@@ -2442,7 +2579,9 @@ def register_installation():
                     """,
                     (device_id, platform, hint_hash),
                 )
-            except psycopg2.errors.UniqueViolation:
+            except Exception as error:
+                if not DIALECT.is_unique_violation(error):
+                    raise
                 # A concurrent registration used the same reinstall hint.
                 # Roll back this transaction and ask the client to retry once.
                 raise ApiProblem(
@@ -2468,7 +2607,7 @@ def register_installation():
                 submitted_installation_id,
                 device_id,
                 key_algorithm,
-                Json(public_key_jwk),
+                DIALECT.json_param(public_key_jwk),
                 public_key_jwk.get("n"),
                 public_key_jwk.get("e"),
                 key_thumbprint,
@@ -2672,7 +2811,7 @@ def integrity_challenge():
                 device_id,
                 platform,
                 hashlib.sha256(nonce).hexdigest(),
-                Json(probes),
+                DIALECT.json_param(probes),
                 expires_at,
             ),
         )
@@ -2842,8 +2981,8 @@ def integrity_report():
                 scored["score"],
                 scored["verdict"],
                 scored["hard_block"],
-                Json(scored["reasons"]),
-                Json(probes),
+                DIALECT.json_param(scored["reasons"]),
+                DIALECT.json_param(probes),
                 hashlib.sha256(report_bytes).hexdigest(),
             ),
         )
@@ -2919,7 +3058,9 @@ def account_register():
                 installation_id,
                 policy=policy,
             )
-    except psycopg2.errors.UniqueViolation:
+    except Exception as error:
+        if not DIALECT.is_unique_violation(error):
+            raise
         raise ApiProblem(
             "That account handle is already registered.",
             409,
