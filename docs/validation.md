@@ -156,12 +156,12 @@ Two behaviours are worth recording separately.
 all local state — a fresh `enroll` presented a new key and a new UUID, and the server correlated it
 back to the *same* `device_id` through the reinstall hint:
 
-\`\`\`
+```
 Installation id     b50b2407-27d5-4b08-b8ed-acfa467155a0   (new)
 Device id           36ba72bf-9f39-4bb4-808f-63a751d4eef4   (unchanged)
 Recognition         reinstall_hint / medium
 Known installations 2
-\`\`\`
+```
 
 Running the commands rather than assuming them found a real defect: `account register --handle x
 --password y` failed with "Both --handle and --password are required", because the subcommand
