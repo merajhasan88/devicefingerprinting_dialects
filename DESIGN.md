@@ -2068,3 +2068,65 @@ compromised device is still caught across reinstalls of an app", shown rather th
 
 `hard_block=0` on the gadget reports is worth noting: the block came from the weighted score
 reaching the 100 cap, not from a hard-block rule. The scoring model, not a special case, did the work.
+
+## 27.5 SQL Server 2019 — handset battery on both phones — PASS (2026-09-05)
+
+Same battery as §27.4, `sqlserver 15.0.4480.2`, enforce mode, Redis nonces, rate limiting on.
+Migration clean (11 tables, schema v1); conformance suite 24 passed / 0 failed / 2 skipped.
+
+All twelve rows of the §27.4 table repeated with identical results on both handsets. Reinstall
+correlation again held: two full app wipes with new hardware keys moved `installations` 4 → 6 while
+`devices` stayed at **4**.
+
+### 27.5.1 Defect found on real hardware: the login credential oracle
+
+The user mistyped a password on a Frida-compromised OPPO, and the response differed from the
+correct-password case:
+
+```text
+blocked device + wrong password    -> 401 invalid_credentials
+blocked device + correct password  -> 403 integrity_blocked
+```
+
+`account_login` ran `_enforce_integrity_gate` **after** the account lookup and the bcrypt
+comparison. The attacker could not obtain tokens — the gate still stopped that — but could
+distinguish valid credentials from invalid ones on exactly the device class the gate exists to
+distrust, then reuse the confirmed credentials from a clean device or another channel. Rate
+limiting throttles the volume but does not remove the oracle.
+
+Fixed by moving the gate ahead of the lookup; it needs only `device_id` and `installation_id`.
+Both cases now answer `403` identically, verified on the same compromised handset.
+`/v1/accounts/register` already had the correct ordering and is the only other credential-touching
+endpoint, so login was the sole instance.
+
+Worth noting how this was found: every synthetic suite run and both prior handset batteries used
+the *correct* password, so the oracle was invisible to them. It took a human typo on a
+genuinely compromised device. Negative-path inputs deserve a place in the battery.
+
+## 27.6 Factory reset defeats device reputation, not device detection (analysis, 2026-09-05)
+
+Raised during the 2019 run: if a factory reset breaks reinstall correlation, can a compromised
+device wipe itself and escape?
+
+**Detection is unaffected.** The gate is a live measurement, not a memory lookup. Every protected
+operation mints a challenge, the collector reads its own `/proc/self/maps`, and the report is
+scored fresh. A factory-reset phone still running the gadget presents a new `device_id` and still
+scores `frida_runtime_artifact +90`, `frida_port_open +75`, `block`. It gets no further than an
+un-reset one. To use the app the attacker must remove the compromise, which is the desired outcome.
+
+**Reputation is defeated.** A reset changes `ANDROID_ID`, so the hint changes, so the `device_id`
+changes, and the 24-hour block memory is shed.
+
+The consequence for product design is concrete: **permanent device-level blocking is worth less
+than it appears**, because a factory reset launders the device. What survives a wipe is the
+account. Relationship risk — devices per account, accounts per device, reinstall velocity — keeps
+working, and a brand-new device appearing on an established account is itself a signal. Durable
+enforcement belongs at the account and relationship layer; device blocking is a short-window
+tactical control, which is what the 24-hour retention already encodes.
+
+Beneath this is the boundary recorded from the start: with no independent hardware root of trust
+there is nothing to bind to that a factory reset cannot change. This is a limit of the
+architecture, honestly stated, not a defect in it.
+
+**Not tested, and deliberately so** — the physical handsets are never wiped. This is analysis, and
+is recorded as analysis.
