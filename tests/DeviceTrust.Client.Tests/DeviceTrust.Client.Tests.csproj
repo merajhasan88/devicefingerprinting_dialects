@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <!-- Multi-targeted on purpose: the SDK claims .NET 6 and onwards, and the
+         only way to keep that claim honest is to compile and run the tests
+         against the net6.0 assets as well as the net8.0 ones. -->
+    <TargetFrameworks>net6.0;net8.0</TargetFrameworks>
+    <IsPackable>false</IsPackable>
+    <RootNamespace>DeviceTrust.Client.Tests</RootNamespace>
+    <!-- Only the .NET 9 runtime is installed on the build machine, so the
+         net6.0 test host has to be allowed to roll forward onto it. -->
+    <RollForward>LatestMajor</RollForward>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.11.1" />
+    <PackageReference Include="xunit" Version="2.9.2" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\DeviceTrust.Client\DeviceTrust.Client.csproj" />
+  </ItemGroup>
+
+</Project>
