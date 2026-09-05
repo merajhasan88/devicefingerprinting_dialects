@@ -26,7 +26,12 @@ import org.json.JSONObject
  */
 class IntegrityProbeManager(private val context: Context) {
     companion object {
-        private const val COLLECTOR_VERSION = 1
+        // 1 = name-based hook detection only (runtime_maps token scan).
+        // 2 = adds the structural probes: instrumentation_threads,
+        //     exec_mappings, and the native code_integrity buckets. Every
+        //     report carries this, so a stored report says which probe set
+        //     produced it - see DESIGN.md 29.
+        private const val COLLECTOR_VERSION = 2
         private const val MAX_TEXT = 8192
         private val suspiciousRuntimeTokens = listOf(
             "frida", "gadget", "objection", "xposed", "lsposed",

@@ -2466,3 +2466,85 @@ risks crashing a phone that must not be disturbed.
 
 **Remaining to enable extended scoring by default:** baseline ext/app clean on the OPPO, then flip
 the flag; optionally a careful live libflutter hook to close the app-bucket demonstration.
+
+---
+
+# 29. Collector versions, and which battery runs used which (2026-09-05)
+
+Raised by the question "what does the extended flag being off mean for the databases we already ran
+on?". The database conclusions are unaffected, but the battery results needed stamping so they are
+not misread later.
+
+## 29.1 The two collector versions
+
+`collector_version` is sent in every integrity report and stored in `integrity_reports`, so any
+stored report is self-describing.
+
+| Version | Probes |
+|---|---|
+| **1** | `app_identity`, `debug_state`, `root_files`, `system_properties`, `runtime_maps`, `tracer`, `root_shell`, `selinux`, `mounts`, `frida_ports`, `emulator`, `developer_settings` — hook detection is **name-based only** (token scan of `/proc/self/maps`) |
+| **2** | everything in 1, plus the structural probes: `instrumentation_threads`, `exec_mappings`, and the native three-bucket `code_integrity` |
+
+## 29.2 Stamping the completed runs
+
+**Every database battery in this project ran on collector v1.** The structural detection (§28) was
+built *after* the SQL Server phase closed (§27.9).
+
+| Run | Collector | Note |
+|---|---|---|
+| PostgreSQL 18.1 — full battery, both handsets (§25.8) | **v1** | |
+| PostgreSQL 17.11 / 16.15 / 15.19 / 14.24 (§25.4) | **v1** | conformance suite only, by agreement |
+| SQL Server 2017 / 2019 / 2022 / 2025 — full batteries (§27.4–27.8) | **v1** | |
+| SQL Server 2025 — structural validation (§28.8) | **v2** | Huawei only; extended flag on for the test |
+
+So "full battery PASS on SQL Server 2017" means **the 13-item battery as it existed then, with the
+v1 collector**. It does not mean structural detection was exercised there.
+
+## 29.3 Why this does not invalidate the database work
+
+Dialect parity is what the database phase proves, and it is orthogonal to which probes the client
+runs. The collector measures on the phone; the server scores; the database only stores the report
+and serves the dialect-sensitive paths (replay nonce, row locking, reinstall correlation, device
+memory). The only database-facing change in v2 is **more fields inside the `probe_results` JSON**,
+and that is already re-validated on SQL Server 2025 — the conformance suite now carries 30 checks
+including the four structural ones and passes 28/0/2.
+
+Re-running the five engines with v2 was considered and judged unnecessary for the dialect claim.
+That is a recommendation, not a decision taken unilaterally: if a "current battery passed on every
+engine" statement is wanted for Payactiv, the engines must be recreated and the batteries re-run.
+A cheaper middle path is to run the v2 battery on the next engine stood up anyway (Supabase is
+still outstanding).
+
+## 29.4 What the extended flag being off actually costs
+
+`INTEGRITY_SCORE_EXTENDED_LIBS=0` (the default) still scores, unconditionally:
+`android_instrumentation_runtime_thread` +90, `android_glib_runtime_thread` +40,
+`android_wx_memory` +60, `android_deleted_code_mapping` +55, and
+`android_code_integrity_violation` +90 for the **core** bucket (libc/libart).
+
+Gated off are only the **ext** bucket (libc++, libssl, libcrypto, libandroid_runtime, libbinder)
+and the **app** bucket (`android_app_code_modified`).
+
+Consequence: the renamed-gadget evasion is closed by default, and any Frida-based attacker is still
+caught by the thread / w^x / libc signals. The genuine remaining gap is narrow and specific — **a
+bespoke, non-Frida inline hooker that patches only an ext library**, the classic case being a
+cert-pinning bypass that patches `libssl`. Today that is measured and stored but not scored.
+
+## 29.5 Queued: the OPPO baseline (blocks enabling the flag by default)
+
+The flag stays off until the OPPO is baselined, because ext/app were measured clean only on the
+Huawei and a different vendor/Android version could carry a benign in-memory difference in some ext
+library. Procedure, for when the OPPO is free:
+
+1. Stand up an engine (SQL Server or PostgreSQL) and the EC2 server; server in `enforce`,
+   `INTEGRITY_SCORE_EXTENDED_LIBS` **off**.
+2. Install the current clean client (v2 collector) on the OPPO; launch; it auto-scans.
+3. Read the stored report's `code_integrity` and confirm **`core_diff_bytes`, `ext_diff_bytes` and
+   `app_diff_bytes` are all 0**, and `*_compared_bytes` are all non-zero (a zero `compared` means the
+   bucket is inert, which is exactly the defect found on the Huawei in §28.8).
+4. Turn the flag on and re-scan the clean OPPO; it must stay `18/trusted` (no false positive).
+5. Only then flip the flag on by default in `device_trust_server.py`.
+
+Optional, to close the app-bucket demonstration: a careful live `libflutter` hook. Not attempted on
+the Huawei because it instruments the UI engine and risks crashing a handset that must not be
+disturbed.
