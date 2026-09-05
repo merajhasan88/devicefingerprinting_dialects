@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <AssemblyName>devicetrust</AssemblyName>
+    <RootNamespace>DeviceTrust.Cli</RootNamespace>
+    <!-- No package references on purpose: the harness proves that the SDK
+         needs nothing but the BCL to speak this protocol. -->
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <!-- Built against .NET 8 so it demonstrates the SDK on an LTS, but allowed to
+         run on a newer installed runtime. Without this, a machine that has only
+         .NET 9 refuses to launch a net8.0 application. -->
+    <RollForward>LatestMajor</RollForward>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\DeviceTrust.Client\DeviceTrust.Client.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Update="appsettings.json" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+</Project>
