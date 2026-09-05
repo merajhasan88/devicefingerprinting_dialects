@@ -28,6 +28,7 @@ import logging
 import os
 import re
 import secrets
+import struct
 import threading
 import unicodedata
 import uuid
@@ -404,6 +405,10 @@ class Dialect(object):
     def is_unique_violation(self, error):
         raise NotImplementedError
 
+    def bind_parameters(self, parameters):
+        """Adapt bound parameters to what the driver expects."""
+        return parameters
+
     def row_lock_suffix(self):
         """Statement suffix that takes an exclusive row lock."""
         return ""
@@ -462,6 +467,30 @@ class SqlServerDialect(Dialect):
     name = "sqlserver"
     paramstyle = "qmark"
 
+    # SQL_SS_TIMESTAMPOFFSET. pyodbc has no native mapping for datetimeoffset
+    # and hands back the raw TDS bytes, so every timestamp in the system would
+    # arrive as bytes and every expiry comparison would fail. The converter
+    # below is what makes datetimeoffset usable.
+    _SQL_SS_TIMESTAMPOFFSET = -155
+
+    @staticmethod
+    def _decode_datetimeoffset(raw):
+        if raw is None:
+            return None
+        year, month, day, hour, minute, second, fraction, tz_hour, tz_minute = (
+            struct.unpack("<6hI2h", raw)
+        )
+        return datetime(
+            year,
+            month,
+            day,
+            hour,
+            minute,
+            second,
+            fraction // 1000,
+            timezone(timedelta(hours=tz_hour, minutes=tz_minute)),
+        )
+
     def connect(self):
         import pyodbc  # imported lazily so PostgreSQL deployments need no ODBC
 
@@ -480,7 +509,11 @@ class SqlServerDialect(Dialect):
             "TrustServerCertificate=no",
             "LoginTimeout=%s" % os.environ.get("DB_CONNECT_TIMEOUT", "5"),
         ]
-        return pyodbc.connect(";".join(parts))
+        connection = pyodbc.connect(";".join(parts))
+        connection.add_output_converter(
+            self._SQL_SS_TIMESTAMPOFFSET, self._decode_datetimeoffset
+        )
+        return connection
 
     _LIMIT_TAIL = re.compile(r"\s+LIMIT\s+(\d+)\s*$", re.IGNORECASE)
     _LEADING_SELECT = re.compile(r"^(\s*)SELECT\s", re.IGNORECASE)
@@ -511,6 +544,20 @@ class SqlServerDialect(Dialect):
     def is_unique_violation(self, error):
         # 2627 = unique constraint, 2601 = unique index.
         return any(code in str(error) for code in ("2627", "2601"))
+
+    def bind_parameters(self, parameters):
+        # pyodbc binds a datetime as SQL_TIMESTAMP and drops tzinfo rather than
+        # converting it, so an aware non-UTC value would be written with its
+        # wall-clock fields and silently shift the expiry it represents.
+        # Converting to UTC first makes the implicit datetime2 ->
+        # datetimeoffset promotion land on +00:00, which is what every column
+        # in this schema means.
+        adapted = []
+        for value in parameters:
+            if isinstance(value, datetime) and value.tzinfo is not None:
+                value = value.astimezone(timezone.utc).replace(tzinfo=None)
+            adapted.append(value)
+        return tuple(adapted)
 
     def row_lock_hint(self):
         # PostgreSQL is MVCC; SQL Server READ COMMITTED takes shared locks and
@@ -543,7 +590,9 @@ class _DialectCursor(object):
         translated = DIALECT.sql(statement)
         if parameters is None:
             return self._cursor.execute(translated)
-        return self._cursor.execute(translated, parameters)
+        return self._cursor.execute(
+            translated, DIALECT.bind_parameters(parameters)
+        )
 
     def __getattr__(self, name):
         return getattr(self._cursor, name)

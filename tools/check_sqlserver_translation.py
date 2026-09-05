@@ -32,6 +32,29 @@ FORBIDDEN = [
     (re.compile(r"\bJSONB\b", re.I), "JSONB survived translation"),
 ]
 STATEMENT = re.compile(r"\b(SELECT|INSERT|UPDATE|DELETE)\b", re.I)
+# Statements are sometimes built by concatenating fragments, so a literal need
+# not start with a keyword to be worth checking. Two things must be excluded
+# though, or they report themselves: docstrings that merely discuss the
+# dialect, and the short lock fragments the dialect returns on purpose.
+MIN_LENGTH = 20
+
+
+def _docstring_nodes(tree):
+    """Node ids of every docstring, which are prose and not SQL."""
+    found = set()
+    for node in ast.walk(tree):
+        if not isinstance(
+            node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
+        ):
+            continue
+        body = getattr(node, "body", None)
+        if not body:
+            continue
+        first = body[0]
+        if isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant) \
+                and isinstance(first.value.value, str):
+            found.add(id(first.value))
+    return found
 
 
 def main(path):
@@ -48,9 +71,13 @@ def main(path):
         return 2
 
     source = io.open(path, encoding="utf-8").read()
+    tree = ast.parse(source)
+    docstrings = _docstring_nodes(tree)
     checked, problems = 0, []
-    for node in ast.walk(ast.parse(source)):
+    for node in ast.walk(tree):
         if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
+            continue
+        if id(node) in docstrings or len(node.value) < MIN_LENGTH:
             continue
         if not STATEMENT.search(node.value):
             continue
