@@ -2358,5 +2358,43 @@ It closes the realistic Frida-repackaging evasion: rename plus port change no lo
 the Gum runtime thread and the rwx trampoline memory remain. It does **not** yet catch a bespoke,
 non-Frida inline-hooking library that spawns no recognizable thread and allocates no rwx page — that
 needs the `code_integrity` text-diff, which requires a native component to read process memory under
-SELinux. That is the recommended next hardening step. Both handsets were returned to the clean
+SELinux. That component is now implemented — see §28.6. Both handsets were returned to the clean
 release build (`18/trusted`) after the tests.
+
+---
+
+# 28.6 Native code_integrity — implemented and verified (2026-09-05)
+
+The Kotlin `code_integrity` probe reported `checked:false` because SELinux denies `untrusted_app`
+access to `/proc/self/mem` on Android 9/10. The fix is an NDK component that runs in-process and
+reads the app's own already-mapped, readable `r-x` pages by direct pointer — no `/proc/self/mem`,
+no ptrace, so the SELinux block does not apply. For libc and libart it compares every executable
+mapping against the same bytes on disk.
+
+**Iterating every VMA is essential, and a first cut got it wrong.** An inline hooker flips
+individual code pages writable to patch them, splitting a library's single `r-x` mapping into
+several; the patched page is usually not the first. An early single-VMA version compared only
+114 KB of libc and read `diff_bytes:0` against an active hook — a false negative caught during
+testing. Scanning all executable VMAs of the target library fixed it (libc then compares in full,
+~864 KB).
+
+**Scoring** is behaviour-based: any difference of 4+ bytes (one arm64 branch, the smallest inline
+hook) raises `android_code_integrity_violation +90`, which blocks on its own — modified
+system-library code is as definitive as a mapped Frida artifact. Clean devices measured exactly
+zero across libc (614 KB) and libart (to the 4 MB cap) on both handsets, so the threshold is margin.
+
+**Verified on real hardware.** A Frida Gadget in script mode inline-hooked five libc functions
+(`strcmp`, `strlen`, `memcmp`, `open`, `fopen`) at load. The scan read `libc_diff_bytes:71` and
+`android_code_integrity_violation +90` fired; both clean phones read `libc_diff_bytes:0` and stayed
+`18/trusted`. Unlike the thread-name probe, this catches **any** inline hooker — Frida or a bespoke
+library such as Dobby — because it compares bytes rather than recognizing a framework. The
+conformance suite gains a check for it: 28 passed, 0 failed on SQL Server 2025.
+
+Build wiring is a CMake `externalNativeBuild`; the library loads best-effort, so a build without it
+degrades to `checked:false` rather than crashing. Nothing extra to install — the Android SDK ships
+the NDK and CMake 3.22.1.
+
+**Remaining gap, now smaller.** This probe compares libc and libart. An attacker who hooks a
+library outside that set, or who tampers only with the app's own Dart/Flutter code rather than a
+system library, is not covered as configured; extending the target-library set and adding the app's
+own mapped code are the follow-ons.
