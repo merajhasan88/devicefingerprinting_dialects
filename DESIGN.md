@@ -1743,3 +1743,38 @@ legitimate protected call  PASS  body SHA-256, timestamp window, one-time nonce,
 So the same server, in the same minute, accepted the legitimate device and refused the thief.
 
 **Method note.** Injecting the token by `adb shell input text` corrupted it — the predictive keyboard inserted spaces — and the app correctly reported `INCONCLUSIVE: refresh challenge was rejected before key proof` with `invalid_token` rather than claiming a pass. That is the test harness behaving well: a malformed-token rejection is not evidence of key binding. The tokens were then supplied through the app's designed `--dart-define=STOLEN_REFRESH_TOKEN` / `STOLEN_ACCESS_TOKEN` build-time mechanism, which is keyboard-free and exact. Use that route; the access token's 10-minute lifetime means minting it immediately before the build.
+
+### 25.6 Access-proof boundary tests on both handsets — PASS (2026-09-05)
+
+Release builds, PostgreSQL 18.1 on RDS, enforce mode. Identical results on OPPO and Huawei:
+
+```text
+1  exact signed-request replay   401 access_proof_replay                   (first 200; same proof, signature and nonce reused)
+2  body tampering                401 access_proof_body_mismatch            (signed original, sent modified)
+3  path tampering                401 access_proof_path_mismatch
+   method tampering              401 access_proof_method_mismatch
+4  stale proof                   401 access_proof_timestamp_outside_window (age 180s vs 120s allowed)
+```
+
+An earlier attempt returned INCONCLUSIVE with `expired_token` because the access token had passed its 10-minute life. **Operationally: run the boundary tests within 10 minutes of a session refresh**, since a token-expiry rejection proves nothing about proof binding. The app distinguishes the two, which is why the first attempt was not miscounted as a pass.
+
+### 25.7 Scope decision: controlled Android compromise fixtures retired (2026-09-05)
+
+The six debug-only fixtures are **removed from the test plan**. They are gated by `applyDebugTestFixture`, which refuses to run on a non-debuggable APK, so they are incompatible with the release-only build policy; and running them would require `INTEGRITY_ALLOW_DEBUG=1`, the very switch that concealed `android_app_debuggable +35` throughout the proof of concept.
+
+They are also superseded: fixtures 1, 2 and 6 (Frida runtime, Frida port, enforcement rejection) are proven far better by the embedded Frida Gadget on real hardware, and all six scoring rules are asserted deterministically by the conformance suite. Fixtures 3, 4 and 5 (hook framework, root/su, writable mount) have no real-tooling equivalent yet and remain covered only by the suite.
+
+### 25.8 PostgreSQL 18.1 — full suite complete, both handsets
+
+| Test | OPPO | Huawei |
+|---|---|---|
+| Clean baseline | 18/trusted | 18/trusted |
+| Account creation through enforce gate | 201 | 201 |
+| Stolen refresh token (cross-device) | PASS | n/a (was Phone B) |
+| Stolen access token (cross-device) | PASS | n/a (was Phone B) |
+| Real Frida Gadget -> block | PASS | PASS |
+| Account refused while compromised | PASS | PASS |
+| Device memory after reinstall | PASS | PASS |
+| Access-proof boundary tests (4) | PASS | PASS |
+
+Note the stolen-token rows: the OPPO was Phone A (victim) and the Huawei Phone B (thief), so the pair is tested once, not once per handset.
