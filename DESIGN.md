@@ -1661,3 +1661,35 @@ Step 2 is a finding rather than a nuisance: the lab server had `INTEGRITY_ALLOW_
 The Frida Gadget works in a release build: it is an ordinary bundled native library loaded with `System.loadLibrary`, so it does not depend on the app being debuggable. Only the synthetic debug fixtures are unavailable in release, and they are not needed for real-compromise testing.
 
 Operational note: one bootstrap timed out client-side with the request never reaching the server, and a plain relaunch succeeded. The phone's Wi-Fi showed 120-700 ms jitter to 8.8.8.8 at the time. Retry before investigating; the 15 s client timeout is tight for a congested link.
+
+### 25.2 Huawei full battery on AWS — identical to the OPPO (2026-09-05)
+
+Same six steps, same release-only builds, same server (PostgreSQL 18.1 on RDS, enforce mode, `verify-full` TLS, real certificate allow-list, no `INTEGRITY_ALLOW_*` switches).
+
+```text
+1  clean release                     score=18  trusted   -> POST /v1/accounts/register 201 (hw1)
+2  release + embedded Frida Gadget   score=100 block      frida_runtime_artifact +90, frida_port_open +75
+3  account attempt while compromised 403 integrity_blocked
+4  gadget removed, clean release     score=18  trusted
+5  new install, new key, clean scan  403 integrity_device_blocked_recently
+```
+
+**No behavioural difference between the two handsets.** Both are `user`/`release-keys` builds with green Verified Boot, enforcing SELinux and `secure_hardware`-backed keys, and both produced identical scores, identical reason codes and identical verdicts at every step. The Huawei's lack of Google Play Services is irrelevant, as expected, because no Play Integrity or remote attestation is used.
+
+### 25.3 Results matrix
+
+Full battery = both phones, six steps each, real Frida Gadget. Conformance = the 26-check suite.
+
+| Backend | Version | Conformance | Full battery | Notes |
+|---|---|---|---|---|
+| PostgreSQL (lab) | 13.23 | 26/26 | n/a | Debian 11 laptop, the supported floor |
+| PostgreSQL (RDS) | 18.1 | 26/26 | OPPO + Huawei, both clean | HTTPS, verify-full TLS, enforce |
+| PostgreSQL (RDS) | 17.x | pending | | |
+| PostgreSQL (RDS) | 16.x | pending | | |
+| PostgreSQL (RDS) | 15.x | pending | | |
+| PostgreSQL (RDS) | 14.x | pending | | |
+| PostgreSQL (RDS) | 13.x | pending | | |
+| SQL Server (RDS) | 2016-2022 | blocked | | needs the dialect work first |
+| Supabase | - | pending | | |
+
+Per-phone differences observed so far: **none**.
