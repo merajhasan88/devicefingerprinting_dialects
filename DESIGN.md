@@ -2288,3 +2288,75 @@ which was scoped to running the tests.
 
 Both handsets were returned to the clean release build (`18/trusted`, zero gadget artefacts) after
 the tests.
+
+---
+
+# 28. Structural hook detection — implemented and verified (2026-09-05)
+
+Closes the rename evasion confirmed in §27.11. Detection no longer relies solely on the injected
+library's filename; three new mandatory probes report raw measurements that the server scores. The
+phone still never scores itself.
+
+## 28.1 The three probes
+
+- **`instrumentation_threads`** reads `/proc/self/task/<tid>/comm` for Frida/Gum runtime threads
+  (`gum-js-loop`, `pool-frida`) and, separately, GLib threads (`gmain`, `gdbus`). These names are
+  compiled into the framework, so renaming the injected `.so` does not rename them. This is the
+  signal that catches the renamed gadget.
+- **`exec_mappings`** flags writable-and-executable memory and executable memory backed by a
+  `(deleted)` file — both rare in a W^X-compliant app. The ART JIT code cache, which legitimately
+  presents as executable and `(deleted)` (`/memfd:/jit-cache`, `/dev/ashmem/dalvik-jit-code-cache`),
+  is excluded client-side; without that exclusion every clean device is a false positive.
+- **`code_integrity`** compares libc's in-memory `.text` against the on-disk file. On Android 9/10
+  SELinux blocks `untrusted_app` from reading `/proc/self/mem`, so it returns `checked:false` there
+  and is not scored — kept as best-effort telemetry. Reliable text-diffing needs a native (NDK)
+  component and is deferred; it is the one probe that would catch a non-Frida inline hooker such as
+  Dobby, so it remains the recommended follow-on.
+
+## 28.2 Scoring, tuned to a measured clean baseline
+
+Before wiring any scoring, the three probes were shipped in report-only mode and the raw output was
+captured from both handsets. The baseline decided the thresholds:
+
+| Signal | Clean OPPO | Clean Huawei | Decision |
+|---|---|---|---|
+| `frida_threads` | `[]` | `[]` | score 90 (block) |
+| `wx_mappings` | 0 | 0 | score 60 |
+| `deleted_exec_mappings` (non-JIT) | 0 | 0 | score 55 |
+| `deleted_exec_jit` | 1 (JIT cache) | 1 (JIT cache) | never scored |
+| `glib_threads` | `[]` | `[]` | score 40 (elevated, not block) |
+| `code_integrity` | `checked:false` (SELinux) | `checked:false` | not scored |
+
+GLib threads score only 40 because an app could in principle bundle GLib; Frida-specific threads are
+unambiguous and score 90.
+
+## 28.3 Verification on real hardware
+
+- **No false positive:** with scoring live, both clean handsets still scored **18/trusted**, the JIT
+  cache correctly ignored.
+- **Evasion closed:** the exact Test B build — Frida Gadget renamed `libhelper.so`, listening on
+  27100 — now scores **100/block** via `android_instrumentation_runtime_thread +90` and
+  `android_wx_memory +60`. Neither `runtime_maps` nor `frida_ports` fired, proving the block came
+  from name-independent signals. The same build scored 18/trusted before this change (§27.11).
+
+## 28.4 Regression tests
+
+The conformance suite gains three checks (now **27 passed, 0 failed** on SQL Server 2025):
+
+- *a renamed Frida gadget is caught by its runtime thread* — encodes the §27.11 evasion with
+  `runtime_maps` and `frida_ports` explicitly clean, so a future change that reintroduced
+  name-only detection would fail here.
+- *writable-executable memory is caught*.
+- *the ART JIT code cache is not mistaken for injection* — guards the false-positive exclusion.
+
+`clean_probes` gained the three probes' clean defaults, which the mandatory-probe requirement now
+demands of every report.
+
+## 28.5 What this does and does not close
+
+It closes the realistic Frida-repackaging evasion: rename plus port change no longer helps, because
+the Gum runtime thread and the rwx trampoline memory remain. It does **not** yet catch a bespoke,
+non-Frida inline-hooking library that spawns no recognizable thread and allocates no rwx page — that
+needs the `code_integrity` text-diff, which requires a native component to read process memory under
+SELinux. That is the recommended next hardening step. Both handsets were returned to the clean
+release build (`18/trusted`) after the tests.
