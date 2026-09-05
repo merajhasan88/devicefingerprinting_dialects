@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFrameworks>net6.0-windows;net8.0-windows</TargetFrameworks>
+    <AssemblyName>DeviceTrust.Client.Windows</AssemblyName>
+    <RootNamespace>DeviceTrust.Client.Windows</RootNamespace>
+    <PackageId>DeviceTrust.Client.Windows</PackageId>
+    <Description>Windows key storage (CNG, TPM where available) and a Windows-native integrity probe set for the Device Trust client SDK.</Description>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <AllowUnsafeBlocks>false</AllowUnsafeBlocks>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\DeviceTrust.Client\DeviceTrust.Client.csproj" />
+  </ItemGroup>
+
+</Project>
