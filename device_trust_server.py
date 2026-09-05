@@ -3355,6 +3355,16 @@ def account_login():
     device_id = claims.get("did")
     installation_id = claims.get("iid")
 
+    # The gate runs BEFORE any credential comparison, and must stay here.
+    # Checking the password first turns a blocked device into a credential
+    # oracle: a wrong password answered 401 invalid_credentials while a correct
+    # one answered 403 integrity_blocked, so an attacker on a compromised
+    # device - exactly the device class this gate exists to distrust - could
+    # confirm which passwords are valid and reuse them on a clean device or
+    # another channel. Refusing before the lookup makes both cases identical.
+    # /v1/accounts/register already had this ordering.
+    _enforce_integrity_gate(device_id, installation_id)
+
     with _cursor(commit=True) as cursor:
         cursor.execute(
             """
@@ -3372,8 +3382,6 @@ def account_login():
                 "invalid_credentials",
             )
         account_id = str(row[0])
-
-    _enforce_integrity_gate(device_id, installation_id)
     policy = _evaluate_risk_policy(
         "account_login",
         device_id,
