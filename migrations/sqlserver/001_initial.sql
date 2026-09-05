@@ -236,5 +236,8 @@ CREATE INDEX integrity_reports_device_idx ON dbo.integrity_reports(device_id, cr
 GO
 
 IF NOT EXISTS (SELECT 1 FROM dbo.schema_migrations WHERE version = 1)
-INSERT INTO dbo.schema_migrations (version, description) VALUES (1, 'initial schema');
+-- Guarded like every other statement in this file, so the migration can be
+-- re-run safely. The PostgreSQL counterpart uses ON CONFLICT DO NOTHING.
+IF NOT EXISTS (SELECT 1 FROM dbo.schema_migrations WHERE version = 1)
+    INSERT INTO dbo.schema_migrations (version, description) VALUES (1, 'initial schema');
 GO
