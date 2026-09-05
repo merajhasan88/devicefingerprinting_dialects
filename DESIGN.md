@@ -2230,3 +2230,61 @@ The durable answer is not a longer denylist but **structural detection**: compar
 bytes of critical libc/JNI functions against their on-disk originals, or diffing a loaded library's
 in-memory `.text` against the file on disk. That catches an unnamed hooking library; no name list
 ever will.
+
+## 27.11 Hook-detection probe tests — one reassuring, one a confirmed evasion (2026-09-05)
+
+Two follow-up tests on the OPPO to characterise the §27.10 limitation. Both use a real, active Frida
+Gadget in a release APK; neither needs a login tap, because the app scans on launch. Ground truth in
+each case is the gadget's own `I Frida : Listening on 127.0.0.1 TCP port <n>` line in logcat, which
+proves the framework loaded and is live regardless of what the collector concludes.
+
+| Test | Gadget name | Port | Gadget live? | `frida_port_open` | `frida_runtime_artifact` | Verdict |
+|---|---|---|---|---|---|---|
+| Default (all prior tests) | libfrida-gadget.so | 27042 | yes | fires | fires | block |
+| **A** | libfrida-gadget.so | **27100** | yes | absent | **fires** | block (score 100) |
+| **B** | **libhelper.so** | 27100 | yes | absent | absent | **trusted (score 18)** |
+
+### Test A — the maps read is independent of the port probe (reassuring)
+
+Moving the listener to 27100, a port `probeFridaPorts` does not check, removed the
+`android_frida_port_open` signal but `android_frida_runtime_artifact +90` still fired and the verdict
+was still `block`. This answers the open question in §27.10: the two signals had always fired
+together, so their independence was unproven. It is now established — an attacker who avoids the
+default Frida port is still caught by the `/proc/self/maps` read. Detection does not depend on the
+default port.
+
+### Test B — a rename defeats detection entirely (CONFIRMED evasion)
+
+The identical gadget, renamed `libhelper.so` (config `libhelper.config.so`) and left on 27100,
+loaded and listened exactly as before — logcat shows `Frida : Listening on 127.0.0.1 TCP port 27100`
+— yet the collector scored **18/trusted** and the server stored `18 | trusted`. The login gate would
+admit it.
+
+`probeRuntimeMaps` lowercases each `/proc/self/maps` line and matches it against a fixed token list.
+`libhelper.so` contains none of those tokens, so the mapped, active instrumentation framework is
+invisible. Two changes an attacker fully controls when repackaging an APK — rename the shared object,
+move the port — reduce the score from 100 to 18.
+
+**Severity.** This is the realistic attack path for this project. The whole point of the Gadget (as
+opposed to frida-server) is that it ships inside a repackaged app and needs no root; an attacker who
+can embed it can trivially rename it. Name-based matching raises the bar only against an adversary
+who does not bother to rename, which is not the adversary that matters.
+
+**The fix is structural, not a longer list.** Detection must key on *behaviour that hooking requires*
+rather than on *what the tool is called*:
+
+- Diff the first bytes (the prologue) of security-critical libc/JNI functions against a known-good
+  copy; an inline hook overwrites them with a trampoline.
+- Diff a loaded library's in-memory `.text` against the same section on disk; any patched code
+  diverges.
+- Flag `rwx` or writable-then-executable mappings and code pages whose backing file has been
+  deleted, both of which legitimate libraries rarely present.
+
+These catch an unnamed hooking library, and would have caught Test B. A name denylist never will.
+The name list still has value as a cheap first pass against lazy tooling and should stay, but it
+cannot be the only mechanism. **Recommend implementing structural detection as the next hardening
+step; it is scoped native work and belongs in its own change.** Not implemented in this session,
+which was scoped to running the tests.
+
+Both handsets were returned to the clean release build (`18/trusted`, zero gadget artefacts) after
+the tests.
