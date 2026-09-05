@@ -1596,3 +1596,47 @@ Five checks are tagged `[db]` as the ones whose behaviour depends on the engine:
 ### 24.2 Agreed: versioned migration scripts per dialect
 
 The runtime DDL in `schema_guard` will be replaced by **versioned migration scripts per dialect**, run by a DBA, with the application verifying schema version at boot and refusing to start on mismatch. Agreed 2026-09-05. Rationale: enterprise DBAs reject applications that issue `CREATE`/`ALTER` against production, and runtime DDL forces the application's database principal to hold DDL rights permanently. This also shapes the "server file(s) to set up their database" deliverable — those files become the migration set.
+
+## 25. Phase 1a — AWS, HTTPS, PostgreSQL RDS — PASS (2026-09-05)
+
+First deployment off the lab laptop. Everything below ran against AWS in `us-west-2`, created for the test and torn down afterwards.
+
+### Infrastructure
+
+```text
+EC2      t4g.micro, Ubuntu 24.04.4 LTS arm64, Python 3.12.3, Redis 7 installed (not yet wired in)
+RDS      devicetrust-pg, PostgreSQL 18.1, db.t4g.micro, private, encrypted,
+         backup-retention-period 0 (so no snapshot can survive teardown)
+Network  default VPC. No NAT Gateway, no Elastic IP, no load balancer
+TLS      Caddy serving <dashed-ip>.nip.io with a real Let's Encrypt certificate -
+         HTTPS with no domain purchase and no DNS work
+Cost     ~USD 0.031/hour (~PKR 9/hour)
+```
+
+The client now takes its endpoint only from `--dart-define=API_BASE_URL`; there is no default, and a build without one fails with `api_base_url_missing`.
+
+### Results
+
+Conformance suite against PostgreSQL 18.1 over HTTPS, enforce mode, real certificate allow-list:
+
+```text
+26 passed, 0 failed, 0 skipped
+```
+
+The lab proved PostgreSQL 13.23 and this proves 18.1, so both ends of the supported range are now covered by the same 26 assertions.
+
+Physical OPPO CPH2083 against the same stack:
+
+```text
+debug APK:    score=53 verdict=elevated   android_app_debuggable +35, dev options +8, adb +10
+release APK:  score=18 verdict=trusted    dev options +8, adb +10
+              POST /v1/accounts/register -> 201 through the enforce-mode gate
+```
+
+**The debug-build result is a finding, not a nuisance.** The lab server had `INTEGRITY_ALLOW_DEBUG=1` set, which had been silently suppressing `android_app_debuggable +35` for the whole proof of concept. A production-representative server rejects a debug build in enforce mode, exactly as it should. The release build scores the historical clean baseline of 18 with no lab switches enabled at all — no `INTEGRITY_ALLOW_DEBUG`, no `INTEGRITY_ALLOW_EMULATOR`, no `INTEGRITY_ALLOW_USERDEBUG`.
+
+### Notes for the next round
+
+- `psycopg2`'s default `sslmode=prefer` already negotiates TLS against RDS, so no code change was needed to connect. Explicit `sslmode=verify-full` with the RDS CA bundle remains the production hardening, and is still worth doing.
+- Redis is installed on the instance and answering, ready to be wired in as the nonce replay cache and rate limiter.
+- SQL Server cannot be tested until the dialect work exists; an RDS SQL Server instance would have nothing to run against.
