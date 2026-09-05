@@ -1939,3 +1939,66 @@ TLS is verified, not merely encrypted: the Amazon RDS CA bundle is installed int
 system trust store, so `Encrypt=yes` with `TrustServerCertificate=no` — and `sqlcmd` without `-C` —
 actually validate the certificate. This is the SQL Server equivalent of the `verify-full` decision
 taken for PostgreSQL.
+
+---
+
+# 27. Phase 1c — SQL Server 2017 / 2019 / 2022 / 2025 — PASS (2026-09-05)
+
+All four RDS `sqlserver-ex` versions run the conformance suite **identically to PostgreSQL**, with
+`NONCE_BACKEND=redis` and rate limiting enabled.
+
+| Engine | Version | Migration | Suite |
+|---|---|---|---|
+| SQL Server 2017 | 14.0.3540.1 (RTM-CU31-GDR) | 11 tables, 24 indexes, schema v1 | **24 passed, 0 failed, 2 skipped** |
+| SQL Server 2019 | 15.0.4480.2 (RTM-CU32-GDR) | 11 tables, schema v1 | **24 passed, 0 failed, 2 skipped** |
+| SQL Server 2022 | 16.0.4265.3 (RTM-CU26) | 11 tables, schema v1 | **24 passed, 0 failed, 2 skipped** |
+| SQL Server 2025 | 17.0.4065.4 (RTM-CU7) | 11 tables, schema v1 | **24 passed, 0 failed, 2 skipped** |
+| PostgreSQL 18.1 | re-run on the final build | — | **24 passed, 0 failed, 2 skipped** |
+
+The two skips are the enforcement checks, which need `INTEGRITY_MODE=enforce`. The final PostgreSQL
+re-run matters because the last two fixes changed SQL shared by both engines; it confirms the SQL
+Server work cost PostgreSQL nothing.
+
+## 27.1 Three defects found only by running against a real SQL Server
+
+Each of these passed every static check and would have shipped.
+
+**1. Filtered indexes require `SET QUOTED_IDENTIFIER ON` (Msg 1934).** The migration failed at the
+filtered unique index. This is nastier than it looks: SQL Server also refuses `INSERT`/`UPDATE`
+against a table carrying a filtered index from any session where the option is OFF. SSMS and the
+ODBC drivers default it ON; **sqlcmd defaults it OFF**. A migration inheriting the caller's default
+therefore succeeds in SSMS and fails in sqlcmd, which reads as a tooling problem rather than a
+schema one. The file now sets it explicitly.
+
+**2. `datetimeoffset` is not supported by pyodbc out of the box.** `ODBC SQL type -155 is not yet
+supported`. Every timestamp read returned raw bytes until an output converter was registered. The
+write direction was the more dangerous half and is described in §26.3.
+
+**3. `DELETE FROM t AS alias` is PostgreSQL-only.** SQL Server answers *Incorrect syntax near the
+keyword 'AS'* and wants `DELETE alias FROM t AS alias`. Dropping the alias suits both. This was the
+expired-challenge cleanup that must preserve challenges owning a report — the `ForeignKeyViolation`
+trap from the proof of concept — so the `NOT EXISTS` guard was retained exactly.
+
+The lesson worth carrying into the SDK work: the dialect differences that hurt were **not** the ones
+in the obvious list (`LIMIT`, `NOW()`, `ON CONFLICT`). Those were anticipated and translated. The
+ones that bit were a driver type gap, a session option that varies by *client tool*, and an alias in
+a `DELETE`. Static translation checking cannot find any of them; only executing against the real
+engine can.
+
+## 27.2 TLS
+
+Certificates are verified, not merely encrypted. The Amazon RDS CA bundle is installed in the EC2
+host's system trust store, so `Encrypt=yes` with `TrustServerCertificate=no` — and `sqlcmd` run
+without `-C` — validate the server certificate. This is the SQL Server equivalent of the
+`verify-full` decision recorded for PostgreSQL in §25.
+
+## 27.3 Remaining for this phase
+
+The per-engine-family **handset battery** (§25.11) still has to run once against SQL Server on both
+handsets: stolen access token, stolen refresh token, the four access-proof boundary tests, and the
+Frida Gadget release build. By the reasoning recorded in §25.9 it runs once for the family, not once
+per version, because the client and collector are byte-identical across versions and cannot observe
+the database.
+
+2017 was kept running for that battery — the floor version, so a pass there is the strictest result
+available. 2019, 2022 and 2025 were torn down as they passed, following the PostgreSQL pattern.
