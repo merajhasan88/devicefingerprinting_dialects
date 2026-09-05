@@ -26,6 +26,7 @@ import hmac
 import json
 import logging
 import os
+import re
 import secrets
 import threading
 import unicodedata
@@ -34,8 +35,6 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 
 import bcrypt
-import psycopg2
-from psycopg2.extras import Json
 from flask import Flask, jsonify, request
 from flask_jwt_extended import (
     JWTManager,
@@ -405,9 +404,28 @@ class Dialect(object):
     def is_unique_violation(self, error):
         raise NotImplementedError
 
+    def row_lock_suffix(self):
+        """Statement suffix that takes an exclusive row lock."""
+        return ""
+
+    def row_lock_hint(self):
+        """Table hint that takes an exclusive row lock."""
+        return ""
+
 
 class PostgresDialect(Dialect):
     name = "postgresql"
+
+    def __init__(self):
+        # Imported lazily, exactly like pyodbc below, so that each deployment
+        # installs only the driver for the engine it actually runs. A SQL
+        # Server shop should not be made to build psycopg2.
+        import psycopg2
+        import psycopg2.errors
+        from psycopg2.extras import Json
+
+        self._driver = psycopg2
+        self._json = Json
 
     def connect(self):
         options = {
@@ -421,13 +439,16 @@ class PostgresDialect(Dialect):
         }
         if DB_SSLROOTCERT:
             options["sslrootcert"] = DB_SSLROOTCERT
-        return psycopg2.connect(**options)
+        return self._driver.connect(**options)
 
     def json_param(self, value):
-        return Json(value)
+        return self._json(value)
 
     def is_unique_violation(self, error):
-        return isinstance(error, psycopg2.errors.UniqueViolation)
+        return isinstance(error, self._driver.errors.UniqueViolation)
+
+    def row_lock_suffix(self):
+        return " FOR UPDATE"
 
 
 class SqlServerDialect(Dialect):
@@ -461,10 +482,26 @@ class SqlServerDialect(Dialect):
         ]
         return pyodbc.connect(";".join(parts))
 
+    _LIMIT_TAIL = re.compile(r"\s+LIMIT\s+(\d+)\s*$", re.IGNORECASE)
+    _LEADING_SELECT = re.compile(r"^(\s*)SELECT\s", re.IGNORECASE)
+
     def sql(self, text):
+        # Interval arithmetic first, while NOW() is still recognisable.
+        text = text.replace(
+            "NOW() - INTERVAL '1 day'", "DATEADD(day, -1, SYSUTCDATETIME())"
+        )
         # SYSUTCDATETIME, never GETDATE: GETDATE is server-local and would
         # silently shift every expiry window.
         text = text.replace("NOW()", "SYSUTCDATETIME()")
+        # LIMIT n is a trailing clause; TOP n is a prefix. Rewrite rather than
+        # leave it, since only trailing "LIMIT <digits>" is ever used here.
+        trimmed = text.rstrip()
+        match = self._LIMIT_TAIL.search(trimmed)
+        if match:
+            trimmed = self._LIMIT_TAIL.sub("", trimmed)
+            text = self._LEADING_SELECT.sub(
+                "\\1SELECT TOP %s " % match.group(1), trimmed, count=1
+            )
         text = text.replace("%s", "?")
         return text
 
@@ -474,6 +511,11 @@ class SqlServerDialect(Dialect):
     def is_unique_violation(self, error):
         # 2627 = unique constraint, 2601 = unique index.
         return any(code in str(error) for code in ("2627", "2601"))
+
+    def row_lock_hint(self):
+        # PostgreSQL is MVCC; SQL Server READ COMMITTED takes shared locks and
+        # would let refresh-reuse detection be raced without this.
+        return " WITH (UPDLOCK, ROWLOCK)"
 
 
 def _make_dialect():
@@ -1298,7 +1340,7 @@ def _latest_integrity_state(installation_id):
         "score": int(row[1]),
         "verdict": row[2],
         "hard_block": bool(row[3]),
-        "reasons": row[4] if isinstance(row[4], list) else [],
+        "reasons": _as_list(DIALECT.json_value(row[4])),
         "created_at": _iso_z(row[5]),
         "age_seconds": age_seconds,
         "fresh": age_seconds <= INTEGRITY_FRESHNESS_SECONDS,
@@ -2016,11 +2058,13 @@ def _verify_challenge(
             WHERE challenge_id = %s
               AND used_at IS NULL
               AND expires_at > NOW()
-            RETURNING challenge_id
             """,
             (challenge_id,),
         )
-        if cursor.fetchone() is None:
+        # rowcount, not RETURNING/OUTPUT: the conditional UPDATE is itself the
+        # atomic single-use check on both engines, and rowcount reports it
+        # portably. SET NOCOUNT must stay OFF for this to hold on SQL Server.
+        if cursor.rowcount == 0:
             raise ApiProblem(
                 "The challenge was already consumed or expired.",
                 401,
@@ -2263,8 +2307,8 @@ def _require_access_proof(required_role="account"):
         signature,
     )
 
-    # Consume the client nonce after signature verification. ON CONFLICT gives
-    # us an atomic replay check even if the same captured request arrives twice.
+    # Consume the client nonce after signature verification, so an unverified
+    # request can never burn a nonce.
     with _cursor(commit=True) as cursor:
         cursor.execute(
             """
@@ -2272,22 +2316,29 @@ def _require_access_proof(required_role="account"):
             WHERE expires_at < NOW() - INTERVAL '1 day'
             """
         )
-        cursor.execute(
-            """
-            INSERT INTO access_proof_nonces
-                (nonce_hash, installation_id, access_token_jti, expires_at)
-            VALUES (%s, %s, %s, %s)
-            ON CONFLICT (nonce_hash) DO NOTHING
-            RETURNING nonce_hash
-            """,
-            (
-                nonce_hash,
-                installation_id,
-                token_jti,
-                _utc_now() + ACCESS_PROOF_NONCE_RETENTION,
-            ),
-        )
-        if cursor.fetchone() is None:
+        # A plain INSERT is the whole replay defence, and it is portable: a
+        # duplicate primary key IS the replay. This deliberately avoids
+        # ON CONFLICT (PostgreSQL-only) and its SQL Server translations, both
+        # of which are traps - MERGE is racy without HOLDLOCK, and
+        # IF NOT EXISTS(...) INSERT is racy under READ COMMITTED, so either
+        # would let two concurrent identical proofs through.
+        try:
+            cursor.execute(
+                """
+                INSERT INTO access_proof_nonces
+                    (nonce_hash, installation_id, access_token_jti, expires_at)
+                VALUES (%s, %s, %s, %s)
+                """,
+                (
+                    nonce_hash,
+                    installation_id,
+                    token_jti,
+                    _utc_now() + ACCESS_PROOF_NONCE_RETENTION,
+                ),
+            )
+        except Exception as error:
+            if not DIALECT.is_unique_violation(error):
+                raise
             raise ApiProblem(
                 "This signed access proof has already been used.",
                 401,
@@ -2329,16 +2380,30 @@ def _issue_device_token(installation_id, device_id, key_thumbprint):
 
 
 def _link_device_account(cursor, device_id, account_id, installation_id):
+    # Portable upsert: update first, insert only if nothing was updated. A
+    # concurrent insert losing the race raises a duplicate key, which means the
+    # link already exists - the desired end state either way.
     cursor.execute(
         """
-        INSERT INTO device_account_links
-            (device_id, account_id, first_installation_id)
-        VALUES (%s, %s, %s)
-        ON CONFLICT (device_id, account_id)
-        DO UPDATE SET last_seen_at = NOW()
+        UPDATE device_account_links
+        SET last_seen_at = NOW()
+        WHERE device_id = %s AND account_id = %s
         """,
-        (device_id, account_id, installation_id),
+        (device_id, account_id),
     )
+    if cursor.rowcount == 0:
+        try:
+            cursor.execute(
+                """
+                INSERT INTO device_account_links
+                    (device_id, account_id, first_installation_id)
+                VALUES (%s, %s, %s)
+                """,
+                (device_id, account_id, installation_id),
+            )
+        except Exception as error:
+            if not DIALECT.is_unique_violation(error):
+                raise
 
 
 def _issue_account_tokens(
@@ -2402,12 +2467,13 @@ def _refresh_session(cursor, claims, lock=False):
             "invalid_refresh_binding",
         )
 
-    suffix = " FOR UPDATE" if lock else ""
+    hint = DIALECT.row_lock_hint() if lock else ""
+    suffix = DIALECT.row_lock_suffix() if lock else ""
     cursor.execute(
         """
         SELECT family_id, account_id, device_id, installation_id,
                expires_at, revoked_at
-        FROM refresh_sessions
+        FROM refresh_sessions""" + hint + """
         WHERE session_id = %s
         """
         + suffix,
@@ -2880,11 +2946,11 @@ def integrity_report():
             SELECT c.installation_id, c.device_id, c.platform, c.nonce_sha256,
                    c.required_probes, c.expires_at, c.used_at,
                    i.key_algorithm, i.public_key_jwk, i.status, d.status
-            FROM integrity_challenges c
+            FROM integrity_challenges c""" + DIALECT.row_lock_hint() + """
             JOIN app_installations i ON i.installation_id = c.installation_id
             JOIN recognized_devices d ON d.device_id = c.device_id
             WHERE c.challenge_id = %s
-            FOR UPDATE
+            """ + DIALECT.row_lock_suffix() + """
             """,
             (challenge_id,),
         )
@@ -2919,8 +2985,19 @@ def integrity_report():
         if not hmac.compare_digest(nonce_sha256, hashlib.sha256(nonce).hexdigest()):
             raise ApiProblem("Integrity challenge nonce mismatch.", 401, "integrity_nonce_mismatch")
 
+        # psycopg2 hands back a parsed list; pyodbc hands back the raw JSON
+        # text of the nvarchar(max) column. Normalising here is what keeps the
+        # probe requirement meaningful on both engines.
+        required_probes = DIALECT.json_value(required_probes)
         if not isinstance(required_probes, list):
-            required_probes = []
+            # Fail closed. Treating an unreadable requirement list as "no
+            # probes required" would let a client omit every mandatory probe
+            # and still be scored as pristine.
+            raise ApiProblem(
+                "The stored integrity challenge could not be read.",
+                500,
+                "integrity_challenge_unreadable",
+            )
         missing = [name for name in required_probes if name not in probes]
         if missing:
             raise ApiProblem(
