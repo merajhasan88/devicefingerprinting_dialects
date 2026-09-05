@@ -1514,10 +1514,12 @@ The proof of concept becomes a reusable framework: **client SDKs in Flutter/Dart
 
 ### Supported database matrix
 
-| Engine | Floor | Rationale |
-|---|---|---|
-| PostgreSQL | **13+** | The current test server is PostgreSQL 13.23 (Debian 11). Verified. |
-| SQL Server | **2016+** | Payactiv on AWS RDS. 2016 is the first version with `OPENJSON`/`JSON_VALUE`. |
+| Engine | Syntax floor | Tested range | Rationale |
+|---|---|---|---|
+| PostgreSQL | 13 | **13 - 18** | Lab runs 13.23; RDS covers 14-18. All verified. |
+| SQL Server | 2016 | **2017 - 2025** | Written to 2016-compatible T-SQL, but 2016 is untestable: no RDS edition offers it, and SQL Server on Linux began with 2017, so there is no container either. Testing 2016 would need a Windows host. Decision (2026-09-05): keep 2016 syntax compatibility, set the **tested floor at 2017** and the **ceiling at 2025**. |
+
+SQL Server releases in range: **2017 (14.00), 2019 (15.00), 2022 (16.00), 2025 (17.00)** - four releases. There is no SQL Server 2018, 2020 or 2021.
 
 Both floors are 2016-era, so the supported window is roughly a decade. `/health/ready` now reports `database.engine`, `.version`, `.minimum_supported` and `.supported`, and the server logs an error when running below the floor. `DB_ENGINE` (`postgresql` | `sqlserver`) is the dialect selector.
 
@@ -1689,7 +1691,11 @@ Full battery = both phones, six steps each, real Frida Gadget. Conformance = the
 | PostgreSQL (RDS) | 15.19 | 26/26 (x2, incl. verify-full) | covered by 18.1 | |
 | PostgreSQL (RDS) | 14.24 | 26/26 (x2, incl. verify-full) | covered by 18.1 | |
 | PostgreSQL (RDS) | 13.x | not run | | past RDS standard support; needs paid Extended Support, and 13.23 is already proven in the lab |
-| SQL Server (RDS) | 2016-2022 | blocked | | needs the dialect work first |
+| SQL Server (RDS) | 2017 (14.00) | pending | pending | needs dialect + Redis |
+| SQL Server (RDS) | 2019 (15.00) | pending | pending | |
+| SQL Server (RDS) | 2022 (16.00) | pending | pending | |
+| SQL Server (RDS) | 2025 (17.00) | pending | pending | |
+| SQL Server | 2016 (13.00) | not testable | | no RDS edition, no Linux build; syntax compatibility retained |
 | Supabase | - | pending | | |
 
 Per-phone differences observed so far: **none**.
@@ -1794,3 +1800,26 @@ Teardown verified: no snapshots, no instances, no unattached volumes, no unattac
 No further database testing is possible until the dialect exists. `DB_ENGINE=sqlserver` currently has a version-detection branch and nothing else: no driver, no T-SQL schema, no dialect-aware queries. See section 24 for the type mapping, the compatibility policy and the two security-critical dialect differences (replay upsert semantics and refresh-reuse row locking).
 
 Supabase needs **no dialect** - it is PostgreSQL. It will be a connection-configuration test (direct connection on 5432 versus the pooler on 6543), not an engineering phase.
+
+### 25.11 The standard per-engine handset suite (2026-09-05)
+
+Fixed definition, so each engine family is tested identically and results are comparable. Run once per **engine family**, on **both handsets**, with **release builds only**:
+
+1. **Stolen access token** - Phone A mints it, Phone B replays it with its own hardware key. Must fail `invalid_installation_signature` *after* reaching proof verification.
+2. **Stolen refresh token** - same shape, via the refresh challenge. The challenge must return 200 (token genuine) before the refresh is refused.
+3. **Access-proof boundary tests (4)** - replay, body tampering, path+method tampering, stale timestamp. Must run **within 10 minutes of a session refresh**, or an expired access token makes them inconclusive.
+4. **Frida Gadget** - real gadget embedded in a release APK: scan must reach `block`, a protected call must be refused, and after restoring the clean build the device must return to `trusted`.
+
+Surrounding each run, and implied by the above: clean baseline scan, account creation through the enforce gate, and the device-memory check that a reinstall with a new hardware key is still refused.
+
+Individual database **versions** within a family get the 26-check conformance suite only. The handset exercises the client and the native collector, which are byte-identical across versions and cannot observe the database; the suite is what detects dialect behaviour.
+
+### 25.12 Redis is in scope for the SQL Server phase (2026-09-05)
+
+Redis must be incorporated as part of the SQL Server work, not deferred again. Already installed and answering on the EC2 host. Intended uses, in order of value:
+
+1. **Access-proof nonce replay cache.** `SET <nonce_hash> 1 NX PX <ttl>` is a better fit than a table plus a cleanup sweep: same atomicity, automatic expiry, no `DELETE` pass. It also sidesteps the sharpest dialect difference, since the replay defence stops depending on `ON CONFLICT` versus duplicate-key handling. Must stay switchable (`NONCE_BACKEND=redis|database`) with the database path retained, must enable AOF persistence, and the replay conformance check must pass on both backends.
+2. **Rate limiting** on `/v1/accounts/login|register`, `/v1/auth/refresh` and `/v1/installations/register`, per IP and per installation. New protection the system does not have today.
+3. Optional short-TTL caching of `_device_integrity_memory`.
+
+Redis is a new dependency (`redis`), the first added since the proof of concept.

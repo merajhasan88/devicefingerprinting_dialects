@@ -58,10 +58,13 @@ none fails fast with `api_base_url_missing`. Never hardcode an environment into 
 
 ## Supported databases
 
-| Engine | Floor | Role |
-|---|---|---|
-| PostgreSQL | **13+** | First test target, and some Payactiv systems |
-| SQL Server | **2016+** | AWS RDS. The main Payactiv target. First version with `OPENJSON`/`JSON_VALUE` |
+| Engine | Syntax floor | Tested range | Role |
+|---|---|---|---|
+| PostgreSQL | 13 | **13 - 18, all green** | Some Payactiv systems |
+| SQL Server | 2016 | **2017 - 2025** | The main Payactiv target. 2016 is untestable (no RDS edition, no Linux build) so syntax compatibility is kept but the tested floor is 2017 |
+
+SQL Server releases in range: 2017, 2019, 2022, 2025. There is no 2018, 2020 or 2021.
+Redis is in scope for the SQL Server phase - see DESIGN.md section 25.12.
 
 `DB_ENGINE` (`postgresql` or `sqlserver`) selects the dialect. `/health/ready` reports the detected
 engine, version, and whether it meets the floor. DESIGN.md section 24 holds the type mapping, the
