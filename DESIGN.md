@@ -2426,3 +2426,43 @@ remains is the on-device step — install the new client on both phones, confirm
 buckets read zero on a clean device, then enable the flag — plus a real-hardware hook test against
 libssl (`hooktest-ext.apk` is built and staged for it). Deferred only because the handsets were in
 use.
+
+## 28.8 Extended code_integrity — on-device validation (Huawei, 2026-09-05)
+
+The §28.7 extended buckets were validated on real hardware (Huawei AQM-LX1), driven entirely
+foreground (no background tasks).
+
+**App-bucket fix found during Stage 1.** A normal Flutter release APK does not extract its native
+libraries; libflutter/libapp map straight out of `base.apk`, so `/proc/self/maps` shows them backed
+by `.../base.apk`, not `.../lib/arm64/libflutter.so`. The first clean baseline read
+`app_compared_bytes=0` — the bucket was inert. Adding `.apk` to the app-bucket suffix set made it
+scan (7.6 MB), still diff 0.
+
+**Stage 1 — clean baseline, extended flag off.** core 4,808,704 B / ext 4,943,872 B /
+app 7,593,984 B, all diff 0, verdict `18/trusted`.
+
+**Stage 2 — extended flag on.**
+- Clean device stayed `18/trusted` (no false positive).
+- With eight inline hooks placed in `libc++.so` (ext bucket) via a held Frida session, a fresh scan
+  read `ext_diff_bytes=105`, `ext_libs_diff=1`, `diffed_libs=libc.so,libc++.so`, and
+  `android_code_integrity_violation +90` fired → **block**. This is the ext bucket catching a hook in
+  a non-core system library on real hardware.
+
+**A Frida-API trap worth recording.** Earlier attempts to land ext/app hooks read zero because the
+scripts used the Frida-16 `Module.getExportByName`/`Module.enumerateExports` statics, removed in
+Frida 17 (`Process.getModuleByName(name).enumerateExports()`); the calls threw and were swallowed, so
+nothing was hooked except Frida's own libc startup patch (the recurring `core_diff=71`). A second
+subtlety: Frida 17 batches Interceptor patches and flushes them at end-of-tick, so a byte read
+immediately after `attach()` still shows the original prologue — the patch is real, just deferred.
+Script-mode hooks at gadget-load also missed libflutter because it is not yet mapped that early
+(its 66 function exports appear only after engine init).
+
+**Still gated, deliberately.** `INTEGRITY_SCORE_EXTENDED_LIBS` remains **off** by default. ext/app
+were baselined only on the Huawei; the OPPO must be baselined too before enabling by default, since a
+different vendor/version could carry a benign in-memory difference in some ext library. The app bucket
+is validated two ways short of a live on-device hook (clean 7.6 MB scan on-device; scoring proven
+server-side) — a live libflutter hook was not attempted because it instruments the UI engine and
+risks crashing a phone that must not be disturbed.
+
+**Remaining to enable extended scoring by default:** baseline ext/app clean on the OPPO, then flip
+the flag; optionally a careful live libflutter hook to close the app-bucket demonstration.

@@ -39,7 +39,13 @@ const char *kExt[] = {
     "/libc++.so", "/libssl.so", "/libcrypto.so",
     "/libandroid_runtime.so", "/libbinder.so", nullptr,
 };
-const char *kApp[] = {"/libflutter.so", "/libapp.so", nullptr};
+// The app's own native code. A normal Flutter release APK does NOT extract its
+// native libraries: they are mapped straight out of the (uncompressed) zip, so
+// /proc/self/maps shows them backed by ".../base.apk" rather than
+// ".../lib/arm64/libflutter.so". Matching only the .so names measured nothing
+// on a real release build. ".apk" covers the mapped-from-archive case (base
+// and split APKs); the .so names still cover builds that do extract.
+const char *kApp[] = {"/libflutter.so", "/libapp.so", ".apk", nullptr};
 
 // Compare every executable mapping ending with `suffix` against disk.
 // Returns differing bytes (>=0) and sets *compared, or -1 if none matched.
