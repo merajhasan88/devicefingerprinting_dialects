@@ -1684,12 +1684,29 @@ Full battery = both phones, six steps each, real Frida Gadget. Conformance = the
 |---|---|---|---|---|
 | PostgreSQL (lab) | 13.23 | 26/26 | n/a | Debian 11 laptop, the supported floor |
 | PostgreSQL (RDS) | 18.1 | 26/26 | OPPO + Huawei, both clean | HTTPS, verify-full TLS, enforce |
-| PostgreSQL (RDS) | 17.x | pending | | |
-| PostgreSQL (RDS) | 16.x | pending | | |
-| PostgreSQL (RDS) | 15.x | pending | | |
-| PostgreSQL (RDS) | 14.x | pending | | |
-| PostgreSQL (RDS) | 13.x | pending | | |
+| PostgreSQL (RDS) | 17.11 | 26/26 | covered by 18.1 | |
+| PostgreSQL (RDS) | 16.15 | 26/26 | covered by 18.1 | |
+| PostgreSQL (RDS) | 15.19 | 26/26 | covered by 18.1 | |
+| PostgreSQL (RDS) | 14.24 | 26/26 | covered by 18.1 | |
+| PostgreSQL (RDS) | 13.x | not run | | past RDS standard support; needs paid Extended Support, and 13.23 is already proven in the lab |
 | SQL Server (RDS) | 2016-2022 | blocked | | needs the dialect work first |
 | Supabase | - | pending | | |
 
 Per-phone differences observed so far: **none**.
+
+### 25.4 PostgreSQL version sweep — complete (2026-09-05)
+
+Four instances were created in parallel rather than sequentially: five `db.t4g.micro` instances cost about USD 0.09/hour combined and existed for well under an hour, so the spend was the same as doing it one at a time while saving roughly forty minutes of waiting. Each was tested by repointing `DB_HOST` and restarting the service; every database starts empty and the schema guard builds it on first request.
+
+```text
+PostgreSQL 13.23  (lab, Debian 11)  26/26     the supported floor
+PostgreSQL 14.24  (RDS)             26/26
+PostgreSQL 15.19  (RDS)             26/26
+PostgreSQL 16.15  (RDS)             26/26
+PostgreSQL 17.11  (RDS)             26/26
+PostgreSQL 18.1   (RDS)             26/26     plus the full battery on both handsets
+```
+
+**The entire supported range 13 through 18 behaves identically**, including the five database-sensitive checks (replay upsert, refresh rotation and reuse row-locking, thumbprint JSON round-trip, timestamp timezone round-trip, cross-installation device memory). No version-specific behaviour was found, so the PostgreSQL floor of 13 is justified by evidence rather than assumption.
+
+PostgreSQL 13 on RDS was deliberately skipped: it is past RDS standard support and would require opting into paid Extended Support at roughly USD 0.10 per vCPU-hour, about seven times the instance cost, to re-prove a minor version (13.23) the lab has already validated.
