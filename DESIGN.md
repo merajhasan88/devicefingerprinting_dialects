@@ -1812,7 +1812,9 @@ Fixed definition, so each engine family is tested identically and results are co
 
 Surrounding each run, and implied by the above: clean baseline scan, account creation through the enforce gate, and the device-memory check that a reinstall with a new hardware key is still refused.
 
-Individual database **versions** within a family get the 26-check conformance suite only. The handset exercises the client and the native collector, which are byte-identical across versions and cannot observe the database; the suite is what detects dialect behaviour.
+Individual database **versions** within a family get the 26-check conformance suite only.
+**This reduction was agreed for the PostgreSQL sweep specifically and must not be generalised to
+another engine family without asking** — see §27.3, where applying it to SQL Server was wrong. The handset exercises the client and the native collector, which are byte-identical across versions and cannot observe the database; the suite is what detects dialect behaviour.
 
 ### 25.12 Redis is in scope for the SQL Server phase (2026-09-05)
 
@@ -1992,13 +1994,26 @@ host's system trust store, so `Encrypt=yes` with `TrustServerCertificate=no` —
 without `-C` — validate the server certificate. This is the SQL Server equivalent of the
 `verify-full` decision recorded for PostgreSQL in §25.
 
-## 27.3 Remaining for this phase
+## 27.3 Remaining for this phase — the handset battery runs on EVERY SQL Server version
 
-The per-engine-family **handset battery** (§25.11) still has to run once against SQL Server on both
-handsets: stolen access token, stolen refresh token, the four access-proof boundary tests, and the
-Frida Gadget release build. By the reasoning recorded in §25.9 it runs once for the family, not once
-per version, because the client and collector are byte-identical across versions and cannot observe
-the database.
+**Correction (2026-09-05).** The "once per engine family" rule in §25.11 was agreed for the
+**PostgreSQL** version sweep and does not carry over to SQL Server. The instruction for SQL Server
+is explicit: all versions deployed simultaneously, then each one tested on **both physical
+handsets**, and each torn down only once **its own** tests have passed.
 
-2017 was kept running for that battery — the floor version, so a pass there is the strictest result
-available. 2019, 2022 and 2025 were torn down as they passed, following the PostgreSQL pattern.
+So the required work is, for each of 2017, 2019, 2022 and 2025:
+
+1. Apply migration 001 and confirm 11 tables at schema version 1.
+2. Conformance suite (done for all four — see the table above).
+3. **Handset battery on both the OPPO and the Huawei**, release builds only: stolen access token,
+   stolen refresh token, the four access-proof boundary tests, and the Frida Gadget build.
+4. Tear that instance down.
+
+The argument that a handset cannot observe the database version is technically true — the Dart
+client and Kotlin collector are byte-identical across the runs — but it is not the criterion here.
+SQL Server is the platform this proof of concept exists to convince Payactiv about, and a
+per-version pass on real hardware is the evidence being assembled. Reduced coverage is not a
+substitute for it.
+
+2019, 2022 and 2025 were briefly torn down after the suite passed, on a mistaken reading of §25.11,
+and were recreated. 2017 stayed up throughout.
