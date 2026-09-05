@@ -3051,12 +3051,12 @@ def integrity_challenge():
     with _cursor(commit=True) as cursor:
         cursor.execute(
             """
-            DELETE FROM integrity_challenges AS c
-            WHERE c.expires_at < NOW() - INTERVAL '1 day'
+            DELETE FROM integrity_challenges
+            WHERE expires_at < NOW() - INTERVAL '1 day'
               AND NOT EXISTS (
                   SELECT 1
                   FROM integrity_reports AS r
-                  WHERE r.challenge_id = c.challenge_id
+                  WHERE r.challenge_id = integrity_challenges.challenge_id
               )
             """
         )

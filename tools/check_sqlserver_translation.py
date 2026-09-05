@@ -30,6 +30,15 @@ FORBIDDEN = [
     (re.compile(r"\bFOR\s+UPDATE\b", re.I), "FOR UPDATE survived translation"),
     (re.compile(r"\bSERIAL\b", re.I), "SERIAL survived translation"),
     (re.compile(r"\bJSONB\b", re.I), "JSONB survived translation"),
+    # PostgreSQL accepts "DELETE FROM t AS alias"; SQL Server rejects it and
+    # wants "DELETE alias FROM t AS alias". Dropping the alias suits both.
+    (
+        re.compile(
+            r"\bDELETE\s+FROM\s+\w+\s+(?:AS\s+)?(?!WHERE\b|OUTPUT\b|FROM\b)\w+",
+            re.I,
+        ),
+        "aliased DELETE target",
+    ),
 ]
 STATEMENT = re.compile(r"\b(SELECT|INSERT|UPDATE|DELETE)\b", re.I)
 # Statements are sometimes built by concatenating fragments, so a literal need
