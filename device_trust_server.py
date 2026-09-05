@@ -1180,6 +1180,12 @@ def _integrity_probe_plan(platform):
             "selinux",
             "mounts",
             "frida_ports",
+            # Structural hook detection. These do not depend on the injected
+            # library's filename, unlike runtime_maps, so they survive the
+            # rename-and-move-port evasion documented in DESIGN.md 27.11.
+            "instrumentation_threads",
+            "exec_mappings",
+            "code_integrity",
         ]
         optional = [
             "emulator",
@@ -1400,6 +1406,36 @@ def _score_android_integrity(probes):
     if 27042 in open_ports or 27043 in open_ports:
         _integrity_reason(reasons, "android_frida_port_open", 75, "A common local Frida server port is accepting connections.")
         score += 75
+
+    # Structural hook detection (DESIGN.md 27.10-27.12). These signals do not
+    # depend on the injected library's filename, so they survive the rename +
+    # non-default-port evasion that defeats runtime_maps and frida_ports.
+    threads = _probe(probes, "instrumentation_threads")
+    frida_threads = _as_list(threads.get("frida_threads"))
+    token_threads = _as_list(threads.get("token_threads"))
+    glib_threads = _as_list(threads.get("glib_threads"))
+    if frida_threads or token_threads:
+        _integrity_reason(reasons, "android_instrumentation_runtime_thread", 90,
+                          "A Frida/Gum instrumentation runtime thread is present in the process.")
+        score += 90
+    elif glib_threads:
+        # GLib threads are a Frida dependency but not conclusive alone (an app
+        # could in principle bundle GLib); weight to elevated, not block.
+        _integrity_reason(reasons, "android_glib_runtime_thread", 40,
+                          "GLib runtime threads, a common Frida dependency, are present in the process.")
+        score += 40
+
+    exec_maps = _probe(probes, "exec_mappings")
+    if int(exec_maps.get("wx_mappings") or 0) > 0:
+        _integrity_reason(reasons, "android_wx_memory", 60,
+                          "Writable-and-executable memory is mapped into the process.")
+        score += 60
+    if int(exec_maps.get("deleted_exec_mappings") or 0) > 0:
+        # The ART JIT cache is excluded client-side; what remains is an
+        # executable region backed by a deleted file, a classic injection shape.
+        _integrity_reason(reasons, "android_deleted_code_mapping", 55,
+                          "Executable memory backed by a deleted file is mapped into the process.")
+        score += 55
 
     emulator = _probe(probes, "emulator")
     if _as_bool(emulator.get("suspected")) and not INTEGRITY_ALLOW_EMULATOR:

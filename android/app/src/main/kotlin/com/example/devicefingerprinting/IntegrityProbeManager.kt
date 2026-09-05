@@ -74,6 +74,9 @@ class IntegrityProbeManager(private val context: Context) {
                     "frida_ports" -> probeFridaPorts()
                     "emulator" -> probeEmulator()
                     "developer_settings" -> probeDeveloperSettings()
+                    "instrumentation_threads" -> probeInstrumentationThreads()
+                    "exec_mappings" -> probeExecMappings()
+                    "code_integrity" -> probeCodeIntegrity()
                     else -> resultUnsupported("Unknown probe requested by server")
                 }
             } catch (error: Throwable) {
@@ -436,6 +439,184 @@ class IntegrityProbeManager(private val context: Context) {
         return ok(
             "adb_enabled" to adb,
             "developer_options_enabled" to developer
+        )
+    }
+
+    /**
+     * Instrumentation-runtime thread names.
+     *
+     * Structural, not name-of-file based: Frida's Gum runtime and its GLib
+     * dependency spawn threads with names compiled into the framework
+     * (gum-js-loop, pool-frida, gmain, gdbus). Renaming the injected .so - which
+     * defeats the /proc/self/maps pathname scan - does not rename these threads,
+     * so an idle, renamed Frida Gadget is still visible here. Reads
+     * /proc/self/task/<tid>/comm, which an app can always read for its own
+     * threads regardless of SELinux.
+     */
+    private fun probeInstrumentationThreads(): Map<String, Any> {
+        // Unmistakably Frida/Gum: these are compiled into the framework, so a
+        // renamed injected .so keeps them. gum-js-loop is the Gum JS event loop.
+        val fridaThreads = listOf("gum-js-loop", "gum-js", "pool-frida")
+        // GLib runtime threads: Frida pulls GLib in, and Android apps almost
+        // never link GLib themselves, but reported separately so the server can
+        // weight them as corroborating rather than conclusive.
+        val glibThreads = listOf("gmain", "gdbus", "pool-spawner")
+        val fridaHits = linkedSetOf<String>()
+        val glibHits = linkedSetOf<String>()
+        val tokenHits = linkedSetOf<String>()
+        var count = 0
+        val tasks = File("/proc/self/task").listFiles()
+        if (tasks != null) {
+            for (task in tasks) {
+                val comm = File(task, "comm")
+                if (!comm.canRead()) continue
+                val name = try { comm.readText().trim() } catch (_: Throwable) { continue }
+                if (name.isEmpty()) continue
+                count++
+                val lower = name.lowercase(Locale.US)
+                for (t in fridaThreads) if (lower == t || lower.startsWith(t)) fridaHits.add(t)
+                for (t in glibThreads) if (lower == t) glibHits.add(t)
+                for (t in suspiciousRuntimeTokens) if (lower.contains(t)) tokenHits.add(t)
+            }
+        }
+        return ok(
+            "frida_threads" to fridaHits.toList(),
+            "glib_threads" to glibHits.toList(),
+            "token_threads" to tokenHits.toList(),
+            "thread_count" to count
+        )
+    }
+
+    /**
+     * Structurally suspicious executable memory.
+     *
+     * Behaviour-based: inline-hooking and injection frameworks allocate
+     * executable trampoline/agent memory. Two shapes are rare in a clean,
+     * W^X-compliant app and are reported here: mappings that are simultaneously
+     * writable and executable, and executable mappings backed by a file marked
+     * "(deleted)". Anonymous executable regions carrying a recognized
+     * "[anon:...]" label (for example the ART JIT code cache) are counted
+     * separately as telemetry and are NOT treated as suspicious, to avoid
+     * flagging the legitimate runtime.
+     */
+    private fun probeExecMappings(): Map<String, Any> {
+        var wx = 0
+        var deletedExec = 0
+        var deletedExecJit = 0
+        var anonExecLabeled = 0
+        var anonExecUnlabeled = 0
+        val samples = mutableListOf<String>()
+        val file = File("/proc/self/maps")
+        if (file.canRead()) {
+            file.forEachLine { line ->
+                val parts = line.trim().split(Regex("\\s+"), limit = 6)
+                if (parts.size < 5) return@forEachLine
+                val perms = parts[1]
+                if (perms.length < 4) return@forEachLine
+                val writable = perms[1] == 'w'
+                val executable = perms[2] == 'x'
+                if (!executable) return@forEachLine
+                val path = if (parts.size >= 6) parts[5] else ""
+                if (writable) {
+                    wx++
+                    if (samples.size < 8) samples.add(line.trim().take(160))
+                }
+                if (path.contains("(deleted)")) {
+                    // The ART JIT code cache is a memfd/ashmem region that
+                    // always shows as executable and "(deleted)" on a clean
+                    // device. Exclude it, or every device is a false positive.
+                    val lower = path.lowercase(Locale.US)
+                    val isJit = lower.contains("jit-cache") ||
+                        lower.contains("dalvik-jit-code-cache") ||
+                        lower.contains("dalvik-") ||
+                        lower.contains("/art") ||
+                        lower.contains("jit-zygote")
+                    if (isJit) {
+                        deletedExecJit++
+                    } else {
+                        deletedExec++
+                        if (samples.size < 8) samples.add(line.trim().take(160))
+                    }
+                }
+                if (path.isEmpty()) {
+                    anonExecUnlabeled++
+                } else if (path.startsWith("[anon:")) {
+                    anonExecLabeled++
+                }
+            }
+        }
+        return ok(
+            "wx_mappings" to wx,
+            "deleted_exec_mappings" to deletedExec,
+            "deleted_exec_jit" to deletedExecJit,
+            "anon_exec_labeled" to anonExecLabeled,
+            "anon_exec_unlabeled" to anonExecUnlabeled,
+            "samples" to samples
+        )
+    }
+
+    /**
+     * Code integrity of libc: in-memory .text versus the same bytes on disk.
+     *
+     * The purest structural check. An inline hook overwrites the prologue of a
+     * hooked function with a trampoline, so the executable segment loaded in
+     * memory diverges from the file on disk. This is name-independent and
+     * behaviour-based - it catches any inline-hooking library, whatever it is
+     * called. The executable segment is not modified at runtime by the dynamic
+     * linker (relocations land in the GOT/data segments, not in .text), so on a
+     * clean device the two are byte-identical. Reads a bounded window through
+     * /proc/self/mem, which an app may read for its own address space.
+     */
+    private fun probeCodeIntegrity(): Map<String, Any> {
+        val maxWindow = 512 * 1024
+        val maps = File("/proc/self/maps")
+        if (!maps.canRead()) return ok("checked" to false, "reason" to "maps_unreadable")
+        var start = 0L
+        var end = 0L
+        var fileOffset = 0L
+        var path = ""
+        run {
+            maps.forEachLine { line ->
+                if (path.isNotEmpty()) return@forEachLine
+                val parts = line.trim().split(Regex("\\s+"), limit = 6)
+                if (parts.size < 6) return@forEachLine
+                val perms = parts[1]
+                val p = parts[5]
+                if (perms.length >= 3 && perms[2] == 'x' && p.endsWith("/libc.so")) {
+                    val range = parts[0].split('-')
+                    start = range[0].toLong(16)
+                    end = range[1].toLong(16)
+                    fileOffset = parts[2].toLong(16)
+                    path = p
+                }
+            }
+        }
+        if (path.isEmpty()) return ok("checked" to false, "reason" to "libc_text_not_found")
+        val libFile = File(path)
+        if (!libFile.canRead()) return ok("checked" to false, "reason" to "libc_file_unreadable", "path" to path)
+        val length = minOf(end - start, maxWindow.toLong()).toInt()
+        if (length <= 0) return ok("checked" to false, "reason" to "empty_segment")
+        val memBytes = ByteArray(length)
+        val diskBytes = ByteArray(length)
+        try {
+            java.io.RandomAccessFile("/proc/self/mem", "r").use { mem ->
+                mem.seek(start)
+                mem.readFully(memBytes)
+            }
+            java.io.RandomAccessFile(libFile, "r").use { disk ->
+                disk.seek(fileOffset)
+                disk.readFully(diskBytes)
+            }
+        } catch (error: Throwable) {
+            return ok("checked" to false, "reason" to ("read_failed:" + error.javaClass.simpleName))
+        }
+        var diff = 0
+        for (i in 0 until length) if (memBytes[i] != diskBytes[i]) diff++
+        return ok(
+            "checked" to true,
+            "path" to path,
+            "compared_bytes" to length,
+            "diff_bytes" to diff
         )
     }
 

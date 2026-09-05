@@ -601,6 +601,23 @@ def clean_probes(required, cert=None):
         },
         "mounts": {"status": "ok", "protected_rw_mounts": []},
         "frida_ports": {"status": "ok", "open_ports": []},
+        "instrumentation_threads": {
+            "status": "ok",
+            "frida_threads": [],
+            "glib_threads": [],
+            "token_threads": [],
+            "thread_count": 42,
+        },
+        "exec_mappings": {
+            "status": "ok",
+            "wx_mappings": 0,
+            "deleted_exec_mappings": 0,
+            "deleted_exec_jit": 1,
+            "anon_exec_labeled": 1,
+            "anon_exec_unlabeled": 0,
+            "samples": [],
+        },
+        "code_integrity": {"status": "ok", "checked": False, "reason": "libc_file_unreadable"},
         "emulator": {"status": "ok", "suspected": False},
         "developer_settings": {
             "status": "ok",
@@ -843,6 +860,70 @@ def check_cert_mismatch(api, ctx):
         )
     expect(decision["verdict"] == "block", "expected block, got %s" % decision["verdict"])
     expect(decision["score"] == 100, "hard block should cap at 100, got %s" % decision["score"])
+
+
+@check("integrity: a renamed Frida gadget is caught by its runtime thread")
+def check_instrumentation_thread(api, ctx):
+    """The DESIGN.md 27.11 evasion, as a permanent regression test.
+
+    runtime_maps and frida_ports are left CLEAN - as they are when the injected
+    library is renamed and moved off the default port - so only the structural
+    signal is present. This must still block, or the rename evasion is back.
+    """
+    installation, token, _ = integrity_context(ctx)
+
+    def renamed_gadget(probes):
+        probes["runtime_maps"]["suspicious_tokens"] = []
+        probes["frida_ports"]["open_ports"] = []
+        probes["instrumentation_threads"]["frida_threads"] = ["gum-js-loop"]
+
+    decision = submit_report(api, installation, token, renamed_gadget)
+    expect(
+        "android_instrumentation_runtime_thread" in codes(decision),
+        "expected android_instrumentation_runtime_thread, got %s" % codes(decision),
+    )
+    expect(
+        decision.get("verdict") == "block",
+        "a renamed gadget must still block; got verdict %r" % decision.get("verdict"),
+    )
+
+
+@check("integrity: writable-executable memory is caught")
+def check_wx_memory(api, ctx):
+    installation, token, _ = integrity_context(ctx)
+    decision = submit_report(
+        api,
+        installation,
+        token,
+        lambda probes: probes["exec_mappings"].update({"wx_mappings": 1}),
+    )
+    expect(
+        "android_wx_memory" in codes(decision),
+        "expected android_wx_memory, got %s" % codes(decision),
+    )
+
+
+@check("integrity: the ART JIT code cache is not mistaken for injection")
+def check_jit_not_flagged(api, ctx):
+    """deleted_exec_jit is the legitimate JIT cache; it must never score."""
+    installation, token, _ = integrity_context(ctx)
+    decision = submit_report(
+        api,
+        installation,
+        token,
+        lambda probes: probes["exec_mappings"].update(
+            {"deleted_exec_jit": 3, "deleted_exec_mappings": 0}
+        ),
+    )
+    expect(
+        "android_deleted_code_mapping" not in codes(decision),
+        "the JIT cache must not be flagged; got %s" % codes(decision),
+    )
+    expect(
+        decision.get("verdict") == "trusted",
+        "a device with only the JIT cache must stay trusted; got %r"
+        % decision.get("verdict"),
+    )
 
 
 @check("integrity: a probe that fails to run is penalised")
