@@ -53,6 +53,17 @@ class IntegrityProbeManager(private val context: Context) {
 
     @Volatile private var cachedApkSha256: String? = null
 
+    // Native code-integrity component. Loaded best-effort: if it is absent the
+    // probe degrades to reporting checked=false rather than crashing.
+    private external fun nativeCodeIntegrity(): LongArray?
+
+    private val nativeAvailable: Boolean = try {
+        System.loadLibrary("codeintegrity")
+        true
+    } catch (_: Throwable) {
+        false
+    }
+
     fun collect(
         requiredProbes: List<String>,
         challengeNonce: String,
@@ -568,57 +579,41 @@ class IntegrityProbeManager(private val context: Context) {
      * /proc/self/mem, which an app may read for its own address space.
      */
     private fun probeCodeIntegrity(): Map<String, Any> {
-        val maxWindow = 512 * 1024
-        val maps = File("/proc/self/maps")
-        if (!maps.canRead()) return ok("checked" to false, "reason" to "maps_unreadable")
-        var start = 0L
-        var end = 0L
-        var fileOffset = 0L
-        var path = ""
-        run {
-            maps.forEachLine { line ->
-                if (path.isNotEmpty()) return@forEachLine
-                val parts = line.trim().split(Regex("\\s+"), limit = 6)
-                if (parts.size < 6) return@forEachLine
-                val perms = parts[1]
-                val p = parts[5]
-                if (perms.length >= 3 && perms[2] == 'x' && p.endsWith("/libc.so")) {
-                    val range = parts[0].split('-')
-                    start = range[0].toLong(16)
-                    end = range[1].toLong(16)
-                    fileOffset = parts[2].toLong(16)
-                    path = p
-                }
-            }
+        // Native reads our own mapped r-x pages by pointer, so unlike the
+        // /proc/self/mem path it is not blocked by SELinux. Compares libc and
+        // libart .text in memory against the same bytes on disk; any inline
+        // hook overwrites a prologue and shows up as a byte difference,
+        // whatever the hooking framework is called.
+        if (!nativeAvailable) {
+            return ok("checked" to false, "reason" to "native_unavailable")
         }
-        if (path.isEmpty()) return ok("checked" to false, "reason" to "libc_text_not_found")
-        val libFile = File(path)
-        if (!libFile.canRead()) return ok("checked" to false, "reason" to "libc_file_unreadable", "path" to path)
-        val length = minOf(end - start, maxWindow.toLong()).toInt()
-        if (length <= 0) return ok("checked" to false, "reason" to "empty_segment")
-        val memBytes = ByteArray(length)
-        val diskBytes = ByteArray(length)
-        try {
-            java.io.RandomAccessFile("/proc/self/mem", "r").use { mem ->
-                mem.seek(start)
-                mem.readFully(memBytes)
-            }
-            java.io.RandomAccessFile(libFile, "r").use { disk ->
-                disk.seek(fileOffset)
-                disk.readFully(diskBytes)
-            }
+        val values = try {
+            nativeCodeIntegrity()
         } catch (error: Throwable) {
-            return ok("checked" to false, "reason" to ("read_failed:" + error.javaClass.simpleName))
+            return ok("checked" to false, "reason" to ("native_error:" + error.javaClass.simpleName))
         }
-        var diff = 0
-        for (i in 0 until length) if (memBytes[i] != diskBytes[i]) diff++
+        if (values == null || values.size < 5) {
+            return ok("checked" to false, "reason" to "native_no_result")
+        }
+        val status = values[0]
+        if (status < 0L) {
+            return ok("checked" to false, "reason" to ("libc_status:" + status))
+        }
+        val libcCompared = values[1]
+        val libcDiff = values[2]
+        val libartCompared = values[3]
+        val libartDiff = values[4]
+        val totalDiff = libcDiff + (if (libartDiff > 0) libartDiff else 0)
         return ok(
             "checked" to true,
-            "path" to path,
-            "compared_bytes" to length,
-            "diff_bytes" to diff
+            "libc_compared_bytes" to libcCompared,
+            "libc_diff_bytes" to libcDiff,
+            "libart_compared_bytes" to libartCompared,
+            "libart_diff_bytes" to libartDiff,
+            "diff_bytes" to totalDiff
         )
     }
+
 
     private fun runCommand(command: List<String>): String {
         return try {

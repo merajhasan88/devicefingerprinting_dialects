@@ -1425,6 +1425,16 @@ def _score_android_integrity(probes):
                           "GLib runtime threads, a common Frida dependency, are present in the process.")
         score += 40
 
+    # Code integrity: native compares libc/libart .text in memory against disk.
+    # An inline hook overwrites a function prologue (at least one 4-byte branch
+    # on arm64), so any diff at or above that is a modification. Clean devices
+    # measured exactly zero, so the threshold is margin, not tuning.
+    code = _probe(probes, "code_integrity")
+    if _as_bool(code.get("checked")) and int(code.get("diff_bytes") or 0) >= 4:
+        _integrity_reason(reasons, "android_code_integrity_violation", 85,
+                          "A system library's executable code differs from its on-disk image (inline hook).")
+        score += 85
+
     exec_maps = _probe(probes, "exec_mappings")
     if int(exec_maps.get("wx_mappings") or 0) > 0:
         _integrity_reason(reasons, "android_wx_memory", 60,
