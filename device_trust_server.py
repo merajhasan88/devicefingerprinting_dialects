@@ -345,15 +345,35 @@ def transport_guard():
 # ---------------------------------------------------------------------------
 
 
-def _connect_db():
-    return psycopg2.connect(
-        host=os.environ.get("DB_HOST", "localhost"),
-        port=int(os.environ.get("DB_PORT", "5432")),
-        database=os.environ.get("DB_NAME", "familyappdb"),
-        user=os.environ["DB_USERNAME"],
-        password=os.environ["DB_PASSWORD"],
-        connect_timeout=int(os.environ.get("DB_CONNECT_TIMEOUT", "5")),
+# TLS to the database. Managed engines commonly force TLS (RDS sets
+# rds.force_ssl), and psycopg2's default "prefer" would silently accept an
+# unverified session. "verify-full" additionally pins the server certificate to
+# a trusted CA *and* checks the hostname, which is what stops an attacker who
+# can reach the database subnet from impersonating it. Point DB_SSLROOTCERT at
+# the provider CA bundle (for RDS:
+# https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem).
+DB_SSLMODE = os.environ.get("DB_SSLMODE", "prefer").strip()
+DB_SSLROOTCERT = os.environ.get("DB_SSLROOTCERT", "").strip()
+
+if DB_SSLMODE in ("verify-ca", "verify-full") and not DB_SSLROOTCERT:
+    raise RuntimeError(
+        "DB_SSLMODE=%s requires DB_SSLROOTCERT to point at the CA bundle." % DB_SSLMODE
     )
+
+
+def _connect_db():
+    options = {
+        "host": os.environ.get("DB_HOST", "localhost"),
+        "port": int(os.environ.get("DB_PORT", "5432")),
+        "database": os.environ.get("DB_NAME", "familyappdb"),
+        "user": os.environ["DB_USERNAME"],
+        "password": os.environ["DB_PASSWORD"],
+        "connect_timeout": int(os.environ.get("DB_CONNECT_TIMEOUT", "5")),
+        "sslmode": DB_SSLMODE,
+    }
+    if DB_SSLROOTCERT:
+        options["sslrootcert"] = DB_SSLROOTCERT
+    return psycopg2.connect(**options)
 
 
 @contextmanager
