@@ -39,7 +39,7 @@ namespace DeviceTrust.Cli
 
             try
             {
-                return await DispatchAsync(command, positional, configuration, cancellation.Token)
+                return await DispatchAsync(command, positional, switches, configuration, cancellation.Token)
                     .ConfigureAwait(false);
             }
             catch (DeviceTrustConfigurationException error)
@@ -70,6 +70,7 @@ namespace DeviceTrust.Cli
         private static async Task<int> DispatchAsync(
             string command,
             IReadOnlyList<string> positional,
+            IReadOnlyDictionary<string, string> switches,
             HarnessConfiguration configuration,
             CancellationToken cancellationToken)
         {
@@ -83,7 +84,8 @@ namespace DeviceTrust.Cli
                 case "bootstrap":
                     return await EnrollAsync(configuration, cancellationToken).ConfigureAwait(false);
                 case "account":
-                    return await AccountAsync(positional, configuration, cancellationToken).ConfigureAwait(false);
+                    return await AccountAsync(positional, switches, configuration, cancellationToken)
+                        .ConfigureAwait(false);
                 case "me":
                     return await AccountMeAsync(configuration, cancellationToken).ConfigureAwait(false);
                 case "echo":
@@ -197,6 +199,7 @@ namespace DeviceTrust.Cli
 
         private static async Task<int> AccountAsync(
             IReadOnlyList<string> positional,
+            IReadOnlyDictionary<string, string> switches,
             HarnessConfiguration configuration,
             CancellationToken cancellationToken)
         {
@@ -207,7 +210,9 @@ namespace DeviceTrust.Cli
                 return 1;
             }
 
-            var switches = ParseArguments(positional.Skip(1).ToArray()).Switches;
+            // The switches come from the single top-level parse. Re-parsing the
+            // leftover positional arguments here would find nothing, because
+            // --handle and --password were already consumed as switches.
             if (!switches.TryGetValue("handle", out var handle) || string.IsNullOrWhiteSpace(handle)
                 || !switches.TryGetValue("password", out var password) || string.IsNullOrWhiteSpace(password))
             {

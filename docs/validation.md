@@ -136,7 +136,39 @@ The four access-proof boundary tests ran within seconds of a session refresh, sa
 "within 10 minutes of a refresh" condition that stops an expired access token from making them
 inconclusive.
 
-## 5. Builds
+## 5. The command surface, end to end
+
+Every CLI command was run against the live server, not only the two suites.
+
+`health` reported the engine and mode above. `keyinfo` printed the software key and warned that it
+is not hardware-backed. `enroll` registered, proved possession, scored 0/trusted and read the device
+record. `account register`, `me`, `echo`, `policy`, `refresh`, `me` again, and `account login` all
+succeeded; `echo` confirmed `access_proof: accepted` with the body round-tripped, and the session id
+in `me` changed after `refresh`, which is the rotation actually taking effect rather than a cached
+token being reused.
+
+Two behaviours are worth recording separately.
+
+**A run with no endpoint fails closed.** Unsetting `API_BASE_URL` produced
+`api_base_url_missing` and exit code 2, before any network call.
+
+**Reinstall recognition works from .NET.** After `reset` — which deletes the installation key and
+all local state — a fresh `enroll` presented a new key and a new UUID, and the server correlated it
+back to the *same* `device_id` through the reinstall hint:
+
+\`\`\`
+Installation id     b50b2407-27d5-4b08-b8ed-acfa467155a0   (new)
+Device id           36ba72bf-9f39-4bb4-808f-63a751d4eef4   (unchanged)
+Recognition         reinstall_hint / medium
+Known installations 2
+\`\`\`
+
+Running the commands rather than assuming them found a real defect: `account register --handle x
+--password y` failed with "Both --handle and --password are required", because the subcommand
+re-parsed the leftover positional arguments after the top-level parser had already consumed those
+switches. Fixed by threading the single parse result through.
+
+## 6. Builds
 
 ```
 DeviceTrust.Client           net6.0, net8.0                    0 warnings, 0 errors
