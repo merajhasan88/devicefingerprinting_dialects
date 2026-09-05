@@ -1431,9 +1431,11 @@ def _score_android_integrity(probes):
     # measured exactly zero, so the threshold is margin, not tuning.
     code = _probe(probes, "code_integrity")
     if _as_bool(code.get("checked")) and int(code.get("diff_bytes") or 0) >= 4:
-        _integrity_reason(reasons, "android_code_integrity_violation", 85,
+        # Modified system-library code in memory is unambiguous tampering, as
+        # definitive as a mapped Frida artifact, so it blocks on its own.
+        _integrity_reason(reasons, "android_code_integrity_violation", 90,
                           "A system library's executable code differs from its on-disk image (inline hook).")
-        score += 85
+        score += 90
 
     exec_maps = _probe(probes, "exec_mappings")
     if int(exec_maps.get("wx_mappings") or 0) > 0:

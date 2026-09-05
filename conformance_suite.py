@@ -617,7 +617,15 @@ def clean_probes(required, cert=None):
             "anon_exec_unlabeled": 0,
             "samples": [],
         },
-        "code_integrity": {"status": "ok", "checked": False, "reason": "libc_file_unreadable"},
+        "code_integrity": {
+            "status": "ok",
+            "checked": True,
+            "libc_compared_bytes": 614400,
+            "libc_diff_bytes": 0,
+            "libart_compared_bytes": 4194304,
+            "libart_diff_bytes": 0,
+            "diff_bytes": 0,
+        },
         "emulator": {"status": "ok", "suspected": False},
         "developer_settings": {
             "status": "ok",
@@ -900,6 +908,29 @@ def check_wx_memory(api, ctx):
     expect(
         "android_wx_memory" in codes(decision),
         "expected android_wx_memory, got %s" % codes(decision),
+    )
+
+
+@check("integrity: an inline hook in a system library is caught")
+def check_code_integrity(api, ctx):
+    """Native code_integrity: libc .text in memory diverging from disk is an
+    inline hook, caught by byte comparison whatever the hooking tool is called."""
+    installation, token, _ = integrity_context(ctx)
+    decision = submit_report(
+        api,
+        installation,
+        token,
+        lambda probes: probes["code_integrity"].update(
+            {"libc_diff_bytes": 71, "diff_bytes": 71}
+        ),
+    )
+    expect(
+        "android_code_integrity_violation" in codes(decision),
+        "expected android_code_integrity_violation, got %s" % codes(decision),
+    )
+    expect(
+        decision.get("verdict") == "block",
+        "an inline hook must block; got %r" % decision.get("verdict"),
     )
 
 
