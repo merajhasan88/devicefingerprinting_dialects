@@ -2536,11 +2536,18 @@ The flag stays off until the OPPO is baselined, because ext/app were measured cl
 Huawei and a different vendor/Android version could carry a benign in-memory difference in some ext
 library. Procedure, for when the OPPO is free:
 
-0. **The EC2 public IP changes on restart.** The instance was stopped without an Elastic IP, so
-   `54.203.12.110` is gone. On restart: read the new public IP, update the Caddy site block to the
-   new `<a-b-c-d>.nip.io` name (Let's Encrypt re-issues automatically), and **rebuild the APK with
-   the new `--dart-define=API_BASE_URL`** — the old APKs point at the retired hostname. Allocating an
-   Elastic IP would avoid this permanently, at roughly USD 3.60/month if left attached.
+0. **The address is now pinned.** The old auto-assigned `54.203.12.110` was released when the
+   instance stopped and could not be reclaimed (auto-assigned addresses return to the AWS pool;
+   only previously-allocated Elastic IPs can be recovered). An Elastic IP
+   **`35.84.247.101` (`eipalloc-02009d861ed53203d`)** is now associated with the instance and
+   survives stop/start, so this is a one-time cost:
+   - update the Caddy site block once to **`35-84-247-101.nip.io`** (Let's Encrypt re-issues
+     automatically), and
+   - rebuild the client once with `--dart-define=API_BASE_URL=https://35-84-247-101.nip.io` — the
+     staged APKs still point at the retired host.
+
+   After that the hostname is stable for the life of the project. Release the Elastic IP at final
+   teardown or it accrues (~USD 3.60/month if left allocated).
 1. Stand up an engine (SQL Server or PostgreSQL) and the EC2 server; server in `enforce`,
    `INTEGRITY_SCORE_EXTENDED_LIBS` **off**.
 2. Install the current clean client (v2 collector) on the OPPO; launch; it auto-scans.
