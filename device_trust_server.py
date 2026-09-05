@@ -152,6 +152,14 @@ INTEGRITY_FRESHNESS_SECONDS = int(
 INTEGRITY_DEVICE_MEMORY_HOURS = int(
     os.environ.get("INTEGRITY_DEVICE_MEMORY_HOURS", "24")
 )
+# Code-integrity scoring for the extended library set (ext + the app's own
+# native code) is off until its clean baseline is confirmed on real hardware.
+# Core (libc/libart) is always scored; it was validated at zero on both
+# handsets. Turning this on scores the additional system libraries and the
+# app's own code once they are likewise confirmed clean.
+INTEGRITY_SCORE_EXTENDED_LIBS = (
+    os.environ.get("INTEGRITY_SCORE_EXTENDED_LIBS", "0").strip() == "1"
+)
 INTEGRITY_RANDOM_OPTIONAL_PROBES = int(
     os.environ.get("INTEGRITY_RANDOM_OPTIONAL_PROBES", "4")
 )
@@ -1430,11 +1438,23 @@ def _score_android_integrity(probes):
     # on arm64), so any diff at or above that is a modification. Clean devices
     # measured exactly zero, so the threshold is margin, not tuning.
     code = _probe(probes, "code_integrity")
-    if _as_bool(code.get("checked")) and int(code.get("diff_bytes") or 0) >= 4:
+    code_checked = _as_bool(code.get("checked"))
+    core_diff = int(code.get("diff_bytes") or 0)
+    ext_diff = int(code.get("ext_diff_bytes") or 0)
+    app_diff = int(code.get("app_diff_bytes") or 0)
+    # Core libc/libart is always scored. The extended system libraries are
+    # folded in only once their on-device baseline is confirmed (the flag).
+    system_diff = core_diff + (ext_diff if INTEGRITY_SCORE_EXTENDED_LIBS else 0)
+    if code_checked and system_diff >= 4:
         # Modified system-library code in memory is unambiguous tampering, as
-        # definitive as a mapped Frida artifact, so it blocks on its own.
+        # definitive as a mapped Frida artifact, so it blocks on its own. The
+        # 4-byte floor is one arm64 branch, the smallest inline hook.
         _integrity_reason(reasons, "android_code_integrity_violation", 90,
                           "A system library's executable code differs from its on-disk image (inline hook).")
+        score += 90
+    if code_checked and INTEGRITY_SCORE_EXTENDED_LIBS and app_diff >= 4:
+        _integrity_reason(reasons, "android_app_code_modified", 90,
+                          "The application's own native code differs from its packaged image.")
         score += 90
 
     exec_maps = _probe(probes, "exec_mappings")

@@ -14,6 +14,7 @@ import java.net.InetSocketAddress
 import java.net.Socket
 import java.security.MessageDigest
 import java.util.Locale
+import org.json.JSONObject
 
 /**
  * Local integrity measurement collector.
@@ -55,7 +56,7 @@ class IntegrityProbeManager(private val context: Context) {
 
     // Native code-integrity component. Loaded best-effort: if it is absent the
     // probe degrades to reporting checked=false rather than crashing.
-    private external fun nativeCodeIntegrity(): LongArray?
+    private external fun nativeCodeIntegrity(): String?
 
     private val nativeAvailable: Boolean = try {
         System.loadLibrary("codeintegrity")
@@ -580,40 +581,41 @@ class IntegrityProbeManager(private val context: Context) {
      */
     private fun probeCodeIntegrity(): Map<String, Any> {
         // Native reads our own mapped r-x pages by pointer, so unlike the
-        // /proc/self/mem path it is not blocked by SELinux. Compares libc and
-        // libart .text in memory against the same bytes on disk; any inline
-        // hook overwrites a prologue and shows up as a byte difference,
-        // whatever the hooking framework is called.
+        // /proc/self/mem path it is not blocked by SELinux. It compares three
+        // buckets of libraries in memory against disk: core (libc/libart),
+        // ext (other system hook targets incl. TLS), and app (the app's own
+        // native code). Any inline hook overwrites a prologue and shows up as
+        // a byte difference, whatever the hooking framework is called.
         if (!nativeAvailable) {
             return ok("checked" to false, "reason" to "native_unavailable")
         }
-        val values = try {
+        val json = try {
             nativeCodeIntegrity()
         } catch (error: Throwable) {
             return ok("checked" to false, "reason" to ("native_error:" + error.javaClass.simpleName))
         }
-        if (values == null || values.size < 5) {
+        if (json.isNullOrEmpty()) {
             return ok("checked" to false, "reason" to "native_no_result")
         }
-        val status = values[0]
-        if (status < 0L) {
-            return ok("checked" to false, "reason" to ("libc_status:" + status))
+        return try {
+            val o = JSONObject(json)
+            ok(
+                "checked" to o.optBoolean("checked", false),
+                "diff_bytes" to o.optLong("diff_bytes", 0),
+                "core_compared_bytes" to o.optLong("core_compared_bytes", 0),
+                "core_diff_bytes" to o.optLong("core_diff_bytes", 0),
+                "ext_compared_bytes" to o.optLong("ext_compared_bytes", 0),
+                "ext_diff_bytes" to o.optLong("ext_diff_bytes", 0),
+                "ext_libs_diff" to o.optInt("ext_libs_diff", 0),
+                "app_compared_bytes" to o.optLong("app_compared_bytes", 0),
+                "app_diff_bytes" to o.optLong("app_diff_bytes", 0),
+                "app_libs_diff" to o.optInt("app_libs_diff", 0),
+                "diffed_libs" to o.optString("diffed_libs", "")
+            )
+        } catch (error: Throwable) {
+            ok("checked" to false, "reason" to ("parse_error:" + error.javaClass.simpleName))
         }
-        val libcCompared = values[1]
-        val libcDiff = values[2]
-        val libartCompared = values[3]
-        val libartDiff = values[4]
-        val totalDiff = libcDiff + (if (libartDiff > 0) libartDiff else 0)
-        return ok(
-            "checked" to true,
-            "libc_compared_bytes" to libcCompared,
-            "libc_diff_bytes" to libcDiff,
-            "libart_compared_bytes" to libartCompared,
-            "libart_diff_bytes" to libartDiff,
-            "diff_bytes" to totalDiff
-        )
     }
-
 
     private fun runCommand(command: List<String>): String {
         return try {

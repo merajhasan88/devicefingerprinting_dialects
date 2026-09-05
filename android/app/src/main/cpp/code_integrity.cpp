@@ -1,20 +1,27 @@
 // Native code-integrity probe.
 //
-// Runs IN the app's own process, so it reads the app's own mapped executable
-// pages by direct pointer. That is the whole reason this lives in native code:
+// Runs IN the app's own process and reads the app's own already-mapped,
+// readable r-x pages by direct pointer. That is the whole reason it is native:
 // the Kotlin attempt opened /proc/self/mem, which SELinux denies to
-// untrusted_app on Android 9/10. A process reading its own already-mapped,
-// readable pages needs no such access and no ptrace.
+// untrusted_app on Android 9/10; reading one's own mapped pages needs no such
+// access and no ptrace.
 //
-// For each target library it compares EVERY executable mapping against the
-// same bytes on disk. Iterating every VMA (not just the first) is essential:
-// an inline hooker flips individual code pages writable to patch them, which
-// splits the library's single r-x mapping into several, and the patched page
-// is often not the first. The executable segment is otherwise not modified at
-// runtime by the dynamic linker (relocations land in the GOT/data segments),
-// so on a clean device memory and disk are byte-identical. A hook overwrites a
-// function prologue, which shows up here as a difference regardless of what the
-// hooking framework is called.
+// For each target library it compares EVERY executable mapping against the same
+// bytes on disk. Iterating every VMA (not just the first) is essential: an
+// inline hooker flips individual code pages writable to patch them, which
+// splits a library's single r-x mapping into several, and the patched page is
+// usually not the first. The dynamic linker does not modify .text at runtime
+// (relocations land in the GOT/data segments), so on a clean device memory and
+// disk are byte-identical; a hook overwrites a prologue and shows up here as a
+// difference, whatever the hooking framework is called.
+//
+// Targets are grouped into three buckets so the server can weight them
+// separately:
+//   core - libc, libart. Validated at zero on clean hardware; scored today.
+//   ext  - other high-value system hook targets, TLS included (cert-pinning
+//          bypass patches libssl/libcrypto). Scored once baselined on device.
+//   app  - the app's own native code (Flutter engine + Dart AOT). Catches
+//          in-memory patching of the app itself. Scored once baselined.
 
 #include <jni.h>
 #include <fcntl.h>
@@ -25,44 +32,41 @@
 
 namespace {
 
-// Per-library budget: enough to cover libc/libart .text across split VMAs
-// without making the scan slow.
-constexpr size_t kMaxPerLib = 4u << 20;
+constexpr size_t kMaxPerLib = 4u << 20;  // 4 MiB budget per library
 
-// Compare every executable mapping whose path ends with `suffix` against disk.
-// Returns total differing bytes, or a negative status if nothing was compared:
-//   -2 no matching executable mapping found, -1 maps unreadable.
-// Sets *compared to the total bytes compared.
-long compare_library(const char *suffix, long *compared) {
+const char *kCore[] = {"/libc.so", "/libart.so", nullptr};
+const char *kExt[] = {
+    "/libc++.so", "/libssl.so", "/libcrypto.so",
+    "/libandroid_runtime.so", "/libbinder.so", nullptr,
+};
+const char *kApp[] = {"/libflutter.so", "/libapp.so", nullptr};
+
+// Compare every executable mapping ending with `suffix` against disk.
+// Returns differing bytes (>=0) and sets *compared, or -1 if none matched.
+long compare_one(const char *suffix, long *compared) {
     *compared = 0;
     FILE *maps = fopen("/proc/self/maps", "r");
     if (!maps) return -1;
-
     size_t suffix_len = strlen(suffix);
-    long total_diff = 0;
-    size_t total_compared = 0;
+    long diff = 0;
+    size_t done = 0;
     bool any = false;
     char line[1024];
-
     while (fgets(line, sizeof(line), maps)) {
-        if (total_compared >= kMaxPerLib) break;
+        if (done >= kMaxPerLib) break;
         unsigned long start = 0, end = 0, offset = 0;
         char perms[8] = {0};
         char path[512] = {0};
         int matched = sscanf(line, "%lx-%lx %7s %lx %*x:%*x %*d %511[^\n]",
                              &start, &end, perms, &offset, path);
-        if (matched < 5) continue;
-        if (perms[2] != 'x') continue;  // executable pages only
+        if (matched < 5 || perms[2] != 'x') continue;
         char *p = path;
         while (*p == ' ') p++;
         size_t len = strlen(p);
-        if (len < suffix_len) continue;
-        if (strcmp(p + len - suffix_len, suffix) != 0) continue;
-
+        if (len < suffix_len || strcmp(p + len - suffix_len, suffix) != 0) continue;
         size_t span = end - start;
         if (span == 0) continue;
-        if (span > kMaxPerLib - total_compared) span = kMaxPerLib - total_compared;
-
+        if (span > kMaxPerLib - done) span = kMaxPerLib - done;
         int fd = open(p, O_RDONLY);
         if (fd < 0) continue;
         unsigned char *disk = (unsigned char *) malloc(span);
@@ -70,48 +74,70 @@ long compare_library(const char *suffix, long *compared) {
         ssize_t got = pread(fd, disk, span, (off_t) offset);
         close(fd);
         if (got <= 0) { free(disk); continue; }
-        size_t n = (size_t) got;
-
         const unsigned char *mem = (const unsigned char *) start;
-        for (size_t i = 0; i < n; i++) {
-            if (mem[i] != disk[i]) total_diff++;
-        }
+        for (ssize_t i = 0; i < got; i++) if (mem[i] != disk[i]) diff++;
         free(disk);
-        total_compared += n;
+        done += (size_t) got;
         any = true;
     }
     fclose(maps);
-    if (!any) return -2;
-    *compared = (long) total_compared;
-    return total_diff;
+    if (!any) return -1;
+    *compared = (long) done;
+    return diff;
+}
+
+// Sum a bucket; append the name of any library that differs to `names`.
+void compare_bucket(const char **suffixes, long *compared, long *diff,
+                    int *checked, int *withDiff, char *names, size_t names_cap) {
+    *compared = 0; *diff = 0; *checked = 0; *withDiff = 0;
+    for (int i = 0; suffixes[i] != nullptr; i++) {
+        long c = 0;
+        long d = compare_one(suffixes[i], &c);
+        if (d < 0) continue;  // library not mapped; skip
+        (*checked)++;
+        *compared += c;
+        *diff += d;
+        if (d > 0) {
+            (*withDiff)++;
+            const char *n = suffixes[i] + 1;  // drop leading '/'
+            size_t used = strlen(names);
+            size_t need = strlen(n) + (used ? 1 : 0);
+            if (used + need + 1 < names_cap) {
+                if (used) strcat(names, ",");
+                strcat(names, n);
+            }
+        }
+    }
 }
 
 }  // namespace
 
-extern "C" JNIEXPORT jlongArray JNICALL
+extern "C" JNIEXPORT jstring JNICALL
 Java_com_example_devicefingerprinting_IntegrityProbeManager_nativeCodeIntegrity(
         JNIEnv *env, jobject /* this */) {
-    // Layout: [status, libcCompared, libcDiff, libartCompared, libartDiff]
-    // status: 0 ok, negative = the libc error code.
-    jlong values[5] = {0, 0, 0, 0, 0};
+    long coreC, coreD, extC, extD, appC, appD;
+    int coreN, coreW, extN, extW, appN, appW;
+    char names[512] = {0};
 
-    long compared = 0;
-    long libc = compare_library("/libc.so", &compared);
-    if (libc < 0) {
-        values[0] = (jlong) libc;
-    } else {
-        values[1] = (jlong) compared;
-        values[2] = (jlong) libc;
-    }
+    compare_bucket(kCore, &coreC, &coreD, &coreN, &coreW, names, sizeof(names));
+    compare_bucket(kExt, &extC, &extD, &extN, &extW, names, sizeof(names));
+    compare_bucket(kApp, &appC, &appD, &appN, &appW, names, sizeof(names));
 
-    long compared2 = 0;
-    long libart = compare_library("/libart.so", &compared2);
-    if (libart >= 0) {
-        values[3] = (jlong) compared2;
-        values[4] = (jlong) libart;
-    }
+    bool checked = (coreN + extN + appN) > 0;
+    char json[1024];
+    snprintf(json, sizeof(json),
+             "{\"checked\":%s,"
+             "\"diff_bytes\":%ld,"                 // core diff, scored today
+             "\"core_compared_bytes\":%ld,\"core_diff_bytes\":%ld,"
+             "\"ext_compared_bytes\":%ld,\"ext_diff_bytes\":%ld,\"ext_libs_diff\":%d,"
+             "\"app_compared_bytes\":%ld,\"app_diff_bytes\":%ld,\"app_libs_diff\":%d,"
+             "\"diffed_libs\":\"%s\"}",
+             checked ? "true" : "false",
+             coreD,
+             coreC, coreD,
+             extC, extD, extW,
+             appC, appD, appW,
+             names);
 
-    jlongArray out = env->NewLongArray(5);
-    if (out != nullptr) env->SetLongArrayRegion(out, 0, 5, values);
-    return out;
+    return env->NewStringUTF(json);
 }

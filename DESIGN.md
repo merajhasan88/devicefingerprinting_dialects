@@ -2398,3 +2398,31 @@ the NDK and CMake 3.22.1.
 library outside that set, or who tampers only with the app's own Dart/Flutter code rather than a
 system library, is not covered as configured; extending the target-library set and adding the app's
 own mapped code are the follow-ons.
+
+## 28.7 Extended code_integrity — prepared, gated pending on-device baseline (2026-09-05)
+
+Bridges the gap noted in §28.6: the native probe now covers three buckets instead of only libc/libart.
+
+- **core** — libc, libart. Scored today (validated at zero on both handsets).
+- **ext** — libc++, libssl, libcrypto, libandroid_runtime, libbinder. TLS is the notable addition:
+  cert-pinning bypasses patch libssl/libcrypto, so this is a high-value target.
+- **app** — libflutter, libapp (the Flutter engine and the Dart AOT snapshot). Catches in-memory
+  patching of the application's own native code, scored under a new reason
+  `android_app_code_modified`.
+
+The native component compares every executable VMA of each target against disk and returns a JSON
+summary (per-bucket compared/diff plus the names of any libraries that differ); Kotlin parses it with
+the framework's `org.json`. Each bucket is capped at 4 MiB per library.
+
+**Scoring of ext and app is gated behind `INTEGRITY_SCORE_EXTENDED_LIBS`, default off.** Core keeps
+scoring unconditionally. This preserves the discipline used throughout: a signal is measured on real
+hardware and confirmed zero on clean devices before it is allowed to reject anyone. The flag is off
+until the ext/app buckets are baselined on both handsets.
+
+**Validated server-side already:** with the flag on, a report carrying `ext_diff_bytes` raises
+`android_code_integrity_violation` and blocks, and one carrying `app_diff_bytes` raises
+`android_app_code_modified` and blocks (conformance suite, flag-on run: 30 passed, 0 failed). What
+remains is the on-device step — install the new client on both phones, confirm the ext and app
+buckets read zero on a clean device, then enable the flag — plus a real-hardware hook test against
+libssl (`hooktest-ext.apk` is built and staged for it). Deferred only because the handsets were in
+use.
