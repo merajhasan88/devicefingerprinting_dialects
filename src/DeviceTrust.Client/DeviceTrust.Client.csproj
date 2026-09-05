@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <!-- .NET 6 is the floor the brief asks for; net8.0 gets the newer BCL
+         overloads without forcing consumers off the LTS they are on. Anything
+         from .NET 6 onwards can consume the net6.0 assets. -->
+    <TargetFrameworks>net6.0;net8.0</TargetFrameworks>
+    <AssemblyName>DeviceTrust.Client</AssemblyName>
+    <RootNamespace>DeviceTrust.Client</RootNamespace>
+    <PackageId>DeviceTrust.Client</PackageId>
+    <Description>Device-trust client SDK: installation identity, proof of possession, access proofs and signed integrity reports against the device-trust server.</Description>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+  </PropertyGroup>
+
+</Project>
