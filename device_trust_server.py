@@ -1,13 +1,21 @@
 """
-Device-recognition API for the Flutter proof of concept.
+Device-recognition and device-trust API server.
 
 Python compatibility: 3.9+
-Runtime dependencies:
+
+Always required:
     Flask
     Flask-JWT-Extended 4.x
-    psycopg2-binary
     bcrypt
     pycryptodome
+
+Per backend, imported lazily so only what is used must be installed:
+    DB_ENGINE=postgresql   psycopg2-binary
+    DB_ENGINE=sqlserver    pyodbc, plus the system package
+                           "ODBC Driver 18 for SQL Server" (msodbcsql18)
+
+Optional:
+    REDIS_URL set          redis
 
 This replaces the old shared-passphrase/RSA-AES transport. Run it behind HTTPS.
 The private installation key stays inside Android Keystore or the iOS Secure
