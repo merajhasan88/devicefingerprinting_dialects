@@ -1694,6 +1694,15 @@ Full battery = both phones, six steps each, real Frida Gadget. Conformance = the
 
 Per-phone differences observed so far: **none**.
 
+Cross-device tests (require two physical handsets, cannot be simulated by the harness):
+
+| Test | Result |
+|---|---|
+| Stolen refresh token, Phone A -> Phone B | PASS, `invalid_installation_signature` |
+| Stolen access token, Phone A -> Phone B | PASS, `invalid_installation_signature` |
+| Legitimate bound refresh on Phone A | PASS, session rotated |
+| Legitimate protected request on Phone A | PASS, full proof accepted |
+
 ### 25.4 PostgreSQL version sweep — complete (2026-09-05)
 
 Four instances were created in parallel rather than sequentially: five `db.t4g.micro` instances cost about USD 0.09/hour combined and existed for well under an hour, so the spend was the same as doing it one at a time while saving roughly forty minutes of waiting. Each was tested by repointing `DB_HOST` and restarting the service; every database starts empty and the schema guard builds it on first request.
@@ -1710,3 +1719,27 @@ PostgreSQL 18.1   (RDS)             26/26     plus the full battery on both hand
 **The entire supported range 13 through 18 behaves identically**, including the five database-sensitive checks (replay upsert, refresh rotation and reuse row-locking, thumbprint JSON round-trip, timestamp timezone round-trip, cross-installation device memory). No version-specific behaviour was found, so the PostgreSQL floor of 13 is justified by evidence rather than assumption.
 
 PostgreSQL 13 on RDS was deliberately skipped: it is past RDS standard support and would require opting into paid Extended Support at roughly USD 0.10 per vCPU-hour, about seven times the instance cost, to re-prove a minor version (13.23) the lab has already validated.
+
+### 25.5 Cross-device stolen-token tests on AWS — PASS (2026-09-05)
+
+The one property the software conformance harness cannot demonstrate: it generates both keys in the same process, so "signed by the wrong key" is simulated. This ran with **two physically separate hardware keystores**, OPPO as Phone A and Huawei as Phone B, against PostgreSQL 18.1 on RDS over HTTPS in enforce mode. Release builds throughout.
+
+```text
+stolen refresh token   challenge 200  -> refresh 401  invalid_installation_signature
+stolen access token    protected 401                  invalid_installation_signature
+                       "access token reached proof verification: yes"
+```
+
+Both results have the same important shape: **the stolen credential was accepted as genuine** — the refresh challenge returned 200 and the access token reached proof verification — and the rejection happened at *signature verification*, because Phone B signed with its own Keystore key. The binding is to the hardware key, not to token validity or freshness.
+
+Contrast, on Phone A in the same session:
+
+```text
+legitimate bound refresh   PASS  session aab35032 -> fab74388, native signature accepted
+legitimate protected call  PASS  body SHA-256, timestamp window, one-time nonce,
+                                 native signature all accepted
+```
+
+So the same server, in the same minute, accepted the legitimate device and refused the thief.
+
+**Method note.** Injecting the token by `adb shell input text` corrupted it — the predictive keyboard inserted spaces — and the app correctly reported `INCONCLUSIVE: refresh challenge was rejected before key proof` with `invalid_token` rather than claiming a pass. That is the test harness behaving well: a malformed-token rejection is not evidence of key binding. The tokens were then supplied through the app's designed `--dart-define=STOLEN_REFRESH_TOKEN` / `STOLEN_ACCESS_TOKEN` build-time mechanism, which is keyboard-free and exact. Use that route; the access token's 10-minute lifetime means minting it immediately before the build.
