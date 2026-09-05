@@ -1823,3 +1823,119 @@ Redis must be incorporated as part of the SQL Server work, not deferred again. A
 3. Optional short-TTL caching of `_device_integrity_memory`.
 
 Redis is a new dependency (`redis`), the first added since the proof of concept.
+
+---
+
+# 26. Phase 1b — the dialect abstraction, Redis, and SQL Server preparation (2026-09-05)
+
+The server now speaks to both engines through a `Dialect` object chosen by `DB_ENGINE`. What is
+worth recording is not that the layer exists but **which constructs refused to be translated
+mechanically**, because those are the ones that would have shipped as silent defects.
+
+## 26.1 What token substitution can and cannot do
+
+`SqlServerDialect.sql()` safely rewrites `%s` → `?`, `NOW()` → `SYSUTCDATETIME()`, trailing
+`LIMIT n` → leading `TOP n`, and `NOW() - INTERVAL '1 day'` → `DATEADD`. Interval arithmetic must
+be rewritten *before* `NOW()` is substituted, or the pattern is no longer recognisable.
+
+Everything else was converted by hand at its call site, deliberately. A regex that rewrote the
+locking or replay paths could produce statements that run without error and are silently wrong,
+and a wrong lock is not visible in a test that runs one request at a time.
+
+`tools/check_sqlserver_translation.py` walks the module AST, pushes all 51 literal statements
+through the SQL Server dialect and fails if any PostgreSQL-only syntax survives. It exists because
+adding one more `LIMIT 1` while developing against PostgreSQL is a natural thing to do and would
+otherwise surface only on a customer's SQL Server.
+
+## 26.2 The replay defence stopped depending on either engine's upsert
+
+`ON CONFLICT (nonce_hash) DO NOTHING RETURNING nonce_hash` became a plain `INSERT` whose
+duplicate-key error *is* the replay signal.
+
+This is not merely portability. Both natural SQL Server translations are **wrong**: `MERGE` is racy
+without `HOLDLOCK`, and `IF NOT EXISTS(...) INSERT` is racy under `READ COMMITTED`. Either would
+let two concurrent identical proofs through — precisely the attack the nonce exists to stop. The
+plain insert has identical atomicity on both engines and is simpler to review.
+
+Single-use challenge consumption moved from `RETURNING challenge_id` to `cursor.rowcount`: the
+conditional `UPDATE` is itself the atomic check. **`SET NOCOUNT` must stay OFF** on SQL Server or
+`rowcount` stops reporting truthfully.
+
+Row locking is now `DIALECT.row_lock_suffix()` / `row_lock_hint()` — `FOR UPDATE` on PostgreSQL,
+`WITH (UPDLOCK, ROWLOCK)` on SQL Server, which is required because `READ COMMITTED` there takes
+only shared locks and refresh-reuse detection could otherwise be raced.
+
+## 26.3 Two latent defects found by writing the abstraction
+
+**JSON read-back.** psycopg2 returns parsed `dict`/`list`; pyodbc returns raw text. Only two
+columns are read back, and one of them mattered: `integrity_challenges.required_probes` was guarded
+by `if not isinstance(required_probes, list): required_probes = []`. On SQL Server that branch
+would always have been taken, turning every mandatory-probe requirement into a vacuous one — a
+report that omitted **every** probe would have scored as pristine. It now normalises through
+`DIALECT.json_value()` and **fails closed** if the stored list is unreadable.
+
+**datetimeoffset.** pyodbc has no native mapping for it and returns the raw 20-byte
+`SQL_SS_TIMESTAMPOFFSET` struct, so every timestamp would have arrived as bytes. Worse in the write
+direction: pyodbc binds a `datetime` as `SQL_TIMESTAMP` and **drops** `tzinfo` rather than
+converting, so a token expiring at `20:00:45+05:30` would be stored as `20:00:45+00:00` and live
+five and a half hours longer than intended. An output converter and a `bind_parameters()` hook fix
+both directions; verified against a constructed struct.
+
+## 26.4 Redis — implemented, with the failure modes chosen deliberately
+
+Nonces **fail closed**, rate limits **fail open**. Allowing requests when the nonce store is
+unreachable would turn a Redis outage into an open replay window; refusing all traffic when the
+rate limiter is down would turn a cache outage into a total outage.
+
+`NONCE_BACKEND` defaults to `database`. Redis is faster and removes write load, but it is a weaker
+durability guarantee: a committed row survives anything, whereas `appendfsync=everysec` can lose up
+to a second of nonces on an unclean stop, and any nonce lost that way stays replayable until its
+original expiry. `/health/ready` therefore reports whether AOF is actually enabled, because
+`NONCE_BACKEND=redis` without it is a silent downgrade of the replay defence.
+
+Rate limiting keys on the installation id, falling back to the source address. An installation is
+bound to a non-exportable key, so unlike an IP an attacker cannot rotate it for a fresh budget.
+
+**Item 3 of §25.12 (caching `_device_integrity_memory`) was deliberately not implemented.** A cached
+*block* is harmless, but a cached *trusted* verdict would let a device that has just been
+compromised keep passing until the TTL expired. The read is one indexed lookup; the latency saved
+does not justify a window in which the system knowingly serves a stale trust decision.
+
+### Results (PostgreSQL 18.1, RDS, through the new layer)
+
+| Configuration | Result |
+|---|---|
+| `NONCE_BACKEND=database` | 24 passed, 0 failed, 2 skipped |
+| `NONCE_BACKEND=redis` | 24 passed, 0 failed, 2 skipped (27 nonce keys present afterwards) |
+| Redis stopped, `NONCE_BACKEND=redis` | every access-proof request refused; nothing let through |
+| Rate limiter | budget honoured exactly, 429 `rate_limited` on the next attempt, per-installation budgets independent, allows traffic when Redis is down |
+
+The two skips are the enforcement checks, which need `INTEGRITY_MODE=enforce`.
+
+The Redis nonce count is the load-bearing detail: it proves the Redis path was genuinely exercised
+rather than silently falling through to the database.
+
+## 26.5 Schema review before first contact with SQL Server
+
+The two migrations declare identical table sets. The only structural difference is
+`recognized_devices_platform_hint_unique`, an inline `UNIQUE` constraint on PostgreSQL and a
+**filtered** unique index on SQL Server — the documented fix for SQL Server treating NULLs as equal.
+Auditing every other uniqueness rule confirmed the remaining three (`key_thumbprint`,
+`handle_lookup`, `challenge_id`) are all on `NOT NULL` columns, so `reinstall_hint_hash` was the
+only column exposed to that difference.
+
+The SQL Server migration's `schema_migrations` seed row was not guarded, unlike every other
+statement in the file, so a second run failed with a primary-key violation after appearing to
+succeed. Fixed.
+
+## 26.6 SQL Server version coverage
+
+RDS `sqlserver-ex` offers 2017 (14.00.3540.1), 2019 (15.00.4480.2), 2022 (16.00.4265.3) and
+2025 (17.00.4065.4). All four were provisioned in parallel on `db.t3.micro`, `--backup-retention-period 0`,
+private, reachable only from the application security group. 2016 remains untestable, as recorded
+in §24.
+
+TLS is verified, not merely encrypted: the Amazon RDS CA bundle is installed into the EC2 host's
+system trust store, so `Encrypt=yes` with `TrustServerCertificate=no` — and `sqlcmd` without `-C` —
+actually validate the certificate. This is the SQL Server equivalent of the `verify-full` decision
+taken for PostgreSQL.
