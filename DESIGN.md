@@ -2017,3 +2017,54 @@ substitute for it.
 
 2019, 2022 and 2025 were briefly torn down after the suite passed, on a mistaken reading of §25.11,
 and were recreated. 2017 stayed up throughout.
+
+## 27.4 SQL Server 2017 — handset battery on both phones — PASS (2026-09-05)
+
+First full battery (§25.11) against SQL Server, run on real hardware in `INTEGRITY_MODE=enforce`
+with `NONCE_BACKEND=redis` and rate limiting on. OPPO CPH2083 (Android 9) and Huawei AQM-LX1
+(Android 10), release builds only.
+
+| # | Test | OPPO | Huawei | Evidence |
+|---|---|---|---|---|
+| 1 | Clean baseline scan | PASS | PASS | `score=18 verdict=trusted` (dev options +8, adb +10) |
+| 2 | Account creation through the enforce gate | PASS | PASS | `POST /v1/accounts/register` 201 |
+| 3 | Stolen access token | PASS | — | client `PASS: stolen access token rejected`, `invalid_installation_signature`, `GET /v1/account/me` 401 |
+| 4 | Stolen refresh token | PASS | — | challenge **200** then refresh **401** `invalid_installation_signature` |
+| 5 | Boundary: exact replay | PASS | PASS | 200 then 401 `access_proof_replay` |
+| 6 | Boundary: body tampering | PASS | PASS | 401 `access_proof_body_mismatch` |
+| 7 | Boundary: path + method | PASS | PASS | 401 `access_proof_path_mismatch` and `access_proof_method_mismatch` |
+| 8 | Boundary: stale timestamp | PASS | PASS | 401 `access_proof_timestamp_outside_window` (age 180s, skew 120s) |
+| 9 | Frida Gadget — detection | PASS | PASS | `score=100 verdict=block`, `frida_runtime_artifact +90`, `frida_port_open +75` |
+| 10 | Frida Gadget — enforcement | PASS | PASS | `POST /v1/accounts/login` **403** |
+| 11 | Frida Gadget — restore | PASS | PASS | clean APK (0 frida entries) returns `score=18 trusted` |
+| 12 | Device memory across reinstall | PASS | PASS | full uninstall + new key → `403 integrity_device_blocked_recently` |
+
+Tests 3 and 4 are cross-device by construction: the OPPO is the victim, the Huawei the attacker
+holding its tokens, so a single run exercises both handsets.
+
+### What this run adds beyond the PostgreSQL result
+
+**The replay defence ran on Redis, on real hardware.** After the handset boundary tests: **18 keys
+under `dt:nonce:*` in Redis and 0 rows in `dbo.access_proof_nonces`.** The rewritten replay path —
+a plain `INSERT` on the database backend, `SET NX PX` on Redis — was exercised end to end by a
+phone, not just by the software conformance client, with no silent fallback to the database.
+
+**Row locking was exercised.** `Test bound refresh` rotated the session (`cd2b35c0` → `6eb74be6` on
+the OPPO), which is the `WITH (UPDLOCK, ROWLOCK)` path written for SQL Server; refresh-reuse
+revocation depends on it.
+
+**Reinstall correlation holds on SQL Server.** Wiping the app destroys the AndroidKeyStore key, so
+the reinstall enrols a genuinely new installation. Counts moved `installations` 8 → 9 → 10 across
+the two wipes while `devices` stayed at **8**: both reinstalls correlated back to the same
+`device_id` rather than creating new devices. The `char(36) COLLATE Latin1_General_BIN2` hint
+columns and the filtered unique index behave as the PostgreSQL originals do.
+
+**The device-memory refusal is the project's stated objective, demonstrated.** After the gadget was
+removed both phones scanned `trusted` again, yet login was still refused — and refused with
+`integrity_device_blocked_recently`, not `integrity_blocked`. The live measurement was clean; only
+the server's memory of *that physical device* being compromised minutes earlier produced the
+refusal, and it survived a full app uninstall and a fresh hardware key. That is "a rooted or
+compromised device is still caught across reinstalls of an app", shown rather than argued.
+
+`hard_block=0` on the gadget reports is worth noting: the block came from the weighted score
+reaching the 100 cap, not from a hard-block rule. The scoring model, not a special case, did the work.
