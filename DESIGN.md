@@ -1640,3 +1640,24 @@ release APK:  score=18 verdict=trusted    dev options +8, adb +10
 - `psycopg2`'s default `sslmode=prefer` already negotiates TLS against RDS, so no code change was needed to connect. Explicit `sslmode=verify-full` with the RDS CA bundle remains the production hardening, and is still worth doing.
 - Redis is installed on the instance and answering, ready to be wired in as the nonce replay cache and rate limiter.
 - SQL Server cannot be tested until the dialect work exists; an RDS SQL Server instance would have nothing to run against.
+
+### 25.1 OPPO full battery on AWS, release builds only (2026-09-05)
+
+All builds release (`flutter build apk --release`), server in enforce mode with `verify-full` database TLS, a real certificate allow-list, and no `INTEGRITY_ALLOW_*` switches set.
+
+```text
+1  clean release                     score=18  trusted   -> POST /v1/accounts/register 201
+2  debug build (for comparison)      score=53  elevated  android_app_debuggable +35
+3  release + embedded Frida Gadget   score=100 block      frida_runtime_artifact +90, frida_port_open +75
+4  account attempt while compromised 403 integrity_blocked
+5  gadget removed, clean release     score=18  trusted
+6  new install, new key, clean scan  403 integrity_device_blocked_recently
+```
+
+Step 6 is the first proof of change (d) on production hardware. The installation was new, its key thumbprint was new, and its own integrity scan was clean at 18/trusted - yet the server refused it because the physical device had been Frida-compromised minutes earlier. Recognition of the device outlived both the application install and the cryptographic identity.
+
+Step 2 is a finding rather than a nuisance: the lab server had `INTEGRITY_ALLOW_DEBUG=1` set, which suppressed `android_app_debuggable +35` for the entire proof of concept. A production-representative server refuses a debug build in enforce mode. **All builds are release from now on.**
+
+The Frida Gadget works in a release build: it is an ordinary bundled native library loaded with `System.loadLibrary`, so it does not depend on the app being debuggable. Only the synthetic debug fixtures are unavailable in release, and they are not needed for real-compromise testing.
+
+Operational note: one bootstrap timed out client-side with the request never reaching the server, and a plain relaunch succeeded. The phone's Wi-Fi showed 120-700 ms jitter to 8.8.8.8 at the time. Retry before investigating; the 15 s client timeout is tight for a congested link.
