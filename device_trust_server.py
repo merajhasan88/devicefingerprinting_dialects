@@ -552,6 +552,136 @@ class _DialectCursor(object):
         return iter(self._cursor)
 
 
+# ---------------------------------------------------------------------------
+# Redis
+#
+# Redis is optional. It is configured only when REDIS_URL is set, and the
+# `redis` package is imported lazily, so a deployment that does not use it
+# installs nothing extra.
+#
+# Two very different things are stored here, and they deliberately fail in
+# opposite directions:
+#
+#   nonces        fail CLOSED. The nonce store IS the replay defence. If it
+#                 cannot be reached we must refuse the request, because
+#                 "allow on error" turns a Redis outage into an open replay
+#                 window - exactly the attack the nonce exists to stop.
+#
+#   rate limits   fail OPEN. Rate limiting protects availability. Refusing
+#                 every request because the rate limiter is down converts a
+#                 cache outage into a total outage, which is a worse outcome
+#                 than briefly not enforcing a throttle.
+#
+# The nonce backend defaults to the database. Redis is faster and takes the
+# write load off the database, but it is a weaker durability guarantee: a
+# committed row survives anything, whereas Redis with appendfsync=everysec can
+# lose up to a second of nonces on an unclean stop, and any nonce lost that way
+# becomes replayable until its original expiry. Choose it deliberately, run it
+# with appendonly yes, and know what the trade is.
+# ---------------------------------------------------------------------------
+REDIS_URL = os.environ.get("REDIS_URL", "").strip()
+NONCE_BACKEND = os.environ.get("NONCE_BACKEND", "database").strip().lower()
+RATE_LIMIT_ENABLED = os.environ.get("RATE_LIMIT_ENABLED", "0").strip() == "1"
+RATE_LIMIT_MAX_ATTEMPTS = int(os.environ.get("RATE_LIMIT_MAX_ATTEMPTS", "20"))
+RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("RATE_LIMIT_WINDOW_SECONDS", "60"))
+
+if NONCE_BACKEND not in ("database", "redis"):
+    raise RuntimeError(
+        "NONCE_BACKEND must be 'database' or 'redis', not %r." % NONCE_BACKEND
+    )
+if NONCE_BACKEND == "redis" and not REDIS_URL:
+    raise RuntimeError("NONCE_BACKEND=redis requires REDIS_URL to be set.")
+
+_REDIS_CLIENT = None
+_REDIS_LOCK = threading.Lock()
+
+
+def _redis():
+    """Return a shared Redis client, or raise if Redis is not configured."""
+    global _REDIS_CLIENT
+    if not REDIS_URL:
+        raise RuntimeError("REDIS_URL is not configured.")
+    if _REDIS_CLIENT is None:
+        with _REDIS_LOCK:
+            if _REDIS_CLIENT is None:
+                import redis  # imported lazily; not a dependency without Redis
+
+                _REDIS_CLIENT = redis.Redis.from_url(
+                    REDIS_URL,
+                    socket_timeout=2,
+                    socket_connect_timeout=2,
+                    health_check_interval=30,
+                    decode_responses=True,
+                )
+    return _REDIS_CLIENT
+
+
+def _redis_status():
+    """Health-check view of Redis. Never raises."""
+    if not REDIS_URL:
+        return {"configured": False, "nonce_backend": NONCE_BACKEND}
+    state = {
+        "configured": True,
+        "nonce_backend": NONCE_BACKEND,
+        "rate_limiting": RATE_LIMIT_ENABLED,
+    }
+    try:
+        info = _redis().info("persistence")
+        state["reachable"] = True
+        # Surface this: NONCE_BACKEND=redis without AOF is a silent downgrade
+        # of the replay defence, and an operator should be able to see it.
+        state["appendonly"] = info.get("aof_enabled") in (1, "1", True)
+    except Exception as error:
+        state["reachable"] = False
+        state["error"] = type(error).__name__
+    return state
+
+
+def _claim_nonce_redis(nonce_hash, installation_id):
+    """Atomically claim a nonce. SET NX is atomic on Redis's single thread, so
+    a concurrent duplicate loses the race and is reported as a replay."""
+    ttl_ms = int(ACCESS_PROOF_NONCE_RETENTION.total_seconds() * 1000)
+    try:
+        claimed = _redis().set(
+            "dt:nonce:%s" % nonce_hash, installation_id, nx=True, px=ttl_ms
+        )
+    except Exception:
+        logger.exception("The Redis nonce store is unreachable.")
+        # Fail closed. See the note at the top of this section.
+        raise ApiProblem(
+            "The replay-protection store is unavailable.",
+            503,
+            "nonce_store_unavailable",
+        )
+    if not claimed:
+        raise ApiProblem(
+            "This signed access proof has already been used.",
+            401,
+            "access_proof_replay",
+        )
+
+
+def _enforce_rate_limit(bucket, identity):
+    """Throttle repeated attempts. Fails open by design."""
+    if not RATE_LIMIT_ENABLED or not REDIS_URL:
+        return
+    key = "dt:rate:%s:%s" % (bucket, identity)
+    try:
+        client = _redis()
+        attempts = client.incr(key)
+        if attempts == 1:
+            client.expire(key, RATE_LIMIT_WINDOW_SECONDS)
+    except Exception:
+        logger.exception("The Redis rate limiter is unreachable; allowing.")
+        return
+    if attempts > RATE_LIMIT_MAX_ATTEMPTS:
+        raise ApiProblem(
+            "Too many attempts. Try again shortly.",
+            429,
+            "rate_limited",
+        )
+
+
 def _connect_db():
     return DIALECT.connect()
 
@@ -2309,41 +2439,49 @@ def _require_access_proof(required_role="account"):
 
     # Consume the client nonce after signature verification, so an unverified
     # request can never burn a nonce.
+    if NONCE_BACKEND == "redis":
+        # Redis expires nonces itself, so there is no sweep and no INSERT; the
+        # database work below still runs, because last_seen_at feeds the
+        # relationship-risk signals and must not depend on the nonce backend.
+        _claim_nonce_redis(nonce_hash, installation_id)
+
     with _cursor(commit=True) as cursor:
-        cursor.execute(
-            """
-            DELETE FROM access_proof_nonces
-            WHERE expires_at < NOW() - INTERVAL '1 day'
-            """
-        )
-        # A plain INSERT is the whole replay defence, and it is portable: a
-        # duplicate primary key IS the replay. This deliberately avoids
-        # ON CONFLICT (PostgreSQL-only) and its SQL Server translations, both
-        # of which are traps - MERGE is racy without HOLDLOCK, and
-        # IF NOT EXISTS(...) INSERT is racy under READ COMMITTED, so either
-        # would let two concurrent identical proofs through.
-        try:
+        if NONCE_BACKEND == "database":
             cursor.execute(
                 """
-                INSERT INTO access_proof_nonces
-                    (nonce_hash, installation_id, access_token_jti, expires_at)
-                VALUES (%s, %s, %s, %s)
-                """,
-                (
-                    nonce_hash,
-                    installation_id,
-                    token_jti,
-                    _utc_now() + ACCESS_PROOF_NONCE_RETENTION,
-                ),
+                DELETE FROM access_proof_nonces
+                WHERE expires_at < NOW() - INTERVAL '1 day'
+                """
             )
-        except Exception as error:
-            if not DIALECT.is_unique_violation(error):
-                raise
-            raise ApiProblem(
-                "This signed access proof has already been used.",
-                401,
-                "access_proof_replay",
-            )
+            # A plain INSERT is the whole replay defence, and it is portable:
+            # a duplicate primary key IS the replay. This deliberately avoids
+            # ON CONFLICT (PostgreSQL-only) and its SQL Server translations,
+            # both of which are traps - MERGE is racy without HOLDLOCK, and
+            # IF NOT EXISTS(...) INSERT is racy under READ COMMITTED, so
+            # either would let two concurrent identical proofs through.
+            try:
+                cursor.execute(
+                    """
+                    INSERT INTO access_proof_nonces
+                        (nonce_hash, installation_id, access_token_jti,
+                         expires_at)
+                    VALUES (%s, %s, %s, %s)
+                    """,
+                    (
+                        nonce_hash,
+                        installation_id,
+                        token_jti,
+                        _utc_now() + ACCESS_PROOF_NONCE_RETENTION,
+                    ),
+                )
+            except Exception as error:
+                if not DIALECT.is_unique_violation(error):
+                    raise
+                raise ApiProblem(
+                    "This signed access proof has already been used.",
+                    401,
+                    "access_proof_replay",
+                )
 
         cursor.execute(
             """
@@ -2536,6 +2674,7 @@ def health_ready():
             "integrity_mode": INTEGRITY_MODE,
             "integrity_freshness_seconds": INTEGRITY_FRESHNESS_SECONDS,
             "remote_attestation": "not_used",
+            "redis": _redis_status(),
         }
     )
 
@@ -3097,6 +3236,7 @@ def integrity_me():
 @app.post("/v1/accounts/register")
 @jwt_required()
 def account_register():
+    _enforce_rate_limit("accounts_register", get_jwt().get("iid") or request.remote_addr)
     claims = _require_access_proof("device")
     body = _json_body()
     lookup = _handle_lookup(body.get("handle"))
@@ -3150,6 +3290,7 @@ def account_register():
 @app.post("/v1/accounts/login")
 @jwt_required()
 def account_login():
+    _enforce_rate_limit("accounts_login", get_jwt().get("iid") or request.remote_addr)
     claims = _require_access_proof("device")
     body = _json_body()
     lookup = _handle_lookup(body.get("handle"))
