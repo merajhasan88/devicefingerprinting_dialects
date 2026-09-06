@@ -1,0 +1,79 @@
+# Codemagic CI - iOS build for the Device Trust client.
+#
+# Why this is configured the way it is:
+#
+#   * UNSIGNED. Codemagic's stock iOS workflows assume TestFlight distribution
+#     and therefore demand Apple signing certificates and a paid Apple
+#     Developer account. We do not need either: the target is a
+#     checkm8-jailbroken device, where AMFI signature enforcement is bypassed
+#     and an unsigned app installs directly. `--no-codesign` keeps the whole
+#     path free of Apple account requirements.
+#
+#   * MANUAL .ipa PACKAGING. `flutter build ipa` requires signing, so it cannot
+#     be used here. `flutter build ios --no-codesign` emits Runner.app instead,
+#     which is not installable as-is. An .ipa is just a zip with the bundle
+#     under Payload/, so we assemble it ourselves.
+#
+#   * MANUAL TRIGGER ONLY. No `triggering:` block, so pushes do not start
+#     builds. The free tier is 500 macOS minutes/month and an iOS build costs
+#     10-20 of them; automatic builds on every push would burn that quickly.
+#
+#   * API_BASE_URL comes from an environment variable, not the repo. The test
+#     server's public IP changes every time the EC2 instance restarts, so
+#     hardcoding it would mean a commit per restart. Override it in the
+#     Codemagic UI (Environment variables) before each build.
+
+workflows:
+  ios-unsigned:
+    name: iOS unsigned build (jailbroken-device target)
+    instance_type: mac_mini_m2       # the machine the free tier provides
+    max_build_duration: 45
+
+    environment:
+      flutter: stable
+      xcode: latest
+      cocoapods: default
+      vars:
+        # Placeholder. Set the real value in the Codemagic UI per build.
+        # The Dart client fails loudly with api_base_url_missing if this is
+        # empty, so it must be present at compile time even for a smoke test.
+        API_BASE_URL: "https://example.invalid"
+
+    scripts:
+      - name: Flutter version in use
+        script: |
+          flutter --version
+
+      - name: Fetch packages
+        script: |
+          flutter pub get
+
+      - name: Build iOS without code signing
+        script: |
+          flutter build ios --release --no-codesign \
+            --dart-define=API_BASE_URL="$API_BASE_URL"
+
+      - name: Package Runner.app into an unsigned .ipa
+        script: |
+          set -e
+          APP="build/ios/iphoneos/Runner.app"
+          test -d "$APP" || { echo "Runner.app not found at $APP"; exit 1; }
+          rm -rf build/ipa && mkdir -p build/ipa/Payload
+          cp -R "$APP" build/ipa/Payload/
+          cd build/ipa
+          zip -qry ../../devicetrust-unsigned.ipa Payload
+          cd ../..
+          ls -lh devicetrust-unsigned.ipa
+
+      - name: Report what the build produced
+        script: |
+          echo "--- app bundle ---"
+          ls -1 build/ios/iphoneos/Runner.app | head -20
+          echo "--- minimum OS the binary declares ---"
+          /usr/libexec/PlistBuddy -c "Print :MinimumOSVersion" \
+            build/ios/iphoneos/Runner.app/Info.plist || true
+
+    artifacts:
+      - devicetrust-unsigned.ipa
+      - build/ios/iphoneos/Runner.app
+      - flutter_drive.log
