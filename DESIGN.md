@@ -2765,3 +2765,59 @@ clean baseline and the jailbroken case on demand, which suits the battery well.
 
 Codemagic plus a one-time handset is far cheaper than any cloud-Mac arrangement, and unlike a device
 farm it gives the same depth of access already available on the two Android handsets.
+
+---
+
+# 32. iOS identity and possession — Swift implementation (2026-09-06)
+
+First native iOS code in the project. Covers battery items 1–4's prerequisite: an installation
+identity and proof of possession. The integrity collector is deliberately not part of this step.
+
+## 32.1 What was written
+
+- `ios/Runner/InstallationKeyManager.swift` — one non-exportable P-256 key in the Secure Enclave.
+- `ios/Runner/AppDelegate.swift` — registers `devicefingerprinting/installation_key_v2` with the
+  same three methods the Android host exposes: `getOrCreateKey`, `sign`, `deleteKey`.
+- `ios/Runner.xcodeproj/project.pbxproj` — the new Swift file had to be registered by hand
+  (PBXBuildFile, PBXFileReference, group membership, Sources build phase). Xcode is not available on
+  the Linux dev machine, and a `.swift` file that is not referenced simply never compiles.
+
+**No Dart changes were needed.** `NativeInstallationKey` is platform-agnostic; it calls the channel
+by name and validates the returned map. iOS satisfies the same contract.
+
+## 32.2 The two properties that had to match Android exactly
+
+- **The payload arrives as base64url text, is decoded, and the raw bytes are signed.** The server
+  verifies over exactly the bytes the client signed, which is why no canonical JSON is needed across
+  platforms.
+- **The signature is ASN.1 DER.** `ecdsaSignatureMessageX962SHA256` yields X9.62/DER, matching
+  Android's `SHA256withECDSA` and what PyCryptodome verifies. A raw `r||s` signature would be
+  rejected — the same trap already documented for the .NET SDK, where the default .NET signature
+  format is IEEE-P1363.
+
+Secure Enclave is attempted first with a graceful fallback to a software keychain key, mirroring the
+Android host's StrongBox-then-fallback shape (the Simulator has no Secure Enclave). The honest
+result is reported to the server through `security_level` and `hardware_backed` rather than being
+hidden.
+
+## 32.3 A platform divergence that will affect battery items 12 and 13
+
+**iOS keychain items survive app uninstall; Android Keystore entries do not.**
+
+On Android, deleting the app destroys the key, so a reinstall necessarily enrols a *new*
+installation — which is exactly what items 12 (device memory across reinstall) and 13 (pristine
+reinstall) rely on. On iOS the keychain item, and therefore the Secure Enclave key, will normally
+still be there after a reinstall, so `getOrCreateKey` returns the **same** key and `created` is
+`false`.
+
+This is not a bug in either platform, but it means those two items cannot be run on iOS by simply
+uninstalling and reinstalling. The iOS equivalent must either call `deleteKey` explicitly to
+simulate a fresh installation, or the test must be redefined for iOS. This needs deciding before
+items 12 and 13 are attempted on the iPhone; it is flagged here rather than discovered mid-test.
+
+## 32.4 Not yet verified
+
+Written but not yet compiled — the Linux dev machine cannot build iOS. The next Codemagic run is the
+first compile. Two things are most likely to need a fix: whether
+`FlutterPluginRegistry.registrar(forPlugin:)` is nullable in this Flutter version (the code assumes
+it is, via `guard let`), and the exact `SecAccessControlCreateWithFlags` overload resolution.
