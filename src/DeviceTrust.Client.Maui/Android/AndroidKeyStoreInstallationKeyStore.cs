@@ -8,6 +8,7 @@ using DeviceTrust.Client.Keys;
 using Java.Security;
 using Java.Security.Interfaces;
 using Java.Security.Spec;
+using Android.Runtime;
 
 namespace DeviceTrust.Client.Maui.Android
 {
@@ -84,7 +85,13 @@ namespace DeviceTrust.Client.Maui.Android
 
                 _createdThisSession |= created;
 
-                if (entry.Certificate?.PublicKey is not IECPublicKey publicKey)
+                // JavaCast, not a C# "is" pattern. AndroidKeyStore hands the key
+                // back through a generic Java proxy typed as IPublicKey, which does
+                // not implement the IECPublicKey managed interface until it is
+                // re-cast across the JNI bridge -- a plain pattern match always
+                // fails and looks like the keystore returning the wrong key type.
+                var publicKey = entry.Certificate?.PublicKey?.JavaCast<IECPublicKey>();
+                if (publicKey is null)
                 {
                     throw new InstallationKeyException(
                         "INVALID_PUBLIC_KEY",
@@ -321,8 +328,8 @@ namespace DeviceTrust.Client.Maui.Android
 
         private static bool IsExpectedP256Key(KeyStore.PrivateKeyEntry entry)
         {
-            return entry.Certificate?.PublicKey is IECPublicKey publicKey
-                   && publicKey.Params?.Curve?.Field?.FieldSize == 256;
+            var publicKey = entry.Certificate?.PublicKey?.JavaCast<IECPublicKey>();
+            return publicKey?.Params?.Curve?.Field?.FieldSize == 256;
         }
 
         private (string Level, bool HardwareBacked) DescribeSecurity(KeyStore.PrivateKeyEntry entry)

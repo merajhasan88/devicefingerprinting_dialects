@@ -10,17 +10,25 @@ namespace DeviceTrust.Client.Internal
     /// </summary>
     public static class Json
     {
-        /// <summary>Serializer options used for every body this SDK sends.</summary>
-        public static readonly JsonSerializerOptions Options = new JsonSerializerOptions
+        /// <summary>
+        /// Serializes a request body to the exact UTF-8 bytes that will be
+        /// transmitted.
+        /// </summary>
+        /// <remarks>
+        /// Written explicitly rather than through
+        /// <c>JsonSerializer.Serialize&lt;T&gt;</c>, which is not trim-safe and
+        /// would stop the SDK building inside an AOT-compiled Android
+        /// application. See <see cref="JsonValueWriter"/>.
+        /// </remarks>
+        public static byte[] SerializeToUtf8Bytes(IReadOnlyDictionary<string, object?> value)
         {
-            WriteIndented = false,
-            DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.Never,
-        };
+            using var buffer = new System.IO.MemoryStream();
+            using (var writer = new Utf8JsonWriter(buffer, new JsonWriterOptions { Indented = false }))
+            {
+                JsonValueWriter.WriteObject(writer, value);
+            }
 
-        /// <summary>Serializes a value to the exact UTF-8 bytes that will be transmitted.</summary>
-        public static byte[] SerializeToUtf8Bytes(object? value)
-        {
-            return JsonSerializer.SerializeToUtf8Bytes(value, Options);
+            return buffer.ToArray();
         }
 
         /// <summary>Reads a string property, or null when it is missing or not a string.</summary>

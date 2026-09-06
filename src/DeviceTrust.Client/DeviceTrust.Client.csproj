@@ -10,6 +10,12 @@
     <PackageId>DeviceTrust.Client</PackageId>
     <Description>Device-trust client SDK: installation identity, proof of possession, access proofs and signed integrity reports against the device-trust server.</Description>
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <!-- A .NET Android release build needs RunAOTCompilation to avoid the Mono
+         JIT's writable-and-executable memory, which the server scores as
+         android_wx_memory +60, and AOT requires trimming. Declaring the library
+         trimmable makes the analyzer enforce that the SDK stays usable there. -->
+    <IsTrimmable Condition="'$(TargetFramework)' != 'net6.0'">true</IsTrimmable>
+    <EnableTrimAnalyzer Condition="'$(TargetFramework)' != 'net6.0'">true</EnableTrimAnalyzer>
   </PropertyGroup>
 
 </Project>

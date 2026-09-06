@@ -1,0 +1,35 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0-android</TargetFramework>
+    <OutputType>Exe</OutputType>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <RootNamespace>DeviceTrust.Android.Harness</RootNamespace>
+    <!-- Distinct from the Flutter reference client's com.example.devicefingerprinting.
+         Android keys an install by package name, so a collision would replace that
+         app and destroy its AndroidKeyStore entries on a shared test handset. -->
+    <ApplicationId>com.example.devicefingerprinting_dotnet</ApplicationId>
+    <ApplicationVersion>1</ApplicationVersion>
+    <ApplicationDisplayVersion>1.0</ApplicationDisplayVersion>
+    <SupportedOSPlatformVersion>23.0</SupportedOSPlatformVersion>
+    <!-- The battery is defined for release builds only: a debuggable APK scores
+         android_app_debuggable +35 and would never reach the clean baseline. -->
+    <AndroidPackageFormat>apk</AndroidPackageFormat>
+    <RunAOTCompilation>false</RunAOTCompilation>
+    <PublishTrimmed>false</PublishTrimmed>
+    <AndroidEnableProfiledAot>false</AndroidEnableProfiledAot>
+    <!-- The docs comment in the SDK's code-integrity probe explains why this
+         matters: with extractNativeLibs off, the app's native code maps straight
+         out of base.apk and the app bucket must accept an .apk backing file.
+         Extracting them instead gives the bucket real .so files to compare, which
+         is the clearer arrangement for a test harness. -->
+    <AndroidUseLegacyPackaging>true</AndroidUseLegacyPackaging>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\DeviceTrust.Client\DeviceTrust.Client.csproj" />
+    <ProjectReference Include="..\DeviceTrust.Client.Maui\DeviceTrust.Client.Maui.csproj" />
+  </ItemGroup>
+
+</Project>

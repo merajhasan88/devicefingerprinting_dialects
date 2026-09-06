@@ -1,8 +1,7 @@
 using System;
-using System.Collections;
 using System.Collections.Generic;
-using System.Globalization;
 using System.Text.Json;
+using DeviceTrust.Client.Internal;
 
 namespace DeviceTrust.Client.Integrity
 {
@@ -53,63 +52,7 @@ namespace DeviceTrust.Client.Integrity
         /// <summary>Writes one loosely typed measurement value.</summary>
         public static void WriteValue(Utf8JsonWriter writer, object? value)
         {
-            if (writer is null)
-            {
-                throw new ArgumentNullException(nameof(writer));
-            }
-
-            switch (value)
-            {
-                case null:
-                    writer.WriteNullValue();
-                    break;
-                case string text:
-                    writer.WriteStringValue(text);
-                    break;
-                case bool flag:
-                    writer.WriteBooleanValue(flag);
-                    break;
-                case int number:
-                    writer.WriteNumberValue(number);
-                    break;
-                case long number:
-                    writer.WriteNumberValue(number);
-                    break;
-                case double number:
-                    writer.WriteNumberValue(number);
-                    break;
-                case IReadOnlyDictionary<string, string> map:
-                    writer.WriteStartObject();
-                    foreach (var entry in map)
-                    {
-                        writer.WriteString(entry.Key, entry.Value);
-                    }
-
-                    writer.WriteEndObject();
-                    break;
-                case IReadOnlyDictionary<string, object?> map:
-                    writer.WriteStartObject();
-                    foreach (var entry in map)
-                    {
-                        writer.WritePropertyName(entry.Key);
-                        WriteValue(writer, entry.Value);
-                    }
-
-                    writer.WriteEndObject();
-                    break;
-                case IEnumerable sequence:
-                    writer.WriteStartArray();
-                    foreach (var item in sequence)
-                    {
-                        WriteValue(writer, item);
-                    }
-
-                    writer.WriteEndArray();
-                    break;
-                default:
-                    writer.WriteStringValue(Convert.ToString(value, CultureInfo.InvariantCulture));
-                    break;
-            }
+            JsonValueWriter.WriteValue(writer, value);
         }
     }
 }

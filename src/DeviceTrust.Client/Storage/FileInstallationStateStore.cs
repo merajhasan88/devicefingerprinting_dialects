@@ -1,20 +1,30 @@
 using System;
 using System.IO;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using System.Threading;
 using System.Threading.Tasks;
 
 namespace DeviceTrust.Client.Storage
 {
+    /// <summary>
+    /// Source-generated serialization metadata for <see cref="InstallationState"/>.
+    /// </summary>
+    /// <remarks>
+    /// Reflection-based <c>JsonSerializer</c> is not trim-safe, and an Android
+    /// application built with <c>RunAOTCompilation</c> must be trimmed, so a
+    /// reflection call here would stop the whole application building. The
+    /// generated context costs nothing and removes that constraint.
+    /// </remarks>
+    [JsonSourceGenerationOptions(WriteIndented = true, PropertyNamingPolicy = JsonKnownNamingPolicy.CamelCase)]
+    [JsonSerializable(typeof(InstallationState))]
+    internal sealed partial class InstallationStateJsonContext : JsonSerializerContext
+    {
+    }
+
     /// <summary>A JSON-file state store for desktop builds, CI and test harnesses.</summary>
     public sealed class FileInstallationStateStore : IInstallationStateStore
     {
-        private static readonly JsonSerializerOptions SerializerOptions = new JsonSerializerOptions
-        {
-            WriteIndented = true,
-            PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
-        };
-
         private readonly string _path;
 
         /// <summary>Creates a store backed by the file at <paramref name="path"/>.</summary>
@@ -40,7 +50,7 @@ namespace DeviceTrust.Client.Storage
             try
             {
                 var text = File.ReadAllText(_path);
-                var state = JsonSerializer.Deserialize<InstallationState>(text, SerializerOptions);
+                var state = JsonSerializer.Deserialize(text, InstallationStateJsonContext.Default.InstallationState);
                 return Task.FromResult(state ?? new InstallationState());
             }
             catch (JsonException)
@@ -69,7 +79,7 @@ namespace DeviceTrust.Client.Storage
                 Directory.CreateDirectory(directory!);
             }
 
-            File.WriteAllText(_path, JsonSerializer.Serialize(state, SerializerOptions));
+            File.WriteAllText(_path, JsonSerializer.Serialize(state, InstallationStateJsonContext.Default.InstallationState));
             return Task.CompletedTask;
         }
 

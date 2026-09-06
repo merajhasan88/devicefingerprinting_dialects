@@ -88,21 +88,30 @@ namespace DeviceTrust.Client.Maui.Android
         };
 
         private readonly Context _context;
-        private readonly bool _nativeAvailable;
         private string? _cachedApkSha256;
 
         /// <summary>Creates a collector for the current application context.</summary>
         public AndroidIntegrityCollector(Context context)
         {
             _context = context ?? throw new ArgumentNullException(nameof(context));
-            _nativeAvailable = TryLoadNativeLibrary();
         }
 
         /// <inheritdoc />
         public string Platform => "android";
 
-        /// <inheritdoc />
-        public int CollectorVersion => 1;
+        /// <summary>
+        /// Two, not one.
+        /// </summary>
+        /// <remarks>
+        /// The reference implementation versions its Android collector per
+        /// platform, and v2 is the set that adds <c>instrumentation_threads</c>,
+        /// <c>exec_mappings</c> and <c>code_integrity</c> to the v1 baseline —
+        /// which is exactly this set. Every stored report carries the value, so a
+        /// report says which probe set produced it; DESIGN.md 29.2 exists because
+        /// a whole run of database batteries had to be stamped as v1 after the
+        /// fact so the results would not be misread later.
+        /// </remarks>
+        public int CollectorVersion => 2;
 
         /// <inheritdoc />
         public Task<IntegrityCollection> CollectAsync(
@@ -674,76 +683,46 @@ namespace DeviceTrust.Client.Maui.Android
 
         private ProbeResult ProbeCodeIntegrity()
         {
-            // Native compares the app's own mapped r-x pages against the same
-            // bytes on disk. An inline hook overwrites a function prologue, so any
-            // difference at or above one arm64 branch is a modification. Reading
-            // by pointer rather than through /proc/self/mem is what keeps this
-            // working under SELinux.
-            if (!_nativeAvailable)
-            {
-                return ProbeResult.Ok().With("checked", false).With("reason", "native_unavailable");
-            }
-
-            string? json;
-            try
-            {
-                json = NativeCodeIntegrity.Measure();
-            }
-            catch (Exception error)
+            // Managed, with no native component. /proc/self/maps is an ordinary
+            // file read and Marshal.Copy reads this process's own mapped pages by
+            // pointer, so the SELinux block on /proc/self/mem that forced the
+            // reference implementation into an NDK component does not apply here.
+            var measurement = ManagedCodeIntegrity.Measure();
+            if (!measurement.Checked)
             {
                 return ProbeResult.Ok()
                     .With("checked", false)
-                    .With("reason", "native_error:" + error.GetType().Name);
+                    .With("reason", measurement.Reason);
             }
 
-            if (string.IsNullOrEmpty(json))
-            {
-                return ProbeResult.Ok().With("checked", false).With("reason", "native_no_result");
-            }
-
-            try
-            {
-                using var document = JsonDocument.Parse(json!);
-                var root = document.RootElement;
-                return ProbeResult.Ok()
-                    .With("checked", Json.GetBoolean(root, "checked"))
-                    .With("diff_bytes", Json.GetInt32(root, "diff_bytes"))
-                    .With("core_compared_bytes", Json.GetInt32(root, "core_compared_bytes"))
-                    .With("core_diff_bytes", Json.GetInt32(root, "core_diff_bytes"))
-                    .With("ext_compared_bytes", Json.GetInt32(root, "ext_compared_bytes"))
-                    .With("ext_diff_bytes", Json.GetInt32(root, "ext_diff_bytes"))
-                    .With("ext_libs_diff", Json.GetInt32(root, "ext_libs_diff"))
-                    .With("app_compared_bytes", Json.GetInt32(root, "app_compared_bytes"))
-                    .With("app_diff_bytes", Json.GetInt32(root, "app_diff_bytes"))
-                    .With("app_libs_diff", Json.GetInt32(root, "app_libs_diff"))
-                    .With("diffed_libs", Json.GetString(root, "diffed_libs") ?? string.Empty);
-            }
-            catch (JsonException error)
-            {
-                return ProbeResult.Ok()
-                    .With("checked", false)
-                    .With("reason", "parse_error:" + error.GetType().Name);
-            }
-        }
-
-        private static bool TryLoadNativeLibrary()
-        {
-            try
-            {
-                return NativeCodeIntegrity.Measure() is not null;
-            }
-            catch (DllNotFoundException)
-            {
-                return false;
-            }
-            catch (EntryPointNotFoundException)
-            {
-                return false;
-            }
-            catch (Exception)
-            {
-                return false;
-            }
+            return ProbeResult.Ok()
+                .With("checked", true)
+                // diff_bytes is the CORE bucket. The server reads this field as
+                // the core figure and adds ext separately; reporting a combined
+                // total here would double-count the extended bucket.
+                .With("diff_bytes", measurement.CoreDiffBytes)
+                .With("core_compared_bytes", measurement.CoreComparedBytes)
+                .With("core_diff_bytes", measurement.CoreDiffBytes)
+                .With("ext_compared_bytes", measurement.ExtComparedBytes)
+                .With("ext_diff_bytes", measurement.ExtDiffBytes)
+                .With("ext_libs_diff", measurement.ExtLibrariesDiffering)
+                .With("app_compared_bytes", measurement.AppComparedBytes)
+                .With("app_diff_bytes", measurement.AppDiffBytes)
+                .With("app_libs_diff", measurement.AppLibrariesDiffering)
+                .With("diffed_libs", measurement.DiffedLibraries)
+                // Emitted so an operator can tell an inert bucket from a clean
+                // one at a glance. A bucket with compared_bytes = 0 measured
+                // nothing; treating that as "no difference found" is the defect
+                // that shipped once in the reference implementation.
+                .With("core_bucket_live", measurement.CoreComparedBytes > 0)
+                .With("ext_bucket_live", measurement.ExtComparedBytes > 0)
+                .With("app_bucket_live", measurement.AppComparedBytes > 0)
+                // Android 10+ maps system libraries execute-only. These say how
+                // many such regions had to be temporarily made readable, and how
+                // many could not be -- the second number is what separates an
+                // incomplete measurement from a clean one.
+                .With("xom_regions_unlocked", measurement.ExecuteOnlyRegionsUnlocked)
+                .With("xom_regions_unreadable", measurement.ExecuteOnlyRegionsUnreadable);
         }
 
         private static string? ReadInstallerPackage(PackageManager packageManager, string packageName)
@@ -864,29 +843,6 @@ namespace DeviceTrust.Client.Maui.Android
             }
 
             return value.Length <= maximum ? value : value.Substring(0, maximum);
-        }
-    }
-
-    /// <summary>
-    /// Binding to the <c>libcodeintegrity.so</c> shipped with the reference
-    /// Android host.
-    /// </summary>
-    /// <remarks>
-    /// The native library is the same one the Kotlin collector loads; package it
-    /// into the application's <c>lib/&lt;abi&gt;</c> directory. When it is absent
-    /// the probe reports <c>checked=false</c> with a reason, which the server can
-    /// see and weigh, rather than silently reporting a clean measurement it never
-    /// took.
-    /// </remarks>
-    internal static class NativeCodeIntegrity
-    {
-        [DllImport("codeintegrity", EntryPoint = "dt_code_integrity_measure_json")]
-        private static extern IntPtr MeasureNative();
-
-        internal static string? Measure()
-        {
-            var pointer = MeasureNative();
-            return pointer == IntPtr.Zero ? null : Marshal.PtrToStringAnsi(pointer);
         }
     }
 }
