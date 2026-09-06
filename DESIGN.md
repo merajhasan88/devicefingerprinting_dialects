@@ -1820,9 +1820,24 @@ after the original four groups and are folded in here so this list is the single
 | 9 | Frida Gadget — detection | `score=100 verdict=block`, `frida_runtime_artifact` +90 | each |
 | 10 | Frida Gadget — enforcement | `POST /v1/accounts/login` 403 `integrity_blocked` | each |
 | 11 | Frida Gadget — restore | clean APK (0 frida entries) returns `18/trusted` | each |
-| 12 | Device memory across reinstall | full uninstall + new hardware key → 403 `integrity_device_blocked_recently` | each |
-| 13 | Pristine reinstall (recognition) | `devices` unchanged, `installations` +1, same `device_id`, **login 200** | each |
+| 12 | Device memory across a new hardware key | **Android:** full uninstall + reinstall. **iOS:** `deleteKey` then re-enrol (see below). Either way a new hardware key → 403 `integrity_device_blocked_recently` | each |
+| 13 | Pristine re-enrolment (recognition) | **Android:** uninstall + reinstall. **iOS:** `deleteKey` then re-enrol. `devices` unchanged, `installations` +1, same `device_id`, **login 200** | each |
 | 14 | Structural code-integrity (ext bucket) | deferred libc++ hook → `ext_diff_bytes > 0` → `android_code_integrity_violation` +90 → `block` | each |
+| 15 | Key survives app reinstall (**iOS only**) | uninstall + reinstall **without** `deleteKey` → `getOrCreateKey` returns `created: false`, the **same** key thumbprint, and the same `installation_id` | iPhone |
+
+**Items 12, 13 and 15 differ by platform, deliberately.** Android Keystore entries are destroyed
+when the app is uninstalled, so a reinstall necessarily enrols a new hardware key — which is exactly
+what items 12 and 13 exercise. **iOS keychain items survive app uninstall**, so on iPhone a reinstall
+returns the *same* Secure Enclave key and proves nothing about re-enrolment. The iOS parallel of
+"uninstall" is therefore an explicit `deleteKey` on the installation-key channel, which destroys the
+Secure Enclave key and forces a genuinely new installation. That preserves each item's *intent* — a
+new hardware key on the same physical device must still correlate to the same `device_id`, and must
+still be refused while the device is blocked — rather than pretending the platforms behave alike.
+
+Item 15 exists because that divergence is itself a property worth asserting rather than assuming.
+On iOS the installation identity survives app reinstall, which is a *stronger* recognition guarantee
+than Android's; the test makes it explicit and would catch a future iOS change that silently
+weakened it. It has no Android counterpart, because there the key is gone by design.
 
 **Items 5–8 must run within 10 minutes of a session refresh**, or an expired access token makes them
 inconclusive. Items 3 and 4 are cross-device by construction — one run exercises both handsets.
@@ -2821,3 +2836,54 @@ Written but not yet compiled — the Linux dev machine cannot build iOS. The nex
 first compile. Two things are most likely to need a fix: whether
 `FlutterPluginRegistry.registrar(forPlugin:)` is nullable in this Flutter version (the code assumes
 it is, via `guard let`), and the exact `SecAccessControlCreateWithFlags` overload resolution.
+
+---
+
+# 33. iOS integrity collector (2026-09-06)
+
+`ios/Runner/IntegrityProbeManager.swift` implements the eight probes
+`_score_ios_integrity` already scores, on the `devicefingerprinting/integrity_v1` channel. As on
+Android, **the collector computes no score** — it reports raw measurements and the server decides.
+
+## 33.1 The probes and what each maps to
+
+| Probe | Fields the server reads | Implementation |
+|---|---|---|
+| `app_identity` | `bundle_id`, `executable_sha256` | `Bundle.main` + SHA-256 of the main executable |
+| `code_signing` | `signing_identifier`, `team_identifier`, `get_task_allow` | `SecTaskCreateFromSelf` + entitlement lookups |
+| `debugger` | `traced` | `sysctl` `KERN_PROC` / `P_TRACED` — the standard non-private check |
+| `jailbreak_files` | `found_paths` | 20 artifact paths incl. rootless `/var/jb` layouts (palera1n, Dopamine) |
+| `sandbox` | `write_outside_sandbox_succeeded` | attempts a write to `/private/`, removes it if it unexpectedly works |
+| `dyld_images` | `suspicious_tokens` | `_dyld_image_count` / `_dyld_get_image_name` — the iOS analogue of `/proc/self/maps` |
+| `environment` | `dyld_insert_libraries` | `DYLD_INSERT_LIBRARIES` |
+| `simulator` | `is_simulator` | `targetEnvironment(simulator)` + device model |
+
+## 33.2 Honest reporting over flattering reporting
+
+`code_signing` returns empty `signing_identifier` and `team_identifier` for the unsigned builds the
+jailbroken-device workflow produces. That is reported as-is rather than faked; the server only
+compares those fields when a baseline is configured, so an unsigned test build simply does not
+trigger the mismatch rules.
+
+`jailbreak_files` will return an empty list on a clean device partly because the sandbox makes most
+of those paths unreadable, which is indistinguishable from their being absent. That false negative
+is acceptable: the `dyld_images` and `environment` probes catch in-process instrumentation whether
+or not the filesystem is legible, and the same reasoning already applies to Android's `root_files`
+under SELinux (§21.5).
+
+## 33.3 The known weakness, carried over deliberately
+
+`dyld_images` matches on **image name**, exactly like Android's original `runtime_maps` token scan —
+and it inherits the same defeat: rename the injected dylib and it goes unseen. That evasion was
+demonstrated on Android in §27.11 and closed there by structural detection (§28). The iOS structural
+answer is not yet written; until it is, iOS hook detection is name-based only and should be
+described that way rather than as equivalent to the Android collector.
+
+## 33.4 Next: the iOS code-integrity analogue
+
+There is no `/proc/self/maps` and no readable `/proc/self/mem` on iOS. The equivalent of the Android
+`code_integrity` probe is to walk loaded images with `_dyld_image_count` /
+`_dyld_get_image_header`, resolve each image's `__TEXT` segment, and compare the in-memory bytes
+against the same range of the on-disk Mach-O — including the `slide` returned by
+`_dyld_get_image_vmaddr_slide`. That is a genuinely different design from the Linux version rather
+than a port, and it is the natural `collector_version` 2 for iOS.

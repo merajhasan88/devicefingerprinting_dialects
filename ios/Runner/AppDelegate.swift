@@ -6,8 +6,10 @@ import UIKit
   /// Matches the Android host's channel name exactly. The Dart client is
   /// platform-agnostic and talks to this same name on both platforms.
   private static let keyChannelName = "devicefingerprinting/installation_key_v2"
+  private static let integrityChannelName = "devicefingerprinting/integrity_v1"
 
   private var installationKeys: InstallationKeyManager?
+  private var integrityProbes: IntegrityProbeManager?
 
   /// Keychain and Secure Enclave calls can block, so they run off the platform
   /// thread. FlutterResult must be invoked on the platform thread, hence the
@@ -27,6 +29,51 @@ import UIKit
   func didInitializeImplicitFlutterEngine(_ engineBridge: FlutterImplicitEngineBridge) {
     GeneratedPluginRegistrant.register(with: engineBridge.pluginRegistry)
     registerInstallationKeyChannel(with: engineBridge.pluginRegistry)
+    registerIntegrityChannel(with: engineBridge.pluginRegistry)
+  }
+
+  private func registerIntegrityChannel(with registry: FlutterPluginRegistry) {
+    guard let registrar = registry.registrar(forPlugin: "DeviceTrustIntegrity") else {
+      return
+    }
+
+    let collector = IntegrityProbeManager()
+    integrityProbes = collector
+
+    let channel = FlutterMethodChannel(
+      name: AppDelegate.integrityChannelName,
+      binaryMessenger: registrar.messenger()
+    )
+
+    channel.setMethodCallHandler { [weak self] call, result in
+      guard let self = self else { return }
+      switch call.method {
+      case "collect":
+        guard
+          let arguments = call.arguments as? [String: Any],
+          let nonce = arguments["challenge_nonce"] as? String,
+          let required = arguments["required_probes"] as? [String]
+        else {
+          result(FlutterError(
+            code: "INVALID_ARGUMENT",
+            message: "challenge_nonce must be a string and required_probes a list of strings.",
+            details: nil
+          ))
+          return
+        }
+        let fixture = arguments["integrity_test_fixture"] as? String
+        self.runOffPlatformThread(result) {
+          collector.collect(
+            requiredProbes: required,
+            challengeNonce: nonce,
+            testFixture: fixture
+          )
+        }
+
+      default:
+        result(FlutterMethodNotImplemented)
+      }
+    }
   }
 
   private func registerInstallationKeyChannel(with registry: FlutterPluginRegistry) {
