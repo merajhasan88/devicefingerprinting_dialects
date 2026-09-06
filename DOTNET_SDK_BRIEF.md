@@ -159,3 +159,124 @@ the way the Flutter app takes `--dart-define=STOLEN_ACCESS_TOKEN`.
 - `DESIGN.md` — every property already validated and why each rule is shaped the way it is.
 - `android/app/src/main/kotlin/.../InstallationKeyManager.kt` and `IntegrityProbeManager.kt` — the
   native key and probe implementations the .NET side must find platform analogues for.
+
+---
+
+# UPDATE — 2026-09-06
+
+Everything above still holds. This section records what changed in the reference implementation
+**after** this brief was written, limited to what actually changes decisions on the .NET side.
+`DESIGN.md` in this repository has been refreshed to match; it now runs through §33.
+
+## 1. Extended code-integrity scoring is ON by default (was off)
+
+When this SDK was started, `INTEGRITY_SCORE_EXTENDED_LIBS` defaulted to `0`: the `code_integrity`
+probe's **ext** and **app** buckets were collected but not scored. Both handsets have since been
+baselined clean and the default is now **`1`** (§30.2).
+
+**What this changes for you:** the bucket fields your Android collector already emits are now
+load-bearing. `ext_diff_bytes >= 4` raises `android_code_integrity_violation` +90 and
+`app_diff_bytes >= 4` raises `android_app_code_modified` +90 — both block on their own. A collector
+that over-reports a diff will now **block real users**, where before it was merely noisy.
+
+Follow the same discipline the reference implementation used, and do not skip it: ship the buckets
+**report-only first**, capture the values on a real clean device, confirm every bucket has a
+**non-zero `compared_bytes` and a zero `diff_bytes`**, and only then let them score. A
+`compared_bytes` of **zero means the bucket is inert, not clean** — that exact defect shipped once
+and was caught only by looking at the raw numbers (§28.8, §30.1).
+
+## 2. .NET can do the in-memory comparison without a native component
+
+The reference collector needed an **NDK/C component** for `code_integrity`, because Kotlin cannot
+dereference an arbitrary address and SELinux blocks `untrusted_app` from opening `/proc/self/mem`
+(§28.6).
+
+.NET does not have that problem. `/proc/self/maps` is an ordinary file read, and
+`Marshal.Copy(IntPtr, byte[], int, int)` reads the process's own mapped pages directly — no JNI, no
+native library. If you implement `code_integrity` for MAUI Android, you can do it in pure C#.
+
+Two implementation details that cost the reference version real debugging time:
+
+- **Iterate every executable VMA of a target library, not just the first.** An inline hooker flips
+  individual code pages writable to patch them, which splits the library's single `r-x` mapping into
+  several, and the patched page is usually *not* the first. An early single-VMA version compared
+  114 KB of libc and reported `diff_bytes: 0` against a live hook — a false negative.
+- **Exclude the ART JIT code cache.** It legitimately presents as executable and `(deleted)`
+  (`/memfd:/jit-cache`, `/dev/ashmem/dalvik-jit-code-cache`). Without that exclusion every clean
+  device is a false positive.
+
+## 3. Name-based hook detection is defeatable — proven, not theorised
+
+`runtime_maps`-style token scanning matches on the *name* of a mapped file. A real Frida Gadget
+renamed to `libhelper.so` and moved off port 27042 scored **`18/trusted`** while fully active
+(§27.11). Renaming a file is free for an attacker who is already repackaging your app.
+
+If your collector's hook detection is name-based, describe it as such. The structural answers that
+actually work are in §28: instrumentation-runtime **thread names** (`gum-js-loop`, `pool-frida` —
+compiled into the framework, so a rename does not touch them), **writable-and-executable** memory,
+and the in-memory-versus-on-disk code comparison above.
+
+## 4. The battery is now 15 items, and items 12/13 differ by platform
+
+`§25.11` has been rewritten as the canonical list — your `CLAUDE.md` already points readers there,
+so re-read it rather than relying on the four-group version this brief originally described.
+
+The part that matters for a cross-platform SDK: **iOS keychain items survive app uninstall; Android
+Keystore entries do not.** On Android, uninstall destroys the key so a reinstall necessarily enrols
+a new one. On iOS the same key comes back, so a reinstall proves nothing about re-enrolment.
+
+- Items **12** and **13** therefore use uninstall on Android and an explicit **`DeleteKey`** on iOS.
+- New item **15**, iOS only: uninstall and reinstall *without* deleting the key must return
+  `created: false`, the **same** key thumbprint and the same `installation_id`.
+
+Your `IInstallationKeyStore` needs a delete that genuinely destroys the key material on every
+platform, because on iOS that is the only way to simulate a fresh installation.
+
+## 5. An iOS reference implementation now exists — mirror it
+
+`ios/Runner/InstallationKeyManager.swift` and `ios/Runner/IntegrityProbeManager.swift` in the
+reference repository are the Secure Enclave key store and the iOS probe collector (§32, §33). For
+MAUI iOS the same Security-framework calls are available through the .NET bindings.
+
+Two details worth copying rather than rediscovering:
+
+- Sign with the equivalent of `ecdsaSignatureMessageX962SHA256`, which yields **X9.62/DER** —
+  the same requirement that makes `DSASignatureFormat.Rfc3279DerSequence` mandatory in .NET.
+- Attempt the Secure Enclave first and fall back to a software keychain key, then report the truth
+  through `security_level` / `hardware_backed`. The Simulator has no Secure Enclave, and a fallback
+  that lies about its own strength is worse than one that admits it.
+
+The exact iOS probe field contract the server reads is tabulated in §33.1. iOS hook detection there
+is currently **name-based only** and is documented as not yet equivalent to the Android collector —
+do not assume parity.
+
+## 6. `collector_version` is per-platform
+
+Android is at **2** (baseline probes plus `instrumentation_threads`, `exec_mappings`,
+`code_integrity`); iOS is at **1** (its baseline set). Every stored report carries the value, so a
+report says which probe set produced it. Version your own collectors the same way — §29.2 exists
+because every database battery in the project ran on Android collector v1 and that had to be
+stamped after the fact so the results were not misread later.
+
+## 7. A blocked device now returns 403 regardless of the password
+
+`account_login` used to check credentials **before** the integrity gate, so a blocked device
+answered `401 invalid_credentials` for a wrong password and `403 integrity_blocked` for a correct
+one — a credential oracle on exactly the device class the gate exists to distrust. The gate now runs
+first and both cases return `403` (§27.5.1).
+
+If your harness asserts on login failures for a blocked device, expect **403**, not 401. Note also
+that input-shape validation still precedes the gate, so a malformed request can return `400` —
+that is not the same leak, because it says nothing about whether an account or password exists.
+
+## 8. Test infrastructure state
+
+The AWS test stack is **down**: the RDS instance is deleted and the EC2 instance is stopped, with no
+Elastic IP. On restart it receives a **new public IP**, so the Caddy site block and any hard-coded
+`API_BASE_URL` must be updated each time. Do not bake an endpoint into the SDK or its tests — read
+it from configuration, exactly as the Flutter client takes `--dart-define=API_BASE_URL` and fails
+loudly with `api_base_url_missing` when it is unset.
+
+The Python conformance suite now carries **30 checks** and is client-agnostic — pointing it at the
+same server is still the cheapest way to prove the *server* side, leaving your harness to prove that
+the *.NET client* produces proofs the server accepts.

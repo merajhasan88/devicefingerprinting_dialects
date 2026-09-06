@@ -1801,20 +1801,62 @@ No further database testing is possible until the dialect exists. `DB_ENGINE=sql
 
 Supabase needs **no dialect** - it is PostgreSQL. It will be a connection-configuration test (direct connection on 5432 versus the pooler on 6543), not an engineering phase.
 
-### 25.11 The standard per-engine handset suite (2026-09-05)
+### 25.11 The standard per-engine handset suite — canonical list (updated 2026-09-06)
 
-Fixed definition, so each engine family is tested identically and results are comparable. Run once per **engine family**, on **both handsets**, with **release builds only**:
+Fixed definition, so each engine family is tested identically and results are comparable. Run once
+per **engine family**, on **both handsets**, with **release builds only**. Items 13 and 14 were added
+after the original four groups and are folded in here so this list is the single source of truth.
 
-1. **Stolen access token** - Phone A mints it, Phone B replays it with its own hardware key. Must fail `invalid_installation_signature` *after* reaching proof verification.
-2. **Stolen refresh token** - same shape, via the refresh challenge. The challenge must return 200 (token genuine) before the refresh is refused.
-3. **Access-proof boundary tests (4)** - replay, body tampering, path+method tampering, stale timestamp. Must run **within 10 minutes of a session refresh**, or an expired access token makes them inconclusive.
-4. **Frida Gadget** - real gadget embedded in a release APK: scan must reach `block`, a protected call must be refused, and after restoring the clean build the device must return to `trusted`.
+| # | Item | Pass criterion | Phones |
+|---|---|---|---|
+| 1 | Clean baseline scan | `score=18 verdict=trusted` (dev options +8, adb +10) | each |
+| 2 | Account creation through the enforce gate | `POST /v1/accounts/register` 201 | each |
+| 3 | Stolen access token | `invalid_installation_signature`, refused *after* reaching proof verification | **both, simultaneously** |
+| 4 | Stolen refresh token | refresh challenge 200 (token genuine) **then** refresh 401 | **both, simultaneously** |
+| 5 | Boundary: exact replay | 200 then 401 `access_proof_replay` | each |
+| 6 | Boundary: body tampering | 401 `access_proof_body_mismatch` | each |
+| 7 | Boundary: path + method tampering | 401 `access_proof_path_mismatch` and `_method_mismatch` | each |
+| 8 | Boundary: stale timestamp | 401 `access_proof_timestamp_outside_window` | each |
+| 9 | Frida Gadget — detection | `score=100 verdict=block`, `frida_runtime_artifact` +90 | each |
+| 10 | Frida Gadget — enforcement | `POST /v1/accounts/login` 403 `integrity_blocked` | each |
+| 11 | Frida Gadget — restore | clean APK (0 frida entries) returns `18/trusted` | each |
+| 12 | Device memory across a new hardware key | **Android:** full uninstall + reinstall. **iOS:** `deleteKey` then re-enrol (see below). Either way a new hardware key → 403 `integrity_device_blocked_recently` | each |
+| 13 | Pristine re-enrolment (recognition) | **Android:** uninstall + reinstall. **iOS:** `deleteKey` then re-enrol. `devices` unchanged, `installations` +1, same `device_id`, **login 200** | each |
+| 14 | Structural code-integrity (ext bucket) | deferred libc++ hook → `ext_diff_bytes > 0` → `android_code_integrity_violation` +90 → `block` | each |
+| 15 | Key survives app reinstall (**iOS only**) | uninstall + reinstall **without** `deleteKey` → `getOrCreateKey` returns `created: false`, the **same** key thumbprint, and the same `installation_id` | iPhone |
 
-Surrounding each run, and implied by the above: clean baseline scan, account creation through the enforce gate, and the device-memory check that a reinstall with a new hardware key is still refused.
+**Items 12, 13 and 15 differ by platform, deliberately.** Android Keystore entries are destroyed
+when the app is uninstalled, so a reinstall necessarily enrols a new hardware key — which is exactly
+what items 12 and 13 exercise. **iOS keychain items survive app uninstall**, so on iPhone a reinstall
+returns the *same* Secure Enclave key and proves nothing about re-enrolment. The iOS parallel of
+"uninstall" is therefore an explicit `deleteKey` on the installation-key channel, which destroys the
+Secure Enclave key and forces a genuinely new installation. That preserves each item's *intent* — a
+new hardware key on the same physical device must still correlate to the same `device_id`, and must
+still be refused while the device is blocked — rather than pretending the platforms behave alike.
 
-Individual database **versions** within a family get the 26-check conformance suite only.
+Item 15 exists because that divergence is itself a property worth asserting rather than assuming.
+On iOS the installation identity survives app reinstall, which is a *stronger* recognition guarantee
+than Android's; the test makes it explicit and would catch a future iOS change that silently
+weakened it. It has no Android counterpart, because there the key is gone by design.
+
+**Items 5–8 must run within 10 minutes of a session refresh**, or an expired access token makes them
+inconclusive. Items 3 and 4 are cross-device by construction — one run exercises both handsets.
+
+Surrounding every run: the device is returned to the clean release build and must scan `trusted`
+again before the engine is torn down.
+
+**Item 14 notes.** It is the only item that needs no tap: the gadget script defers its hook with
+`setTimeout(..., 4000)` so the libraries are mapped, then the app's own launch scan catches it.
+Two things make it work, both learned the hard way — use the Frida 17 API
+(`Process.getModuleByName(n).enumerateExports()`, not the removed `Module.*` statics, which throw
+and get swallowed), and defer, because at gadget-load time the target libraries are not yet mapped.
+It requires `INTEGRITY_SCORE_EXTENDED_LIBS` (on by default since 2026-09-06).
+
+Individual database **versions** within a family get the conformance suite only.
 **This reduction was agreed for the PostgreSQL sweep specifically and must not be generalised to
-another engine family without asking** — see §27.3, where applying it to SQL Server was wrong. The handset exercises the client and the native collector, which are byte-identical across versions and cannot observe the database; the suite is what detects dialect behaviour.
+another engine family without asking** — see §27.3, where applying it to SQL Server was wrong. The
+handset exercises the client and the native collector, which are byte-identical across versions and
+cannot observe the database; the suite is what detects dialect behaviour.
 
 ### 25.12 Redis is in scope for the SQL Server phase (2026-09-05)
 
@@ -2426,3 +2468,422 @@ remains is the on-device step — install the new client on both phones, confirm
 buckets read zero on a clean device, then enable the flag — plus a real-hardware hook test against
 libssl (`hooktest-ext.apk` is built and staged for it). Deferred only because the handsets were in
 use.
+
+## 28.8 Extended code_integrity — on-device validation (Huawei, 2026-09-05)
+
+The §28.7 extended buckets were validated on real hardware (Huawei AQM-LX1), driven entirely
+foreground (no background tasks).
+
+**App-bucket fix found during Stage 1.** A normal Flutter release APK does not extract its native
+libraries; libflutter/libapp map straight out of `base.apk`, so `/proc/self/maps` shows them backed
+by `.../base.apk`, not `.../lib/arm64/libflutter.so`. The first clean baseline read
+`app_compared_bytes=0` — the bucket was inert. Adding `.apk` to the app-bucket suffix set made it
+scan (7.6 MB), still diff 0.
+
+**Stage 1 — clean baseline, extended flag off.** core 4,808,704 B / ext 4,943,872 B /
+app 7,593,984 B, all diff 0, verdict `18/trusted`.
+
+**Stage 2 — extended flag on.**
+- Clean device stayed `18/trusted` (no false positive).
+- With eight inline hooks placed in `libc++.so` (ext bucket) via a held Frida session, a fresh scan
+  read `ext_diff_bytes=105`, `ext_libs_diff=1`, `diffed_libs=libc.so,libc++.so`, and
+  `android_code_integrity_violation +90` fired → **block**. This is the ext bucket catching a hook in
+  a non-core system library on real hardware.
+
+**A Frida-API trap worth recording.** Earlier attempts to land ext/app hooks read zero because the
+scripts used the Frida-16 `Module.getExportByName`/`Module.enumerateExports` statics, removed in
+Frida 17 (`Process.getModuleByName(name).enumerateExports()`); the calls threw and were swallowed, so
+nothing was hooked except Frida's own libc startup patch (the recurring `core_diff=71`). A second
+subtlety: Frida 17 batches Interceptor patches and flushes them at end-of-tick, so a byte read
+immediately after `attach()` still shows the original prologue — the patch is real, just deferred.
+Script-mode hooks at gadget-load also missed libflutter because it is not yet mapped that early
+(its 66 function exports appear only after engine init).
+
+**Still gated, deliberately.** `INTEGRITY_SCORE_EXTENDED_LIBS` remains **off** by default. ext/app
+were baselined only on the Huawei; the OPPO must be baselined too before enabling by default, since a
+different vendor/version could carry a benign in-memory difference in some ext library. The app bucket
+is validated two ways short of a live on-device hook (clean 7.6 MB scan on-device; scoring proven
+server-side) — a live libflutter hook was not attempted because it instruments the UI engine and
+risks crashing a phone that must not be disturbed.
+
+**Remaining to enable extended scoring by default:** baseline ext/app clean on the OPPO, then flip
+the flag; optionally a careful live libflutter hook to close the app-bucket demonstration.
+
+---
+
+# 29. Collector versions, and which battery runs used which (2026-09-05)
+
+Raised by the question "what does the extended flag being off mean for the databases we already ran
+on?". The database conclusions are unaffected, but the battery results needed stamping so they are
+not misread later.
+
+## 29.1 The two collector versions
+
+`collector_version` is sent in every integrity report and stored in `integrity_reports`, so any
+stored report is self-describing.
+
+| Version | Probes |
+|---|---|
+| **1** | `app_identity`, `debug_state`, `root_files`, `system_properties`, `runtime_maps`, `tracer`, `root_shell`, `selinux`, `mounts`, `frida_ports`, `emulator`, `developer_settings` — hook detection is **name-based only** (token scan of `/proc/self/maps`) |
+| **2** | everything in 1, plus the structural probes: `instrumentation_threads`, `exec_mappings`, and the native three-bucket `code_integrity` |
+
+## 29.2 Stamping the completed runs
+
+**Every database battery in this project ran on collector v1.** The structural detection (§28) was
+built *after* the SQL Server phase closed (§27.9).
+
+| Run | Collector | Note |
+|---|---|---|
+| PostgreSQL 18.1 — full battery, both handsets (§25.8) | **v1** | |
+| PostgreSQL 17.11 / 16.15 / 15.19 / 14.24 (§25.4) | **v1** | conformance suite only, by agreement |
+| SQL Server 2017 / 2019 / 2022 / 2025 — full batteries (§27.4–27.8) | **v1** | |
+| SQL Server 2025 — structural validation (§28.8) | **v2** | Huawei only; extended flag on for the test |
+
+So "full battery PASS on SQL Server 2017" means **the 13-item battery as it existed then, with the
+v1 collector**. It does not mean structural detection was exercised there.
+
+## 29.3 Why this does not invalidate the database work
+
+Dialect parity is what the database phase proves, and it is orthogonal to which probes the client
+runs. The collector measures on the phone; the server scores; the database only stores the report
+and serves the dialect-sensitive paths (replay nonce, row locking, reinstall correlation, device
+memory). The only database-facing change in v2 is **more fields inside the `probe_results` JSON**,
+and that is already re-validated on SQL Server 2025 — the conformance suite now carries 30 checks
+including the four structural ones and passes 28/0/2.
+
+Re-running the five engines with v2 was considered and judged unnecessary for the dialect claim.
+That is a recommendation, not a decision taken unilaterally: if a "current battery passed on every
+engine" statement is wanted for Payactiv, the engines must be recreated and the batteries re-run.
+A cheaper middle path is to run the v2 battery on the next engine stood up anyway (Supabase is
+still outstanding).
+
+## 29.4 What the extended flag being off actually costs
+
+`INTEGRITY_SCORE_EXTENDED_LIBS=0` (the default) still scores, unconditionally:
+`android_instrumentation_runtime_thread` +90, `android_glib_runtime_thread` +40,
+`android_wx_memory` +60, `android_deleted_code_mapping` +55, and
+`android_code_integrity_violation` +90 for the **core** bucket (libc/libart).
+
+Gated off are only the **ext** bucket (libc++, libssl, libcrypto, libandroid_runtime, libbinder)
+and the **app** bucket (`android_app_code_modified`).
+
+Consequence: the renamed-gadget evasion is closed by default, and any Frida-based attacker is still
+caught by the thread / w^x / libc signals. The genuine remaining gap is narrow and specific — **a
+bespoke, non-Frida inline hooker that patches only an ext library**, the classic case being a
+cert-pinning bypass that patches `libssl`. Today that is measured and stored but not scored.
+
+## 29.5 Queued: the OPPO baseline (blocks enabling the flag by default)
+
+The flag stays off until the OPPO is baselined, because ext/app were measured clean only on the
+Huawei and a different vendor/Android version could carry a benign in-memory difference in some ext
+library. Procedure, for when the OPPO is free:
+
+0. **Read the new public IP first — it changes on every start.** The instance runs without an
+   Elastic IP by choice, so each `start-instances` assigns a fresh auto-assigned address and the
+   previous one cannot be reclaimed (auto-assigned addresses return to the AWS pool; only
+   previously-allocated Elastic IPs are recoverable). Each restart therefore needs:
+   - `aws ec2 describe-instances ... PublicIpAddress` to read the new address,
+   - the Caddy site block pointed at the new `<a-b-c-d>.nip.io` name (Let's Encrypt re-issues
+     automatically), and
+   - the client rebuilt with `--dart-define=API_BASE_URL=https://<a-b-c-d>.nip.io`, because staged
+     APKs reference the previous host.
+
+   An Elastic IP would remove this step permanently but accrues about USD 3.60/month while
+   allocated, so it was deliberately not kept.
+
+1. Stand up an engine (SQL Server or PostgreSQL) and the EC2 server; server in `enforce`,
+   `INTEGRITY_SCORE_EXTENDED_LIBS` **off**.
+2. Install the current clean client (v2 collector) on the OPPO; launch; it auto-scans.
+3. Read the stored report's `code_integrity` and confirm **`core_diff_bytes`, `ext_diff_bytes` and
+   `app_diff_bytes` are all 0**, and `*_compared_bytes` are all non-zero (a zero `compared` means the
+   bucket is inert, which is exactly the defect found on the Huawei in §28.8).
+4. Turn the flag on and re-scan the clean OPPO; it must stay `18/trusted` (no false positive).
+5. Only then flip the flag on by default in `device_trust_server.py`.
+
+Optional, to close the app-bucket demonstration: a careful live `libflutter` hook. Not attempted on
+the Huawei because it instruments the UI engine and risks crashing a handset that must not be
+disturbed.
+
+---
+
+# 30. OPPO baseline, extended scoring enabled by default, and battery item 14 (2026-09-06)
+
+Closes the work queued in §29.5. Run on a fresh SQL Server 2025 instance; no other tests were
+repeated on it.
+
+## 30.1 OPPO baseline — PASS
+
+Collector v2, extended flag off, enforce mode:
+
+```text
+core: 5,058,560 B  diff 0
+ext : 5,742,592 B  diff 0
+app : 4,194,304 B  diff 0
+instrumentation_threads: none    exec_mappings: wx 0, deleted 0 (jit 1, excluded)
+verdict 18/trusted
+```
+
+All three buckets have **non-zero `compared_bytes`**, which is the check that matters: a zero there
+means the bucket is inert rather than clean, the defect found on the Huawei in §28.8. The numbers
+differ from the Huawei's (different vendor and Android version) but every diff is zero.
+
+## 30.2 Extended scoring enabled by default
+
+With `INTEGRITY_SCORE_EXTENDED_LIBS=1` the clean OPPO still scored `18/trusted` — no false positive.
+Both handsets are now baselined clean, so the default in `device_trust_server.py` was flipped from
+`0` to `1`. Verified by redeploying with **no environment override** and rescanning the clean OPPO:
+still `18/trusted`, carried by the code default.
+
+This closes the gap described in §29.4: a non-Frida inline hooker patching only an ext library — the
+cert-pinning-bypass case against `libssl` — is now scored by default.
+
+## 30.3 Item 14 is a real battery item, and needs no tap
+
+The §28.8 ext-bucket demonstration needed a held Frida session and a manual rescan, which is why it
+was not promoted then. It is now a one-step item, because the reason it previously failed was
+understood:
+
+- use the **Frida 17** API (`Process.getModuleByName(n).enumerateExports()`); the removed
+  `Module.*` statics throw and the exception was being swallowed, so nothing was ever hooked;
+- **defer** the hook (`setTimeout(..., 4000)`) — at gadget-load time the target libraries are not yet
+  mapped, which is why script-mode attempts measured zero even with the right API;
+- Frida batches Interceptor patches, so call `Interceptor.flush()`.
+
+With that, the hook lands before the app's own launch scan and the item runs unattended — install,
+launch, read. Validated on the OPPO:
+
+```text
+ext_diff_bytes 100   ext_libs_diff 1   diffed_libs libc.so,libc++.so
+android_code_integrity_violation +90  ->  score 100, verdict block
+```
+
+`§25.11` has been rewritten as the canonical **14-item** battery, folding in item 13 (pristine
+reinstall, added in §27.7.1) and item 14, so that section is now the single source of truth rather
+than the original four groups.
+
+## 30.4 App bucket closed on device by controlled byte modification (2026-09-06)
+
+The app bucket was the last unproven one. A live `libflutter` hook was rejected as the vehicle: that
+library is the whole Flutter runtime — Dart VM, rasterizer, platform-channel plumbing, task runners —
+so an inline hook risks prologue-relocation corruption, per-frame overhead leading to an ANR,
+re-entrancy against engine locks, and, worst for a test, breaking the very MethodChannel path the
+integrity scan travels on. It is also unstable as a fixed battery target, since "the first N exports"
+changes between Flutter builds.
+
+**Correction to an earlier statement:** this was described as risking "crashing a handset that must
+not be disturbed". That overstated it. The gadget runs inside the app sandbox and cannot touch the
+OS; the worst case is the app crashing and being reinstalled. The risk is to the test's reliability,
+not to the hardware.
+
+The chosen vehicle instead tests exactly what the probe asserts — *in-memory differs from on-disk* —
+without inserting a live trampoline: flip `e_ident` bytes 9–15 (`EI_PAD`), which are reserved, never
+read after load, and never executed. A raw `Memory.write` also **persists after Frida disconnects**,
+unlike Interceptor hooks which are reverted on script unload, so the session can be dropped before
+triggering the rescan.
+
+Result on the OPPO:
+
+```text
+app_diff_bytes 7   app_libs_diff 1   diffed_libs libc.so,libflutter.so
+android_app_code_modified +90  ->  block
+```
+
+The diff is exactly the seven bytes written — an unambiguous match rather than an inferred one.
+
+**A per-library detail worth keeping.** `libflutter.so` maps its ELF header inside the `r-x`
+segment, so the header is within what `code_integrity` scans and was flippable. `libapp.so` maps its
+header `r--`, so the guard correctly skipped it. This does **not** mean libapp is unscanned: the
+probe compares every executable mapping matching the suffix, so libapp's own `.text` is still
+covered — only its header happens to fall outside an executable range, which is why libflutter was
+used for the demonstration. `libapp.so` also exports no functions, so symbol-based hooking is
+impossible there regardless.
+
+## 30.5 All three buckets now proven on real hardware
+
+| Bucket | Vehicle | Measured diff | Handset |
+|---|---|---|---|
+| core | Frida's own libc patching at gadget load | 71 B (`libc.so`) | OPPO + Huawei |
+| ext | deferred inline hooks in `libc++.so` | 100–105 B | OPPO + Huawei |
+| app | controlled `EI_PAD` flip in `libflutter.so` | 7 B | OPPO |
+
+Clean baselines remain zero on both handsets with extended scoring enabled by default.
+
+---
+
+# 31. iOS toolchain smoke test, and the hardware it implies (2026-09-06)
+
+## 31.1 The Mac-free build path works
+
+Corellium was ruled out (Solo is students/faculty only; other tiers are unavailable in Pakistan), so
+the plan is a physical jailbroken iPhone plus cloud macOS for builds. A Codemagic workflow
+(`codemagic.yaml`) was added and smoke-tested against the current repo, whose iOS side is still the
+stock Flutter template — the point was to prove the toolchain before writing any Swift.
+
+It produced a genuine, installable artifact:
+
+```text
+Payload/Runner.app        valid IPA layout
+Runner                    Mach-O arm64, PIE
+Frameworks                Flutter.framework, App.framework, objective_c.framework
+embedded.mobileprovision  ABSENT  -> unsigned, as intended
+```
+
+**No Apple Developer account is required for this path.** Codemagic builds with `--no-codesign`, and
+a checkm8-jailbroken device bypasses AMFI signature enforcement, so an unsigned `.ipa` installs
+directly. An earlier claim in this project that a paid account was needed for "any real device" was
+wrong and is corrected here: the paid programme only buys App Store distribution and ad-hoc UDID
+profiles for third-party device farms, neither of which this path uses.
+
+Codemagic's free tier is 500 macOS minutes/month on a personal account; an iOS build costs roughly
+10–20, so the workflow deliberately has **no `triggering:` block** and is started by hand.
+
+## 31.2 The real minimum iOS version is 15.0, not 13.0
+
+`IPHONEOS_DEPLOYMENT_TARGET` in the Xcode project reads **13.0**, but the built binary declares
+`MinimumOSVersion` **15.0**. The cause is `flutter_secure_storage: 10.3.1`, whose v10 Darwin
+implementation requires iOS 15 — its `flutter_secure_storage_darwin` bundle is visible inside the
+IPA. Trust the binary, not the project setting.
+
+## 31.3 Which iPhone to buy
+
+Two constraints, and the second is the one that is easy to get wrong:
+
+1. **iOS 15.0 floor** (§31.2).
+2. **checkm8 jailbreakability.** `checkm8` is a bootrom vulnerability — unpatchable in software —
+   present in **A7–A11 only**, i.e. up to iPhone X. From A12 (iPhone XR) onward it is gone and
+   jailbreaks become version-specific and unreliable. The iOS probes the server already scores
+   include `ios_jailbreak_artifact` and `ios_sandbox_escape_signal`, so a non-jailbreakable device
+   would leave them untestable — the very gap that sent us looking at Corellium.
+
+| Device | Chip | Max iOS | vs the 15.0 floor | checkm8 |
+|---|---|---|---|---|
+| iPhone 6s / SE1 | A9 | 15.8 | works, **no headroom** | yes |
+| iPhone 7 | A10 | 15.8 | works, **no headroom** | yes |
+| **iPhone 8 / X** | **A11** | **16.7** | **headroom** | **yes** |
+
+**Recommendation: iPhone 8 or iPhone X.** A 6s or 7 clears 15.0 by less than one version and would
+be stranded by the next plugin bump, for roughly the same money.
+
+**Non-PTA is fine** and much cheaper: the lab needs only WiFi (to reach the server) and USB, never
+cellular. Indicative pricing at the time of writing: iPhone 8 non-PTA around PKR 14,000.
+
+A useful property of checkm8: the jailbreak is *semi-tethered*, so a reboot returns the device to a
+clean state and re-running the exploit compromises it again. One handset therefore provides both the
+clean baseline and the jailbroken case on demand, which suits the battery well.
+
+## 31.4 Costs compared
+
+| Option | Rate | Catch | Minimum for one session |
+|---|---|---|---|
+| AWS EC2 Mac (`mac2.metal`) | ~USD 0.65/hr | **24-hour minimum allocation** (Apple licence) | ~USD 15.60 |
+| **Codemagic** | 500 free macOS min/month, then ~USD 0.095/min | free minutes are personal accounts, not Teams | **USD 0** |
+
+Codemagic plus a one-time handset is far cheaper than any cloud-Mac arrangement, and unlike a device
+farm it gives the same depth of access already available on the two Android handsets.
+
+---
+
+# 32. iOS identity and possession — Swift implementation (2026-09-06)
+
+First native iOS code in the project. Covers battery items 1–4's prerequisite: an installation
+identity and proof of possession. The integrity collector is deliberately not part of this step.
+
+## 32.1 What was written
+
+- `ios/Runner/InstallationKeyManager.swift` — one non-exportable P-256 key in the Secure Enclave.
+- `ios/Runner/AppDelegate.swift` — registers `devicefingerprinting/installation_key_v2` with the
+  same three methods the Android host exposes: `getOrCreateKey`, `sign`, `deleteKey`.
+- `ios/Runner.xcodeproj/project.pbxproj` — the new Swift file had to be registered by hand
+  (PBXBuildFile, PBXFileReference, group membership, Sources build phase). Xcode is not available on
+  the Linux dev machine, and a `.swift` file that is not referenced simply never compiles.
+
+**No Dart changes were needed.** `NativeInstallationKey` is platform-agnostic; it calls the channel
+by name and validates the returned map. iOS satisfies the same contract.
+
+## 32.2 The two properties that had to match Android exactly
+
+- **The payload arrives as base64url text, is decoded, and the raw bytes are signed.** The server
+  verifies over exactly the bytes the client signed, which is why no canonical JSON is needed across
+  platforms.
+- **The signature is ASN.1 DER.** `ecdsaSignatureMessageX962SHA256` yields X9.62/DER, matching
+  Android's `SHA256withECDSA` and what PyCryptodome verifies. A raw `r||s` signature would be
+  rejected — the same trap already documented for the .NET SDK, where the default .NET signature
+  format is IEEE-P1363.
+
+Secure Enclave is attempted first with a graceful fallback to a software keychain key, mirroring the
+Android host's StrongBox-then-fallback shape (the Simulator has no Secure Enclave). The honest
+result is reported to the server through `security_level` and `hardware_backed` rather than being
+hidden.
+
+## 32.3 A platform divergence that will affect battery items 12 and 13
+
+**iOS keychain items survive app uninstall; Android Keystore entries do not.**
+
+On Android, deleting the app destroys the key, so a reinstall necessarily enrols a *new*
+installation — which is exactly what items 12 (device memory across reinstall) and 13 (pristine
+reinstall) rely on. On iOS the keychain item, and therefore the Secure Enclave key, will normally
+still be there after a reinstall, so `getOrCreateKey` returns the **same** key and `created` is
+`false`.
+
+This is not a bug in either platform, but it means those two items cannot be run on iOS by simply
+uninstalling and reinstalling. The iOS equivalent must either call `deleteKey` explicitly to
+simulate a fresh installation, or the test must be redefined for iOS. This needs deciding before
+items 12 and 13 are attempted on the iPhone; it is flagged here rather than discovered mid-test.
+
+## 32.4 Not yet verified
+
+Written but not yet compiled — the Linux dev machine cannot build iOS. The next Codemagic run is the
+first compile. Two things are most likely to need a fix: whether
+`FlutterPluginRegistry.registrar(forPlugin:)` is nullable in this Flutter version (the code assumes
+it is, via `guard let`), and the exact `SecAccessControlCreateWithFlags` overload resolution.
+
+---
+
+# 33. iOS integrity collector (2026-09-06)
+
+`ios/Runner/IntegrityProbeManager.swift` implements the eight probes
+`_score_ios_integrity` already scores, on the `devicefingerprinting/integrity_v1` channel. As on
+Android, **the collector computes no score** — it reports raw measurements and the server decides.
+
+## 33.1 The probes and what each maps to
+
+| Probe | Fields the server reads | Implementation |
+|---|---|---|
+| `app_identity` | `bundle_id`, `executable_sha256` | `Bundle.main` + SHA-256 of the main executable |
+| `code_signing` | `signing_identifier`, `team_identifier`, `get_task_allow` | `SecTaskCreateFromSelf` + entitlement lookups |
+| `debugger` | `traced` | `sysctl` `KERN_PROC` / `P_TRACED` — the standard non-private check |
+| `jailbreak_files` | `found_paths` | 20 artifact paths incl. rootless `/var/jb` layouts (palera1n, Dopamine) |
+| `sandbox` | `write_outside_sandbox_succeeded` | attempts a write to `/private/`, removes it if it unexpectedly works |
+| `dyld_images` | `suspicious_tokens` | `_dyld_image_count` / `_dyld_get_image_name` — the iOS analogue of `/proc/self/maps` |
+| `environment` | `dyld_insert_libraries` | `DYLD_INSERT_LIBRARIES` |
+| `simulator` | `is_simulator` | `targetEnvironment(simulator)` + device model |
+
+## 33.2 Honest reporting over flattering reporting
+
+`code_signing` returns empty `signing_identifier` and `team_identifier` for the unsigned builds the
+jailbroken-device workflow produces. That is reported as-is rather than faked; the server only
+compares those fields when a baseline is configured, so an unsigned test build simply does not
+trigger the mismatch rules.
+
+`jailbreak_files` will return an empty list on a clean device partly because the sandbox makes most
+of those paths unreadable, which is indistinguishable from their being absent. That false negative
+is acceptable: the `dyld_images` and `environment` probes catch in-process instrumentation whether
+or not the filesystem is legible, and the same reasoning already applies to Android's `root_files`
+under SELinux (§21.5).
+
+## 33.3 The known weakness, carried over deliberately
+
+`dyld_images` matches on **image name**, exactly like Android's original `runtime_maps` token scan —
+and it inherits the same defeat: rename the injected dylib and it goes unseen. That evasion was
+demonstrated on Android in §27.11 and closed there by structural detection (§28). The iOS structural
+answer is not yet written; until it is, iOS hook detection is name-based only and should be
+described that way rather than as equivalent to the Android collector.
+
+## 33.4 Next: the iOS code-integrity analogue
+
+There is no `/proc/self/maps` and no readable `/proc/self/mem` on iOS. The equivalent of the Android
+`code_integrity` probe is to walk loaded images with `_dyld_image_count` /
+`_dyld_get_image_header`, resolve each image's `__TEXT` segment, and compare the in-memory bytes
+against the same range of the on-disk Mach-O — including the `slide` returned by
+`_dyld_get_image_vmaddr_slide`. That is a genuinely different design from the Linux version rather
+than a port, and it is the natural `collector_version` 2 for iOS.
