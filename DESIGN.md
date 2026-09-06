@@ -2692,3 +2692,76 @@ impossible there regardless.
 | app | controlled `EI_PAD` flip in `libflutter.so` | 7 B | OPPO |
 
 Clean baselines remain zero on both handsets with extended scoring enabled by default.
+
+---
+
+# 31. iOS toolchain smoke test, and the hardware it implies (2026-09-06)
+
+## 31.1 The Mac-free build path works
+
+Corellium was ruled out (Solo is students/faculty only; other tiers are unavailable in Pakistan), so
+the plan is a physical jailbroken iPhone plus cloud macOS for builds. A Codemagic workflow
+(`codemagic.yaml`) was added and smoke-tested against the current repo, whose iOS side is still the
+stock Flutter template — the point was to prove the toolchain before writing any Swift.
+
+It produced a genuine, installable artifact:
+
+```text
+Payload/Runner.app        valid IPA layout
+Runner                    Mach-O arm64, PIE
+Frameworks                Flutter.framework, App.framework, objective_c.framework
+embedded.mobileprovision  ABSENT  -> unsigned, as intended
+```
+
+**No Apple Developer account is required for this path.** Codemagic builds with `--no-codesign`, and
+a checkm8-jailbroken device bypasses AMFI signature enforcement, so an unsigned `.ipa` installs
+directly. An earlier claim in this project that a paid account was needed for "any real device" was
+wrong and is corrected here: the paid programme only buys App Store distribution and ad-hoc UDID
+profiles for third-party device farms, neither of which this path uses.
+
+Codemagic's free tier is 500 macOS minutes/month on a personal account; an iOS build costs roughly
+10–20, so the workflow deliberately has **no `triggering:` block** and is started by hand.
+
+## 31.2 The real minimum iOS version is 15.0, not 13.0
+
+`IPHONEOS_DEPLOYMENT_TARGET` in the Xcode project reads **13.0**, but the built binary declares
+`MinimumOSVersion` **15.0**. The cause is `flutter_secure_storage: 10.3.1`, whose v10 Darwin
+implementation requires iOS 15 — its `flutter_secure_storage_darwin` bundle is visible inside the
+IPA. Trust the binary, not the project setting.
+
+## 31.3 Which iPhone to buy
+
+Two constraints, and the second is the one that is easy to get wrong:
+
+1. **iOS 15.0 floor** (§31.2).
+2. **checkm8 jailbreakability.** `checkm8` is a bootrom vulnerability — unpatchable in software —
+   present in **A7–A11 only**, i.e. up to iPhone X. From A12 (iPhone XR) onward it is gone and
+   jailbreaks become version-specific and unreliable. The iOS probes the server already scores
+   include `ios_jailbreak_artifact` and `ios_sandbox_escape_signal`, so a non-jailbreakable device
+   would leave them untestable — the very gap that sent us looking at Corellium.
+
+| Device | Chip | Max iOS | vs the 15.0 floor | checkm8 |
+|---|---|---|---|---|
+| iPhone 6s / SE1 | A9 | 15.8 | works, **no headroom** | yes |
+| iPhone 7 | A10 | 15.8 | works, **no headroom** | yes |
+| **iPhone 8 / X** | **A11** | **16.7** | **headroom** | **yes** |
+
+**Recommendation: iPhone 8 or iPhone X.** A 6s or 7 clears 15.0 by less than one version and would
+be stranded by the next plugin bump, for roughly the same money.
+
+**Non-PTA is fine** and much cheaper: the lab needs only WiFi (to reach the server) and USB, never
+cellular. Indicative pricing at the time of writing: iPhone 8 non-PTA around PKR 14,000.
+
+A useful property of checkm8: the jailbreak is *semi-tethered*, so a reboot returns the device to a
+clean state and re-running the exploit compromises it again. One handset therefore provides both the
+clean baseline and the jailbroken case on demand, which suits the battery well.
+
+## 31.4 Costs compared
+
+| Option | Rate | Catch | Minimum for one session |
+|---|---|---|---|
+| AWS EC2 Mac (`mac2.metal`) | ~USD 0.65/hr | **24-hour minimum allocation** (Apple licence) | ~USD 15.60 |
+| **Codemagic** | 500 free macOS min/month, then ~USD 0.095/min | free minutes are personal accounts, not Teams | **USD 0** |
+
+Codemagic plus a one-time handset is far cheaper than any cloud-Mac arrangement, and unlike a device
+farm it gives the same depth of access already available on the two Android handsets.
