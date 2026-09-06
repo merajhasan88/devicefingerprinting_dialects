@@ -153,12 +153,13 @@ INTEGRITY_DEVICE_MEMORY_HOURS = int(
     os.environ.get("INTEGRITY_DEVICE_MEMORY_HOURS", "24")
 )
 # Code-integrity scoring for the extended library set (ext + the app's own
-# native code) is off until its clean baseline is confirmed on real hardware.
-# Core (libc/libart) is always scored; it was validated at zero on both
-# handsets. Turning this on scores the additional system libraries and the
-# app's own code once they are likewise confirmed clean.
+# native code). ON by default since 2026-09-06: both handsets were baselined
+# clean across all three buckets (OPPO core 5,058,560 / ext 5,742,592 /
+# app 4,194,304 bytes compared, all zero diff; Huawei likewise), and neither
+# false-positived with it enabled. Set to 0 to fall back to scoring the core
+# libc/libart bucket only.
 INTEGRITY_SCORE_EXTENDED_LIBS = (
-    os.environ.get("INTEGRITY_SCORE_EXTENDED_LIBS", "0").strip() == "1"
+    os.environ.get("INTEGRITY_SCORE_EXTENDED_LIBS", "1").strip() == "1"
 )
 INTEGRITY_RANDOM_OPTIONAL_PROBES = int(
     os.environ.get("INTEGRITY_RANDOM_OPTIONAL_PROBES", "4")

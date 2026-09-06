@@ -1801,20 +1801,47 @@ No further database testing is possible until the dialect exists. `DB_ENGINE=sql
 
 Supabase needs **no dialect** - it is PostgreSQL. It will be a connection-configuration test (direct connection on 5432 versus the pooler on 6543), not an engineering phase.
 
-### 25.11 The standard per-engine handset suite (2026-09-05)
+### 25.11 The standard per-engine handset suite — canonical list (updated 2026-09-06)
 
-Fixed definition, so each engine family is tested identically and results are comparable. Run once per **engine family**, on **both handsets**, with **release builds only**:
+Fixed definition, so each engine family is tested identically and results are comparable. Run once
+per **engine family**, on **both handsets**, with **release builds only**. Items 13 and 14 were added
+after the original four groups and are folded in here so this list is the single source of truth.
 
-1. **Stolen access token** - Phone A mints it, Phone B replays it with its own hardware key. Must fail `invalid_installation_signature` *after* reaching proof verification.
-2. **Stolen refresh token** - same shape, via the refresh challenge. The challenge must return 200 (token genuine) before the refresh is refused.
-3. **Access-proof boundary tests (4)** - replay, body tampering, path+method tampering, stale timestamp. Must run **within 10 minutes of a session refresh**, or an expired access token makes them inconclusive.
-4. **Frida Gadget** - real gadget embedded in a release APK: scan must reach `block`, a protected call must be refused, and after restoring the clean build the device must return to `trusted`.
+| # | Item | Pass criterion | Phones |
+|---|---|---|---|
+| 1 | Clean baseline scan | `score=18 verdict=trusted` (dev options +8, adb +10) | each |
+| 2 | Account creation through the enforce gate | `POST /v1/accounts/register` 201 | each |
+| 3 | Stolen access token | `invalid_installation_signature`, refused *after* reaching proof verification | **both, simultaneously** |
+| 4 | Stolen refresh token | refresh challenge 200 (token genuine) **then** refresh 401 | **both, simultaneously** |
+| 5 | Boundary: exact replay | 200 then 401 `access_proof_replay` | each |
+| 6 | Boundary: body tampering | 401 `access_proof_body_mismatch` | each |
+| 7 | Boundary: path + method tampering | 401 `access_proof_path_mismatch` and `_method_mismatch` | each |
+| 8 | Boundary: stale timestamp | 401 `access_proof_timestamp_outside_window` | each |
+| 9 | Frida Gadget — detection | `score=100 verdict=block`, `frida_runtime_artifact` +90 | each |
+| 10 | Frida Gadget — enforcement | `POST /v1/accounts/login` 403 `integrity_blocked` | each |
+| 11 | Frida Gadget — restore | clean APK (0 frida entries) returns `18/trusted` | each |
+| 12 | Device memory across reinstall | full uninstall + new hardware key → 403 `integrity_device_blocked_recently` | each |
+| 13 | Pristine reinstall (recognition) | `devices` unchanged, `installations` +1, same `device_id`, **login 200** | each |
+| 14 | Structural code-integrity (ext bucket) | deferred libc++ hook → `ext_diff_bytes > 0` → `android_code_integrity_violation` +90 → `block` | each |
 
-Surrounding each run, and implied by the above: clean baseline scan, account creation through the enforce gate, and the device-memory check that a reinstall with a new hardware key is still refused.
+**Items 5–8 must run within 10 minutes of a session refresh**, or an expired access token makes them
+inconclusive. Items 3 and 4 are cross-device by construction — one run exercises both handsets.
 
-Individual database **versions** within a family get the 26-check conformance suite only.
+Surrounding every run: the device is returned to the clean release build and must scan `trusted`
+again before the engine is torn down.
+
+**Item 14 notes.** It is the only item that needs no tap: the gadget script defers its hook with
+`setTimeout(..., 4000)` so the libraries are mapped, then the app's own launch scan catches it.
+Two things make it work, both learned the hard way — use the Frida 17 API
+(`Process.getModuleByName(n).enumerateExports()`, not the removed `Module.*` statics, which throw
+and get swallowed), and defer, because at gadget-load time the target libraries are not yet mapped.
+It requires `INTEGRITY_SCORE_EXTENDED_LIBS` (on by default since 2026-09-06).
+
+Individual database **versions** within a family get the conformance suite only.
 **This reduction was agreed for the PostgreSQL sweep specifically and must not be generalised to
-another engine family without asking** — see §27.3, where applying it to SQL Server was wrong. The handset exercises the client and the native collector, which are byte-identical across versions and cannot observe the database; the suite is what detects dialect behaviour.
+another engine family without asking** — see §27.3, where applying it to SQL Server was wrong. The
+handset exercises the client and the native collector, which are byte-identical across versions and
+cannot observe the database; the suite is what detects dialect behaviour.
 
 ### 25.12 Redis is in scope for the SQL Server phase (2026-09-05)
 
@@ -2561,3 +2588,68 @@ library. Procedure, for when the OPPO is free:
 Optional, to close the app-bucket demonstration: a careful live `libflutter` hook. Not attempted on
 the Huawei because it instruments the UI engine and risks crashing a handset that must not be
 disturbed.
+
+---
+
+# 30. OPPO baseline, extended scoring enabled by default, and battery item 14 (2026-09-06)
+
+Closes the work queued in §29.5. Run on a fresh SQL Server 2025 instance; no other tests were
+repeated on it.
+
+## 30.1 OPPO baseline — PASS
+
+Collector v2, extended flag off, enforce mode:
+
+```text
+core: 5,058,560 B  diff 0
+ext : 5,742,592 B  diff 0
+app : 4,194,304 B  diff 0
+instrumentation_threads: none    exec_mappings: wx 0, deleted 0 (jit 1, excluded)
+verdict 18/trusted
+```
+
+All three buckets have **non-zero `compared_bytes`**, which is the check that matters: a zero there
+means the bucket is inert rather than clean, the defect found on the Huawei in §28.8. The numbers
+differ from the Huawei's (different vendor and Android version) but every diff is zero.
+
+## 30.2 Extended scoring enabled by default
+
+With `INTEGRITY_SCORE_EXTENDED_LIBS=1` the clean OPPO still scored `18/trusted` — no false positive.
+Both handsets are now baselined clean, so the default in `device_trust_server.py` was flipped from
+`0` to `1`. Verified by redeploying with **no environment override** and rescanning the clean OPPO:
+still `18/trusted`, carried by the code default.
+
+This closes the gap described in §29.4: a non-Frida inline hooker patching only an ext library — the
+cert-pinning-bypass case against `libssl` — is now scored by default.
+
+## 30.3 Item 14 is a real battery item, and needs no tap
+
+The §28.8 ext-bucket demonstration needed a held Frida session and a manual rescan, which is why it
+was not promoted then. It is now a one-step item, because the reason it previously failed was
+understood:
+
+- use the **Frida 17** API (`Process.getModuleByName(n).enumerateExports()`); the removed
+  `Module.*` statics throw and the exception was being swallowed, so nothing was ever hooked;
+- **defer** the hook (`setTimeout(..., 4000)`) — at gadget-load time the target libraries are not yet
+  mapped, which is why script-mode attempts measured zero even with the right API;
+- Frida batches Interceptor patches, so call `Interceptor.flush()`.
+
+With that, the hook lands before the app's own launch scan and the item runs unattended — install,
+launch, read. Validated on the OPPO:
+
+```text
+ext_diff_bytes 100   ext_libs_diff 1   diffed_libs libc.so,libc++.so
+android_code_integrity_violation +90  ->  score 100, verdict block
+```
+
+`§25.11` has been rewritten as the canonical **14-item** battery, folding in item 13 (pristine
+reinstall, added in §27.7.1) and item 14, so that section is now the single source of truth rather
+than the original four groups.
+
+## 30.4 Still open
+
+The **app bucket** (libflutter/libapp) is validated three ways short of a live on-device hook: clean
+non-zero scan on both handsets, scoring proven server-side, and the identical comparison code proven
+by the ext bucket. A live `libflutter` hook was not attempted because it instruments the UI engine
+and risks crashing a handset. `libapp.so` exports no functions, so it cannot be hooked by symbol at
+all — modifying it would need direct memory patching.
