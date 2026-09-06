@@ -22,6 +22,10 @@ SafetyNet, App Attest or DeviceCheck anywhere in this design. Do not introduce o
   the client-SDK contract invariants; section 25.11 defines the standard battery.
 - `DOTNET_SDK_BRIEF.md` — the brief this SDK was built from.
 - `docs/protocol.md` — what this client actually puts on the wire.
+- `docs/aws-test-stack.md` — the shared AWS test stack and the owner's **binding** cost and teardown
+  conditions. Read it before running any `aws` command. The account is personal, on roughly a
+  PKR 500/month budget, and is shared with another Claude session; never create resources unasked,
+  never delete anything you did not create this session, and never allocate an Elastic IP.
 - `docs/validation.md` — what has been run, and what has not.
 
 ## Hard rules
