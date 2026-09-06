@@ -2646,10 +2646,49 @@ android_code_integrity_violation +90  ->  score 100, verdict block
 reinstall, added in §27.7.1) and item 14, so that section is now the single source of truth rather
 than the original four groups.
 
-## 30.4 Still open
+## 30.4 App bucket closed on device by controlled byte modification (2026-09-06)
 
-The **app bucket** (libflutter/libapp) is validated three ways short of a live on-device hook: clean
-non-zero scan on both handsets, scoring proven server-side, and the identical comparison code proven
-by the ext bucket. A live `libflutter` hook was not attempted because it instruments the UI engine
-and risks crashing a handset. `libapp.so` exports no functions, so it cannot be hooked by symbol at
-all — modifying it would need direct memory patching.
+The app bucket was the last unproven one. A live `libflutter` hook was rejected as the vehicle: that
+library is the whole Flutter runtime — Dart VM, rasterizer, platform-channel plumbing, task runners —
+so an inline hook risks prologue-relocation corruption, per-frame overhead leading to an ANR,
+re-entrancy against engine locks, and, worst for a test, breaking the very MethodChannel path the
+integrity scan travels on. It is also unstable as a fixed battery target, since "the first N exports"
+changes between Flutter builds.
+
+**Correction to an earlier statement:** this was described as risking "crashing a handset that must
+not be disturbed". That overstated it. The gadget runs inside the app sandbox and cannot touch the
+OS; the worst case is the app crashing and being reinstalled. The risk is to the test's reliability,
+not to the hardware.
+
+The chosen vehicle instead tests exactly what the probe asserts — *in-memory differs from on-disk* —
+without inserting a live trampoline: flip `e_ident` bytes 9–15 (`EI_PAD`), which are reserved, never
+read after load, and never executed. A raw `Memory.write` also **persists after Frida disconnects**,
+unlike Interceptor hooks which are reverted on script unload, so the session can be dropped before
+triggering the rescan.
+
+Result on the OPPO:
+
+```text
+app_diff_bytes 7   app_libs_diff 1   diffed_libs libc.so,libflutter.so
+android_app_code_modified +90  ->  block
+```
+
+The diff is exactly the seven bytes written — an unambiguous match rather than an inferred one.
+
+**A per-library detail worth keeping.** `libflutter.so` maps its ELF header inside the `r-x`
+segment, so the header is within what `code_integrity` scans and was flippable. `libapp.so` maps its
+header `r--`, so the guard correctly skipped it. This does **not** mean libapp is unscanned: the
+probe compares every executable mapping matching the suffix, so libapp's own `.text` is still
+covered — only its header happens to fall outside an executable range, which is why libflutter was
+used for the demonstration. `libapp.so` also exports no functions, so symbol-based hooking is
+impossible there regardless.
+
+## 30.5 All three buckets now proven on real hardware
+
+| Bucket | Vehicle | Measured diff | Handset |
+|---|---|---|---|
+| core | Frida's own libc patching at gadget load | 71 B (`libc.so`) | OPPO + Huawei |
+| ext | deferred inline hooks in `libc++.so` | 100–105 B | OPPO + Huawei |
+| app | controlled `EI_PAD` flip in `libflutter.so` | 7 B | OPPO |
+
+Clean baselines remain zero on both handsets with extended scoring enabled by default.
