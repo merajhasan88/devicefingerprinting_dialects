@@ -27,6 +27,30 @@
     <AndroidUseLegacyPackaging>true</AndroidUseLegacyPackaging>
   </PropertyGroup>
 
+  <!-- Battery item 14 only. Building with -p:HookTest=true embeds a real Frida
+       Gadget, RENAMED to libhelper.so and listening on 27999 rather than the
+       default 27042. That is deliberate: item 14 is about detecting an inline
+       hook by BEHAVIOUR (bytes in memory differing from bytes on disk), so
+       the name-based probes must be blind for the result to mean anything.
+       DESIGN.md 27.11 records exactly this evasion scoring 18/trusted against
+       name matching while the gadget was fully active.
+       Without the flag none of this is in the APK: a harness that shipped a
+       gadget would be a liability, and the clean build is what every other
+       item runs against. -->
+  <PropertyGroup Condition="'$(HookTest)' == 'true'">
+    <DefineConstants>$(DefineConstants);HOOKTEST</DefineConstants>
+  </PropertyGroup>
+
+  <!-- The gadget lives OUTSIDE the project directory and is passed in by path.
+       The .NET Android SDK auto-globs **/*.so into AndroidNativeLibrary, so a
+       copy anywhere under the project is packaged whatever any Condition says:
+       a "clean" build silently shipped the 25 MB gadget that way once. Keeping
+       it out of the tree makes that impossible rather than merely discouraged. -->
+  <ItemGroup Condition="'$(HookTest)' == 'true' AND '$(HookTestGadgetDir)' != ''">
+    <AndroidNativeLibrary Include="$(HookTestGadgetDir)\libhelper.so" Abi="arm64-v8a" />
+    <AndroidNativeLibrary Include="$(HookTestGadgetDir)\libhelper.config.so" Abi="arm64-v8a" />
+  </ItemGroup>
+
   <ItemGroup>
     <ProjectReference Include="..\DeviceTrust.Client\DeviceTrust.Client.csproj" />
     <ProjectReference Include="..\DeviceTrust.Client.Maui\DeviceTrust.Client.Maui.csproj" />

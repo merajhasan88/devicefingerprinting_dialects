@@ -22,10 +22,12 @@ signed with a dedicated release key (`9020 70b6 ... a663`).
 | 6 | Body tampering | **PASS** | **PASS** | observe |
 | 7 | Path + method tampering | **PASS** | **PASS** | observe |
 | 8 | Stale timestamp | **PASS** | **PASS** | observe |
-| 9-11 | Frida Gadget detect / enforce / restore | not run | not run | — |
+| 9 | Frida Gadget — detection by name | n/a, see below | n/a, see below | enforce |
+| 10 | Frida Gadget — enforcement (login 403) | not run | not run | — |
+| 11 | Frida Gadget — restore | **PASS** | **PASS** | enforce |
 | 12 | Device memory across a new hardware key | not run | not run | — |
-| 13 | Pristine re-enrolment (enrolment half) | **PASS** | — | enforce |
-| 14 | Structural code-integrity, ext bucket | not run | not run | — |
+| 13 | Pristine re-enrolment (enrolment half) | **PASS** | **PASS** | enforce |
+| 14 | Structural code-integrity, ext bucket | **PASS** | **PASS** | **enforce** |
 
 Items 3 and 4 are cross-device by construction: the Huawei minted, the OPPO replayed with its own
 keystore key. That is the property the desktop harness could only approximate with two software
@@ -35,6 +37,47 @@ Item 13: uninstalling destroyed the AndroidKeyStore entry, so the reinstall enro
 hardware key (`88387af3…` → `e356cee7…`) under a new `installation_id`, and the server still
 correlated it to the **same** `device_id` through the reinstall hint — `reinstall_hint / medium`,
 installations 1 → 2.
+
+## Item 14 — detecting an inline hook by behaviour, not by name
+
+Item 14 is the item that proves the code-integrity probe *detects* something. Every other
+code-integrity result above is a zero on a clean device, and a probe that always returned zero would
+look exactly the same.
+
+A real Frida Gadget was embedded in the release APK, **renamed to `libhelper.so` and moved to port
+27999**, so that the name-based probes are blind — which is the point. DESIGN.md 27.11 records that
+exact evasion scoring `18/trusted` against token scanning while the gadget was fully active.
+
+Two scans, one process, the session held open across the second:
+
+| | Huawei run A | Huawei run B | OPPO run A | OPPO run B |
+|---|---|---|---|---|
+| core diff | 71 | 71 | 71 | 71 |
+| ext diff | 0 | **105** | 0 | **100** |
+| ext_libs_diff | 0 | **1** | 0 | **1** |
+| diffed_libs | `libc.so` | `libc++.so,libc.so` | `libc.so` | `libc.so,libc++.so` |
+
+Run A has the gadget loaded but nothing hooked; run B has eight inline hooks placed in `libc++`.
+The ext bucket moving 0 → 105 is the measurement under test, and it raised
+`android_code_integrity_violation +90` → `block`.
+
+**The name-based probes never fired.** No `android_frida_runtime_artifact`, no
+`android_frida_port_open` — the library is not called frida and the port is not 27042. What caught
+it was `android_code_integrity_violation` (bytes in memory differing from bytes on disk) and
+`android_instrumentation_runtime_thread` (Gum thread names compiled into the framework). Both are
+structural; neither can be renamed away.
+
+The `core diff = 71` in *both* runs is Frida's own patch to libc at gadget load. DESIGN.md 28.8
+records "the recurring `core_diff=71`" from the NDK implementation, and 28.8's hooked run recorded
+`ext_diff_bytes=105`, `ext_libs_diff=1`, `diffed_libs=libc.so,libc++.so`. This pure-C# port
+reproduces all four numbers.
+
+Item 11 (restore) passed on both: reinstalling the clean APK returned every bucket to `diff 0` and
+`diffed_libs=<none>`.
+
+Items 9, 10 and 12 were not run. Item 9 as written asks for detection *by name*, and this run
+deliberately defeated that; the harder structural version is item 14 above. Items 10 and 12 both end
+in an account operation, which the W^X finding below makes unreachable.
 
 ## The finding that blocks item 2: the Mono runtime maps W^X memory
 
@@ -51,10 +94,23 @@ Android client scores at least 60 even with developer options and ADB off, so **
 the gate as the server currently scores Android**. Account registration, login, `/v1/account/me`,
 `/v1/policy/me` and refresh are all unreachable in enforce mode.
 
-Nothing was changed client-side to hide this, because there is nothing honest to change: full AOT
-was tried and reduced the count without eliminating it, and NativeAOT for Android is not available
-on `net8.0-android`. Nothing was changed server-side either — scoring belongs to the server, and
-this repository is a client.
+### Everything tried, and what it measured
+
+| Attempt | Result |
+|---|---|
+| Default build (Mono JIT) | 20 anonymous `rwxp` regions |
+| `RunAOTCompilation=true` (normal AOT) | **14** regions — reduced, not eliminated |
+| `AndroidAotMode=Full` (aot-only) | **app dies on launch**; Android needs JIT-capable paths |
+| Search `libmonosgen-2.0.so` for a W^X / dual-mapping switch | no such option exists for android-arm64 |
+| NativeAOT / CoreCLR on Android | not available on `net8.0-android` |
+
+The runtime does contain an aot-only mode in which it refuses to "allocate from the global code
+manager" — the RWX allocator — which is why that mode was worth trying. It is not usable on Android:
+the process terminates during startup.
+
+So there is no honest client-side fix available today. Nothing was changed to hide the signal, and
+nothing was changed server-side either — scoring belongs to the server, and this repository is a
+client.
 
 **This needs a server-side decision**, and it is the single most consequential result of the .NET
 work:

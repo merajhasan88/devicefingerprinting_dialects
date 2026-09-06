@@ -53,6 +53,30 @@ namespace DeviceTrust.Android.Harness
     public sealed class MainActivity : Activity
     {
         private const string Tag = "DTHARNESS";
+
+#if HOOKTEST
+        static MainActivity()
+        {
+            // Battery item 14 build only. Loading the gadget here, before any
+            // managed work, gives it the earliest point at which it can take
+            // over the process. It listens on 127.0.0.1:27042 and resumes
+            // immediately, so the hook is placed afterwards over an adb-forwarded
+            // session -- deferred deliberately, because at gadget-load time the
+            // target libraries are not yet mapped.
+            try
+            {
+                // "helper", not "frida-gadget": the library is renamed so that
+                // /proc/self/maps token scanning cannot see it. Only the
+                // structural probes should be able to catch what it does.
+                Java.Lang.JavaSystem.LoadLibrary("helper");
+                global::Android.Util.Log.Info(Tag, "HOOKTEST build: renamed gadget loaded");
+            }
+            catch (Exception error)
+            {
+                global::Android.Util.Log.Info(Tag, "HOOKTEST build: gadget load failed " + error.Message);
+            }
+        }
+#endif
         private const string Preferences = "devicetrust.harness";
 
         private readonly StringBuilder _transcript = new StringBuilder();
