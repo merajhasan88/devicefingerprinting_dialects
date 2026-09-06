@@ -100,6 +100,7 @@ the gate as the server currently scores Android**. Account registration, login, 
 |---|---|
 | Default build (Mono JIT) | 20 anonymous `rwxp` regions |
 | `RunAOTCompilation=true` (normal AOT) | **14** regions — reduced, not eliminated |
+| Same AOT build, measured seconds after launch | **7** regions — the count grows as Mono compiles, and is never zero |
 | `AndroidAotMode=Full` (aot-only) | **app dies on launch**; Android needs JIT-capable paths |
 | Search `libmonosgen-2.0.so` for a W^X / dual-mapping switch | no such option exists for android-arm64 |
 | NativeAOT / CoreCLR on Android | not available on `net8.0-android` |

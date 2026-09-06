@@ -127,7 +127,8 @@ namespace DeviceTrust.Android.Harness
             root.AddView(_identityView);
 
             root.AddView(Button("Enrol + native integrity scan", () => RunAsync("scan", ScanAsync)));
-            root.AddView(Button("Show installation key", () => RunAsync("keyinfo", KeyInfoAsync)));
+            root.AddView(Button("Show installation key", () => RunLocalAsync("keyinfo", KeyInfoLocalAsync)));
+            root.AddView(Button("Dump executable mappings", () => RunLocalAsync("mapsdump", MapsDumpAsync)));
 
             root.AddView(SectionLabel("Account"));
             _handle = Field("handle", GetPreference("handle", "huawei-net"));
@@ -169,7 +170,7 @@ namespace DeviceTrust.Android.Harness
 
             root.AddView(SectionLabel("Local state"));
             root.AddView(Button("Clear local account tokens", () => RunAsync("clear-session", ClearSessionAsync)));
-            root.AddView(Button("Simulate fresh installation (delete key)", () => RunAsync("reset", ResetAsync)));
+            root.AddView(Button("Simulate fresh installation (delete key)", () => RunLocalAsync("reset", ResetLocalAsync)));
 
             root.AddView(SectionLabel("Result"));
             _result = new TextView(this) { Text = "-", TextSize = 10f };
@@ -248,7 +249,7 @@ namespace DeviceTrust.Android.Harness
             {
                 case "scan":
                 case "enroll": RunAsync("scan", ScanAsync); break;
-                case "keyinfo": RunAsync("keyinfo", KeyInfoAsync); break;
+                case "keyinfo": RunLocalAsync("keyinfo", KeyInfoLocalAsync); break;
                 case "account": RunAsync("account", c => AccountAsync(c, intent!.GetStringExtra("mode") ?? "register")); break;
                 case "boundary": RunAsync("boundary", BoundaryAllAsync); break;
                 case "bound-access": RunAsync("bound-access", BoundAccessAsync); break;
@@ -260,8 +261,8 @@ namespace DeviceTrust.Android.Harness
                 case "stolen-refresh": RunAsync("stolen-refresh", StolenRefreshAsync); break;
                 case "policy": RunAsync("policy", PolicyAsync); break;
                 case "clear-session": RunAsync("clear-session", ClearSessionAsync); break;
-                case "reset": RunAsync("reset", ResetAsync); break;
-                case "mapsdump": RunAsync("mapsdump", MapsDumpAsync); break;
+                case "reset": RunLocalAsync("reset", ResetLocalAsync); break;
+                case "mapsdump": RunLocalAsync("mapsdump", MapsDumpAsync); break;
                 default: Line("Unknown action '" + action + "'."); break;
             }
         }
@@ -325,6 +326,89 @@ namespace DeviceTrust.Android.Harness
                     });
                 }
             });
+        }
+
+        /// <summary>
+        /// Runs an action that touches only this device.
+        /// </summary>
+        /// <remarks>
+        /// Inspecting the key, dumping mappings and deleting the key are local
+        /// operations, but they used to be routed through DeviceTrustClient,
+        /// whose constructor resolves the endpoint and throws
+        /// api_base_url_missing when there is none. A freshly installed phone has
+        /// no endpoint yet, so the one screen that could tell you whether the
+        /// hardware key exists refused to run. The endpoint rule is right for
+        /// anything that talks to a server; it should not gate what does not.
+        /// </remarks>
+        private void RunLocalAsync(string name, Func<AndroidKeyStoreInstallationKeyStore, string, Task> body)
+        {
+            if (_busy)
+            {
+                Toast.MakeText(this, "A test is already running.", ToastLength.Short)?.Show();
+                return;
+            }
+
+            _busy = true;
+            SetButtonsEnabled(false);
+            _transcript.Clear();
+            Status("Running " + name + "...");
+
+            var started = DateTimeOffset.UtcNow;
+            Task.Run(async () =>
+            {
+                var ok = true;
+                try
+                {
+                    var stateDirectory = System.IO.Path.Combine(FilesDir!.AbsolutePath, "devicetrust");
+                    Directory.CreateDirectory(stateDirectory);
+                    await body(new AndroidKeyStoreInstallationKeyStore(ApplicationContext!), stateDirectory)
+                        .ConfigureAwait(false);
+                }
+                catch (Exception error)
+                {
+                    ok = false;
+                    Line("FAILED " + error.GetType().Name + ": " + error.Message);
+                }
+                finally
+                {
+                    Line("=== DONE action=" + name + " ok=" + (ok ? "1" : "0") + " seconds="
+                         + (DateTimeOffset.UtcNow - started).TotalSeconds.ToString("F1", CultureInfo.InvariantCulture)
+                         + " ===");
+                    RunOnUiThread(() =>
+                    {
+                        _busy = false;
+                        SetButtonsEnabled(true);
+                        Status((ok ? "Finished: " : "Failed: ") + name);
+                    });
+                }
+            });
+        }
+
+        private async Task KeyInfoLocalAsync(AndroidKeyStoreInstallationKeyStore keyStore, string stateDirectory)
+        {
+            var metadata = await keyStore.GetOrCreateKeyAsync().ConfigureAwait(false);
+            Line("key_alias              " + metadata.KeyAlias);
+            Line("provider               " + metadata.Provider);
+            Line("security_level         " + metadata.SecurityLevel);
+            Line("hardware_backed        " + metadata.HardwareBacked);
+            Line("private_key_exportable " + metadata.PrivateKeyExportable);
+            Line("created_this_run       " + metadata.Created);
+            Line("key_thumbprint         " + metadata.PublicKey.Thumbprint);
+            Identity("Thumbprint " + metadata.PublicKey.Thumbprint + "\n"
+                     + metadata.SecurityLevel + ", hardware_backed=" + metadata.HardwareBacked);
+        }
+
+        private async Task ResetLocalAsync(AndroidKeyStoreInstallationKeyStore keyStore, string stateDirectory)
+        {
+            await keyStore.DeleteKeyAsync().ConfigureAwait(false);
+            foreach (var file in Directory.GetFiles(stateDirectory))
+            {
+                File.Delete(file);
+            }
+
+            Line("Installation key deleted and local state cleared.");
+            Line("The next enrolment presents a NEW hardware key; the reinstall hint is what");
+            Line("correlates it back to this same device.");
         }
 
         private async Task WithClientAsync(Func<DeviceTrustClient, Task> body)
@@ -710,7 +794,7 @@ namespace DeviceTrust.Android.Harness
         /// a clean one are indistinguishable in the score, so the only way to tell
         /// them apart is to look at what the process actually has mapped.
         /// </remarks>
-        private Task MapsDumpAsync(DeviceTrustClient client)
+        private Task MapsDumpAsync(AndroidKeyStoreInstallationKeyStore keyStore, string stateDirectory)
         {
             var counts = new Dictionary<string, int>(StringComparer.Ordinal);
             var wx = new List<string>();
