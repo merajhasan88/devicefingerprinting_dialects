@@ -109,6 +109,19 @@ namespace DeviceTrust.Client
         public IReadOnlyList<string> LastRequiredProbes { get; private set; } = Array.Empty<string>();
 
         /// <summary>
+        /// The measurements the collector produced for the most recent report.
+        /// </summary>
+        /// <remarks>
+        /// Exposed so a caller can display or log what was actually sent without
+        /// running the collector a second time. That matters more than
+        /// convenience: some probes are not free and not perfectly side-effect
+        /// free — the Android code-integrity probe temporarily lifts PROT_READ on
+        /// execute-only system libraries — so a caller that re-measured for
+        /// display would double that work on every scan.
+        /// </remarks>
+        public IntegrityCollection? LastIntegrityCollection { get; private set; }
+
+        /// <summary>
         /// Loads the installation identity, creating the key and the UUID if this
         /// is a first run.
         /// </summary>
@@ -286,6 +299,8 @@ namespace DeviceTrust.Client
                     "The integrity collector's response did not match the server challenge.",
                     "integrity_challenge_binding_failed");
             }
+
+            LastIntegrityCollection = collection;
 
             var reportBytes = BuildIntegrityReport(challenge, collection, identity.InstallationId);
             var reportPayload = Base64Url.Encode(reportBytes);

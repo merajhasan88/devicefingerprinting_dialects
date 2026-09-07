@@ -12,6 +12,7 @@ using Android.OS;
 using Android.Views;
 using Android.Widget;
 using DeviceTrust.Client;
+using DeviceTrust.Client.Integrity;
 using DeviceTrust.Client.Internal;
 using DeviceTrust.Client.Keys;
 using DeviceTrust.Client.Maui.Android;
@@ -129,6 +130,7 @@ namespace DeviceTrust.Android.Harness
             root.AddView(Button("Enrol + native integrity scan", () => RunAsync("scan", ScanAsync)));
             root.AddView(Button("Show installation key", () => RunLocalAsync("keyinfo", KeyInfoLocalAsync)));
             root.AddView(Button("Dump executable mappings", () => RunLocalAsync("mapsdump", MapsDumpAsync)));
+            root.AddView(Button("Measure W^X baseline (one sample)", () => RunLocalAsync("wxreport", WxReportAsync)));
 
             root.AddView(SectionLabel("Account"));
             _handle = Field("handle", GetPreference("handle", "huawei-net"));
@@ -263,6 +265,7 @@ namespace DeviceTrust.Android.Harness
                 case "clear-session": RunAsync("clear-session", ClearSessionAsync); break;
                 case "reset": RunLocalAsync("reset", ResetLocalAsync); break;
                 case "mapsdump": RunLocalAsync("mapsdump", MapsDumpAsync); break;
+                case "wxreport": RunLocalAsync("wxreport", WxReportAsync); break;
                 default: Line("Unknown action '" + action + "'."); break;
             }
         }
@@ -469,26 +472,35 @@ namespace DeviceTrust.Android.Harness
                  + "  hardware_backed=" + identity.Key.HardwareBacked);
 
             var deviceToken = await client.AcquireDeviceTokenAsync().ConfigureAwait(false);
-
-            // The raw bucket numbers are logged before the verdict, because a
-            // bucket reporting compared_bytes = 0 is inert rather than clean and
-            // that distinction is invisible in the score.
-            var measurement = ManagedCodeIntegrity.Measure();
-            Line("code_integrity checked=" + measurement.Checked
-                 + (measurement.Reason.Length > 0 ? " reason=" + measurement.Reason : string.Empty));
-            Line("  core compared=" + measurement.CoreComparedBytes + " diff=" + measurement.CoreDiffBytes
-                 + (measurement.CoreComparedBytes == 0 ? "  <-- INERT" : string.Empty));
-            Line("  ext  compared=" + measurement.ExtComparedBytes + " diff=" + measurement.ExtDiffBytes
-                 + " libs=" + measurement.ExtLibrariesDiffering
-                 + (measurement.ExtComparedBytes == 0 ? "  <-- INERT" : string.Empty));
-            Line("  app  compared=" + measurement.AppComparedBytes + " diff=" + measurement.AppDiffBytes
-                 + " libs=" + measurement.AppLibrariesDiffering
-                 + (measurement.AppComparedBytes == 0 ? "  <-- INERT" : string.Empty));
-            Line("  diffed_libs=" + (measurement.DiffedLibraries.Length == 0 ? "<none>" : measurement.DiffedLibraries));
-            Line("  execute-only regions unlocked=" + measurement.ExecuteOnlyRegionsUnlocked
-                 + " unreadable=" + measurement.ExecuteOnlyRegionsUnreadable);
-
             var decision = await client.SubmitIntegrityReportAsync(deviceToken).ConfigureAwait(false);
+
+            // Read straight out of what the collector produced, rather than
+            // measuring again for display. The code-integrity probe temporarily
+            // lifts PROT_READ on execute-only system libraries, so a second pass
+            // would double that work -- and its exposure -- on every scan.
+            var probes = client.LastIntegrityCollection?.Probes;
+            if (probes is not null && probes.TryGetValue("code_integrity", out var code))
+            {
+                Line("code_integrity checked=" + Field(code, "checked"));
+                Line("  core compared=" + Field(code, "core_compared_bytes") + " diff=" + Field(code, "core_diff_bytes"));
+                Line("  ext  compared=" + Field(code, "ext_compared_bytes") + " diff=" + Field(code, "ext_diff_bytes")
+                     + " libs=" + Field(code, "ext_libs_diff"));
+                Line("  app  compared=" + Field(code, "app_compared_bytes") + " diff=" + Field(code, "app_diff_bytes")
+                     + " libs=" + Field(code, "app_libs_diff"));
+                var diffed = Field(code, "diffed_libs");
+                Line("  diffed_libs=" + (diffed.Length == 0 ? "<none>" : diffed));
+                Line("  execute-only regions unlocked=" + Field(code, "xom_regions_unlocked")
+                     + " unreadable=" + Field(code, "xom_regions_unreadable"));
+            }
+
+            if (probes is not null && probes.TryGetValue("exec_mappings", out var maps))
+            {
+                Line("WXREPORT bytes=" + Field(maps, "wx_bytes")
+                     + " regions=" + Field(maps, "wx_mappings")
+                     + " classes=" + (Field(maps, "wx_size_classes").Length == 0
+                         ? "none" : Field(maps, "wx_size_classes")));
+            }
+
             Line("probes " + string.Join(",", client.LastRequiredProbes));
             Line("INTEGRITY score=" + decision.Score.ToString(CultureInfo.InvariantCulture)
                  + " verdict=" + decision.Verdict + " mode=" + decision.Mode);
@@ -914,6 +926,36 @@ namespace DeviceTrust.Android.Harness
             }
 
             return Task.CompletedTask;
+        }
+
+        /// <summary>
+        /// Emits one machine-readable writable-executable measurement.
+        /// </summary>
+        /// <remarks>
+        /// Needs no endpoint, no account and no network, so a release pipeline can
+        /// derive a build's baseline from a device without standing up a server.
+        /// </remarks>
+        private Task WxReportAsync(AndroidKeyStoreInstallationKeyStore keyStore, string stateDirectory)
+        {
+            var summary = ExecutableMemorySummary.Summarise(
+                ProcMapsParser.ParseAll(File.ReadAllLines("/proc/self/maps")));
+
+            Line("Measured at launch, BEFORE the app has done network, TLS, JSON or signing work.");
+            Line("Mono allocates more code-manager blocks as it compiles, so this is NOT the number");
+            Line("to pin as a baseline -- use the scan flow, which measures at report time.");
+            Line("WXSAMPLE bytes=" + summary.WritableExecutableBytes.ToString(CultureInfo.InvariantCulture)
+                 + " regions=" + summary.WritableExecutableCount.ToString(CultureInfo.InvariantCulture)
+                 + " unlabeled=" + summary.WritableExecutableUnlabelled.ToString(CultureInfo.InvariantCulture)
+                 + " classes=" + (summary.WritableExecutableSizeClasses.Length == 0
+                     ? "none" : summary.WritableExecutableSizeClasses));
+            return Task.CompletedTask;
+        }
+
+        private static string Field(DeviceTrust.Client.Integrity.ProbeResult probe, string name)
+        {
+            return probe.Fields.TryGetValue(name, out var value) && value is not null
+                ? Convert.ToString(value, CultureInfo.InvariantCulture) ?? string.Empty
+                : string.Empty;
         }
 
         // ----------------------------------------------------------- helpers

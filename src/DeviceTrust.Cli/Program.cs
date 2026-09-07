@@ -104,6 +104,17 @@ namespace DeviceTrust.Cli
                     return await ConformanceAsync(configuration, cancellationToken).ConfigureAwait(false);
                 case "battery":
                     return await BatteryAsync(configuration, cancellationToken).ConfigureAwait(false);
+                case "baseline":
+                    return await Commands.BaselineCommand.RunAsync(
+                        switches.TryGetValue("device", out var serial) ? serial : null,
+                        switches.TryGetValue("runs", out var runs)
+                            && int.TryParse(runs, System.Globalization.NumberStyles.Integer,
+                                CultureInfo.InvariantCulture, out var parsedRuns)
+                            ? parsedRuns
+                            : 5,
+                        switches.TryGetValue("apk-sha256", out var apk) ? apk : null,
+                        configuration.ApiBaseUrl,
+                        cancellationToken).ConfigureAwait(false);
                 default:
                     Console.Error.WriteLine("Unknown command '" + command + "'.");
                     PrintUsage();
@@ -568,6 +579,8 @@ COMMANDS
   reset                     Delete the local key and state, so the next run enrols fresh
   conformance               Prove this .NET client against a live server
   battery                   The DESIGN.md 25.11 battery, between two simulated devices
+  baseline                  Derive this build's W^X baseline from a connected device.
+                            Needs no server. --device <serial> --runs <n> --apk-sha256 <h>
 
 OPTIONS
   --base-url <url>          The API endpoint. No default: a run without one fails
