@@ -25,12 +25,13 @@ the current build (at the time of writing, `664e9c8e…e3`).
 | 6 | Body tampering | **PASS** | **PASS** | observe |
 | 7 | Path + method tampering | **PASS** | **PASS** | observe |
 | 8 | Stale timestamp | **PASS** | **PASS** | observe |
-| 9 | Frida Gadget — detection by name | n/a, see below | n/a, see below | enforce |
+| 9 | Frida Gadget — **name-based** detection | n/a, defeated on purpose | n/a, defeated on purpose | enforce |
 | 10 | Frida Gadget — enforcement (login 403) | not run | not run | — |
 | 11 | Frida Gadget — restore | **PASS** | **PASS** | enforce |
 | 12 | Device memory across a new hardware key | not run | not run | — |
 | 13 | Pristine re-enrolment (enrolment half) | **PASS** | **PASS** | enforce |
-| 14 | Structural code-integrity, ext bucket | **PASS** | **PASS** | **enforce** |
+| 14 | Structural code-integrity, **ext** bucket | **PASS** | **PASS** | **enforce** |
+| 16 | Structural code-integrity, **app** bucket | **PASS** | not run | **enforce** |
 
 Items 3 and 4 are cross-device by construction: the Huawei minted, the OPPO replayed with its own
 keystore key. That is the property the desktop harness could only approximate with two software
@@ -78,9 +79,15 @@ reproduces all four numbers.
 Item 11 (restore) passed on both: reinstalling the clean APK returned every bucket to `diff 0` and
 `diffed_libs=<none>`.
 
-Items 9, 10 and 12 were not run. Item 9 as written asks for detection *by name*, and this run
-deliberately defeated that; the harder structural version is item 14 above. Items 10 and 12 both end
-in an account operation, which the W^X finding below makes unreachable.
+Items 10 and 12 were not run: both end in an account operation, which the W^X finding below makes
+unreachable. Item 9 was deliberately defeated rather than skipped — the gadget was renamed and moved
+off port 27042 precisely so that only the structural signals could fire, which is what makes items 14
+and 16 worth anything. Item 15 is iOS-only and has no Android counterpart.
+
+**Item 16 is new**, added to DESIGN.md 25.11 as part of this work. It is item 14 aimed at the
+application's own code instead of a system library, and it is the more directly meaningful of the two
+for a customer: it is their code an attacker wants to patch. It is recorded above under
+"Requirement 3".
 
 ## Requirement 3 — an attacker altering the app's own bytes is caught
 

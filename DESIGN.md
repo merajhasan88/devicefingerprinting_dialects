@@ -1817,13 +1817,29 @@ after the original four groups and are folded in here so this list is the single
 | 6 | Boundary: body tampering | 401 `access_proof_body_mismatch` | each |
 | 7 | Boundary: path + method tampering | 401 `access_proof_path_mismatch` and `_method_mismatch` | each |
 | 8 | Boundary: stale timestamp | 401 `access_proof_timestamp_outside_window` | each |
-| 9 | Frida Gadget — detection | `score=100 verdict=block`, `frida_runtime_artifact` +90 | each |
+| 9 | Frida Gadget — **name-based** detection (gadget left named `libfrida-gadget.so` on port 27042) | `score=100 verdict=block`, `frida_runtime_artifact` +90 | each |
 | 10 | Frida Gadget — enforcement | `POST /v1/accounts/login` 403 `integrity_blocked` | each |
 | 11 | Frida Gadget — restore | clean APK (0 frida entries) returns `18/trusted` | each |
 | 12 | Device memory across a new hardware key | **Android:** full uninstall + reinstall. **iOS:** `deleteKey` then re-enrol (see below). Either way a new hardware key → 403 `integrity_device_blocked_recently` | each |
 | 13 | Pristine re-enrolment (recognition) | **Android:** uninstall + reinstall. **iOS:** `deleteKey` then re-enrol. `devices` unchanged, `installations` +1, same `device_id`, **login 200** | each |
 | 14 | Structural code-integrity (ext bucket) | deferred libc++ hook → `ext_diff_bytes > 0` → `android_code_integrity_violation` +90 → `block` | each |
 | 15 | Key survives app reinstall (**iOS only**) | uninstall + reinstall **without** `deleteKey` → `getOrCreateKey` returns `created: false`, the **same** key thumbprint, and the same `installation_id` | iPhone |
+| 16 | Structural code-integrity (**app bucket**) | hook the app's **own** native code → `app_diff_bytes > 0` → `android_app_code_modified` +90 → `block` | each |
+
+**Item 9 is the weakest item in the list, and is named to say so.** It tests detection by *filename*,
+which DESIGN.md 27.11 already proved defeatable: a real gadget renamed to `libhelper.so` and moved
+off port 27042 scored `18/trusted` while fully active. It is retained because an attacker who does
+not bother to rename should still be caught cheaply, but a passing item 9 says much less than a
+passing item 14 or 16. When running 14 and 16, rename the gadget and move its port deliberately, so
+that only the structural signals can fire — otherwise those items are not testing what they claim.
+
+**Item 16 is item 14 aimed at the application's own code rather than a system library.** It is
+separated because the two catch different attacks and are configured by different server settings:
+14 raises `android_code_integrity_violation` from the ext bucket, 16 raises
+`android_app_code_modified` from the app bucket, and both are gated behind
+`INTEGRITY_SCORE_EXTENDED_LIBS`. For a customer, 16 is the more directly meaningful of the two —
+it is *their* code an attacker wants to patch — and an app bucket reporting
+`app_compared_bytes: 0` is inert rather than clean, which is invisible in the score.
 
 **Items 12, 13 and 15 differ by platform, deliberately.** Android Keystore entries are destroyed
 when the app is uninstalled, so a reinstall necessarily enrols a new hardware key — which is exactly

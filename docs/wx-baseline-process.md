@@ -85,3 +85,77 @@ multiples of 65,536.
 signs the report, but the compromised process composes it. The APK hash is pinned by the operator,
 so it cannot be forged by the process under suspicion — and a Flutter build simply pins a baseline
 of zero, keeping it exactly as strict as it is today.
+
+## What this change does to the Flutter/Dart client
+
+Short answer: **nothing, by construction** — and the design is arranged so that it cannot,
+even if someone configures it carelessly.
+
+### Why Flutter is untouched in the normal case
+
+A Flutter release build maps **no** writable-and-executable memory at all: Dart is AOT-compiled into
+`libapp.so` and mapped `r-xp`, the Dart AOT runtime has no JIT, and the ART beneath it separates
+write from execute. It scores zero on this probe today and would score zero after the change.
+
+The new logic only engages for a build that has a **non-zero** baseline pinned. A build with no
+baseline pinned keeps exactly today's rule — `+60` if any writable-executable mapping is present. So
+a Flutter build is in the unchanged path whether or not anyone remembers to configure it.
+
+### The trap, and it is a real one
+
+A naive implementation would compute `excess = wx_bytes - baseline` and score the excess. **That
+would silently switch off W^X scoring for the Flutter client entirely.**
+
+`wx_bytes` is a field this .NET collector added. The Flutter collector does not emit it. A server
+reading `int(probe.get("wx_bytes") or 0)` gets **0** for every Flutter report — not because the
+device is clean, but because the field was never sent. Excess would compute as zero, and a Flutter
+device with a live Frida gadget mapping executable memory would score nothing at all.
+
+The rule must therefore be written to fall back on absence, not to treat absence as zero:
+
+```python
+wx_count = int(exec_maps.get("wx_mappings") or 0)
+wx_bytes = exec_maps.get("wx_bytes")            # None on a client that does not report it
+
+if wx_bytes is None or baseline_bytes <= 0:
+    # Today's rule, unchanged. Covers every Flutter report and every
+    # unconfigured build.
+    if wx_count > 0:
+        reason("android_wx_memory", 60)
+else:
+    ...                                          # baseline-relative logic
+```
+
+This is the same class of defect as an integrity bucket reporting `compared_bytes: 0` — an absent
+measurement reading as a clean one. It is worth a conformance check of its own: *a report with no
+`wx_bytes` field and a non-zero `wx_mappings` must still score 60.*
+
+### Why a Flutter build cannot accidentally acquire an allowance
+
+Someone could try to pin a baseline for the Flutter APK. They cannot get a non-zero one: the
+`baseline` command refuses when no writable-executable memory is observed, emitting *"no
+writable-and-executable memory was observed, so there is nothing to baseline"* and exiting non-zero.
+There is a unit test for exactly that case. The only baseline a Flutter build can be given is
+effectively zero, which is defined above to mean today's rule.
+
+### Where Flutter would have to change, if you wanted it to
+
+Nowhere, for this to be safe. But two optional improvements would be available once the server reads
+the richer fields:
+
+- Adding `wx_bytes` and `wx_size_classes` to the Kotlin collector would give Flutter reports the same
+  forensic detail — useful when investigating an incident, not needed for scoring.
+- The `dual_mapped_runtime_code` count would show ART's JIT cache on Flutter devices too, which is a
+  positive signal (a runtime that separates write from execute) rather than a risk one.
+
+Neither is required, and neither changes any verdict.
+
+### Net effect per client
+
+| client | today | after the change |
+|---|---|---|
+| Flutter/Dart release | 0 points (no W^X present) | **0 points, identical path** |
+| Flutter/Dart with an injected gadget | +60 | **+60, identical path** (absence-fallback rule) |
+| .NET Android, clean, baseline pinned | +60 → refused | **0 points → passes the gate** |
+| .NET Android with an injected gadget | +60 | **+45 foreign allocator, plus excess-over-baseline** |
+| .NET Android, no baseline pinned | +60 | **+60, unchanged — fails closed** |
