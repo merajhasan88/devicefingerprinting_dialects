@@ -82,6 +82,33 @@ Items 9, 10 and 12 were not run. Item 9 as written asks for detection *by name*,
 deliberately defeated that; the harder structural version is item 14 above. Items 10 and 12 both end
 in an account operation, which the W^X finding below makes unreachable.
 
+## Requirement 3 — an attacker altering the app's own bytes is caught
+
+Item 14 proves the *ext* bucket fires on a hooked system library. This proves the *app* bucket fires
+when the application's own native code is altered, which is the property that matters most to a
+customer: it is their code an attacker wants to patch.
+
+Same method, aimed at a library under `/data/app` instead of a system one. One variable changed
+between the runs — eight inline hooks placed in the app's own `libSystem.Native.so`:
+
+| run | app compared | app diff | app libs | diffed_libs | new reason |
+|---|---|---|---|---|---|
+| A — gadget loaded, app untouched | 12,797,736 | **0** | 0 | `libc.so` | — |
+| B — 8 hooks in the app's own library | 13,070,504 | **108** | **1** | `libSystem.Native.so,libc.so` | **`android_app_code_modified +90`** |
+
+The hooked module's path confirms the bucket:
+`/data/app/com.example.devicefingerprinting_dotnet-…/lib/arm64/libSystem.Native.so`.
+
+Restoring the clean APK returned every bucket to `diff 0` with `diffed_libs=<none>`, and six
+consecutive scans of the restored build completed cleanly at `78/review`.
+
+**A known limitation of the managed implementation.** Lifting `PROT_READ` on an execute-only mapping
+and reading it with `Marshal.Copy` is a pointer read: if a mapping were unmapped between the
+`/proc/self/maps` snapshot and the copy, the result is a SIGSEGV, which .NET cannot catch and which
+would take the process down. The targets are libraries that are never `dlclose`d, and one incomplete
+run was seen immediately after a reinstall and did not reproduce in six further attempts, so this is
+recorded as a bounded risk rather than an observed defect.
+
 ## The finding that blocks item 2: the Mono runtime maps W^X memory
 
 A clean .NET Android device scores **78 / review**, not the 18 / trusted a clean Flutter device
