@@ -2,7 +2,10 @@
 
 Run against **PostgreSQL 18.6** (RDS, schema v1, Redis nonces, rate limiting on) with the .NET
 harness app `com.example.devicefingerprinting_dotnet`, a **release, non-debuggable, full-AOT** APK
-signed with a dedicated release key (`9020 70b6 ... a663`).
+signed with a dedicated release key. The keystore lives at `~/.devicetrust-harness/harness.keystore`;
+it was regenerated once after the original was lost with a cleaned temp directory, so the
+certificate digest a server allow-list needs is whatever `apksigner verify --print-certs` reports for
+the current build (at the time of writing, `664e9c8e…e3`).
 
 | Device | Model | Android | Build | Verified boot | Key |
 |---|---|---|---|---|---|
@@ -93,6 +96,44 @@ The consequence is not "a worse score". `_enforce_integrity_gate` admits **only*
 Android client scores at least 60 even with developer options and ADB off, so **it can never pass
 the gate as the server currently scores Android**. Account registration, login, `/v1/account/me`,
 `/v1/policy/me` and refresh are all unreachable in enforce mode.
+
+### Why Flutter does not trip this and .NET does
+
+The difference is not "native versus managed". It is one runtime's allocator policy, and both
+behaviours are visible **in a single .NET process on one handset**, because that process runs ART and
+Mono side by side:
+
+```
+--- WRITABLE + EXECUTABLE (what android_wx_memory counts) ---
+regions=6  anonymous=6  file_backed=0  total=384 KB
+  rwxp      64 KB  anonymous (no backing file)     <- Mono's code manager
+
+--- ART JIT CODE CACHE (same pages, separate views) ---
+  rw-s   32768 KB  /memfd:/jit-cache (deleted)     <- ART writes here
+  r-xs   32768 KB  /memfd:/jit-cache (deleted)     <- ART executes here
+  r--s   32768 KB  /memfd:/jit-cache (deleted)
+```
+
+ART has a JIT and compiles code at runtime, exactly as Mono does, and it contributes **zero** to
+`wx_mappings` — because it maps the same memfd three times and never grants write and execute
+together. That is deliberate W^X separation.
+
+Mono's code manager maps one anonymous region that is writable and executable at once, and does so
+even in an AOT build, because trampolines (delegate invoke, generic sharing, interface dispatch,
+marshalling stubs) are still generated at runtime.
+
+So a Flutter release build scores zero for three reasons that all hold at once: its Dart code is
+AOT-compiled into `libapp.so` and mapped `r-xp`, the Dart AOT runtime has no JIT at all, and the ART
+underneath it separates write from execute. A .NET build inherits the same clean ART, then adds
+Mono.
+
+**The consequence for any server-side rule.** "Trust managed runtimes" is the wrong shape, because
+ART is a managed runtime with a JIT and it already passes. The real distinguishing property is the
+allocator's W^X policy, whose observable signature is *anonymous, unbacked, simultaneously writable
+and executable*. That is honest, but it is not a clean discriminator either: an injected hook
+trampoline has the same signature. Mono's regions are uniform 64 KB blocks and there are few of
+them, so count and size may help, but this should be treated as a heuristic to be measured, not a
+property to be assumed.
 
 ### Everything tried, and what it measured
 

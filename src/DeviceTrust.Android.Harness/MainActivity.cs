@@ -794,12 +794,27 @@ namespace DeviceTrust.Android.Harness
         /// a clean one are indistinguishable in the score, so the only way to tell
         /// them apart is to look at what the process actually has mapped.
         /// </remarks>
+        /// <summary>
+        /// Reports how executable memory is mapped in this process.
+        /// </summary>
+        /// <remarks>
+        /// Written to answer one question with evidence: why does a Flutter
+        /// release build score 0 for writable-and-executable memory while a .NET
+        /// build scores +60? Both answers are visible in a single .NET process,
+        /// because it runs ART and Mono side by side. ART's JIT keeps write and
+        /// execute in two separate views of the same pages and never maps them
+        /// together; Mono's code manager maps one anonymous region that is
+        /// writable and executable at once.
+        /// </remarks>
         private Task MapsDumpAsync(AndroidKeyStoreInstallationKeyStore keyStore, string stateDirectory)
         {
-            var counts = new Dictionary<string, int>(StringComparer.Ordinal);
-            var wx = new List<string>();
             var lines = File.ReadAllLines("/proc/self/maps");
-            Line("maps_total_lines " + lines.Length);
+            var wx = new List<string>();
+            long wxBytes = 0;
+            var wxAnonymous = 0;
+            var wxFileBacked = 0;
+            var jit = new List<string>();
+            var executableGroups = new Dictionary<string, int>(StringComparer.Ordinal);
 
             foreach (var raw in lines)
             {
@@ -809,31 +824,93 @@ namespace DeviceTrust.Android.Harness
                     continue;
                 }
 
+                var bounds = parts[0].Split('-');
                 var perms = parts[1];
-                if (perms.Length < 4 || perms[2] != 'x')
+                var inode = parts[4];
+                var path = parts.Length >= 6 ? parts[5].Trim() : string.Empty;
+                if (perms.Length < 4 || bounds.Length != 2)
                 {
                     continue;
                 }
 
-                var path = parts.Length >= 6 ? parts[5].Trim() : "<anonymous>";
-                var key = perms.Substring(0, 4) + " " + path;
-                counts[key] = counts.TryGetValue(key, out var seen) ? seen + 1 : 1;
-
-                if (perms[1] == 'w' && wx.Count < 12)
+                long size = 0;
+                if (ulong.TryParse(bounds[0], NumberStyles.HexNumber, CultureInfo.InvariantCulture, out var from)
+                    && ulong.TryParse(bounds[1], NumberStyles.HexNumber, CultureInfo.InvariantCulture, out var to)
+                    && to > from)
                 {
-                    wx.Add(raw.Trim());
+                    size = (long)(to - from);
+                }
+
+                var lower = path.ToLowerInvariant();
+                var isJit = lower.Contains("jit-cache", StringComparison.Ordinal)
+                            || lower.Contains("jit-zygote", StringComparison.Ordinal)
+                            || lower.Contains("dalvik-jit-code-cache", StringComparison.Ordinal);
+                if (isJit)
+                {
+                    jit.Add(perms + "  " + (size / 1024).ToString(CultureInfo.InvariantCulture).PadLeft(6)
+                            + " KB  " + path);
+                }
+
+                if (perms[1] == 'w' && perms[2] == 'x')
+                {
+                    wxBytes += size;
+                    var anonymous = inode == "0" && path.Length == 0;
+                    if (anonymous)
+                    {
+                        wxAnonymous++;
+                    }
+                    else
+                    {
+                        wxFileBacked++;
+                    }
+
+                    if (wx.Count < 20)
+                    {
+                        wx.Add(perms + "  " + (size / 1024).ToString(CultureInfo.InvariantCulture).PadLeft(6)
+                               + " KB  " + (anonymous ? "anonymous (no backing file)" : path));
+                    }
+                }
+
+                if (perms[2] == 'x')
+                {
+                    var key = perms.Substring(0, 4) + " " + (path.Length == 0 ? "<anonymous>" : path);
+                    executableGroups[key] = executableGroups.TryGetValue(key, out var seen) ? seen + 1 : 1;
                 }
             }
 
-            foreach (var entry in counts.OrderByDescending(item => item.Value))
+            Line("maps_total_lines " + lines.Length);
+            Line("executable mapping groups " + executableGroups.Count);
+            Line(string.Empty);
+            Line("--- WRITABLE + EXECUTABLE (what android_wx_memory counts) ---");
+            Line("regions=" + (wxAnonymous + wxFileBacked)
+                 + "  anonymous=" + wxAnonymous + "  file_backed=" + wxFileBacked
+                 + "  total=" + (wxBytes / 1024).ToString(CultureInfo.InvariantCulture) + " KB");
+            foreach (var entry in wx)
             {
-                Line("  x-map " + entry.Value.ToString(CultureInfo.InvariantCulture).PadLeft(3) + "  " + entry.Key);
+                Line("  " + entry);
             }
 
-            Line("writable-and-executable mappings: " + wx.Count);
-            foreach (var sample in wx)
+            Line(string.Empty);
+            Line("--- ART JIT CODE CACHE (same pages, separate views) ---");
+            if (jit.Count == 0)
             {
-                Line("  WX " + sample);
+                Line("  none mapped");
+            }
+            else
+            {
+                foreach (var entry in jit)
+                {
+                    Line("  " + entry);
+                }
+
+                Line("  note: ART maps the cache rw- and r-x separately and never rwx.");
+            }
+
+            Line(string.Empty);
+            Line("--- top executable mapping groups ---");
+            foreach (var entry in executableGroups.OrderByDescending(item => item.Value).Take(6))
+            {
+                Line("  " + entry.Value.ToString(CultureInfo.InvariantCulture).PadLeft(3) + "  " + entry.Key);
             }
 
             return Task.CompletedTask;
