@@ -605,44 +605,36 @@ namespace DeviceTrust.Client.Maui.Android
 
         private static ProbeResult ProbeExecMappings()
         {
-            var wx = 0;
+            var lines = ReadLines("/proc/self/maps");
+            var entries = ProcMapsParser.ParseAll(lines);
+            var summary = ExecutableMemorySummary.Summarise(entries);
+
             var deletedExec = 0;
             var deletedExecJit = 0;
             var anonExecLabeled = 0;
             var anonExecUnlabeled = 0;
             var samples = new List<string>();
 
-            foreach (var raw in ReadLines("/proc/self/maps"))
+            foreach (var entry in entries)
             {
-                var line = raw.Trim();
-                var parts = line.Split(new[] { ' ', '\t' }, 6, StringSplitOptions.RemoveEmptyEntries);
-                if (parts.Length < 5)
+                if (!entry.Executable)
                 {
                     continue;
                 }
 
-                var permissions = parts[1];
-                if (permissions.Length < 4 || permissions[2] != 'x')
+                if (entry.Writable && samples.Count < 8)
                 {
-                    continue;
+                    samples.Add(Truncate(
+                        entry.Permissions + " " + entry.Length.ToString(CultureInfo.InvariantCulture)
+                        + " " + (entry.Path.Length == 0 ? "<anonymous>" : entry.Path), 160));
                 }
 
-                var path = parts.Length >= 6 ? parts[5] : string.Empty;
-                if (permissions[1] == 'w')
+                if (entry.Path.Contains("(deleted)", StringComparison.Ordinal))
                 {
-                    wx++;
-                    if (samples.Count < 8)
-                    {
-                        samples.Add(Truncate(line, 160));
-                    }
-                }
-
-                if (path.Contains("(deleted)", StringComparison.Ordinal))
-                {
-                    // The ART JIT code cache is executable and "(deleted)" on
-                    // every clean device. Excluding it here is what stops the
-                    // whole fleet from being a false positive.
-                    var lower = path.ToLowerInvariant();
+                    // The ART JIT code cache is executable and backed by a deleted
+                    // memfd on every clean device. Excluding it is what stops the
+                    // whole fleet being a false positive.
+                    var lower = entry.Path.ToLowerInvariant();
                     var isJit = lower.Contains("jit-cache", StringComparison.Ordinal)
                                 || lower.Contains("dalvik-jit-code-cache", StringComparison.Ordinal)
                                 || lower.Contains("dalvik-", StringComparison.Ordinal)
@@ -657,28 +649,50 @@ namespace DeviceTrust.Client.Maui.Android
                         deletedExec++;
                         if (samples.Count < 8)
                         {
-                            samples.Add(Truncate(line, 160));
+                            samples.Add(Truncate(entry.Permissions + " " + entry.Path, 160));
                         }
                     }
                 }
 
-                if (path.Length == 0)
-                {
-                    anonExecUnlabeled++;
-                }
-                else if (path.StartsWith("[anon:", StringComparison.Ordinal))
+                if (entry.IsLabelledAnonymous)
                 {
                     anonExecLabeled++;
+                }
+                else if (entry.IsUnlabelledAnonymous)
+                {
+                    anonExecUnlabeled++;
                 }
             }
 
             return ProbeResult.Ok()
-                .With("wx_mappings", wx)
+                // The original fields, unchanged. The server scores these today
+                // and their meaning must not drift.
+                .With("wx_mappings", summary.WritableExecutableCount)
                 .With("deleted_exec_mappings", deletedExec)
                 .With("deleted_exec_jit", deletedExecJit)
                 .With("anon_exec_labeled", anonExecLabeled)
                 .With("anon_exec_unlabeled", anonExecUnlabeled)
-                .With("samples", samples);
+                .With("samples", samples)
+                // Added detail. A managed runtime maps writable-and-executable
+                // pages by design, so scoring their mere presence cannot separate
+                // a healthy process from a compromised one -- on this very device
+                // ART runs a JIT and contributes none of them, because it splits
+                // write from execute across two views of one memfd, while Mono's
+                // code manager does not. These fields describe the shape of what
+                // is mapped so a server can compare a report against what this
+                // build is known to look like, the way code_integrity compares
+                // against the on-disk image. No verdict is computed here.
+                .With("wx_bytes", summary.WritableExecutableBytes)
+                .With("wx_unlabeled", summary.WritableExecutableUnlabelled)
+                .With("wx_labeled", summary.WritableExecutableLabelled)
+                .With("wx_file_backed", summary.WritableExecutableFileBacked)
+                .With("wx_smallest_bytes", summary.WritableExecutableSmallestBytes)
+                .With("wx_largest_bytes", summary.WritableExecutableLargestBytes)
+                .With("wx_size_classes", summary.WritableExecutableSizeClasses)
+                .With("dual_mapped_files", summary.DualMappedFiles)
+                .With("dual_mapped_runtime_code", summary.DualMappedRuntimeCodeRegions)
+                .With("execute_only_mappings", summary.ExecuteOnlyCount)
+                .With("readable_exec_mappings", summary.ReadableExecutableCount);
         }
 
         private ProbeResult ProbeCodeIntegrity()
