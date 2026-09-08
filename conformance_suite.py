@@ -939,6 +939,31 @@ def check_code_integrity(api, ctx):
     )
 
 
+@check("integrity: w^x still scores when the client sends no wx_bytes")
+def check_wx_absent_field_still_scores(api, ctx):
+    """Regression guard requested by the .NET SDK session.
+
+    A proposed change scores writable-executable memory against a per-build
+    baseline using a `wx_bytes` field that only some clients send. Implemented
+    naively as `int(probe.get("wx_bytes") or 0)`, a client that does not send
+    the field yields 0, the excess computes to zero, and W^X scoring is
+    silently switched off for that client - a Flutter device with a live
+    injected gadget would score nothing. Absence must not be read as zero.
+    """
+    installation, token, _ = integrity_context(ctx)
+
+    def wx_without_bytes(probes):
+        probes["exec_mappings"].update({"wx_mappings": 1})
+        probes["exec_mappings"].pop("wx_bytes", None)
+
+    decision = submit_report(api, installation, token, wx_without_bytes)
+    expect(
+        "android_wx_memory" in codes(decision),
+        "a report with wx_mappings>0 and no wx_bytes must still score "
+        "android_wx_memory; got %s" % codes(decision),
+    )
+
+
 @check("integrity: the ART JIT code cache is not mistaken for injection")
 def check_jit_not_flagged(api, ctx):
     """deleted_exec_jit is the legitimate JIT cache; it must never score."""

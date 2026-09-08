@@ -29,6 +29,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <sys/mman.h>
 
 namespace {
 
@@ -49,7 +50,8 @@ const char *kApp[] = {"/libflutter.so", "/libapp.so", ".apk", nullptr};
 
 // Compare every executable mapping ending with `suffix` against disk.
 // Returns differing bytes (>=0) and sets *compared, or -1 if none matched.
-long compare_one(const char *suffix, long *compared) {
+long compare_one(const char *suffix, long *compared,
+                 int *xomUnlocked, int *xomUnreadable) {
     *compared = 0;
     FILE *maps = fopen("/proc/self/maps", "r");
     if (!maps) return -1;
@@ -66,6 +68,22 @@ long compare_one(const char *suffix, long *compared) {
         int matched = sscanf(line, "%lx-%lx %7s %lx %*x:%*x %*d %511[^\n]",
                              &start, &end, perms, &offset, path);
         if (matched < 5 || perms[2] != 'x') continue;
+        // Android 10+ maps system libraries EXECUTE-ONLY (--xp). Dereferencing
+        // such a page segfaults, so selecting on 'x' and then reading through
+        // the pointer - which is what this loop used to do - is a latent crash
+        // on any device that uses XOM. Lift PROT_READ for the duration of the
+        // copy and restore it after. If that is refused, skip the mapping and
+        // COUNT it: silently skipping is exactly how a bucket ends up inert
+        // while still reading as clean in the score (DESIGN.md 28.8).
+        bool relocked = false;
+        if (perms[0] != 'r') {
+            if (mprotect((void *) start, end - start, PROT_READ | PROT_EXEC) != 0) {
+                if (xomUnreadable) (*xomUnreadable)++;
+                continue;
+            }
+            relocked = true;
+            if (xomUnlocked) (*xomUnlocked)++;
+        }
         char *p = path;
         while (*p == ' ') p++;
         size_t len = strlen(p);
@@ -73,16 +91,29 @@ long compare_one(const char *suffix, long *compared) {
         size_t span = end - start;
         if (span == 0) continue;
         if (span > kMaxPerLib - done) span = kMaxPerLib - done;
+        // Every early exit below must restore the original protection.
         int fd = open(p, O_RDONLY);
-        if (fd < 0) continue;
+        if (fd < 0) {
+            if (relocked) mprotect((void *) start, end - start, PROT_EXEC);
+            continue;
+        }
         unsigned char *disk = (unsigned char *) malloc(span);
-        if (!disk) { close(fd); continue; }
+        if (!disk) {
+            close(fd);
+            if (relocked) mprotect((void *) start, end - start, PROT_EXEC);
+            continue;
+        }
         ssize_t got = pread(fd, disk, span, (off_t) offset);
         close(fd);
-        if (got <= 0) { free(disk); continue; }
+        if (got <= 0) {
+            free(disk);
+            if (relocked) mprotect((void *) start, end - start, PROT_EXEC);
+            continue;
+        }
         const unsigned char *mem = (const unsigned char *) start;
         for (ssize_t i = 0; i < got; i++) if (mem[i] != disk[i]) diff++;
         free(disk);
+        if (relocked) mprotect((void *) start, end - start, PROT_EXEC);
         done += (size_t) got;
         any = true;
     }
@@ -94,11 +125,12 @@ long compare_one(const char *suffix, long *compared) {
 
 // Sum a bucket; append the name of any library that differs to `names`.
 void compare_bucket(const char **suffixes, long *compared, long *diff,
-                    int *checked, int *withDiff, char *names, size_t names_cap) {
+                    int *checked, int *withDiff, char *names, size_t names_cap,
+                    int *xomUnlocked, int *xomUnreadable) {
     *compared = 0; *diff = 0; *checked = 0; *withDiff = 0;
     for (int i = 0; suffixes[i] != nullptr; i++) {
         long c = 0;
-        long d = compare_one(suffixes[i], &c);
+        long d = compare_one(suffixes[i], &c, xomUnlocked, xomUnreadable);
         if (d < 0) continue;  // library not mapped; skip
         (*checked)++;
         *compared += c;
@@ -123,11 +155,12 @@ Java_com_example_devicefingerprinting_IntegrityProbeManager_nativeCodeIntegrity(
         JNIEnv *env, jobject /* this */) {
     long coreC, coreD, extC, extD, appC, appD;
     int coreN, coreW, extN, extW, appN, appW;
+    int xomUnlocked = 0, xomUnreadable = 0;
     char names[512] = {0};
 
-    compare_bucket(kCore, &coreC, &coreD, &coreN, &coreW, names, sizeof(names));
-    compare_bucket(kExt, &extC, &extD, &extN, &extW, names, sizeof(names));
-    compare_bucket(kApp, &appC, &appD, &appN, &appW, names, sizeof(names));
+    compare_bucket(kCore, &coreC, &coreD, &coreN, &coreW, names, sizeof(names), &xomUnlocked, &xomUnreadable);
+    compare_bucket(kExt, &extC, &extD, &extN, &extW, names, sizeof(names), &xomUnlocked, &xomUnreadable);
+    compare_bucket(kApp, &appC, &appD, &appN, &appW, names, sizeof(names), &xomUnlocked, &xomUnreadable);
 
     bool checked = (coreN + extN + appN) > 0;
     char json[1024];
@@ -137,12 +170,14 @@ Java_com_example_devicefingerprinting_IntegrityProbeManager_nativeCodeIntegrity(
              "\"core_compared_bytes\":%ld,\"core_diff_bytes\":%ld,"
              "\"ext_compared_bytes\":%ld,\"ext_diff_bytes\":%ld,\"ext_libs_diff\":%d,"
              "\"app_compared_bytes\":%ld,\"app_diff_bytes\":%ld,\"app_libs_diff\":%d,"
+             "\"xom_regions_unlocked\":%d,\"xom_regions_unreadable\":%d,"
              "\"diffed_libs\":\"%s\"}",
              checked ? "true" : "false",
              coreD,
              coreC, coreD,
              extC, extD, extW,
              appC, appD, appW,
+             xomUnlocked, xomUnreadable,
              names);
 
     return env->NewStringUTF(json);

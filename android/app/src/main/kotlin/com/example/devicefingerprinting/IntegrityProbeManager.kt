@@ -615,6 +615,10 @@ class IntegrityProbeManager(private val context: Context) {
                 "app_compared_bytes" to o.optLong("app_compared_bytes", 0),
                 "app_diff_bytes" to o.optLong("app_diff_bytes", 0),
                 "app_libs_diff" to o.optInt("app_libs_diff", 0),
+                // Visibility into execute-only mappings: a bucket that skipped
+                // everything reads as clean unless these are reported.
+                "xom_regions_unlocked" to o.optInt("xom_regions_unlocked", 0),
+                "xom_regions_unreadable" to o.optInt("xom_regions_unreadable", 0),
                 "diffed_libs" to o.optString("diffed_libs", "")
             )
         } catch (error: Throwable) {

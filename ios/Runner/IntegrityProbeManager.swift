@@ -176,6 +176,18 @@ final class IntegrityProbeManager {
     }
 
     private func probeJailbreakFiles() -> [String: Any] {
+        // The Simulator's filesystem is the MAC's filesystem, and macOS really
+        // does ship /bin/bash, /bin/sh, /usr/bin/ssh and /usr/sbin/sshd - four
+        // entries in the list below. Running this check there produces a
+        // confident false positive on a perfectly clean machine, so it is
+        // skipped with an explicit reason rather than silently returning empty.
+        #if targetEnvironment(simulator)
+        return [
+            "status": "unsupported",
+            "reason": "simulator_filesystem_is_the_host",
+            "found_paths": [String](),
+        ]
+        #else
         var found: [String] = []
         let manager = FileManager.default
         for path in IntegrityProbeManager.jailbreakPaths {
@@ -192,6 +204,7 @@ final class IntegrityProbeManager {
             "found_paths": found,
             "checked_count": IntegrityProbeManager.jailbreakPaths.count,
         ]
+        #endif
     }
 
     /// Attempt a write outside the app container. On a sandboxed device this
