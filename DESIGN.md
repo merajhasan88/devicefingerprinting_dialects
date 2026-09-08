@@ -2909,3 +2909,81 @@ There is no `/proc/self/maps` and no readable `/proc/self/mem` on iOS. The equiv
 against the same range of the on-disk Mach-O — including the `slide` returned by
 `_dyld_get_image_vmaddr_slide`. That is a genuinely different design from the Linux version rather
 than a port, and it is the natural `collector_version` 2 for iOS.
+
+---
+
+# 34. Adopting the .NET session's findings, and first iOS scoring checks (2026-09-07)
+
+`DESIGN_UPDATE_FROM_DOTNET.md` arrived from the .NET SDK session. Its battery edits were adopted
+(§25.11), and it found a genuine defect here.
+
+## 34.1 A latent crash in the native code-integrity probe
+
+Android 10+ maps system libraries **execute-only** (`--xp`). The native probe selected mappings on
+the executable bit and then read through the pointer, so on any device using XOM it would have
+segfaulted. It had not fired on the OPPO (Android 9, no XOM) or the Huawei only by luck. The .NET
+implementation hit it directly: **283 of 336 executable mappings on the Huawei are `--xp`**.
+
+The probe now lifts `PROT_READ` for the duration of the copy and restores the original protection on
+every exit path. Where `mprotect` is refused it skips the mapping and **counts** it, reporting
+`xom_regions_unlocked` and `xom_regions_unreadable`. Skipping silently is exactly how a bucket ends
+up inert while still reading as clean — the failure mode §28.8 records shipping once already.
+
+**Not yet verified on hardware.** The AWS stack is down, so this compiles but has not run on a
+handset. It must be re-baselined on both phones before it is trusted.
+
+## 34.2 Item 9 was over-claiming, and items 14/16 were run wrongly
+
+Item 9 tests detection **by filename**, which §27.11 proved defeatable. It is renamed to say so.
+
+More important operationally: when items 14 and 16 are run with the gadget left named
+`libfrida-gadget.so` on port 27042, the name-based signals fire too and the verdict is
+over-determined — the item passes without demonstrating the structural probes. **That is how item 14
+was first run here** (§30.3): `android_frida_runtime_artifact` fired alongside the structural
+reasons. The bucket evidence (`ext_diff_bytes 100`) was still unambiguous, so the conclusion holds,
+but the run did not isolate what it claimed. The .NET session ran it properly — gadget renamed, port
+27999 — and saw only the two structural reasons fire.
+
+## 34.3 The W^X trap, guarded before it can be introduced
+
+A clean .NET Android device scores `android_wx_memory +60` and is refused: Mono maps
+writable-and-executable memory by design and there is no client-side fix. ART, which also has a JIT,
+contributes zero because it never grants write and execute on the same mapping — so "trust managed
+runtimes" is the wrong rule; the property that differs is the allocator's W^X policy.
+
+The proposed fix scores W^X against an operator-pinned per-build baseline keyed on `apk_sha256`
+— correctly **not** on a runtime name the client reports, since a compromised app could then claim
+the allowance. **That rule is not implemented here; it is a security-posture change and belongs to
+the owner.**
+
+What *is* implemented is the guard against its trap. `wx_bytes` is a field only the .NET collector
+sends. A naive `int(probe.get("wx_bytes") or 0)` reads **absent as zero**, computes no excess, and
+silently switches off W^X scoring for every Flutter report — a Flutter device with a live injected
+gadget would score nothing. A conformance check now asserts that a report with `wx_mappings > 0` and
+**no** `wx_bytes` still scores `android_wx_memory`. Same class of defect as a bucket reporting
+`compared_bytes: 0` and reading as clean.
+
+## 34.4 First checks for the iOS scoring rules
+
+`_score_ios_integrity` had **never been executed**. Seven checks now exercise it against crafted
+reports: pristine iPhone scores zero, jailbreak artifacts, Frida in dyld images, a hooking
+framework, sandbox escape as a hard block, `DYLD_INSERT_LIBRARIES`, and a traced process. The suite
+gains an iOS registration path and an iOS clean probe set, and `clean_probes` now dispatches on
+platform because the two collectors report entirely different measurements.
+
+This proves the server half before any iPhone exists. The collector half still needs hardware.
+
+## 34.5 A Simulator false positive, closed
+
+The iOS Simulator's filesystem is the **Mac's** filesystem, and macOS genuinely ships `/bin/bash`,
+`/bin/sh`, `/usr/bin/ssh` and `/usr/sbin/sshd` — four entries in `jailbreakPaths`. Running the probe
+there would report a confident jailbreak on a clean machine. It now returns `unsupported` with the
+reason `simulator_filesystem_is_the_host` rather than a fabricated clean result or a false positive.
+
+## 34.6 Independent agreement is evidence
+
+The .NET `code_integrity`, implemented in pure C# with `Marshal.Copy` and no NDK component,
+reproduces this repository's Huawei figures exactly: core 4,808,704, ext 4,943,872, the recurring
+`core_diff=71` from Frida's own libc patch, and `ext_diff_bytes=105` / `ext_libs_diff=1` under a
+libc++ hook. Two independent implementations agreeing to the byte is meaningful evidence that both
+are right.

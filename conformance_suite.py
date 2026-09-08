@@ -206,10 +206,10 @@ def protected(api, installation, method, path, bearer, body_obj=None, **kwargs):
 # ---------------------------------------------------------------------------
 
 
-def enrol(api, installation, reinstall_hint=None):
+def enrol(api, installation, reinstall_hint=None, platform="android"):
     body = {
         "installation_id": installation.submitted_id,
-        "platform": "android",
+        "platform": platform,
         "public_key": installation.jwk,
         "reinstall_hint": reinstall_hint,
     }
@@ -551,8 +551,46 @@ class Skip(Exception):
     """Raised by a check that cannot run under the server's current mode."""
 
 
-def clean_probes(required, cert=None):
-    """A pristine production Android device: every rule should score zero."""
+# A pristine iPhone. Field names are a hard contract with _score_ios_integrity;
+# renaming one silently disables the rule that reads it.
+IOS_CLEAN = {
+    "app_identity": {
+        "status": "ok",
+        "bundle_id": "com.example.devicefingerprinting",
+        "executable_sha256": hashlib.sha256(b"conformance-ios-executable").hexdigest(),
+        "version_name": "1.0.0",
+        "version_code": "1",
+    },
+    "code_signing": {
+        "status": "ok",
+        # Empty is honest for the unsigned builds the jailbroken-device
+        # workflow produces; the server only compares when a baseline is set.
+        "signing_identifier": "",
+        "team_identifier": "",
+        "get_task_allow": False,
+    },
+    "debugger": {"status": "ok", "traced": False},
+    "jailbreak_files": {"status": "ok", "found_paths": [], "checked_count": 20},
+    "sandbox": {"status": "ok", "write_outside_sandbox_succeeded": False},
+    "dyld_images": {
+        "status": "ok",
+        "suspicious_tokens": [],
+        "suspicious_image_count": 0,
+        "image_count": 320,
+    },
+    "environment": {"status": "ok", "dyld_insert_libraries": ""},
+    "simulator": {"status": "ok", "is_simulator": False, "model": "iPhone10,4"},
+}
+
+
+def clean_probes(required, cert=None, platform="android"):
+    """A pristine production device: every rule should score zero.
+
+    Dispatches on platform because the two collectors report entirely different
+    probes - iOS has no /proc and Android has no dyld.
+    """
+    if platform == "ios":
+        return {name: IOS_CLEAN[name] for name in required if name in IOS_CLEAN}
     everything = {
         "app_identity": {
             "status": "ok",
@@ -648,7 +686,9 @@ def submit_report(api, installation, token, mutate=None, cert=None):
     )
     if status != 200:
         raise AssertionError("integrity challenge failed: %s %s" % (status, challenge))
-    probes = clean_probes(challenge["required_probes"], cert=cert)
+    probes = clean_probes(
+        challenge["required_probes"], cert=cert, platform=challenge["platform"]
+    )
     if mutate:
         mutate(probes)
     report = {
@@ -984,6 +1024,147 @@ def check_jit_not_flagged(api, ctx):
         decision.get("verdict") == "trusted",
         "a device with only the JIT cache must stay trusted; got %r"
         % decision.get("verdict"),
+    )
+
+
+# ---------------------------------------------------------------------------
+# iOS integrity scoring
+#
+# _score_ios_integrity had never been executed before these checks existed: the
+# iOS client is new and no iPhone has run the battery yet. Exercising the rules
+# against crafted reports proves the server half now, and would otherwise only
+# be discovered when the hardware arrives.
+# ---------------------------------------------------------------------------
+
+
+def api_for(ctx):
+    return ctx["_api"]
+
+
+def ios_integrity_context(ctx):
+    """One iOS installation with a device token, shared by the iOS checks."""
+    if "ios_integrity" in ctx:
+        return ctx["ios_integrity"]
+    installation = Installation()
+    status, payload = enrol(api_for(ctx), installation, None, platform="ios")
+    if status not in (200, 201):
+        raise Skip("iOS enrol failed: %s %s" % (status, payload))
+    token = device_token(api_for(ctx), installation)
+    ctx["ios_integrity"] = (installation, token)
+    return ctx["ios_integrity"]
+
+
+@check("ios integrity: a pristine iPhone scores zero and is trusted")
+def check_ios_clean(api, ctx):
+    ctx["_api"] = api
+    installation, token = ios_integrity_context(ctx)
+    decision = submit_report(api, installation, token)
+    expect(
+        decision["verdict"] == "trusted",
+        "expected trusted, got %s (%s)" % (decision["verdict"], codes(decision)),
+    )
+    expect(decision["score"] == 0, "expected score 0, got %s" % decision["score"])
+
+
+@check("ios integrity: jailbreak filesystem artifacts are caught")
+def check_ios_jailbreak(api, ctx):
+    ctx["_api"] = api
+    installation, token = ios_integrity_context(ctx)
+    decision = submit_report(
+        api, installation, token,
+        lambda probes: probes["jailbreak_files"].update(
+            {"found_paths": ["/Applications/Cydia.app", "/var/jb"]}
+        ),
+    )
+    expect(
+        "ios_jailbreak_artifact" in codes(decision),
+        "expected ios_jailbreak_artifact, got %s" % codes(decision),
+    )
+
+
+@check("ios integrity: Frida loaded into the process blocks")
+def check_ios_frida(api, ctx):
+    ctx["_api"] = api
+    installation, token = ios_integrity_context(ctx)
+    decision = submit_report(
+        api, installation, token,
+        lambda probes: probes["dyld_images"].update(
+            {"suspicious_tokens": ["frida", "gadget"]}
+        ),
+    )
+    expect(
+        "ios_frida_runtime_artifact" in codes(decision),
+        "expected ios_frida_runtime_artifact, got %s" % codes(decision),
+    )
+    expect(
+        decision["verdict"] == "block",
+        "expected block, got %r" % decision["verdict"],
+    )
+
+
+@check("ios integrity: a jailbreak hooking framework is caught")
+def check_ios_hook_framework(api, ctx):
+    ctx["_api"] = api
+    installation, token = ios_integrity_context(ctx)
+    decision = submit_report(
+        api, installation, token,
+        lambda probes: probes["dyld_images"].update(
+            {"suspicious_tokens": ["substrate", "libhooker"]}
+        ),
+    )
+    expect(
+        "ios_hook_framework_artifact" in codes(decision),
+        "expected ios_hook_framework_artifact, got %s" % codes(decision),
+    )
+
+
+@check("ios integrity: a sandbox escape is a hard block")
+def check_ios_sandbox_escape(api, ctx):
+    ctx["_api"] = api
+    installation, token = ios_integrity_context(ctx)
+    decision = submit_report(
+        api, installation, token,
+        lambda probes: probes["sandbox"].update(
+            {"write_outside_sandbox_succeeded": True}
+        ),
+    )
+    expect(
+        "ios_sandbox_escape_signal" in codes(decision),
+        "expected ios_sandbox_escape_signal, got %s" % codes(decision),
+    )
+    expect(
+        decision["verdict"] == "block",
+        "a sandbox escape must be a hard block; got %r" % decision["verdict"],
+    )
+
+
+@check("ios integrity: DYLD_INSERT_LIBRARIES is caught")
+def check_ios_dyld_insert(api, ctx):
+    ctx["_api"] = api
+    installation, token = ios_integrity_context(ctx)
+    decision = submit_report(
+        api, installation, token,
+        lambda probes: probes["environment"].update(
+            {"dyld_insert_libraries": "/var/jb/usr/lib/libhooker.dylib"}
+        ),
+    )
+    expect(
+        "ios_dyld_injection_environment" in codes(decision),
+        "expected ios_dyld_injection_environment, got %s" % codes(decision),
+    )
+
+
+@check("ios integrity: a traced process is caught")
+def check_ios_traced(api, ctx):
+    ctx["_api"] = api
+    installation, token = ios_integrity_context(ctx)
+    decision = submit_report(
+        api, installation, token,
+        lambda probes: probes["debugger"].update({"traced": True}),
+    )
+    expect(
+        "ios_process_traced" in codes(decision),
+        "expected ios_process_traced, got %s" % codes(decision),
     )
 
 
