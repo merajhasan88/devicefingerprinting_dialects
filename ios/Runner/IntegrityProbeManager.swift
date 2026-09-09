@@ -124,36 +124,194 @@ final class IntegrityProbeManager {
         return result
     }
 
+    /// Reports this app's own code-signing identity by parsing the Mach-O
+    /// signature embedded in its executable on disk.
+    ///
+    /// The obvious implementation - SecTaskCreateFromSelf plus
+    /// SecTaskCopyValueForEntitlement - does not compile for iOS. Those live in
+    /// Security/SecTask.h, which Apple ships as public API on macOS only; on
+    /// iOS the symbols are private and the build fails with "Cannot find
+    /// 'SecTaskCreateFromSelf' in scope".
+    ///
+    /// Reading our own binary is the better measurement regardless. It reports
+    /// what is actually embedded in the file rather than what the kernel was
+    /// told at launch, and it degrades honestly: a TrollStore-installed
+    /// unsigned build carries no LC_CODE_SIGNATURE at all, which is reported as
+    /// signed=false instead of being mistaken for a clean signed app. That is
+    /// the same class of trap as an Android integrity bucket reporting
+    /// compared_bytes=0 and reading as clean (DESIGN.md 28.8).
+    ///
+    /// signing_identifier / team_identifier / get_task_allow are a hard
+    /// contract with _score_ios_integrity. The remaining fields are additive.
     private func probeCodeSigning() -> [String: Any] {
-        var result: [String: Any] = ["status": "ok"]
+        var result: [String: Any] = [
+            "status": "ok",
+            "signing_identifier": "",
+            "team_identifier": "",
+            "get_task_allow": false,
+            "signed": false,
+        ]
 
-        guard let task = SecTaskCreateFromSelf(kCFAllocatorDefault) else {
+        guard let url = Bundle.main.executableURL,
+              let data = try? Data(contentsOf: url, options: .mappedIfSafe) else {
             result["status"] = "error"
-            result["error"] = "SecTaskCreateFromSelf returned nil"
+            result["error"] = "The main executable could not be read."
             return result
         }
 
-        var error: Unmanaged<CFError>?
-        let identifier = SecTaskCopySigningIdentifier(task, &error)
-        result["signing_identifier"] = (identifier as String?) ?? ""
-
-        func entitlement(_ key: String) -> Any? {
-            var entitlementError: Unmanaged<CFError>?
-            let value = SecTaskCopyValueForEntitlement(
-                task, key as CFString, &entitlementError
-            )
-            return value as Any?
+        guard let slice = machOSliceOffset(data) else {
+            result["status"] = "error"
+            result["error"] = "The main executable is not a recognised 64-bit Mach-O image."
+            return result
         }
 
-        // An unsigned build - which is what the jailbroken-device workflow
-        // produces - legitimately has neither of these. Empty is reported
-        // honestly; the server only compares when a baseline is configured.
-        result["team_identifier"] =
-            entitlement("com.apple.developer.team-identifier") as? String ?? ""
-        result["get_task_allow"] =
-            (entitlement("get-task-allow") as? Bool) ?? false
+        guard let signature = codeSignatureRange(data, sliceOffset: slice) else {
+            // Unsigned - legitimate for the jailbroken-device build. The server
+            // only compares these fields when a baseline is configured.
+            result["signature_absent"] = true
+            return result
+        }
 
+        result["signed"] = true
+        parseEmbeddedSignature(
+            data, offset: signature.offset, size: signature.size, into: &result
+        )
         return result
+    }
+
+    // MARK: - Mach-O and code-signature parsing
+
+    // Integers are assembled byte by byte rather than loaded through a bound
+    // pointer: the offsets below are not guaranteed to be naturally aligned,
+    // and loadUnaligned(fromByteOffset:as:) is unavailable at our iOS 15.0
+    // deployment target.
+
+    private func u32le(_ d: Data, _ o: Int) -> UInt32? {
+        guard o >= 0, o + 4 <= d.count else { return nil }
+        return UInt32(d[o]) | (UInt32(d[o + 1]) << 8)
+            | (UInt32(d[o + 2]) << 16) | (UInt32(d[o + 3]) << 24)
+    }
+
+    private func u32be(_ d: Data, _ o: Int) -> UInt32? {
+        guard o >= 0, o + 4 <= d.count else { return nil }
+        return (UInt32(d[o]) << 24) | (UInt32(d[o + 1]) << 16)
+            | (UInt32(d[o + 2]) << 8) | UInt32(d[o + 3])
+    }
+
+    /// File offset of the 64-bit Mach-O image to inspect, resolving a fat
+    /// binary to its arm64 slice. Installed device binaries are thin; fat is
+    /// handled so the same code works on a locally built bundle.
+    ///
+    /// Only MH_MAGIC_64 is accepted. A byte-swapped image would need every
+    /// subsequent field swapped too, and silently misparsing one is worse than
+    /// reporting that the image was not recognised.
+    private func machOSliceOffset(_ d: Data) -> Int? {
+        if let magic = u32le(d, 0), magic == 0xfeed_facf { return 0 }
+
+        guard let fat = u32be(d, 0), fat == 0xcafe_babe,
+              let count = u32be(d, 4), count < 64 else { return nil }
+        let cpuTypeArm64: UInt32 = 0x0100_000c
+        for index in 0..<Int(count) {
+            let base = 8 + index * 20
+            guard let cpu = u32be(d, base), let offset = u32be(d, base + 8) else {
+                return nil
+            }
+            if cpu == cpuTypeArm64,
+               let magic = u32le(d, Int(offset)), magic == 0xfeed_facf {
+                return Int(offset)
+            }
+        }
+        return nil
+    }
+
+    /// Walks the load commands for LC_CODE_SIGNATURE and returns the signature
+    /// blob's range. Its dataoff is relative to the start of the slice, so the
+    /// slice offset is added back for a fat image.
+    private func codeSignatureRange(
+        _ d: Data, sliceOffset: Int
+    ) -> (offset: Int, size: Int)? {
+        guard let commandCount = u32le(d, sliceOffset + 16) else { return nil }
+        var cursor = sliceOffset + 32           // sizeof(struct mach_header_64)
+
+        for _ in 0..<Int(commandCount) {
+            guard let command = u32le(d, cursor),
+                  let commandSize = u32le(d, cursor + 4),
+                  commandSize >= 8 else { return nil }
+
+            if command == 0x1d {                // LC_CODE_SIGNATURE
+                guard let dataOffset = u32le(d, cursor + 8),
+                      let dataSize = u32le(d, cursor + 12) else { return nil }
+                let absolute = sliceOffset + Int(dataOffset)
+                guard absolute >= 0, absolute + Int(dataSize) <= d.count else {
+                    return nil
+                }
+                return (absolute, Int(dataSize))
+            }
+
+            cursor += Int(commandSize)
+            if cursor >= d.count { return nil }
+        }
+        return nil
+    }
+
+    /// Parses the embedded signature SuperBlob. The CodeDirectory carries the
+    /// signing identifier; the entitlements slot carries an XML plist holding
+    /// the team identifier and get-task-allow. Every field in these structures
+    /// is big-endian irrespective of the host byte order.
+    private func parseEmbeddedSignature(
+        _ d: Data, offset: Int, size: Int, into result: inout [String: Any]
+    ) {
+        guard let magic = u32be(d, offset), magic == 0xfade_0cc0,
+              let blobCount = u32be(d, offset + 8), blobCount < 128 else {
+            result["signature_parse_error"] = "Not an embedded signature SuperBlob."
+            return
+        }
+
+        for index in 0..<Int(blobCount) {
+            let entry = offset + 12 + index * 8
+            guard let slot = u32be(d, entry),
+                  let relative = u32be(d, entry + 4) else { return }
+            let blob = offset + Int(relative)
+            guard blob + 8 <= offset + size else { continue }
+
+            switch slot {
+            case 0:                             // CSSLOT_CODEDIRECTORY
+                guard let cdMagic = u32be(d, blob), cdMagic == 0xfade_0c02,
+                      let flags = u32be(d, blob + 12),
+                      let identOffset = u32be(d, blob + 20) else { continue }
+                result["code_directory_flags"] = Int(flags)
+
+                let start = blob + Int(identOffset)
+                var end = start
+                while end < d.count, d[end] != 0 { end += 1 }
+                if end > start,
+                   let text = String(data: d.subdata(in: start..<end), encoding: .utf8) {
+                    result["signing_identifier"] = text
+                }
+
+            case 5:                             // CSSLOT_ENTITLEMENTS
+                guard let entitlementMagic = u32be(d, blob),
+                      entitlementMagic == 0xfade_7171,
+                      let length = u32be(d, blob + 4), length > 8 else { continue }
+                let start = blob + 8
+                let stop = blob + Int(length)
+                guard stop <= d.count, start < stop else { continue }
+
+                let object = try? PropertyListSerialization.propertyList(
+                    from: d.subdata(in: start..<stop), options: [], format: nil
+                )
+                if let parsed = object as? [String: Any] {
+                    result["team_identifier"] =
+                        parsed["com.apple.developer.team-identifier"] as? String ?? ""
+                    result["get_task_allow"] =
+                        (parsed["get-task-allow"] as? Bool) ?? false
+                    result["entitlement_count"] = parsed.count
+                }
+
+            default:
+                continue
+            }
+        }
     }
 
     /// P_TRACED via sysctl is the standard, non-private debugger check.
