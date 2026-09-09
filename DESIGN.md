@@ -3192,3 +3192,31 @@ policy-driven per deployment. The measurement is now recorded; the policy is a s
 **Action:** decide the policy, and add a conformance check that an installation registered without a
 `key_security` block stores `NULL` rather than `false` — the direct analogue of the check §34.3
 added for `wx_bytes`.
+
+### Verified on hardware, 2026-09-09
+
+Three registrations, exercising all three paths on the iPhone 7:
+
+| time | call | path | stored |
+|---|---|---|---|
+| 19:35:02 | `201` | first enrolment, old client | `NULL / NULL / NULL` |
+| 19:49:25 | `201` | fresh install, old client, `INSERT` | `NULL / NULL / NULL` |
+| 20:10:53 | `200` | rebuilt client, `COALESCE` update | `secure_enclave / true / SecureEnclave` |
+
+The middle row is the one that matters for correctness: a genuine `INSERT` through the new code
+with the block absent stored `NULL`, not `false`. Across the table, `null_not_reported: 1`,
+`false_software: 0`, `true_hardware: 1` — a not-reported installation and a hardware-backed one
+coexisting, with nothing wrongly claiming software.
+
+**The substantive answer: the key is genuinely Secure Enclave-backed.** The graceful fallback in
+`InstallationKeyManager.generateKey` did not fire, `kSecAttrTokenIDSecureEnclave` was accepted with
+`.privateKeyUsage` and `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`, and the key remained
+usable unattended with no passcode set on the device. That last point had been reasoned about but
+never demonstrated.
+
+Incidentally confirmed in the same sequence: the Secure Enclave key **survives a TrollStore app
+upgrade** — the 20:10:53 call returned `200` on the existing thumbprint rather than enrolling a new
+installation — and **iOS reinstall correlation works on hardware**. The 19:49:25 registration
+produced a second, genuinely distinct key thumbprint that the IDFV-derived hint correlated back onto
+the same `device_id`, giving one device with two installations. The key stayed authoritative
+throughout; the hint only merged the device record.
