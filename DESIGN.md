@@ -2987,3 +2987,208 @@ reproduces this repository's Huawei figures exactly: core 4,808,704, ext 4,943,8
 `core_diff=71` from Frida's own libc patch, and `ext_diff_bytes=105` / `ext_libs_diff=1` under a
 libc++ hook. Two independent implementations agreeing to the byte is meaningful evidence that both
 are right.
+
+# 35. First iOS run on hardware, and what TrollStore's signature revealed (2026-09-09)
+
+Everything up to this point on iOS was written blind. `InstallationKeyManager.swift` and
+`IntegrityProbeManager.swift` had never been compiled by Xcode, never run on an ARM device, and
+never spoken to the server. This section records the first end-to-end run on a physical iPhone, the
+one compile error that mattered, and two findings that came out of it — one of which is a defect in
+this repository that had been present since the beginning.
+
+Hardware: **iPhone 7 (iPhone9,3, A10 Fusion, arm64), iOS 15.8.5 (19H394)**, no passcode, no Apple ID
+signed in at purchase. Backend: the AWS stack, PostgreSQL 18.3, `INTEGRITY_MODE=observe`.
+
+## 35.1 Getting an unsigned build onto a stock iPhone, without a Mac
+
+The constraint that shaped this whole path is that there is no Mac and no paid Apple Developer
+account. The chain that worked, all of it from Linux:
+
+1. **Codemagic** builds `flutter build ios --release --no-codesign` and packages `Runner.app` into
+   `Payload/` by hand, because `flutter build ipa` demands signing. Free tier, manual trigger only.
+2. A **free Apple ID**, created in a browser. This is the step with a trap: an Apple ID created only
+   in a browser is not fully activated, and developer-session creation fails with
+   **`-22411 "This action cannot be completed at this time"`**. Apple completes account setup on
+   first sign-in *on a device*, when the iCloud terms are accepted. Signing in on the phone and then
+   immediately turning **Find My off** activates the account without creating an Activation Lock,
+   which would otherwise bind the device to that Apple ID for every future restore.
+3. **Sideloader** (Dadoum) signs and installs `TrollInstallerX.ipa` over `usbmuxd`. It ships a
+   prebuilt Linux x86_64 binary; PlumeImpactor is source-only and AltServer-Linux is dated.
+4. **TrollInstallerX** exploits the kernel (`kfd`/physical use-after-free), installs a persistence
+   helper into **Tips** — a stock app with no system function — and installs **TrollStore**.
+5. TrollStore installs our unsigned `.ipa` permanently, served over HTTPS from the EC2 host via
+   `apple-magnifier://install?url=…`.
+
+The device is **not jailbroken**. It runs stock iOS 15.8.5, and DFU restore remains available
+because the A10 bootrom is checkm8-vulnerable and unpatchable. The only irreversible element is the
+firmware version: Apple no longer signs 15.8.5, so a restore lands on 15.8.8, which is still inside
+both the TrollStore and TrollRestore version windows.
+
+**The signing defect worth recording.** The first install of TrollInstallerX crashed instantly at
+launch with no visible error. The device crash report named it exactly:
+
+```
+termination: DYLD "Library missing"
+  Library not loaded: '@loader_path/libxpf.dylib'
+  Reason: code signature invalid (errno=1) sliceOffset=0x00004000
+```
+
+`libxpf.dylib` sits at the **bundle root**, not in `Frameworks/`, and signing tools walk
+`Frameworks/` and `PlugIns/`. It kept its original signature, invalid under our certificate. Thinning
+it to `arm64`, moving it into `Frameworks/`, and patching the load command with
+`llvm-install-name-tool` fixed it. Worth remembering generally: a sideloaded app that flashes and
+closes is usually an unsigned nested binary, and the crash report says so precisely.
+
+## 35.2 `SecTask` is macOS-only, so read our own Mach-O instead
+
+The `code_signing` probe was written against `SecTaskCreateFromSelf`,
+`SecTaskCopySigningIdentifier` and `SecTaskCopyValueForEntitlement`. Those are declared in
+`Security/SecTask.h`, which Apple ships as public API on **macOS only** — on iOS the symbols are
+private, and the build failed with three `Cannot find … in scope` errors.
+
+The replacement reads the app's **own executable** and walks `LC_CODE_SIGNATURE` into the embedded
+signature SuperBlob: the signing identifier comes from the CodeDirectory's `identOffset`, and the
+team identifier and `get-task-allow` from the entitlements plist. Fat images resolve to their arm64
+slice, and integers are assembled byte by byte because the offsets are not guaranteed to be aligned
+and `loadUnaligned` is unavailable at the iOS 15.0 deployment target.
+
+This is a better measurement than the API it replaces, for exactly the reason the Android buckets
+report `compared_bytes`: it describes **what is actually in the file** rather than what the kernel
+was told at launch. It also degrades honestly — an unsigned build carries no `LC_CODE_SIGNATURE`
+at all and now reports `signed: false, signature_absent: true`, rather than presenting as a signed
+app whose fields happen to be empty.
+
+## 35.3 The run
+
+Every step of the critical path worked on the first attempt:
+
+| step | result |
+|---|---|
+| `POST /v1/installations/register` | `201` — ES256, EC P-256, `new_device`/`new` |
+| `POST /v1/installations/challenge` → `/verify` | `200` — **Secure Enclave DER signature accepted** |
+| `POST /v1/integrity/challenge` → `/report` | `200` — `collector_version 1`, all 8 probes `status: ok` |
+| `GET /v1/device/me` | `200` |
+| score | **35, `elevated`**, `hard_block: false` |
+
+The signature interop is the result that mattered most. Android produces its signature through
+`SHA256withECDSA` and iOS through `ecdsaSignatureMessageX962SHA256`; both are ASN.1 DER, and the
+server's PyCryptodome verification accepted the iOS one with **no server change**. The decision
+recorded in §4 — sign the transmitted bytes, never a canonically re-serialised structure — is what
+made that possible.
+
+Every other probe read correctly: sandbox write refused, not traced, not a simulator, 437 dyld
+images with zero suspicious tokens, no `DYLD_INSERT_LIBRARIES`, and no jailbreak files. That last
+one is the *right* answer: TrollStore is not a jailbreak, and there is no Cydia, Sileo or `/var/jb`
+on this device.
+
+## 35.4 What TrollStore's signature looks like from inside the app
+
+The `.ipa` we built had **zero** `LC_CODE_SIGNATURE`. TrollStore adds one during installation, and
+the new parser read it back out of the installed binary:
+
+```json
+"code_signing": {
+    "signed": true,
+    "get_task_allow": true,
+    "team_identifier": "TROLLTROLL",
+    "signing_identifier": "com.icraze.gtatracker",
+    "entitlement_count": 5,
+    "code_directory_flags": 0
+}
+```
+
+Two things are visible here that no baseline was needed to see.
+
+**`team_identifier` is literally `TROLLTROLL`** — a hardcoded fake team.
+
+**`signing_identifier` is `com.icraze.gtatracker`, not our bundle identifier.** This is the
+CoreTrust bypass (CVE-2023-41991) showing its working. TrollStore grafts on a genuinely
+Apple-signed CMS blob taken from a donor App Store application; CoreTrust accepts the signature
+without checking that the CodeDirectory it covers is the one being loaded, so the CodeDirectory
+keeps the **donor's** identifier. The mismatch is not incidental — it is the exploit.
+
+Only `get-task-allow` scored, for `+35`. The far stronger signals were sitting in the same probe
+output unscored, which is what the observe run was for.
+
+## 35.5 Action item 1 — a structural fake-signature rule
+
+**Proposed:** `ios_signing_identifier_bundle_mismatch`, raised when
+`code_signing.signing_identifier` is non-empty and differs from `app_identity.bundle_id`.
+
+A legitimately signed iOS application always has CodeDirectory identifier equal to its bundle
+identifier; Xcode derives one from the other. A mismatch is an **invariant violation**, not a
+heuristic. It requires no configured baseline, which matters because
+`ios_signing_identifier_mismatch` and `ios_team_identifier_mismatch` already exist but fire only
+when `EXPECTED_IOS_SIGNING_ID` / `EXPECTED_IOS_TEAM_ID` are set — and an unconfigured deployment
+therefore scores a fake-signed app at zero for this.
+
+Suggested weight `+90`, not a hard block on its own, pending observation on a legitimately signed
+build. **This rule cannot be adopted until a normally signed iOS build has been observed**, because
+the entire evidence base for it is one TrollStore installation; the discipline in §28 applies —
+ship report-only, baseline on real hardware, only then score.
+
+**Action:** implement report-only, gather one clean signed baseline, then score.
+
+## 35.6 Action item 2 — the `TROLLTROLL` marker, and why it is the weaker rule
+
+**Proposed:** `ios_known_fake_team_identifier`, raised when `team_identifier` matches a known
+fake-signing marker such as `TROLLTROLL`.
+
+This is deliberately recorded as the *secondary* rule, because it is a **name match**, and §27.11
+already proved on Android exactly how that ends: a Frida gadget renamed to `libhelper.so` and moved
+off port 27042 scored `18/trusted` while fully active. One patched constant in a TrollStore fork
+defeats this rule completely, and it is a one-line change in a public repository.
+
+It is still worth having — an attacker who does not bother to change it should be caught cheaply —
+but it must be weighted and documented as corroborating evidence, not as the detection. Suggested
+weight `+25`, never a hard block, and §25.11 should say plainly that a passing test of this rule
+proves much less than a passing test of 35.5.
+
+**Action:** implement alongside 35.5, weighted low, with the same caveat text as battery item 9.
+
+## 35.7 The defect this run exposed: hardware backing was never recorded
+
+The run enrolled successfully with a Secure Enclave key — and that fact was **unprovable from the
+server**, because the server never stored it.
+
+`InstallationKeyManager` on both platforms reports `security_level`, `hardware_backed` and
+`provider`. The Dart client parses all three and *requires* them to be present and correctly typed
+(`NativeKeyMetadata.fromPlatform` throws otherwise). It then never sent them. `device_trust_server.py`
+referenced none of the three names anywhere, and `app_installations` had no column for them.
+
+The consequence is worth stating plainly. `InstallationKeyManager` falls back to a software
+keychain key when the Secure Enclave path fails, and reports that honestly — but a software-backed
+installation and a Secure Enclave installation were **indistinguishable to the server**. A
+successful enrolment proved that *a* P-256 key existed, not that it was hardware-protected. The
+same held for StrongBox versus a software fallback on Android.
+
+**Fixed in migration 002 and the accompanying server and client changes:**
+
+- `app_installations` gains `key_security_level`, `key_hardware_backed` and `key_provider`.
+- The Dart client sends a `key_security` block at registration.
+- The server parses, validates and persists it, and returns it in the registration response.
+
+**Every column is nullable, and that is the load-bearing part.** `NULL` means *this client did not
+report it* and must never be read as `software`. The Kotlin and .NET collectors do not send the
+block at all, and a server that collapsed a missing `hardware_backed` to `False` would mark every
+Android installation software-backed on no evidence. This is the third appearance of one defect
+class in this project — an absent measurement mistaken for a benign one — after the integrity
+bucket reporting `compared_bytes: 0` and scoring as clean (§28.8), and the .NET session's `wx_bytes`
+field being absent on Flutter reports and computing to a harmless zero (§34.3). It is worth naming
+as a recurring hazard rather than three coincidences.
+
+**What this value is and is not.** It is a *client claim* about its own keystore. A compromised
+client can lie about it, so it is a risk input and never proof — the boundary in §2 is unchanged.
+Its value is comparative: the key thumbprint is the authoritative identity, and a non-exportable
+hardware key cannot migrate into software. The same thumbprint later claiming a weaker level is
+therefore a contradiction, and the server logs it, refuses to downgrade the stored value, and
+returns `key_security.downgrade_reported`. Re-registration otherwise uses `COALESCE`, so a client
+that does not report the block cannot erase a value another one recorded.
+
+**Deliberately not done:** no scoring weight is attached to a software-backed key yet. That changes
+verdicts and needs a decision about whether hardware backing is required, advisory, or
+policy-driven per deployment. The measurement is now recorded; the policy is a separate choice.
+
+**Action:** decide the policy, and add a conformance check that an installation registered without a
+`key_security` block stores `NULL` rather than `false` — the direct analogue of the check §34.3
+added for `wx_bytes`.
