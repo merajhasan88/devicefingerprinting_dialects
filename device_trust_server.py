@@ -842,7 +842,7 @@ def _get_backend_identity():
 # against a schema it does not understand. /health/* still answers so operators
 # can see why.
 
-REQUIRED_SCHEMA_VERSION = 1
+REQUIRED_SCHEMA_VERSION = 2
 
 _schema_state = None
 _schema_lock = threading.Lock()
@@ -1058,6 +1058,98 @@ def _verify_installation_signature(key_algorithm, public_key_jwk, payload, signa
             401,
             "invalid_installation_signature",
         )
+
+
+# Recognised key security levels, strongest first. Anything a client sends that
+# is not in this list is stored verbatim but treated as unknown when comparing,
+# so a novel platform cannot claim a strength the server does not understand.
+KEY_SECURITY_RANK = {
+    "strongbox": 3,
+    "secure_enclave": 3,
+    "tee": 2,
+    "hardware": 2,
+    "software": 1,
+}
+
+
+def _parse_key_security(body):
+    """Read the optional key_security block a client may send at registration.
+
+    Returns a dict whose three values are each either a parsed value or None.
+
+    **None means "not reported", and must never be collapsed to False.** The
+    Kotlin and .NET collectors do not send this block at all, and a server that
+    read a missing hardware_backed as False would mark every Android
+    installation software-backed on no evidence. This is the same defect class
+    as an integrity bucket reporting compared_bytes: 0 and scoring as clean
+    (DESIGN.md 28.8), and as the .NET session's wx_bytes finding, where an
+    absent field read as a benign zero.
+
+    Note what this value is and is not. It is a *client claim* about its own
+    keystore, and a compromised client can lie about it, so it is a risk input
+    and never proof. Its value is comparative: the key thumbprint is the
+    authoritative identity, and a non-exportable hardware key cannot migrate
+    into software, so the same thumbprint later claiming a weaker level is a
+    contradiction the server can act on.
+    """
+    block = body.get("key_security")
+    if block is None:
+        return {"security_level": None, "hardware_backed": None, "provider": None}
+    if not isinstance(block, dict):
+        raise ApiProblem(
+            "key_security must be an object when present.",
+            400,
+            "invalid_key_security",
+        )
+
+    level = block.get("security_level")
+    if level is not None:
+        if not isinstance(level, str) or not level.strip():
+            raise ApiProblem(
+                "key_security.security_level must be a non-empty string.",
+                400,
+                "invalid_key_security",
+            )
+        level = level.strip().lower()[:32]
+
+    backed = block.get("hardware_backed")
+    if backed is not None and not isinstance(backed, bool):
+        raise ApiProblem(
+            "key_security.hardware_backed must be a boolean.",
+            400,
+            "invalid_key_security",
+        )
+
+    provider = block.get("provider")
+    if provider is not None:
+        if not isinstance(provider, str):
+            raise ApiProblem(
+                "key_security.provider must be a string.",
+                400,
+                "invalid_key_security",
+            )
+        provider = provider.strip()[:64] or None
+
+    return {
+        "security_level": level,
+        "hardware_backed": backed,
+        "provider": provider,
+    }
+
+
+def _key_security_downgraded(stored_level, stored_backed, reported):
+    """True when a known installation now claims weaker key protection.
+
+    Only a genuine downgrade counts. Either side being None means the
+    comparison was never possible, which is not evidence of anything.
+    """
+    if reported["hardware_backed"] is False and stored_backed is True:
+        return True
+    reported_rank = KEY_SECURITY_RANK.get(reported["security_level"] or "")
+    stored_rank = KEY_SECURITY_RANK.get((stored_level or "").lower())
+    if reported_rank is None or stored_rank is None:
+        return False
+    return reported_rank < stored_rank
 
 
 def _reinstall_hint_hash(platform, hint):
@@ -2822,6 +2914,7 @@ def register_installation():
     public_key_jwk = parsed_key["jwk"]
     key_thumbprint = parsed_key["thumbprint"]
     hint_hash = _reinstall_hint_hash(platform, body.get("reinstall_hint"))
+    key_security = _parse_key_security(body)
 
     with _cursor(commit=True) as cursor:
         # The public key is the authoritative installation identity. This also
@@ -2829,7 +2922,8 @@ def register_installation():
         cursor.execute(
             """
             SELECT installation_id, device_id, registration_method,
-                   registration_confidence, key_algorithm
+                   registration_confidence, key_algorithm,
+                   key_security_level, key_hardware_backed, key_provider
             FROM app_installations
             WHERE key_thumbprint = %s
             """,
@@ -2839,14 +2933,58 @@ def register_installation():
         if row is not None:
             canonical_installation_id = str(row[0])
             device_id = str(row[1])
-            cursor.execute(
-                """
-                UPDATE app_installations
-                SET last_seen_at = NOW()
-                WHERE installation_id = %s
-                """,
-                (canonical_installation_id,),
+            stored_level, stored_backed, stored_provider = row[5], row[6], row[7]
+
+            # A non-exportable hardware key cannot migrate into software. The
+            # thumbprint is the authoritative identity, so the same key later
+            # claiming weaker protection is a contradiction, not an update --
+            # record it and keep the stronger stored value rather than letting
+            # a client talk its own installation down.
+            downgraded = _key_security_downgraded(
+                stored_level, stored_backed, key_security
             )
+            if downgraded:
+                logger.warning(
+                    "Installation %s reported weaker key security than stored "
+                    "(stored level=%s hardware_backed=%s; reported level=%s "
+                    "hardware_backed=%s). Keeping the stored value.",
+                    canonical_installation_id,
+                    stored_level,
+                    stored_backed,
+                    key_security["security_level"],
+                    key_security["hardware_backed"],
+                )
+                cursor.execute(
+                    """
+                    UPDATE app_installations
+                    SET last_seen_at = NOW()
+                    WHERE installation_id = %s
+                    """,
+                    (canonical_installation_id,),
+                )
+            else:
+                # COALESCE keeps a previously recorded value when this client
+                # did not report one, so a mixed fleet cannot erase it.
+                cursor.execute(
+                    """
+                    UPDATE app_installations
+                    SET last_seen_at = NOW(),
+                        key_security_level = COALESCE(%s, key_security_level),
+                        key_hardware_backed = COALESCE(%s, key_hardware_backed),
+                        key_provider = COALESCE(%s, key_provider)
+                    WHERE installation_id = %s
+                    """,
+                    (
+                        key_security["security_level"],
+                        key_security["hardware_backed"],
+                        key_security["provider"],
+                        canonical_installation_id,
+                    ),
+                )
+                stored_level = key_security["security_level"] or stored_level
+                if key_security["hardware_backed"] is not None:
+                    stored_backed = key_security["hardware_backed"]
+                stored_provider = key_security["provider"] or stored_provider
             cursor.execute(
                 "UPDATE recognized_devices SET last_seen_at = NOW() WHERE device_id = %s",
                 (device_id,),
@@ -2861,6 +2999,12 @@ def register_installation():
                         "method": "exact_key",
                         "confidence": "high",
                         "is_reinstall_correlation": False,
+                    },
+                    "key_security": {
+                        "security_level": stored_level,
+                        "hardware_backed": stored_backed,
+                        "provider": stored_provider,
+                        "downgrade_reported": downgraded,
                     },
                 }
             )
@@ -2931,8 +3075,9 @@ def register_installation():
             INSERT INTO app_installations
                 (installation_id, device_id, key_algorithm, public_key_jwk,
                  public_key_n, public_key_e, key_thumbprint,
-                 registration_method, registration_confidence)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                 registration_method, registration_confidence,
+                 key_security_level, key_hardware_backed, key_provider)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """,
             (
                 submitted_installation_id,
@@ -2944,6 +3089,9 @@ def register_installation():
                 key_thumbprint,
                 recognition_method,
                 recognition_confidence,
+                key_security["security_level"],
+                key_security["hardware_backed"],
+                key_security["provider"],
             ),
         )
 
@@ -2958,6 +3106,12 @@ def register_installation():
                     "method": recognition_method,
                     "confidence": recognition_confidence,
                     "is_reinstall_correlation": recognition_method == "reinstall_hint",
+                },
+                "key_security": {
+                    "security_level": key_security["security_level"],
+                    "hardware_backed": key_security["hardware_backed"],
+                    "provider": key_security["provider"],
+                    "downgrade_reported": False,
                 },
             }
         ),

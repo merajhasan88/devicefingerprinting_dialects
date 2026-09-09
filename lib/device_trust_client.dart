@@ -1057,6 +1057,21 @@ class DeviceApi {
         'platform': Platform.isAndroid ? 'android' : 'ios',
         'public_key': identity.publicKeyJson,
         'reinstall_hint': hint?.toJson(),
+        // What the platform keystore reports about how this key is protected.
+        // The server stores it so a Secure Enclave / StrongBox key is
+        // distinguishable from a software fallback, which it previously was
+        // not: the client has always read these values and never sent them.
+        //
+        // This is a client claim, not proof - a compromised client can lie.
+        // Its value is comparative: the key thumbprint is the authoritative
+        // identity, and a non-exportable hardware key cannot move into
+        // software, so the same key later claiming a weaker level is a
+        // contradiction the server can act on.
+        'key_security': <String, dynamic>{
+          'security_level': identity.securityLevel,
+          'hardware_backed': identity.hardwareBacked,
+          'provider': identity.provider,
+        },
       },
     );
     return RegistrationState.fromJson(response);

@@ -25,7 +25,15 @@ psql "host=<host> dbname=<db> user=<ddl-user> sslmode=verify-full sslrootcert=<c
 sqlcmd -S <host>,1433 -d <db> -U <ddl-user> -P <pass> -b -i sqlserver/001_initial.sql
 ```
 
-Both scripts are guarded and safe to re-run.
+Apply migrations **in ascending version order**; each one records its own row in
+`schema_migrations`, and the server requires the highest version it knows about.
+
+| version | file | what it adds |
+|---|---|---|
+| 1 | `001_initial.sql` | the eleven base tables |
+| 2 | `002_key_security.sql` | `app_installations.key_security_level` / `key_hardware_backed` / `key_provider` |
+
+All scripts are guarded and safe to re-run.
 
 ## Application privileges
 
