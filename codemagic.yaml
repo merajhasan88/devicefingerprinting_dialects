@@ -18,10 +18,15 @@
 #     builds. The free tier is 500 macOS minutes/month and an iOS build costs
 #     10-20 of them; automatic builds on every push would burn that quickly.
 #
-#   * API_BASE_URL comes from an environment variable, not the repo. The test
-#     server's public IP changes every time the EC2 instance restarts, so
-#     hardcoding it would mean a commit per restart. Override it in the
-#     Codemagic UI (Environment variables) before each build.
+#   * API_BASE_URL IS PINNED HERE, deliberately, rather than set in the
+#     Codemagic UI. Codemagic requires every UI environment variable to belong
+#     to a group, and a group is only visible to a workflow that declares it
+#     under `environment: groups:`. The precedence between an imported group
+#     and an inline `vars:` entry of the same name is undocumented, so the UI
+#     route is ambiguous as well as easy to get wrong. Pinning the value in the
+#     repo removes both problems, and since the server's public IP changes on
+#     every EC2 restart (no Elastic IP, by design), the commit history becomes
+#     the record of which server a given .ipa was built against.
 
 workflows:
   ios-unsigned:
@@ -34,10 +39,12 @@ workflows:
       xcode: latest
       cocoapods: default
       vars:
-        # Placeholder. Set the real value in the Codemagic UI per build.
-        # The Dart client fails loudly with api_base_url_missing if this is
-        # empty, so it must be present at compile time even for a smoke test.
-        API_BASE_URL: "https://example.invalid"
+        # The EC2 test server's current public IP as a nip.io hostname, for
+        # which Caddy holds a Let's Encrypt certificate. Update this and commit
+        # whenever the instance is restarted. The Dart client fails loudly with
+        # api_base_url_missing if it is empty, so it must be set at compile
+        # time even for a smoke test.
+        API_BASE_URL: "https://52-89-115-124.nip.io"
 
     scripts:
       - name: Flutter version in use
