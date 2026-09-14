@@ -3627,3 +3627,44 @@ closed, so it would have to be marked as conditional in the battery rather than 
   the rig. §37 removed it. That entry is superseded.
 - §35.4 stated the CoreTrust mechanism incorrectly; corrected in place with a citation, and §39.1
   supplies what was actually measured.
+
+# 41. Two clients, one field, and a false positive caught before it shipped (2026-09-14)
+
+Reviewing the .NET SDK's `AppleIntegrityCollector` while preparing its iOS handoff exposed a defect
+in the rule added earlier the same day.
+
+**The two collectors put different values into `code_signing.signing_identifier`.**
+
+| client | source | value on a *legitimately signed* app |
+|---|---|---|
+| Swift (`IntegrityProbeManager.swift`) | CodeDirectory `identOffset` | `com.example.app` |
+| .NET (`AppleIntegrityCollector.cs`) | `application-identifier` entitlement | `ABCDE12345.com.example.app` |
+
+`ios_signing_identifier_bundle_mismatch` compared that field to `bundle_id` for **exact** equality.
+Under the Swift convention that is the invariant §35.5 describes. Under the .NET convention the two
+values are never equal, because the entitlement is always `TEAMID.` + bundle id — so the rule would
+have raised `+90` on **every clean .NET iOS device**, and at `90` that is the block band.
+
+Neither client is wrong. Both values are reasonable readings of "the signing identifier", and the
+field name did not say which was meant.
+
+**Fixed** by accepting either shape:
+
+```python
+identifier_is_consistent = signing_id == bundle_id or signing_id.endswith("." + bundle_id)
+```
+
+A fake signature matches neither, which the offline tool now pins in both directions: a
+`TEAMID.`-prefixed identifier belonging to *this* bundle is accepted, and a `TEAMID.`-prefixed
+identifier belonging to a *different* bundle (`TROLLTROLL.com.someone.else`) is still caught. The
+rule therefore cannot be evaded by adopting the prefixed shape.
+
+**The general point.** A probe field is a contract between two independently written collectors, and
+a name alone does not pin it down. This was caught only because the two implementations were read
+side by side; the conformance suite could not have caught it, because its iOS fixtures were written
+from the Swift client's convention and would have agreed with themselves forever. §34.6 noted that
+two independent implementations agreeing to the byte is good evidence — this is the same coin's
+other face: where they silently *disagree*, only reading both finds it.
+
+Recorded in the .NET handoff as a contract item, with the field defined as the CodeDirectory
+identifier where a collector can read it.

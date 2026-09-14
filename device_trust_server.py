@@ -1668,7 +1668,16 @@ def _score_ios_integrity(probes):
     # a finding -- the recurring trap recorded in 28.8, 34.3 and 35.7. The
     # emptiness check is the guard, not a separate "signed" flag, because a
     # non-empty identifier can only have come from a parsed signature anyway.
-    if signing_id and bundle_id and signing_id != bundle_id:
+    # Two client conventions map into this one field, and both are legitimate.
+    # The Swift collector reports the CodeDirectory identifier, which on a
+    # properly signed app equals the bundle id exactly. The .NET collector
+    # reports the application-identifier entitlement, which is "TEAMID.bundleid"
+    # -- so an exact comparison would raise +90 on every clean .NET device.
+    # Accept either shape; a fake signature matches neither.
+    identifier_is_consistent = signing_id == bundle_id or signing_id.endswith(
+        "." + bundle_id
+    )
+    if signing_id and bundle_id and not identifier_is_consistent:
         _integrity_reason(
             reasons,
             "ios_signing_identifier_bundle_mismatch",

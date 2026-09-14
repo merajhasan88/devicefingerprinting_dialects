@@ -164,6 +164,21 @@ def main():
           reason(reasons, FAKE_TEAM) is None, sorted(r["code"] for r in reasons))
     check("a correctly signed clean app scores 0", score == 0, score)
 
+    # The .NET collector reports the application-identifier entitlement,
+    # "TEAMID.bundleid", where the Swift collector reports the CodeDirectory
+    # identifier. Both are legitimate and neither may raise the rule.
+    score, _, reasons = server._score_ios_integrity(
+        probes(signing_identifier="ABCDE12345." + BUNDLE))
+    check("a TEAMID-prefixed identifier (the .NET convention) is accepted",
+          reason(reasons, MISMATCH) is None, sorted(r["code"] for r in reasons))
+    check("and still scores 0", score == 0, score)
+
+    # ...but a fake signature must not be able to hide behind that shape.
+    score, _, reasons = server._score_ios_integrity(
+        probes(signing_identifier="TROLLTROLL.com.someone.else"))
+    check("a TEAMID-prefixed FAKE identifier is still caught",
+          reason(reasons, MISMATCH) is not None, sorted(r["code"] for r in reasons))
+
     score, _, reasons = server._score_ios_integrity(
         probes(signed=False, signing_identifier="", team_identifier=""))
     check("an UNSIGNED build is not mistaken for a fake signature",
