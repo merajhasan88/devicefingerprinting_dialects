@@ -3127,7 +3127,7 @@ build. **This rule cannot be adopted until a normally signed iOS build has been 
 the entire evidence base for it is one TrollStore installation; the discipline in §28 applies —
 ship report-only, baseline on real hardware, only then score.
 
-**Action:** implement report-only, gather one clean signed baseline, then score.
+**Action — DONE (report-only), 2026-09-14.** Implemented as `ios_signing_identifier_bundle_mismatch`, gated behind `INTEGRITY_SCORE_IOS_FAKE_SIGNATURE` (default `0`). **Still open:** observe one legitimately signed iOS build not raising it, then flip the default.
 
 ## 35.6 Action item 2 — the `TROLLTROLL` marker, and why it is the weaker rule
 
@@ -3144,7 +3144,7 @@ but it must be weighted and documented as corroborating evidence, not as the det
 weight `+25`, never a hard block, and §25.11 should say plainly that a passing test of this rule
 proves much less than a passing test of 35.5.
 
-**Action:** implement alongside 35.5, weighted low, with the same caveat text as battery item 9.
+**Action — DONE (report-only), 2026-09-14.** Implemented as `ios_known_fake_team_identifier`, weight 25, never a hard block, behind the same flag. `IOS_KNOWN_FAKE_TEAM_IDS` currently holds one entry, `TROLLTROLL`.
 
 ## 35.7 The defect this run exposed: hardware backing was never recorded
 
@@ -3189,9 +3189,9 @@ that does not report the block cannot erase a value another one recorded.
 verdicts and needs a decision about whether hardware backing is required, advisory, or
 policy-driven per deployment. The measurement is now recorded; the policy is a separate choice.
 
-**Action:** decide the policy, and add a conformance check that an installation registered without a
-`key_security` block stores `NULL` rather than `false` — the direct analogue of the check §34.3
-added for `wx_bytes`.
+**Action — conformance check DONE, 2026-09-14** (`identity: an absent key_security records null,
+never false`, plus its positive counterpart). **Still open:** the policy decision on what, if
+anything, a software-backed key should score.
 
 ### Verified on hardware, 2026-09-09
 
@@ -3220,3 +3220,79 @@ installation — and **iOS reinstall correlation works on hardware**. The 19:49:
 produced a second, genuinely distinct key thumbprint that the IDFV-derived hint correlated back onto
 the same `device_id`, giving one device with two installations. The key stayed authoritative
 throughout; the hint only merged the device record.
+
+
+# 36. The two fake-signature rules, and a way to test scoring for free (2026-09-14)
+
+§35 left three action items. Two are now implemented, both **report-only by default**, and the
+third — the conformance check — is written. What remains open is deliberate and recorded at the end.
+
+## 36.1 What shipped
+
+| rule | weight | fires when | hard block |
+|---|---|---|---|
+| `ios_signing_identifier_bundle_mismatch` | 90 | CodeDirectory identifier ≠ bundle identifier, both non-empty | no |
+| `ios_known_fake_team_identifier` | 25 | team identifier is in `IOS_KNOWN_FAKE_TEAM_IDS` | never |
+
+Both sit behind `INTEGRITY_SCORE_IOS_FAKE_SIGNATURE`, default `0`. Neither needs `EXPECTED_IOS_*`
+to be configured, which is the point: an unconfigured deployment previously scored a fake-signed
+application at **zero** for its signature.
+
+`_integrity_reason` gained a `report_only` parameter. A report-only reason appears in the stored
+report and the API response with `points: 0` and `hard: false`, plus two extra keys —
+`report_only: true` and `proposed_points` — so an operator can see what enabling the rule *would*
+cost before enabling it. Those two keys appear **only** in the report-only case, so a rule that is
+actually scoring produces output byte-identical to every other rule and nothing downstream changes
+shape when the flag is flipped. `/health/ready` now reports `scoring_flags`, because a reader
+looking at a low score needs to distinguish a signal that was absent from one that was merely inert.
+
+## 36.2 Why they ship inert
+
+The entire evidence base for §35.5 is one TrollStore installation. **No legitimately signed iOS
+build has ever been observed by this server** — the rig cannot produce one, since a properly signed
+build needs a paid Apple Developer account, which is precisely what the Mac-free path exists to
+avoid. The invariant claimed in §35.5 (Xcode derives the CodeDirectory identifier from the bundle
+identifier, so they always match) is well founded, but "well founded" is not "observed", and §28
+exists because this project has previously shipped a signal that read as clean when it was
+measuring nothing at all.
+
+`ios_known_fake_team_identifier` could safely be scored today — no legitimate application has team
+identifier `TROLLTROLL` — but it is held behind the same flag so the pair is enabled together, after
+one clean baseline, rather than leaving a half-armed rule to be forgotten.
+
+## 36.3 Scoring changes are now testable without spending money
+
+Previously the only way to exercise a scoring rule was `conformance_suite.py`, which needs a running
+server and therefore a live RDS instance. That made the cheapest possible check of a pure function
+cost real money and several minutes — the wrong shape for something with no I/O in it.
+
+`tools/check_ios_scoring_rules.py` calls `_score_ios_integrity` directly, with the server's
+third-party imports stubbed out, so it runs on the **system interpreter with no virtualenv and no
+installed dependencies** — like the other tools in that directory. Twenty-three assertions, well
+under a second.
+
+The assertions that earn their keep are the false-positive guards, not the detections:
+
+- a correctly signed application does **not** raise the invariant rule;
+- an **unsigned** build, which honestly reports an empty signing identifier, is not mistaken for a
+  fake signature;
+- a client that omits the fields entirely raises nothing.
+
+That third one is the recurring hazard named in §35.7 — absence read as a finding — approached from
+the opposite direction to the `compared_bytes: 0` and `wx_bytes` cases. There, an absent measurement
+was mistaken for a *benign* value; here it could be mistaken for a *damning* one. Both are the same
+error, and both are now pinned by a test.
+
+The tool also pins the arithmetic on the real device, in both flag states: the observed iPhone 7
+scores **35** today and would score **150** (35 + 90 + 25) with the rules enabled. That number is
+the actual cost of flipping the flag, stated before anyone flips it.
+
+## 36.4 Still open
+
+- **Observe a legitimately signed iOS build.** Until then `INTEGRITY_SCORE_IOS_FAKE_SIGNATURE`
+  stays `0`. This is the only thing standing between these rules and being scored.
+- **Decide what a software-backed key should score** (§35.7). The measurement is recorded; the
+  policy is not, and it changes verdicts.
+- **The rig's permanent +35 floor.** Every iOS measurement from this device carries
+  `ios_get_task_allow`, because TrollStore grants that entitlement to everything it installs. A
+  genuinely trusted iOS reading is not obtainable here at all.
