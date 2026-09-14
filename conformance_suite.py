@@ -41,6 +41,7 @@ integrity-scoring suite (phase 0b) will cover separately.
 
 import argparse
 import base64
+import copy
 import hashlib
 import json
 import secrets
@@ -596,7 +597,18 @@ def clean_probes(required, cert=None, platform="android"):
     probes - iOS has no /proc and Android has no dyld.
     """
     if platform == "ios":
-        return {name: IOS_CLEAN[name] for name in required if name in IOS_CLEAN}
+        # deepcopy, not a dict comprehension over the shared fixture. The
+        # Android branch below builds a fresh literal on every call; this one
+        # used to hand out references into IOS_CLEAN itself, so every check
+        # that did probes["x"].update(...) permanently corrupted the fixture
+        # and each later iOS check ran against a progressively dirtier
+        # "pristine" device. It went unnoticed because no iOS check asserted an
+        # exact score after a mutating one had run.
+        return {
+            name: copy.deepcopy(IOS_CLEAN[name])
+            for name in required
+            if name in IOS_CLEAN
+        }
     everything = {
         "app_identity": {
             "status": "ok",

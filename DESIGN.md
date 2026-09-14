@@ -3406,3 +3406,47 @@ Also unresolved: the app's executable hash has necessarily changed, from
 `2cd1903b…` (425,171 bytes) to `c019a07e…` (386,384 bytes), because the signature is part of the
 file. Any deployment that pins `INTEGRITY_IOS_EXECUTABLE_SHA256` must be updated whenever the
 pre-signing step runs.
+
+# 38. A shared-fixture bug the new checks exposed (2026-09-14)
+
+Running the seven checks from §36 for the first time produced two failures, both reporting a score of
+100 where 0 was expected. The cause was not in the new checks.
+
+`clean_probes()` builds the Android fixture as a dict literal, fresh on every call. The iOS branch
+did not:
+
+```python
+if platform == "ios":
+    return {name: IOS_CLEAN[name] for name in required if name in IOS_CLEAN}
+```
+
+That hands out **references into the module-level `IOS_CLEAN`**. Every iOS check that does
+`probes["jailbreak_files"].update({...})` to simulate a compromise was therefore mutating the shared
+fixture permanently, and each later iOS check ran against a progressively dirtier "pristine" device.
+By the end of the iOS block the accumulated penalties exceeded the cap, which is where the 100 came
+from.
+
+Demonstrated directly rather than inferred:
+
+```
+IOS_CLEAN jailbreak found_paths before : []
+                            AFTER      : ['/Applications/Cydia.app']
+a FRESH "clean" probe set now returns  : ['/Applications/Cydia.app']
+same object? True
+```
+
+**Why it survived until now.** Every pre-existing iOS check asserts only that a particular reason
+code is *present*. That assertion still holds on a dirty fixture — an extra `ios_jailbreak_artifact`
+does not stop `ios_process_traced` from appearing. Only a check asserting an **exact score** can see
+the pollution, and until §36 no iOS check did. `check_ios_clean` asserts `score == 0` and passed
+throughout, because it runs before any mutating iOS check.
+
+So the earlier iOS results in §34.4 were not wrong, but they were weaker than they read: from the
+second mutating check onward, each was verifying its signal on a device that also had every previous
+check's compromise applied. Fixed with `copy.deepcopy`, after which the suite is **43 passed, 0
+failed, 2 skipped** — the two skips being the enforcement checks, which correctly skip in observe
+mode.
+
+The general lesson is worth keeping separate from the specific bug: **a test that only asserts
+"the signal fired" cannot detect contamination of its own fixture.** Asserting the exact score is
+what made the suite able to see this, and it is cheap to do wherever a fixture is meant to be clean.
