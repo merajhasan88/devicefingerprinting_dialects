@@ -161,6 +161,26 @@ INTEGRITY_DEVICE_MEMORY_HOURS = int(
 INTEGRITY_SCORE_EXTENDED_LIBS = (
     os.environ.get("INTEGRITY_SCORE_EXTENDED_LIBS", "1").strip() == "1"
 )
+
+# iOS fake-signature detection (DESIGN.md 35.5 and 35.6).
+#
+# Defaults to 0 -- REPORT-ONLY -- and that default is deliberate. The entire
+# evidence base for these two rules is a single TrollStore installation; no
+# legitimately signed iOS build has ever been observed by this server. Scoring
+# a rule before its clean baseline exists is the mistake DESIGN.md 28 was
+# written to prevent, so the signals ship visible but inert, exactly as
+# INTEGRITY_SCORE_EXTENDED_LIBS did before its default was flipped.
+#
+# Set to 1 once a normally signed iOS build has been observed not to raise
+# ios_signing_identifier_bundle_mismatch.
+INTEGRITY_SCORE_IOS_FAKE_SIGNATURE = (
+    os.environ.get("INTEGRITY_SCORE_IOS_FAKE_SIGNATURE", "0").strip() == "1"
+)
+
+# Team identifiers belonging to known fake-signing tooling. Compared
+# case-insensitively. This is a NAME match and carries every weakness that
+# implies -- see the comment on the rule that uses it.
+IOS_KNOWN_FAKE_TEAM_IDS = {"TROLLTROLL"}
 INTEGRITY_RANDOM_OPTIONAL_PROBES = int(
     os.environ.get("INTEGRITY_RANDOM_OPTIONAL_PROBES", "4")
 )
@@ -1313,15 +1333,27 @@ def _integrity_probe_plan(platform):
     return mandatory + chosen
 
 
-def _integrity_reason(reasons, code, points, message, hard=False):
-    reasons.append(
-        {
-            "code": code,
-            "points": int(points),
-            "message": message,
-            "hard": bool(hard),
-        }
-    )
+def _integrity_reason(reasons, code, points, message, hard=False, report_only=False):
+    """Record one scored reason.
+
+    A report_only reason is visible in the stored report and in the API
+    response but contributes nothing: its points are zero and it can never
+    hard-block. The weight it *would* carry is preserved as proposed_points so
+    that an operator can see what enabling it would cost before enabling it.
+
+    The two extra keys appear only in the report-only case, so a rule that is
+    actually scoring produces output byte-identical to every other rule.
+    """
+    entry = {
+        "code": code,
+        "points": 0 if report_only else int(points),
+        "message": message,
+        "hard": False if report_only else bool(hard),
+    }
+    if report_only:
+        entry["report_only"] = True
+        entry["proposed_points"] = int(points)
+    reasons.append(entry)
 
 
 def _probe(probes, name):
@@ -1605,6 +1637,57 @@ def _score_ios_integrity(probes):
     if _as_bool(signing.get("get_task_allow")) and not INTEGRITY_ALLOW_DEBUG:
         _integrity_reason(reasons, "ios_get_task_allow", 35, "get-task-allow is enabled for this application.")
         score += 35
+
+    # --- Fake-signature detection, baseline-free (DESIGN.md 35.5 / 35.6) ---
+    #
+    # Unlike the two rules above, neither of these needs EXPECTED_IOS_* to be
+    # configured, which matters: an unconfigured deployment currently scores a
+    # fake-signed application at zero for its signature.
+    scoring_fake_signature = INTEGRITY_SCORE_IOS_FAKE_SIGNATURE
+
+    # A legitimately signed iOS application always has its CodeDirectory
+    # identifier equal to its bundle identifier -- Xcode derives one from the
+    # other. A mismatch is an INVARIANT VIOLATION rather than a heuristic, and
+    # it is precisely how a CoreTrust bypass (CVE-2023-41991) shows itself: the
+    # grafted-on Apple-signed CMS blob keeps the donor application's identifier,
+    # because the bug is that CoreTrust never checks the CodeDirectory it
+    # covers is the one being loaded. Observed on the iPhone 7 as
+    # signing_identifier "com.icraze.gtatracker" against our own bundle id.
+    #
+    # Both operands must be non-empty. An unsigned build legitimately reports an
+    # empty signing_identifier, and an absent measurement must never be read as
+    # a finding -- the recurring trap recorded in 28.8, 34.3 and 35.7. The
+    # emptiness check is the guard, not a separate "signed" flag, because a
+    # non-empty identifier can only have come from a parsed signature anyway.
+    if signing_id and bundle_id and signing_id != bundle_id:
+        _integrity_reason(
+            reasons,
+            "ios_signing_identifier_bundle_mismatch",
+            90,
+            "The code-signing identifier does not match the bundle identifier, "
+            "which a legitimately signed application never does.",
+            report_only=not scoring_fake_signature,
+        )
+        if scoring_fake_signature:
+            score += 90
+
+    # Deliberately the WEAKER of the pair, and recorded as such. This is a name
+    # match, and 27.11 already proved on Android exactly how a name match ends:
+    # a real Frida gadget renamed to libhelper.so and moved off port 27042
+    # scored 18/trusted while fully active. One patched constant in a TrollStore
+    # fork defeats this rule completely. It is kept because an attacker who does
+    # not bother to change it should still be caught cheaply -- corroborating
+    # evidence, never the detection, low weight, never a hard block.
+    if team_id and team_id.strip().upper() in IOS_KNOWN_FAKE_TEAM_IDS:
+        _integrity_reason(
+            reasons,
+            "ios_known_fake_team_identifier",
+            25,
+            "The team identifier matches a known fake-signing marker.",
+            report_only=not scoring_fake_signature,
+        )
+        if scoring_fake_signature:
+            score += 25
 
     debugger = _probe(probes, "debugger")
     if _as_bool(debugger.get("traced")) and not INTEGRITY_ALLOW_DEBUG:
@@ -2891,6 +2974,13 @@ def health_ready():
             "device_policy_mode": DEVICE_POLICY_MODE,
             "integrity_mode": INTEGRITY_MODE,
             "integrity_freshness_seconds": INTEGRITY_FRESHNESS_SECONDS,
+            # Which signals are live versus shipped report-only. An operator
+            # reading a low score needs to know whether a rule was absent or
+            # merely inert, and the conformance suite asserts against this.
+            "scoring_flags": {
+                "extended_libs": INTEGRITY_SCORE_EXTENDED_LIBS,
+                "ios_fake_signature": INTEGRITY_SCORE_IOS_FAKE_SIGNATURE,
+            },
             "remote_attestation": "not_used",
             "redis": _redis_status(),
         }

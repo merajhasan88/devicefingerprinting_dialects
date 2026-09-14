@@ -206,13 +206,19 @@ def protected(api, installation, method, path, bearer, body_obj=None, **kwargs):
 # ---------------------------------------------------------------------------
 
 
-def enrol(api, installation, reinstall_hint=None, platform="android"):
+def enrol(api, installation, reinstall_hint=None, platform="android",
+          key_security=None):
     body = {
         "installation_id": installation.submitted_id,
         "platform": platform,
         "public_key": installation.jwk,
         "reinstall_hint": reinstall_hint,
     }
+    # Omitted entirely when not supplied, which is what the Kotlin and .NET
+    # collectors do. The server must record that as "not reported", never as
+    # "software" -- see check_key_security_absent_is_null.
+    if key_security is not None:
+        body["key_security"] = key_security
     status, payload = api.call(
         "POST", "/v1/installations/register", body_text=json.dumps(body)
     )
@@ -720,6 +726,19 @@ def submit_report(api, installation, token, mutate=None, cert=None):
 
 def codes(decision):
     return {reason["code"] for reason in decision.get("reasons", [])}
+
+
+def reason_for(decision, code):
+    """The full reason dict for one code, or None.
+
+    codes() answers "did the rule fire"; this answers "and what did it
+    actually contribute", which is the difference between a live rule and a
+    report-only one.
+    """
+    for reason in decision.get("reasons", []):
+        if reason.get("code") == code:
+            return reason
+    return None
 
 
 def integrity_session(api):
@@ -1246,6 +1265,161 @@ def check_device_memory(api, ctx):
 # ---------------------------------------------------------------------------
 # runner
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# iOS fake-signature detection (DESIGN.md 35.5, 35.6) and the key-security
+# absence guard (35.7).
+# ---------------------------------------------------------------------------
+
+# What a CoreTrust-bypassed application actually looked like on the iPhone 7:
+# an Apple-signed CMS blob grafted from a donor App Store app, so the
+# CodeDirectory keeps the donor's identifier while the bundle is ours.
+IOS_FAKE_SIGNATURE = {
+    "signing_identifier": "com.icraze.gtatracker",
+    "team_identifier": "TROLLTROLL",
+    "signed": True,
+}
+
+
+@check("ios integrity: a fake signature violates the identifier invariant")
+def check_ios_fake_signature_detected(api, ctx):
+    """A legitimately signed iOS app always has CodeDirectory identifier equal
+    to its bundle identifier. TrollStore's grafted signature cannot, which is
+    what makes this structural rather than a name match."""
+    ctx["_api"] = api
+    installation, token = ios_integrity_context(ctx)
+    decision = submit_report(
+        api, installation, token,
+        lambda probes: probes["code_signing"].update(IOS_FAKE_SIGNATURE),
+    )
+    expect(
+        "ios_signing_identifier_bundle_mismatch" in codes(decision),
+        "expected ios_signing_identifier_bundle_mismatch, got %s" % codes(decision),
+    )
+
+
+@check("ios integrity: the fake-signature rule ships report-only and scores 0")
+def check_ios_fake_signature_report_only(api, ctx):
+    """The rule is deliberately inert by default: its whole evidence base is one
+    TrollStore install and no legitimately signed iOS build has been observed.
+    This check pins that it is visible but contributes nothing, so flipping
+    INTEGRITY_SCORE_IOS_FAKE_SIGNATURE is a conscious act."""
+    ctx["_api"] = api
+    installation, token = ios_integrity_context(ctx)
+    decision = submit_report(
+        api, installation, token,
+        lambda probes: probes["code_signing"].update(IOS_FAKE_SIGNATURE),
+    )
+    reason = reason_for(decision, "ios_signing_identifier_bundle_mismatch")
+    expect(reason is not None, "the rule did not fire at all")
+    if not reason.get("report_only"):
+        raise Skip("INTEGRITY_SCORE_IOS_FAKE_SIGNATURE is enabled on this server")
+    expect(reason["points"] == 0,
+           "a report-only reason contributed %s points" % reason["points"])
+    expect(reason.get("hard") is False, "a report-only reason claimed hard block")
+    expect(reason.get("proposed_points") == 90,
+           "expected proposed_points 90, got %s" % reason.get("proposed_points"))
+    expect(decision["score"] == 0,
+           "clean probes plus a report-only rule should score 0, got %s"
+           % decision["score"])
+
+
+@check("ios integrity: the TrollStore team marker is caught, weighted low")
+def check_ios_fake_team_identifier(api, ctx):
+    """The weaker half of the pair, and named so. It is a name match, which
+    27.11 proved defeatable on Android by renaming a live Frida gadget."""
+    ctx["_api"] = api
+    installation, token = ios_integrity_context(ctx)
+    decision = submit_report(
+        api, installation, token,
+        lambda probes: probes["code_signing"].update(IOS_FAKE_SIGNATURE),
+    )
+    reason = reason_for(decision, "ios_known_fake_team_identifier")
+    expect(reason is not None,
+           "expected ios_known_fake_team_identifier, got %s" % codes(decision))
+    proposed = reason.get("proposed_points", reason["points"])
+    expect(proposed == 25, "expected a weight of 25, got %s" % proposed)
+    expect(reason.get("hard") is False,
+           "a name-match rule must never be a hard block")
+
+
+@check("ios integrity: a correctly signed app does not trip the invariant")
+def check_ios_signed_app_is_clean(api, ctx):
+    """The false-positive guard. If this ever fails, the invariant claim in
+    35.5 is wrong and the rule must not be scored."""
+    ctx["_api"] = api
+    installation, token = ios_integrity_context(ctx)
+    decision = submit_report(
+        api, installation, token,
+        lambda probes: probes["code_signing"].update({
+            "signing_identifier": probes["app_identity"]["bundle_id"],
+            "team_identifier": "ABCDE12345",
+            "signed": True,
+        }),
+    )
+    found = codes(decision)
+    expect("ios_signing_identifier_bundle_mismatch" not in found,
+           "a correctly signed app raised the mismatch rule: %s" % found)
+    expect("ios_known_fake_team_identifier" not in found,
+           "an ordinary team identifier matched a fake marker: %s" % found)
+    expect(decision["score"] == 0, "expected score 0, got %s" % decision["score"])
+
+
+@check("ios integrity: an unsigned build is not mistaken for a fake signature")
+def check_ios_unsigned_is_not_a_finding(api, ctx):
+    """An unsigned build reports an empty signing identifier. Absence of a
+    measurement must never read as a finding -- the same trap as an integrity
+    bucket reporting compared_bytes: 0 and scoring as clean (28.8), and as an
+    absent wx_bytes computing to a harmless zero (34.3)."""
+    ctx["_api"] = api
+    installation, token = ios_integrity_context(ctx)
+    decision = submit_report(
+        api, installation, token,
+        lambda probes: probes["code_signing"].update({
+            "signing_identifier": "",
+            "team_identifier": "",
+            "signed": False,
+        }),
+    )
+    expect("ios_signing_identifier_bundle_mismatch" not in codes(decision),
+           "an unsigned build raised the mismatch rule: %s" % codes(decision))
+
+
+@check("identity: an absent key_security records null, never false")
+def check_key_security_absent_is_null(api, ctx):
+    """A client that does not report key security must be stored as unknown.
+    Collapsing a missing hardware_backed to false would mark every Android and
+    .NET installation software-backed on no evidence."""
+    installation = Installation()
+    status, payload = enrol(api, installation)
+    expect(status in (200, 201), "enrol failed: %s %s" % (status, payload))
+    block = payload.get("key_security")
+    if block is None:
+        raise Skip("this server predates the key_security block (schema < 2)")
+    for field in ("security_level", "hardware_backed", "provider"):
+        expect(block.get(field) is None,
+               "%s was %r, expected null for a client that did not report it"
+               % (field, block.get(field)))
+
+
+@check("identity: a reported key_security is recorded as sent")
+def check_key_security_recorded(api, ctx):
+    """The other half: when a client does report it, the value survives."""
+    installation = Installation()
+    status, payload = enrol(api, installation, key_security={
+        "security_level": "secure_enclave",
+        "hardware_backed": True,
+        "provider": "SecureEnclave",
+    })
+    expect(status in (200, 201), "enrol failed: %s %s" % (status, payload))
+    block = payload.get("key_security")
+    if block is None:
+        raise Skip("this server predates the key_security block (schema < 2)")
+    expect(block.get("security_level") == "secure_enclave",
+           "security_level round-tripped as %r" % block.get("security_level"))
+    expect(block.get("hardware_backed") is True,
+           "hardware_backed round-tripped as %r" % block.get("hardware_backed"))
 
 
 def main():
