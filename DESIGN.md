@@ -3545,3 +3545,85 @@ across rebuilds that do not touch the Swift host — though it still has to be t
 - **The policy decision on software-backed keys** (§35.7) is unchanged.
 - **The enforcement checks** skip in observe mode; the suite has not been run in enforce against this
   backend.
+
+# 40. The fake-signature rule, proven on hardware in enforce mode (2026-09-14)
+
+§39 measured the rules report-only. This records enabling them and running the whole thing for real,
+plus a scoring detail that a prediction in this session got wrong.
+
+## 40.1 The run
+
+`INTEGRITY_SCORE_IOS_FAKE_SIGNATURE=1`, `INTEGRITY_MODE=enforce`, `INTEGRITY_ALLOW_DEBUG=0`,
+PostgreSQL 16.15 local to the instance.
+
+| | result |
+|---|---|
+| conformance suite | **44 passed, 0 failed, 1 skipped** |
+| device report | `score 100`, `verdict block`, `hard_block false` |
+| reasons | `ios_signing_identifier_bundle_mismatch +90`, `ios_known_fake_team_identifier +25` |
+| `POST /v1/accounts/register` | **403 `integrity_blocked`** |
+
+Across the two configurations run today, **every one of the 45 checks has passed**:
+
+```
+observe + scoring off   43 passed, 0 failed, 2 skipped   (the enforcement checks skip)
+enforce + scoring on    44 passed, 0 failed, 1 skipped   (the report-only check skips)
+```
+
+The single skip in each case is a check correctly standing down because its precondition is absent,
+which is the behaviour those checks were written to have.
+
+**This is the part that matters.** The rule caught a *real* TrollStore installation, on real
+hardware, in enforce mode, and the gate refused a session holding a valid device token, a valid
+access proof and a genuine Secure Enclave key. Every previous demonstration of these two rules was
+against a conformance fixture. §28 exists to insist on exactly this distinction.
+
+## 40.2 The score is capped, and the cap is not the hard-block flag
+
+The prediction recorded before the run was `115`. The device reported **`100`**, and the reasons
+show `+90` and `+25` exactly as expected. The difference is the cap in `_score_integrity`:
+
+```python
+score = min(sum(max(0, int(reason.get("points", 0))) for reason in reasons), 100)
+```
+
+Worth reading the stored row carefully, because two things that look like one thing are not:
+
+```
+score 100    verdict block    hard_block FALSE
+```
+
+Neither rule is a hard block — deliberately, since §35.6 requires a name match never to be one. The
+`block` verdict comes purely from the numeric band (100 ≥ 90). Score and `hard_block` are
+independent controls, and this is a clean instance of the band alone doing the work with no
+fail-closed override involved.
+
+A consequence worth stating for anyone tuning weights: **once the total exceeds 100, additional
+points are invisible.** Two rules at 90 and 25 present identically to one rule at 100. Weights are
+therefore an ordering over which combinations reach a band, not a quantity that keeps accumulating.
+
+## 40.3 The battery is 16 items, and two more are proposed
+
+Confirmed against both `§25.11` here and `docs/handset-battery.md` in the .NET repository: the
+canonical battery is **16 items**. Today's work suggests two additions, recorded as proposals rather
+than folded in, because adding to the battery changes what every future engine run must cover.
+
+```
+| 17 | iOS clean baseline (**iOS only**) | pre-signed TrollStore build → `get_task_allow: false`, `score 0`, `trusted`, with INTEGRITY_ALLOW_DEBUG=0 | iPhone |
+| 18 | iOS fake-signature detection (**iOS only**) | INTEGRITY_SCORE_IOS_FAKE_SIGNATURE=1 → `ios_signing_identifier_bundle_mismatch` +90 → `score 100`, `block`, login 403 | iPhone |
+```
+
+Item 17 is the iOS counterpart of item 1, which is written in Android terms (`18/trusted`, from
+developer options and ADB). It is only meaningful on a build that has been through
+`tools/presign_trollstore_ipa.sh`; without that step the device sits at `35` and can never be
+`trusted`, which is what §37 removed.
+
+Item 18 depends on a flag that is **off by default** and should stay off until §39.5's open item is
+closed, so it would have to be marked as conditional in the battery rather than unconditional.
+
+## 40.4 Corrections to earlier sections
+
+- §36.4 listed "the rig's permanent +35 floor" under *Still open* and described it as a property of
+  the rig. §37 removed it. That entry is superseded.
+- §35.4 stated the CoreTrust mechanism incorrectly; corrected in place with a citation, and §39.1
+  supplies what was actually measured.
