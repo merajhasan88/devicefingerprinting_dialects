@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Entitlements for the TrollStore test build (DESIGN.md 37).
+
+  These are EXACTLY the entitlements TrollStore grants an app it installs,
+  minus get-task-allow. They were read off the device rather than guessed:
+  TrollStore granted five, and this file reproduces four of them byte for byte.
+
+  Why omit get-task-allow. It is iOS's debuggable flag, scored at +35 by
+  ios_get_task_allow, and TrollStore sets it on everything it installs so its
+  JIT option works. That gave every measurement from the test iPhone a
+  permanent +35 floor, so the device could never read trusted and a clean iOS
+  baseline was unobtainable. Suppressing it server-side with
+  INTEGRITY_ALLOW_DEBUG was the wrong answer: that flag gates SIX rules across
+  both platforms, including ios_process_traced (+50), so it would have blinded
+  the server to a real debugger attaching.
+
+  Why keep the other four unchanged, and keychain-access-groups in particular.
+  The Secure Enclave key lives in the TROLLTROLL.* access group. Change that
+  value and the existing key becomes unreachable, the app silently generates a
+  new one, and the installation identity resets on every rebuild. Verified on
+  device: after re-signing with this file, "Key created this launch" read No.
+
+  Applied by tools/presign_trollstore_ipa.sh. TrollStore preserves entitlements
+  present in the binary rather than overwriting them, which is what makes this
+  work; that behaviour was confirmed on device, not assumed.
+-->
+<plist version="1.0">
+<dict>
+	<key>application-identifier</key>
+	<string>TROLLTROLL.*</string>
+	<key>com.apple.developer.team-identifier</key>
+	<string>TROLLTROLL</string>
+	<key>com.apple.private.security.container-required</key>
+	<string>com.example.devicefingerprinting</string>
+	<key>keychain-access-groups</key>
+	<array>
+		<string>TROLLTROLL.*</string>
+		<string>com.apple.token</string>
+	</array>
+</dict>
+</plist>

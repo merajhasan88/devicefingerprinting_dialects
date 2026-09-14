@@ -3310,3 +3310,99 @@ the actual cost of flipping the flag, stated before anyone flips it.
 - **The rig's permanent +35 floor.** Every iOS measurement from this device carries
   `ios_get_task_allow`, because TrollStore grants that entitlement to everything it installs. A
   genuinely trusted iOS reading is not obtainable here at all.
+
+# 37. Removing the rig's +35 floor at the source (2026-09-14)
+
+§36.4 listed the permanent `+35` on every iOS measurement as an accepted limitation of the test rig.
+It was not a limitation; it was a thing nobody had tried to remove. This section records removing it,
+and the two claims that had to be checked rather than assumed along the way.
+
+## 37.1 Why `INTEGRITY_ALLOW_DEBUG` was the wrong answer
+
+The obvious workaround — the one used for the enforce-mode test in §35 — is to set
+`INTEGRITY_ALLOW_DEBUG=1`. Measured rather than assumed, that flag gates **six** rules, not one:
+
+```
+android_debuggable          android_debugger_connected / waiting_for_debugger
+android_tracer_pid          ro.debuggable
+ios_get_task_allow (+35)    ios_process_traced (+50)
+```
+
+So clearing the +35 that way also blinds the server to a debugger actually attaching to the
+process. That makes it usable for a single controlled test and unusable as the rig's normal state,
+which is not how it was presented in §35 when it was proposed.
+
+## 37.2 The entitlement is TrollStore's, not ours
+
+Our Codemagic artifact ships with **zero** `LC_CODE_SIGNATURE` and no entitlements file — there is
+no `CODE_SIGN_ENTITLEMENTS` in the Xcode project and no `.entitlements` in the bundle. So
+`get-task-allow` is not something the build asks for. TrollStore adds it, along with four others, so
+its JIT option works.
+
+Read off the device rather than guessed, TrollStore granted exactly five:
+
+```
+application-identifier                          TROLLTROLL.*
+com.apple.developer.team-identifier             TROLLTROLL
+com.apple.private.security.container-required   com.example.devicefingerprinting
+get-task-allow                                  true          <- the +35
+keychain-access-groups                          [TROLLTROLL.*, com.apple.token]
+```
+
+TrollStore's documentation states that it **preserves** entitlements already present in a binary
+instead of applying its defaults. That is the whole mechanism this rests on, and it was confirmed on
+device rather than taken on trust.
+
+## 37.3 What was done
+
+`ldid -S<entitlements> -I<bundle-id>` pseudo-signs the main executable with those same four
+entitlements minus `get-task-allow`, before the `.ipa` reaches TrollStore.
+
+`keychain-access-groups` is reproduced **byte for byte**, and that is the load-bearing detail. The
+Secure Enclave key lives in the `TROLLTROLL.*` access group; change that value and the existing key
+becomes unreachable, the app silently generates a new one, and the installation identity resets on
+every rebuild — turning a one-line entitlement change into a device-identity reset.
+
+The CodeDirectory identifier is set explicitly to the bundle identifier, because that is what a
+legitimately signed application has and because leaving `ldid` to derive it from the file name would
+produce `Runner`.
+
+## 37.4 Measured on the device
+
+| | before | after |
+|---|---|---|
+| entitlement count | 5 | **4** |
+| `get-task-allow` | `true` | **absent** |
+| other four entitlements | — | **unchanged** |
+| `Key created this launch` | — | **No** |
+| provider / security level | — | `SecureEnclave` / `secure_enclave` |
+
+Entitlements are embedded in the code signature, so they cannot change unless the binary was
+replaced — which is what establishes that the install landed. TrollStore reported nothing and the
+Apps list looked identical, because it was an in-place upgrade onto the same bundle identifier and
+the same container path.
+
+`Key created this launch: No` is the result that matters beyond the score: the existing Secure
+Enclave key was **loaded, not regenerated**, so this is still the same installation with the same
+hardware key. The +35 is gone with no server-side suppression and `ios_process_traced` fully live.
+
+Reproducible via `tools/presign_trollstore_ipa.sh`, which fails closed if `get-task-allow` survives
+signing or the entitlements do not match the checked-in plist exactly. It was verified by running it
+against the same Codemagic artifact and confirming it produces a byte-identical signed executable to
+the one installed by hand — `sha256 c019a07e…`.
+
+## 37.5 What this does not settle
+
+The device now carries a CodeDirectory identifier of `com.example.devicefingerprinting`, written by
+`ldid` **before** TrollStore resigned it. Whether TrollStore left that alone or replaced it with the
+donor binary's identifier is unknown, and it decides something important: if ours survived, then
+`ios_signing_identifier_bundle_mismatch` (§35.5) does **not** detect a TrollStore installation in
+the general case, and the rule is considerably weaker than §35.4 claimed.
+
+Reading it needs the `code_signing` probe, which needs a server. No prediction is recorded here on
+purpose; the last one in this document was wrong.
+
+Also unresolved: the app's executable hash has necessarily changed, from
+`2cd1903b…` (425,171 bytes) to `c019a07e…` (386,384 bytes), because the signature is part of the
+file. Any deployment that pins `INTEGRITY_IOS_EXECUTABLE_SHA256` must be updated whenever the
+pre-signing step runs.
