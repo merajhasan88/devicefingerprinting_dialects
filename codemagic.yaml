@@ -44,7 +44,7 @@ workflows:
         # whenever the instance is restarted. The Dart client fails loudly with
         # api_base_url_missing if it is empty, so it must be set at compile
         # time even for a smoke test.
-        API_BASE_URL: "https://52-89-115-124.nip.io"
+        API_BASE_URL: "https://35-95-150-125.nip.io"
 
     scripts:
       - name: Flutter version in use
@@ -80,6 +80,11 @@ workflows:
           /usr/libexec/PlistBuddy -c "Print :MinimumOSVersion" \
             build/ios/iphoneos/Runner.app/Info.plist || true
 
+    # The .ipa this produces must be run through
+    # tools/presign_trollstore_ipa.sh before it is handed to TrollStore.
+    # Without that step TrollStore applies its own entitlements, which include
+    # get-task-allow, and every measurement from the device silently regains a
+    # permanent +35 floor. See DESIGN.md 37.
     artifacts:
       - devicetrust-unsigned.ipa
       - build/ios/iphoneos/Runner.app
