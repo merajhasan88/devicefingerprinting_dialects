@@ -3450,3 +3450,98 @@ mode.
 The general lesson is worth keeping separate from the specific bug: **a test that only asserts
 "the signal fired" cannot detect contamination of its own fixture.** Asserting the exact score is
 what made the suite able to see this, and it is cheap to do wherever a fixture is meant to be clean.
+
+# 39. The device answers both open questions (2026-09-14)
+
+§37.5 left one question open and deliberately recorded no prediction. The device has now answered it,
+along with confirming the +35 removal end to end. Backend for this run was **PostgreSQL 16.15 local
+to the EC2 instance**, not RDS — chosen because neither question is a database question and RDS
+bills by the hour. Results that are meant as portability evidence should still be taken on RDS.
+
+## 39.1 The identifier mismatch is TrollStore's, not an artifact
+
+`ldid` wrote `com.example.devicefingerprinting` into slot 0 of the SuperBlob before the `.ipa`
+reached TrollStore. The device reports:
+
+```json
+"code_signing": {
+    "signed": true,
+    "get_task_allow": false,
+    "team_identifier": "TROLLTROLL",
+    "signing_identifier": "com.icraze.gtatracker",
+    "entitlement_count": 4
+}
+```
+
+Our identifier **did not survive**. So `ios_signing_identifier_bundle_mismatch` (§35.5) does detect a
+TrollStore installation, and the doubt raised in §37.5 — that the rule might be keying on an artifact
+of default entitlements — is resolved in the rule's favour. It survives the strongest test available
+here: everything a legitimate signer would do was done first, and the mismatch reappeared anyway.
+
+This also states TrollStore's behaviour more precisely than §37.2 could. It is not simply that
+TrollStore "preserves entitlements": **it preserves the entitlements supplied to it — four, exactly
+ours — while replacing the CodeDirectory.** Entitlements and CodeDirectory are handled differently,
+which is why the +35 fix works and the detection rule survives it.
+
+## 39.2 The +35 removal, confirmed end to end
+
+```
+get_task_allow  false          entitlement_count  4
+score           0              verdict  trusted          hard_block  false
+```
+
+Taken with `INTEGRITY_ALLOW_DEBUG=0`, so nothing is suppressed and `ios_process_traced` stays live.
+This is the first genuinely trusted iOS reading this rig has produced, and it retires the "permanent
++35 floor" recorded as an accepted limitation in §36.4.
+
+**Trusted under the rules currently enabled**, and the qualifier matters. Both fake-signature rules
+fired and contributed nothing by design:
+
+```json
+{"code": "ios_signing_identifier_bundle_mismatch", "points": 0, "report_only": true, "proposed_points": 90}
+{"code": "ios_known_fake_team_identifier",         "points": 0, "report_only": true, "proposed_points": 25}
+```
+
+With `INTEGRITY_SCORE_IOS_FAKE_SIGNATURE=1` this device scores **115**, which is the block band. So
+the rig can now produce either a clean baseline or a caught-red-handed reading from the same
+hardware, depending on one flag — which is considerably more useful than a device permanently stuck
+at 35.
+
+## 39.3 Identity survived everything
+
+```
+installation 39f14bc7   thumbprint 06163520a5d2   secure_enclave / true / SecureEnclave
+```
+
+The same thumbprint and the same installation id as the 2026-09-09 run, across a **fresh database**,
+a Codemagic rebuild, an `ldid` re-sign and a TrollStore reinstall. The installation id persists
+because the client stores it; the thumbprint persists because `keychain-access-groups` was
+reproduced byte for byte (§37.3). Had that value drifted, every rebuild would have silently minted a
+new device identity.
+
+## 39.4 The executable hash baseline cannot come from the build
+
+| stage | bytes | sha256 |
+|---|---|---|
+| Codemagic, unsigned | 382,016 | `33331b93…` |
+| after `ldid` pre-sign, shipped | 386,384 | `c019a07e…` |
+| **on device, as reported** | **425,123** | **`07b56611…`** |
+
+TrollStore rewrites the binary during installation, so the artifact hash and the installed hash are
+necessarily different. **Any deployment setting `INTEGRITY_IOS_EXECUTABLE_SHA256` must use the
+device-reported value, not the hash of the `.ipa` it built.** Pinning the build artifact's hash
+would hard-block every device on first contact.
+
+Incidentally confirmed: the Codemagic iOS host build is **reproducible**. `Runner` was byte-identical
+between two separate builds (`33331b93…`), because no Swift source changed between them; only the
+Dart snapshot in `App.framework` differed, carrying the new server URL. So a pinned hash is stable
+across rebuilds that do not touch the Swift host — though it still has to be taken from the device.
+
+## 39.5 What is still open
+
+- **`INTEGRITY_SCORE_IOS_FAKE_SIGNATURE` stays `0`.** §39.1 removed one of the two reasons for that,
+  but not the other: no legitimately signed iOS build has been observed, and the false-positive
+  guard for the rule is still only a conformance fixture rather than a real Apple-signed app.
+- **The policy decision on software-backed keys** (§35.7) is unchanged.
+- **The enforcement checks** skip in observe mode; the suite has not been run in enforce against this
+  backend.
