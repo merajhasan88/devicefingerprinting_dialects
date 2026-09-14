@@ -3679,3 +3679,76 @@ other face: where they silently *disagree*, only reading both finds it.
 
 Recorded in the .NET handoff as a contract item, with the field defined as the CodeDirectory
 identifier where a collector can read it.
+
+# 42. Battery item 15 — PASS on the iPhone 7 (2026-09-14)
+
+The first item of §25.11 formally executed on iOS. Item 15 exists because Android and iOS diverge on
+what an app uninstall destroys, and that divergence is a property worth asserting rather than
+assuming.
+
+## 42.1 The run
+
+| | before | after |
+|---|---|---|
+| Installation ID | `28a07714-ed32-4774-80a2-b60304f58f36` | **identical** |
+| Key thumbprint | `c0063a46887778dc78d6b93c2399c00b8538785f4d982cea5f20560294b4cbae` | **identical** |
+| Key created this launch | `No` | **`No`** |
+
+The app was removed through the home screen (**Remove App → Delete App**) and reinstalled from a
+pre-signed `.ipa` via TrollStore. `deleteKey` was **not** called, which is the whole point: item 12
+and item 13 use `deleteKey` to force a new key, and item 15 asserts that an ordinary uninstall does
+not.
+
+**PASS.**
+
+## 42.2 What makes the evidence strong
+
+The reinstall was genuine, not an in-place upgrade, and both container identifiers prove it:
+
+```
+bundle container   228B6059-5358-434D-8D48-9BD4C93E5DA2  →  9429B222-9E7A-4B31-B1A2-0D61FCC9BBDD
+data container     (previous)                            →  AE1820C2-692D-4F39-AC71-03B8E1917432
+```
+
+The **data container** is the one that matters. It is the app's entire sandbox — Documents,
+`UserDefaults`, caches — and iOS assigned a new one, so everything stored there was destroyed.
+Anything that survived can only have come from the Keychain.
+
+So the run pins two properties, not one:
+
+1. **The Secure Enclave key survives app deletion.** `created this launch: No` means
+   `getOrCreateKey` *loaded* the existing key rather than generating one, and the thumbprint proves
+   it is the same key.
+2. **`flutter_secure_storage` genuinely backs onto the Keychain, not the sandbox.** The installation
+   id survived a wiped data container, which it could not have done from `UserDefaults` or a file.
+   Nothing had previously checked this, and it is load-bearing: if that storage were sandbox-backed,
+   every reinstall would mint a new installation id while reusing the same key, and the two would
+   disagree.
+
+## 42.3 A control ran by accident, and it helps
+
+At 16:06 the same day, **Simulate fresh installation** was pressed on the same device. That is the
+opposite operation — it calls `deleteKey`, destroying the Secure Enclave key — and the database
+records exactly what item 15 says must *not* happen on an ordinary uninstall:
+
+```
+39f14bc7 | 06163520a5d2 | secure_enclave | new_device      | 15:51:32
+28a07714 | c0063a468877 | secure_enclave | reinstall_hint  | 16:06:21
+```
+
+A genuinely new key, a new installation, correlated back onto the same `device_id` by the
+IDFV-derived reinstall hint. Set beside §42.1, the pair shows the mechanism is discriminating rather
+than simply inert: **deleting the key changes identity, deleting the app does not.** A test that only
+showed the second could not distinguish "the key survived" from "the client never re-checks".
+
+## 42.4 Item 15 is engine-independent
+
+Worth recording because it affects how the battery is scheduled: **every pass criterion for item 15
+is read from the device**, and this run touched no server at all. The instance was running only to
+serve the `.ipa` over HTTPS, and the app's baked-in `API_BASE_URL` still pointed at a previous
+public IP throughout.
+
+So unlike items 2–8, 12 and 13, item 15 exercises no database behaviour and cannot distinguish one
+engine from another. Re-running it per engine family would cost device time and prove nothing new.
+Whether to record it as "run once, engine-independent" rather than "each" is a change to the battery
+and therefore not made here.
