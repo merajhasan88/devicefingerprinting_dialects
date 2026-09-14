@@ -15,10 +15,10 @@ import Security
 /// `_score_ios_integrity` in device_trust_server.py. Renaming a field silently
 /// disables the rule that reads it.
 final class IntegrityProbeManager {
-    /// Per-platform numbering. 1 = the baseline probe set below. A future 2
-    /// would add the dyld code-integrity analogue of Android's `code_integrity`
-    /// (see DESIGN.md 33.4).
-    private static let collectorVersion = 1
+    /// Per-platform numbering. 1 was the baseline probe set; 2 adds
+    /// `code_integrity`, the dyld analogue of Android's native probe
+    /// (DESIGN.md 33.4), which is what battery item 16 needs.
+    private static let collectorVersion = 2
     private static let maxTextLength = 8192
 
     /// Loaded-image names that indicate instrumentation or a hooking runtime.
@@ -70,6 +70,20 @@ final class IntegrityProbeManager {
             probes[probe] = runProbe(probe)
         }
 
+        // code_integrity is reported whether or not the server asked for it.
+        //
+        // The server tolerates probes beyond required_probes but rejects a
+        // report that omits a requested one, so a collector cannot be given a
+        // new mandatory probe without breaking every client that predates it -
+        // here that would mean the .NET iOS collector, which has the same eight
+        // probes this one had. Volunteering the measurement instead lets the
+        // server score it when present and ignore it when absent, so the two
+        // clients can adopt it independently. Promote it to the mandatory list
+        // once both report it.
+        if probes["code_integrity"] == nil {
+            probes["code_integrity"] = runProbe("code_integrity")
+        }
+
         // Debug-only synthetic fixtures exist on Android but were retired
         // (DESIGN.md 25.7) and are deliberately not implemented here. The
         // parameter is accepted and echoed so the channel contract matches.
@@ -93,6 +107,7 @@ final class IntegrityProbeManager {
         case "dyld_images":     return probeDyldImages()
         case "environment":     return probeEnvironment()
         case "simulator":       return probeSimulator()
+        case "code_integrity":  return probeCodeIntegrity()
         default:
             return [
                 "status": "unsupported",
@@ -177,6 +192,179 @@ final class IntegrityProbeManager {
             data, offset: signature.offset, size: signature.size, into: &result
         )
         return result
+    }
+
+    // MARK: - Code integrity
+
+    /// Compares each loaded image's `__TEXT,__text` in memory against the same
+    /// bytes on disk. This is the iOS analogue of Android's native
+    /// `code_integrity`, and the field names are a hard contract with
+    /// `_score_ios_integrity` mirroring `_score_android_integrity`.
+    ///
+    /// **Only the app bucket can be measured on iOS, and that is a platform
+    /// fact rather than an omission.** Android compares libc and libart
+    /// against `/apex/.../libc.so`, real files with real bytes. iOS system
+    /// libraries do not exist as individual files: dyld combines them into the
+    /// shared cache, so there is nothing to `open()` for UIKit or libobjc.
+    /// Those images are therefore counted as *unreadable*, never as clean.
+    ///
+    /// That distinction is the whole point. An implementation that skipped
+    /// them silently would report `ext_compared_bytes: 0, ext_diff_bytes: 0`,
+    /// which scores exactly like a pristine device while having measured
+    /// nothing — the defect recorded in DESIGN.md 28.8, and again in 34.3, and
+    /// again in 35.7. `checked` stays true because the app bucket really was
+    /// compared; `system_images_unreadable` and `system_bucket_reason` say why
+    /// the rest is empty.
+    private func probeCodeIntegrity() -> [String: Any] {
+        var result: [String: Any] = [
+            "status": "ok",
+            "checked": false,
+            // Core and ext are the system buckets. On iOS they are structurally
+            // unmeasurable; reported as zero-compared with a reason, so the
+            // server can tell "nothing to compare" from "compared and clean".
+            "core_compared_bytes": 0,
+            "core_diff_bytes": 0,
+            "diff_bytes": 0,
+            "ext_compared_bytes": 0,
+            "ext_diff_bytes": 0,
+            "ext_libs_diff": 0,
+            "app_compared_bytes": 0,
+            "app_diff_bytes": 0,
+            "app_libs_diff": 0,
+            "diffed_libs": "",
+            "system_images_unreadable": 0,
+            "system_bucket_reason": "dyld_shared_cache_has_no_backing_files",
+        ]
+
+        let bundlePath = Bundle.main.bundlePath
+        var appCompared = 0
+        var appDiff = 0
+        var appLibsDiff = 0
+        var systemUnreadable = 0
+        var diffedLibs: [String] = []
+        var imagesCompared = 0
+
+        for index in 0..<_dyld_image_count() {
+            guard let namePointer = _dyld_get_image_name(index),
+                  let header = _dyld_get_image_header(index) else { continue }
+            let path = String(cString: namePointer)
+
+            // Anything outside our own bundle is in the shared cache. Counted,
+            // not compared, and never treated as clean.
+            guard path.hasPrefix(bundlePath) else {
+                systemUnreadable += 1
+                continue
+            }
+
+            let slide = _dyld_get_image_vmaddr_slide(index)
+            guard let text = textSection(of: header) else { continue }
+            guard let onDisk = readFileRange(
+                path: path, offset: text.fileOffset, length: text.size
+            ) else {
+                // A bundle image we cannot read is also not clean.
+                systemUnreadable += 1
+                continue
+            }
+
+            let live = UnsafeRawPointer(bitPattern: UInt(text.vmAddress) + UInt(bitPattern: slide))
+            guard let live = live else { continue }
+
+            var differing = 0
+            onDisk.withUnsafeBytes { diskBytes in
+                let liveBytes = live.assumingMemoryBound(to: UInt8.self)
+                for offset in 0..<onDisk.count where liveBytes[offset] != diskBytes[offset] {
+                    differing += 1
+                }
+            }
+
+            imagesCompared += 1
+            appCompared += onDisk.count
+            if differing > 0 {
+                appDiff += differing
+                appLibsDiff += 1
+                diffedLibs.append((path as NSString).lastPathComponent)
+            }
+        }
+
+        // checked means "the app bucket was genuinely compared". If not one
+        // bundle image could be read, nothing was measured and saying
+        // otherwise would be the exact lie this probe exists to avoid.
+        result["checked"] = imagesCompared > 0
+        result["app_compared_bytes"] = appCompared
+        result["app_diff_bytes"] = appDiff
+        result["app_libs_diff"] = appLibsDiff
+        result["app_images_compared"] = imagesCompared
+        result["system_images_unreadable"] = systemUnreadable
+        result["diffed_libs"] = diffedLibs.joined(separator: ",")
+        return result
+    }
+
+    private struct TextSection {
+        let vmAddress: UInt64
+        let fileOffset: Int
+        let size: Int
+    }
+
+    /// Locates `__TEXT,__text` in a loaded image by walking its load commands.
+    private func textSection(of header: UnsafePointer<mach_header>) -> TextSection? {
+        let raw = UnsafeRawPointer(header)
+        guard raw.assumingMemoryBound(to: mach_header_64.self).pointee.magic == MH_MAGIC_64 else {
+            return nil
+        }
+        let header64 = raw.assumingMemoryBound(to: mach_header_64.self)
+        var cursor = raw.advanced(by: MemoryLayout<mach_header_64>.size)
+
+        for _ in 0..<header64.pointee.ncmds {
+            let command = cursor.assumingMemoryBound(to: load_command.self)
+            if command.pointee.cmd == UInt32(LC_SEGMENT_64) {
+                let segment = cursor.assumingMemoryBound(to: segment_command_64.self)
+                if name(of: segment.pointee.segname) == "__TEXT" {
+                    var section = cursor.advanced(by: MemoryLayout<segment_command_64>.size)
+                    for _ in 0..<segment.pointee.nsects {
+                        let entry = section.assumingMemoryBound(to: section_64.self)
+                        if name(of: entry.pointee.sectname) == "__text" {
+                            let size = Int(entry.pointee.size)
+                            guard size > 0, size <= 64 * 1024 * 1024 else { return nil }
+                            return TextSection(
+                                vmAddress: entry.pointee.addr,
+                                fileOffset: Int(entry.pointee.offset),
+                                size: size
+                            )
+                        }
+                        section = section.advanced(by: MemoryLayout<section_64>.size)
+                    }
+                }
+            }
+            cursor = cursor.advanced(by: Int(command.pointee.cmdsize))
+        }
+        return nil
+    }
+
+    /// Mach-O stores segment and section names as a fixed 16-byte field that is
+    /// NOT necessarily NUL-terminated, so it cannot be read with String(cString:).
+    private func name(of field: Any) -> String {
+        var bytes: [UInt8] = []
+        withUnsafeBytes(of: field) { raw in
+            for byte in raw {
+                if byte == 0 { break }
+                bytes.append(byte)
+            }
+        }
+        return String(decoding: bytes, as: UTF8.self)
+    }
+
+    private func readFileRange(path: String, offset: Int, length: Int) -> Data? {
+        guard let handle = FileHandle(forReadingAtPath: path) else { return nil }
+        defer { try? handle.close() }
+        do {
+            try handle.seek(toOffset: UInt64(offset))
+            guard let data = try handle.read(upToCount: length), data.count == length else {
+                return nil
+            }
+            return data
+        } catch {
+            return nil
+        }
     }
 
     // MARK: - Mach-O and code-signature parsing

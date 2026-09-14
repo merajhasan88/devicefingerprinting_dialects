@@ -1809,7 +1809,7 @@ after the original four groups and are folded in here so this list is the single
 
 | # | Item | Pass criterion | Phones |
 |---|---|---|---|
-| 1 | Clean baseline scan | `score=18 verdict=trusted` (dev options +8, adb +10) | each |
+| 1 | Clean baseline scan | **Android:** `score=18 verdict=trusted` (dev options +8, adb +10). **iOS:** `score=0 verdict=trusted` on a build put through `tools/presign_trollstore_ipa.sh`, with `INTEGRITY_ALLOW_DEBUG=0` and `INTEGRITY_SCORE_IOS_FAKE_SIGNATURE=0` | each |
 | 2 | Account creation through the enforce gate | `POST /v1/accounts/register` 201 | each |
 | 3 | Stolen access token | `invalid_installation_signature`, refused *after* reaching proof verification | **both, simultaneously** |
 | 4 | Stolen refresh token | refresh challenge 200 (token genuine) **then** refresh 401 | **both, simultaneously** |
@@ -1846,6 +1846,17 @@ separated because they catch different attacks and report through different reas
 the app bucket. For a customer, 16 is the more directly meaningful — it is *their* code an attacker
 wants to patch. An app bucket reporting `app_compared_bytes: 0` is inert rather than clean, and that
 is invisible in the score.
+
+**Item 1's two criteria are not arbitrary.** The Android figure is 18 because the test handsets run
+with developer options and ADB enabled, which are real signals the server is right to score. The iOS
+figure is 0 because an iPhone has no equivalent pair of switches — but only on a **pre-signed** build.
+TrollStore grants `get-task-allow` to everything it installs, which is `ios_get_task_allow` +35, and
+before §37 that made `trusted` unreachable on iOS at all. Both flag states are named in the criterion
+because each changes the expected number: `INTEGRITY_ALLOW_DEBUG=1` would mask the +35 rather than
+remove it (and would also disable `ios_process_traced`), and
+`INTEGRITY_SCORE_IOS_FAKE_SIGNATURE=1` scores the same clean device at 100, since a TrollStore
+install trips the fake-signature rules by construction. A bare "score 0" would therefore be
+unreproducible.
 
 **Items 12, 13 and 15 differ by platform, deliberately.** Android Keystore entries are destroyed
 when the app is uninstalled, so a reinstall necessarily enrols a new hardware key — which is exactly

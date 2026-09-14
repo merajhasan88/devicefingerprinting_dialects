@@ -177,6 +177,15 @@ INTEGRITY_SCORE_IOS_FAKE_SIGNATURE = (
     os.environ.get("INTEGRITY_SCORE_IOS_FAKE_SIGNATURE", "0").strip() == "1"
 )
 
+# iOS structural code integrity, the app bucket (battery item 16, DESIGN.md 33.4).
+# Report-only by default for the same reason as the rules above: the signal has
+# never been baselined on hardware, and a code-integrity probe that has not been
+# confirmed to read non-zero on a clean device is indistinguishable from one
+# that measures nothing at all (DESIGN.md 28.8).
+INTEGRITY_SCORE_IOS_CODE_INTEGRITY = (
+    os.environ.get("INTEGRITY_SCORE_IOS_CODE_INTEGRITY", "0").strip() == "1"
+)
+
 # Team identifiers belonging to known fake-signing tooling. Compared
 # case-insensitively. This is a NAME match and carries every weakness that
 # implies -- see the comment on the rule that uses it.
@@ -1741,6 +1750,29 @@ def _score_ios_integrity(probes):
         _integrity_reason(reasons, "ios_simulator", 25, "The app is running in the iOS simulator.")
         score += 25
 
+    # Structural code integrity, app bucket only (battery item 16).
+    #
+    # There is no iOS equivalent of item 14. Android compares libc and libart
+    # against real files; iOS system libraries have no individual files at all,
+    # because dyld merges them into the shared cache. The collector reports
+    # those images as system_images_unreadable rather than as zero-diff, so a
+    # structurally unmeasurable bucket is never mistaken for a clean one.
+    #
+    # checked gates the rule, exactly as on Android: an app bucket reporting
+    # app_compared_bytes 0 is inert, not clean, and must not be scored as
+    # either. The 4-byte floor is one arm64 branch, the smallest inline hook.
+    code = _probe(probes, "code_integrity")
+    if _as_bool(code.get("checked")) and int(code.get("app_diff_bytes") or 0) >= 4:
+        _integrity_reason(
+            reasons,
+            "ios_app_code_modified",
+            90,
+            "The application's own code differs in memory from its packaged image.",
+            report_only=not INTEGRITY_SCORE_IOS_CODE_INTEGRITY,
+        )
+        if INTEGRITY_SCORE_IOS_CODE_INTEGRITY:
+            score += 90
+
     return score, hard_block, reasons
 
 
@@ -2998,6 +3030,7 @@ def health_ready():
             "scoring_flags": {
                 "extended_libs": INTEGRITY_SCORE_EXTENDED_LIBS,
                 "ios_fake_signature": INTEGRITY_SCORE_IOS_FAKE_SIGNATURE,
+                "ios_code_integrity": INTEGRITY_SCORE_IOS_CODE_INTEGRITY,
             },
             "remote_attestation": "not_used",
             "redis": _redis_status(),

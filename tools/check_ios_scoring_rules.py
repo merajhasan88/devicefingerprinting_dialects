@@ -84,7 +84,7 @@ TROLLSTORE = {
 }
 
 
-def probes(**signing):
+def probes(code_integrity=None, **signing):
     base = {
         "status": "ok",
         "signed": True,
@@ -93,7 +93,7 @@ def probes(**signing):
         "get_task_allow": False,
     }
     base.update(signing)
-    return {
+    result = {
         "app_identity": {"status": "ok", "bundle_id": BUNDLE,
                          "executable_sha256": "ab" * 32},
         "code_signing": base,
@@ -104,6 +104,9 @@ def probes(**signing):
         "environment": {"status": "ok", "dyld_insert_libraries": ""},
         "simulator": {"status": "ok", "is_simulator": False},
     }
+    if code_integrity is not None:
+        result["code_integrity"] = code_integrity
+    return result
 
 
 MISMATCH = "ios_signing_identifier_bundle_mismatch"
@@ -192,9 +195,51 @@ def main():
           reason(reasons, MISMATCH) is None and reason(reasons, FAKE_TEAM) is None,
           sorted(r["code"] for r in reasons))
 
+    # --- code integrity, app bucket (battery item 16) ---------------------
+    clean_ci = {"status": "ok", "checked": True,
+                "app_compared_bytes": 900000, "app_diff_bytes": 0,
+                "system_images_unreadable": 312}
+    score, _, reasons = server._score_ios_integrity(probes(code_integrity=clean_ci))
+    check("a clean app bucket raises nothing",
+          reason(reasons, "ios_app_code_modified") is None, sorted(r["code"] for r in reasons))
+    check("and unreadable system images are not a finding", score == 0, score)
+
+    hooked_ci = dict(clean_ci, app_diff_bytes=108, app_libs_diff=1,
+                     diffed_libs="App")
+    score, _, reasons = server._score_ios_integrity(probes(code_integrity=hooked_ci))
+    modified = reason(reasons, "ios_app_code_modified")
+    check("a modified app bucket raises ios_app_code_modified",
+          modified is not None, sorted(r["code"] for r in reasons))
+    check("and it ships report-only by default",
+          modified is not None and modified.get("report_only") is True, modified)
+    check("contributing 0 while report-only", score == 0, score)
+
+    # The inert-vs-clean distinction, which is the whole reason `checked` exists.
+    inert_ci = {"status": "ok", "checked": False,
+                "app_compared_bytes": 0, "app_diff_bytes": 108}
+    score, _, reasons = server._score_ios_integrity(probes(code_integrity=inert_ci))
+    check("an UNCHECKED bucket is not scored, even reporting a diff",
+          reason(reasons, "ios_app_code_modified") is None, sorted(r["code"] for r in reasons))
+
+    score, _, reasons = server._score_ios_integrity(probes())
+    check("a client that sends no code_integrity at all raises nothing",
+          reason(reasons, "ios_app_code_modified") is None, sorted(r["code"] for r in reasons))
+
+    # A sub-instruction diff is below the one-arm64-branch floor.
+    tiny_ci = dict(clean_ci, app_diff_bytes=3)
+    score, _, reasons = server._score_ios_integrity(probes(code_integrity=tiny_ci))
+    check("a 3-byte diff is below the 4-byte inline-hook floor",
+          reason(reasons, "ios_app_code_modified") is None, sorted(r["code"] for r in reasons))
+
     # --- the same input with scoring enabled ------------------------------
     os.environ["INTEGRITY_SCORE_IOS_FAKE_SIGNATURE"] = "1"
+    os.environ["INTEGRITY_SCORE_IOS_CODE_INTEGRITY"] = "1"
     scoring = load(path)
+    score, _, reasons = scoring._score_ios_integrity(probes(code_integrity=hooked_ci))
+    modified = reason(reasons, "ios_app_code_modified")
+    check("enabled: a modified app bucket scores its full 90",
+          modified is not None and modified["points"] == 90 and score == 90,
+          (modified, score))
     check("the flag switches scoring on",
           scoring.INTEGRITY_SCORE_IOS_FAKE_SIGNATURE is True)
 
