@@ -3101,11 +3101,25 @@ Two things are visible here that no baseline was needed to see.
 
 **`team_identifier` is literally `TROLLTROLL`** — a hardcoded fake team.
 
-**`signing_identifier` is `com.icraze.gtatracker`, not our bundle identifier.** This is the
-CoreTrust bypass (CVE-2023-41991) showing its working. TrollStore grafts on a genuinely
-Apple-signed CMS blob taken from a donor App Store application; CoreTrust accepts the signature
-without checking that the CodeDirectory it covers is the one being loaded, so the CodeDirectory
-keeps the **donor's** identifier. The mismatch is not incidental — it is the exploit.
+**`signing_identifier` is `com.icraze.gtatracker`, not our bundle identifier.**
+
+That sentence is the measurement. The paragraph that originally followed it was not, and has been
+replaced, because it described the wrong bug. CVE-2023-41991 is a **multiple-signer confusion**
+vulnerability: a single CMS blob carries two signers, and CoreTrust decides the binary is
+Apple-signed from the *first* signer's certificate chain while validating the binary against the
+*second* signer's CodeDirectory hashes ([The Apple Wiki][ct]). TrollStore supplies a real App Store
+binary's signature as the first signer.
+
+What has **not** been established is which part of that assembly produces the identifier our probe
+reads. The probe reads slot 0 of the SuperBlob; whether the donor identifier reliably lands there
+across TrollStore versions and donor binaries is unknown. So the rule in §35.5 may be keying on an
+artifact of how TrollStore builds the blob rather than on something intrinsic to the exploit — which
+is a further reason, beyond the missing clean baseline, for it to stay report-only.
+
+Settling it needs the collector to report the full SuperBlob slot inventory rather than slot 0
+alone, which is a probe change and a rebuild.
+
+[ct]: https://theapplewiki.com/wiki/CoreTrust_Multiple_Signer_Validation_Vulnerability
 
 Only `get-task-allow` scored, for `+35`. The far stronger signals were sitting in the same probe
 output unscored, which is what the observe run was for.

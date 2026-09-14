@@ -76,10 +76,8 @@ def load(path):
 
 BUNDLE = "com.example.devicefingerprinting"
 
-# What a CoreTrust-bypassed application actually looked like on the iPhone 7:
-# TrollStore grafts on an Apple-signed CMS blob taken from a donor App Store
-# app, so the CodeDirectory keeps the donor's identifier while the bundle is
-# ours. Recorded verbatim in DESIGN.md 35.4.
+# Exactly what a TrollStore-installed build reported on the iPhone 7, recorded
+# verbatim in DESIGN.md 35.4. An observation, not a model of the exploit.
 TROLLSTORE = {
     "signing_identifier": "com.icraze.gtatracker",
     "team_identifier": "TROLLTROLL",

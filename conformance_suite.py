@@ -1272,9 +1272,9 @@ def check_device_memory(api, ctx):
 # absence guard (35.7).
 # ---------------------------------------------------------------------------
 
-# What a CoreTrust-bypassed application actually looked like on the iPhone 7:
-# an Apple-signed CMS blob grafted from a donor App Store app, so the
-# CodeDirectory keeps the donor's identifier while the bundle is ours.
+# Exactly what a TrollStore-installed build reported on the iPhone 7. This is
+# an observation, not a model of the exploit: why the identifier comes out as
+# another application's has not been established. See DESIGN.md 35.4.
 IOS_FAKE_SIGNATURE = {
     "signing_identifier": "com.icraze.gtatracker",
     "team_identifier": "TROLLTROLL",

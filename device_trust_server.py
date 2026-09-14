@@ -1645,14 +1645,23 @@ def _score_ios_integrity(probes):
     # fake-signed application at zero for its signature.
     scoring_fake_signature = INTEGRITY_SCORE_IOS_FAKE_SIGNATURE
 
-    # A legitimately signed iOS application always has its CodeDirectory
-    # identifier equal to its bundle identifier -- Xcode derives one from the
-    # other. A mismatch is an INVARIANT VIOLATION rather than a heuristic, and
-    # it is precisely how a CoreTrust bypass (CVE-2023-41991) shows itself: the
-    # grafted-on Apple-signed CMS blob keeps the donor application's identifier,
-    # because the bug is that CoreTrust never checks the CodeDirectory it
-    # covers is the one being loaded. Observed on the iPhone 7 as
-    # signing_identifier "com.icraze.gtatracker" against our own bundle id.
+    # A legitimately signed iOS application has its CodeDirectory identifier
+    # equal to its bundle identifier, because Xcode derives one from the other.
+    #
+    # MEASURED: on the iPhone 7, a TrollStore-installed build reported
+    # signing_identifier "com.icraze.gtatracker" against our own bundle id
+    # com.example.devicefingerprinting. That is the whole of the evidence.
+    #
+    # NOT MEASURED, and deliberately not claimed here: exactly which part of
+    # the CoreTrust bypass produces that identifier. CVE-2023-41991 is a
+    # multiple-signer confusion bug -- one CMS blob carries two signers, and
+    # CoreTrust takes the Apple-signed verdict from the first signer's
+    # certificates while validating the binary against the second signer's
+    # CodeDirectory hashes. Whether the donor identifier always lands in
+    # slot 0 of the SuperBlob, across TrollStore versions and donor binaries,
+    # has not been established. The rule may therefore be keying on an
+    # assembly artifact rather than on an invariant of the exploit, which is
+    # one more reason it ships report-only.
     #
     # Both operands must be non-empty. An unsigned build legitimately reports an
     # empty signing_identifier, and an absent measurement must never be read as
