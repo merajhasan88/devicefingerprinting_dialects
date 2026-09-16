@@ -100,34 +100,19 @@ workflows:
           # image's Xcode. Print what was resolved, because that single line is
           # the answer to "which bindings did this actually build against".
           dotnet workload install ios
+          # The manifest version printed here IS the Xcode version the workload
+          # demands, to the minor: 26.5.9004 means Xcode 26.5. Read next to
+          # xcodebuild -version from the first step, that is the entire
+          # diagnosis for the one failure this workflow is prone to.
+          #
+          # A script comparing the two automatically used to live here. It
+          # failed three builds and caught nothing: once by reading the wrong
+          # directory, then twice on SIGPIPE, because `head -1` closes the pipe
+          # while xcodebuild is still writing its second line and pipefail turns
+          # that into a failed step. The build's own error names both versions
+          # plainly, so the comparison added no information and three ways to
+          # break. Printing the facts was always the useful half.
           dotnet workload list
-
-          # Fail here rather than four minutes into the build. This exact
-          # mismatch has already cost one run: restore and the shared library
-          # both succeeded, and the version check fired afterwards, deep in a
-          # targets file. The pairing is an equality, not a floor.
-          # Read the requirement from the workload manifest, whose version IS the
-          # Xcode version to the minor. Listing the installed packs got this
-          # wrong and failed a good build: installing the workload lays down
-          # packs for several frameworks at once, and the first one
-          # alphabetically was Microsoft.iOS.Sdk.net8.0_17.0, nothing to do with
-          # what this build uses.
-          WANT=$(dotnet workload list | awk '$1 == "ios" { print $2 }' | cut -d/ -f1 | cut -d. -f1,2)
-          HAVE=$(xcodebuild -version | head -1 | awk '{print $2}' | cut -d. -f1,2)
-          if echo "$WANT" | grep -qE '^[0-9]+\.[0-9]+$'; then
-            echo "iOS workload wants Xcode $WANT; this image has $HAVE"
-            if [ "$WANT" != "$HAVE" ]; then
-              echo "MISMATCH. Set 'xcode: $WANT' in codemagic.yaml, or move IOS_TFM"
-              echo "to a runtime whose bindings pair with Xcode $HAVE."
-              exit 1
-            fi
-          else
-            # Fail open. A guard exists to make a real mismatch cheap to
-            # diagnose; one that cannot read the versions has nothing to say,
-            # and stopping the build on its own confusion is worse than the
-            # four minutes it was meant to save.
-            echo "could not read the workload's Xcode requirement; leaving it to the build"
-          fi
 
       - name: Verify the parts that can be checked without a device
         script: |
@@ -166,7 +151,7 @@ workflows:
       - name: Package the .app into an unsigned .ipa
         script: |
           set -euo pipefail
-          APP=$(find src/DeviceTrust.iOS.Harness/bin/Release -maxdepth 4 -name '*.app' -type d | head -1)
+          APP=$(find src/DeviceTrust.iOS.Harness/bin/Release -maxdepth 4 -name '*.app' -type d -print -quit)
           test -n "$APP" || { echo "no .app produced; see the build log above"; exit 1; }
           echo "bundling $APP"
           rm -rf build/ipa && mkdir -p build/ipa/Payload
@@ -177,9 +162,9 @@ workflows:
       - name: Report what the build produced
         script: |
           set -euo pipefail
-          APP=$(find src/DeviceTrust.iOS.Harness/bin/Release -maxdepth 4 -name '*.app' -type d | head -1)
+          APP=$(find src/DeviceTrust.iOS.Harness/bin/Release -maxdepth 4 -name '*.app' -type d -print -quit)
           echo "--- bundle contents ---"
-          ls -1 "$APP" | head -30
+          ls -1 "$APP" | awk 'NR <= 30'
           echo "--- nested dylibs OUTSIDE Frameworks/ ---"
           # A dylib at the bundle root is the documented cause of a sideloaded
           # app that flashes and closes: signing tools walk Frameworks/ and
@@ -190,7 +175,7 @@ workflows:
           echo "--- declared minimum OS ---"
           /usr/libexec/PlistBuddy -c "Print :MinimumOSVersion" "$APP/Info.plist" || true
           echo "--- entitlements currently embedded (expect none: unsigned) ---"
-          codesign -d --entitlements :- "$APP" 2>&1 | head -20 || true
+          codesign -d --entitlements :- "$APP" 2>&1 | awk 'NR <= 20' || true
 
     artifacts:
       - devicetrust-dotnet-unsigned.ipa
