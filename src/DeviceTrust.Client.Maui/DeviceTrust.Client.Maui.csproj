@@ -16,7 +16,10 @@
     <Description>AndroidKeyStore and iOS Secure Enclave installation keys, plus the native integrity probe sets, for the Device Trust client SDK.</Description>
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
     <SupportedOSPlatformVersion Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'android'">23.0</SupportedOSPlatformVersion>
-    <SupportedOSPlatformVersion Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'ios'">13.0</SupportedOSPlatformVersion>
+    <!-- 15.0, not 13.0. The reference session measured the real floor: the
+         toolchain's own minimum lands here, and the test iPhone 7 runs 15.8.5,
+         so 13.0 was aspirational rather than tested. -->
+    <SupportedOSPlatformVersion Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'ios'">15.0</SupportedOSPlatformVersion>
   </PropertyGroup>
 
   <ItemGroup>

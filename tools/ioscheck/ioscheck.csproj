@@ -46,6 +46,7 @@
   <ItemGroup>
     <PackageDownload Include="Microsoft.iOS.Ref.net9.0_18.0" Version="[18.0.9617]" />
     <Compile Include="../../src/DeviceTrust.Client.Maui/Apple/*.cs" />
+    <Compile Include="../../src/DeviceTrust.iOS.Harness/*.cs" />
     <ProjectReference Include="../../src/DeviceTrust.Client/DeviceTrust.Client.csproj" />
     <Reference Include="Microsoft.iOS">
       <HintPath>$(MSBuildThisFileDirectory)packages/microsoft.ios.ref.net9.0_18.0/18.0.9617/ref/net9.0/Microsoft.iOS.dll</HintPath>

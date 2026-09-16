@@ -50,7 +50,7 @@ namespace DeviceTrust.Client.Storage
             try
             {
                 var text = File.ReadAllText(_path);
-                var state = JsonSerializer.Deserialize(text, InstallationStateJsonContext.Default.InstallationState);
+                var state = InstallationStateSerializer.Deserialize(text);
                 return Task.FromResult(state ?? new InstallationState());
             }
             catch (JsonException)
@@ -79,7 +79,7 @@ namespace DeviceTrust.Client.Storage
                 Directory.CreateDirectory(directory!);
             }
 
-            File.WriteAllText(_path, JsonSerializer.Serialize(state, InstallationStateJsonContext.Default.InstallationState));
+            File.WriteAllText(_path, InstallationStateSerializer.Serialize(state));
             return Task.CompletedTask;
         }
 

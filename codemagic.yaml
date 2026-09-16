@@ -1,0 +1,116 @@
+# Codemagic CI - unsigned iOS build of the .NET device-trust harness.
+#
+# This is the .NET counterpart of the Flutter client's workflow, and it lives on
+# a separate branch of the same repository so both can share one Codemagic
+# connection. Read the Flutter one first if you have not: the reasoning about
+# unsigned builds, manual .ipa packaging and manual triggering applies here
+# unchanged, and is not repeated.
+#
+# What differs from the Flutter workflow, and why:
+#
+#   * NO API_BASE_URL. The Flutter client takes its endpoint at compile time via
+#     --dart-define, so its .ipa is pinned to one server and has to be rebuilt
+#     whenever the EC2 instance restarts and its public IP changes. This harness
+#     takes the endpoint from a text field on screen and remembers it in
+#     NSUserDefaults, so one build survives every IP change. That matters here:
+#     a rebuild costs 10-20 of the 500 free macOS minutes per month, shared with
+#     the Flutter side.
+#
+#   * .NET IS INSTALLED BY THE BUILD. Codemagic's macOS images carry Xcode and
+#     Flutter, not necessarily the .NET SDK or its ios workload, so both are
+#     installed here. Pinning the SDK version keeps a build reproducible rather
+#     than tracking whatever is current.
+#
+#   * MANUAL TRIGGER ONLY, same as the Flutter workflow and for the same reason.
+#
+# The .ipa this produces is UNSIGNED and must be run through
+# tools/presign_trollstore_ipa.sh before TrollStore sees it. Skip that and
+# TrollStore applies its own entitlements, which include get-task-allow, and the
+# device silently regains a permanent +35 ios_get_task_allow floor that makes a
+# clean baseline unobtainable.
+
+workflows:
+  dotnet-ios-unsigned:
+    name: .NET iOS unsigned build (TrollStore device target)
+    instance_type: mac_mini_m2
+    max_build_duration: 45
+
+    environment:
+      xcode: latest
+      vars:
+        DOTNET_VERSION: "8.0"
+        DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+        DOTNET_NOLOGO: "1"
+        PROJECT: "src/DeviceTrust.iOS.Harness/DeviceTrust.iOS.Harness.csproj"
+
+    scripts:
+      - name: Install the .NET SDK and the ios workload
+        script: |
+          set -euo pipefail
+          curl -fsSL https://dot.net/v1/dotnet-install.sh -o /tmp/dotnet-install.sh
+          chmod +x /tmp/dotnet-install.sh
+          /tmp/dotnet-install.sh --channel "$DOTNET_VERSION" --install-dir "$HOME/.dotnet"
+          export DOTNET_ROOT="$HOME/.dotnet"
+          export PATH="$DOTNET_ROOT:$PATH"
+          dotnet --info | head -12
+          dotnet workload install ios --skip-manifest-update
+
+      - name: Verify the parts that can be checked without a device
+        script: |
+          set -euo pipefail
+          export DOTNET_ROOT="$HOME/.dotnet"; export PATH="$DOTNET_ROOT:$PATH"
+          # The platform-neutral tests include the Mach-O and entitlements
+          # parsing the iOS collector depends on. Failing here is cheaper than
+          # failing on the device.
+          dotnet test --nologo -v q
+
+      - name: Build the iOS app unsigned
+        script: |
+          set -euo pipefail
+          export DOTNET_ROOT="$HOME/.dotnet"; export PATH="$DOTNET_ROOT:$PATH"
+          # Device builds normally demand a signing identity and a provisioning
+          # profile, both of which need a paid Apple Developer account. The
+          # target is a TrollStore device, where the signature is applied later
+          # and by something else, so signing is disabled outright rather than
+          # faked.
+          dotnet publish "$PROJECT" \
+            -f net8.0-ios -c Release \
+            -p:RuntimeIdentifier=ios-arm64 \
+            -p:CodesignKey="" \
+            -p:CodesignProvision="" \
+            -p:EnableCodeSigning=false \
+            -p:_RequireCodeSigning=false \
+            -p:ArchiveOnBuild=false
+
+      - name: Package the .app into an unsigned .ipa
+        script: |
+          set -euo pipefail
+          APP=$(find src/DeviceTrust.iOS.Harness/bin/Release -maxdepth 4 -name '*.app' -type d | head -1)
+          test -n "$APP" || { echo "no .app produced; see the build log above"; exit 1; }
+          echo "bundling $APP"
+          rm -rf build/ipa && mkdir -p build/ipa/Payload
+          cp -R "$APP" build/ipa/Payload/
+          ( cd build/ipa && zip -qry ../../devicetrust-dotnet-unsigned.ipa Payload )
+          ls -lh devicetrust-dotnet-unsigned.ipa
+
+      - name: Report what the build produced
+        script: |
+          set -euo pipefail
+          APP=$(find src/DeviceTrust.iOS.Harness/bin/Release -maxdepth 4 -name '*.app' -type d | head -1)
+          echo "--- bundle contents ---"
+          ls -1 "$APP" | head -30
+          echo "--- nested dylibs OUTSIDE Frameworks/ ---"
+          # A dylib at the bundle root is the documented cause of a sideloaded
+          # app that flashes and closes: signing tools walk Frameworks/ and
+          # PlugIns/ and miss anything else, so it loads with an invalid
+          # signature. A .NET bundle can carry several, so list them explicitly
+          # rather than discovering it from a crash report.
+          find "$APP" -maxdepth 1 -name '*.dylib' -print || true
+          echo "--- declared minimum OS ---"
+          /usr/libexec/PlistBuddy -c "Print :MinimumOSVersion" "$APP/Info.plist" || true
+          echo "--- entitlements currently embedded (expect none: unsigned) ---"
+          codesign -d --entitlements :- "$APP" 2>&1 | head -20 || true
+
+    artifacts:
+      - devicetrust-dotnet-unsigned.ipa
+      - src/DeviceTrust.iOS.Harness/bin/Release/**/*.app

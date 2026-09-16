@@ -1,0 +1,44 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    The iOS counterpart of DeviceTrust.Android.Harness: a button per battery
+    item, driving the real Secure Enclave key store and the real iOS collector.
+
+    Buildable on macOS only, because the ios workload needs Xcode. On Linux the
+    sources are still compile-checked against Apple's genuine bindings by
+    tools/ioscheck, which is what caught four defects in the key store that
+    reading the code had not.
+  -->
+
+  <PropertyGroup>
+    <TargetFramework>net8.0-ios</TargetFramework>
+    <OutputType>Exe</OutputType>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <RootNamespace>DeviceTrust.iOS.Harness</RootNamespace>
+    <ApplicationTitle>DeviceFingerprinting .NET</ApplicationTitle>
+
+    <!-- Distinct from the Flutter reference client's
+         com.example.devicefingerprinting. iOS keys an install by bundle id, and
+         the two apps share the test iPhone. -->
+    <ApplicationId>com.example.devicefingerprinting_dotnet</ApplicationId>
+    <ApplicationVersion>1</ApplicationVersion>
+    <ApplicationDisplayVersion>1.0</ApplicationDisplayVersion>
+
+    <!-- 15.0 is the measured floor, not 13.0; the test iPhone 7 runs 15.8.5. -->
+    <SupportedOSPlatformVersion>15.0</SupportedOSPlatformVersion>
+
+    <!-- .NET for iOS is fully AOT for device builds, so there is no Mono JIT and
+         therefore none of the writable-executable memory that gives the Android
+         client its android_wx_memory floor. The iOS scorer has no W^X rule at
+         all; this is expected to be the easier platform for reaching trusted. -->
+    <RuntimeIdentifier Condition="'$(Configuration)' == 'Release'">ios-arm64</RuntimeIdentifier>
+    <CodesignKey Condition="'$(CodesignKey)' == ''"></CodesignKey>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\DeviceTrust.Client\DeviceTrust.Client.csproj" />
+    <ProjectReference Include="..\DeviceTrust.Client.Maui\DeviceTrust.Client.Maui.csproj" />
+  </ItemGroup>
+
+</Project>

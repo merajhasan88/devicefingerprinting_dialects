@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Entitlements for the TrollStore build of the .NET harness.
+
+  These are exactly the entitlements TrollStore grants an app it installs, minus
+  get-task-allow, with the container identifier pointing at THIS app's bundle id
+  rather than the Flutter client's. The Flutter session read the original set off
+  the device rather than guessing, and this file reproduces it.
+
+  Why omit get-task-allow. It is iOS's debuggable flag, scored +35 by
+  ios_get_task_allow, and TrollStore sets it on everything it installs so its JIT
+  option works. That gave the test iPhone a permanent floor: the device could
+  never read trusted, so no clean iOS baseline was obtainable. Suppressing it
+  server-side with INTEGRITY_ALLOW_DEBUG is the wrong answer, because that flag
+  gates six rules across both platforms including ios_process_traced (+50), and
+  would blind the server to a real debugger attaching.
+
+  Why keep keychain-access-groups byte for byte. The Secure Enclave key AND the
+  installation state both live in that access group. Change the value and both
+  become unreachable, the app silently mints a new key and a new installation id,
+  and the identity resets on every rebuild -- which would make battery item 15
+  fail for a reason that has nothing to do with what item 15 tests.
+
+  Applied by tools/presign_trollstore_ipa.sh, which fails closed if
+  get-task-allow survives signing.
+-->
+<plist version="1.0">
+<dict>
+	<key>application-identifier</key>
+	<string>TROLLTROLL.*</string>
+	<key>com.apple.developer.team-identifier</key>
+	<string>TROLLTROLL</string>
+	<key>com.apple.private.security.container-required</key>
+	<string>com.example.devicefingerprinting_dotnet</string>
+	<key>keychain-access-groups</key>
+	<array>
+		<string>TROLLTROLL.*</string>
+		<string>com.apple.token</string>
+	</array>
+</dict>
+</plist>
