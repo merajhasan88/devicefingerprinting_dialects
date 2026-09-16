@@ -243,6 +243,8 @@ final class IntegrityProbeManager {
         var systemUnreadable = 0
         var diffedLibs: [String] = []
         var imagesCompared = 0
+        var segmentCompared = 0
+        var segmentDiff = 0
 
         for index in 0..<_dyld_image_count() {
             guard let namePointer = _dyld_get_image_name(index),
@@ -257,30 +259,49 @@ final class IntegrityProbeManager {
             }
 
             let slide = _dyld_get_image_vmaddr_slide(index)
-            guard let text = textSection(of: header) else { continue }
+            guard let span = textSpan(of: header) else { continue }
             guard let onDisk = readFileRange(
-                path: path, offset: text.fileOffset, length: text.size
+                path: path, offset: span.segmentFileOffset, length: span.segmentSize
             ) else {
                 // A bundle image we cannot read is also not clean.
                 systemUnreadable += 1
                 continue
             }
 
-            let live = UnsafeRawPointer(bitPattern: UInt(text.vmAddress) + UInt(bitPattern: slide))
-            guard let live = live else { continue }
+            let liveBase = UnsafeRawPointer(
+                bitPattern: UInt(span.segmentVMAddress) + UInt(bitPattern: slide)
+            )
+            guard let liveBase = liveBase else { continue }
 
-            var differing = 0
+            // One pass over the whole __TEXT segment, attributing each differing
+            // byte to __text or to the rest. __text is what gets scored; the
+            // remainder - the Mach-O header, __stubs, __cstring, __unwind_info -
+            // is reported separately because it has no clean baseline yet. If it
+            // measures zero on hardware, the header's unused mach_header_64
+            // .reserved field becomes a safe flip target, the direct analogue of
+            // the ELF EI_PAD bytes used to close the app bucket on Android
+            // (DESIGN.md 30.4). Until then it must not influence a verdict.
+            var textDiffering = 0
+            var segmentDiffering = 0
             onDisk.withUnsafeBytes { diskBytes in
-                let liveBytes = live.assumingMemoryBound(to: UInt8.self)
+                let liveBytes = liveBase.assumingMemoryBound(to: UInt8.self)
+                let textStart = span.textOffsetInSegment
+                let textEnd = textStart + span.textSize
                 for offset in 0..<onDisk.count where liveBytes[offset] != diskBytes[offset] {
-                    differing += 1
+                    segmentDiffering += 1
+                    if offset >= textStart && offset < textEnd {
+                        textDiffering += 1
+                    }
                 }
             }
 
+            segmentCompared += onDisk.count
+            segmentDiff += segmentDiffering
+
             imagesCompared += 1
-            appCompared += onDisk.count
-            if differing > 0 {
-                appDiff += differing
+            appCompared += span.textSize
+            if textDiffering > 0 {
+                appDiff += textDiffering
                 appLibsDiff += 1
                 diffedLibs.append((path as NSString).lastPathComponent)
             }
@@ -295,23 +316,31 @@ final class IntegrityProbeManager {
         result["app_libs_diff"] = appLibsDiff
         result["app_images_compared"] = imagesCompared
         result["system_images_unreadable"] = systemUnreadable
+        // Telemetry only. Never scored until it has a hardware baseline.
+        result["app_segment_compared_bytes"] = segmentCompared
+        result["app_segment_diff_bytes"] = segmentDiff
         result["diffed_libs"] = diffedLibs.joined(separator: ",")
         return result
     }
 
-    private struct TextSection {
-        let vmAddress: UInt64
-        let fileOffset: Int
-        let size: Int
+    private struct TextSpan {
+        /// The whole __TEXT segment: file offset 0 through filesize, which is
+        /// what is mapped at the image's base address.
+        let segmentFileOffset: Int
+        let segmentSize: Int
+        let segmentVMAddress: UInt64
+        /// The __text section, which lies inside that segment. Kept separately
+        /// because only this range is scored; the rest of __TEXT is telemetry
+        /// until it has a clean baseline on hardware.
+        let textOffsetInSegment: Int
+        let textSize: Int
     }
 
-    /// Locates `__TEXT,__text` in a loaded image by walking its load commands.
-    private func textSection(of header: UnsafePointer<mach_header>) -> TextSection? {
+    /// Locates the __TEXT segment and the __text section inside it.
+    private func textSpan(of header: UnsafePointer<mach_header>) -> TextSpan? {
         let raw = UnsafeRawPointer(header)
-        guard raw.assumingMemoryBound(to: mach_header_64.self).pointee.magic == MH_MAGIC_64 else {
-            return nil
-        }
         let header64 = raw.assumingMemoryBound(to: mach_header_64.self)
+        guard header64.pointee.magic == 0xfeed_facf else { return nil }
         var cursor = raw.advanced(by: MemoryLayout<mach_header_64>.size)
 
         for _ in 0..<header64.pointee.ncmds {
@@ -319,16 +348,23 @@ final class IntegrityProbeManager {
             if command.pointee.cmd == UInt32(LC_SEGMENT_64) {
                 let segment = cursor.assumingMemoryBound(to: segment_command_64.self)
                 if name(of: segment.pointee.segname) == "__TEXT" {
+                    let segmentSize = Int(segment.pointee.filesize)
+                    guard segmentSize > 0, segmentSize <= 64 * 1024 * 1024 else { return nil }
                     var section = cursor.advanced(by: MemoryLayout<segment_command_64>.size)
                     for _ in 0..<segment.pointee.nsects {
                         let entry = section.assumingMemoryBound(to: section_64.self)
                         if name(of: entry.pointee.sectname) == "__text" {
-                            let size = Int(entry.pointee.size)
-                            guard size > 0, size <= 64 * 1024 * 1024 else { return nil }
-                            return TextSection(
-                                vmAddress: entry.pointee.addr,
-                                fileOffset: Int(entry.pointee.offset),
-                                size: size
+                            let textOffset = Int(entry.pointee.offset) - Int(segment.pointee.fileoff)
+                            let textSize = Int(entry.pointee.size)
+                            guard textOffset >= 0,
+                                  textSize > 0,
+                                  textOffset + textSize <= segmentSize else { return nil }
+                            return TextSpan(
+                                segmentFileOffset: Int(segment.pointee.fileoff),
+                                segmentSize: segmentSize,
+                                segmentVMAddress: segment.pointee.vmaddr,
+                                textOffsetInSegment: textOffset,
+                                textSize: textSize
                             )
                         }
                         section = section.advanced(by: MemoryLayout<section_64>.size)
