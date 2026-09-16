@@ -232,6 +232,30 @@ not link against a real iOS SDK, run the AOT compiler, or produce a bundle, and 
 target this app needs is `15.0` — the iPhone 7 cannot go past iOS 15.8.5 — which is close enough to
 a current Xcode's floor to be worth confirming rather than assuming.
 
+**The Mach-O reader and the signing script, against real binaries.** `MachOImage` and
+`EntitlementsPlist` were unit-tested against synthetic images, which proves a parser matches its
+author's belief about the format — the one thing it cannot check. Both have now been run over a
+genuine arm64 iOS app (the Flutter client's unsigned Codemagic `.ipa`, borrowed as input only).
+The unsigned executable correctly reports no code signature; after
+`tools/presign_trollstore_ipa.sh`, the same reader recovers the CodeDirectory identifier
+`com.example.devicefingerprinting_dotnet` — the field the server compares against
+`app_identity.bundle_id` — flags `0x0`, and all four entitlements, matching `ldid` byte for byte.
+
+Rehearsing the script on that bundle found two defects that would otherwise have surfaced with the
+phone in hand:
+
+- `ios/trollstore-entitlements.plist` contained `--` inside an XML comment, which is malformed XML.
+  Python refused it outright; `ldid` had been accepting it, which is worse, because it means the
+  entitlements actually embedded were whatever a lenient parser made of a broken file.
+- The nested-binary search matched `*.dylib` and `*.so` and found **nothing** in a real bundle. The
+  objects that need signing are framework binaries — `Frameworks/Flutter.framework/Flutter` and two
+  others — which carry no extension. Signing now selects by Mach-O magic number, which found all
+  three. This is the documented cause of a sideloaded app that flashes and closes, and it fails
+  silently: the script reports success and the app dies on launch.
+
+A relative output path was also being resolved against the temporary work directory rather than the
+caller's, so the finished `.ipa` went missing.
+
 **Windows runtime behaviour.** `CngInstallationKeyStore` and `WindowsIntegrityCollector` compile
 for `net6.0-windows` and `net8.0-windows` but have not been executed, because this machine is
 Linux. The Windows collector also cannot be submitted to the current server at all, which reports

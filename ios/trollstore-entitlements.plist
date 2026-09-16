@@ -19,7 +19,7 @@
   Why keep keychain-access-groups byte for byte. The Secure Enclave key AND the
   installation state both live in that access group. Change the value and both
   become unreachable, the app silently mints a new key and a new installation id,
-  and the identity resets on every rebuild -- which would make battery item 15
+  and the identity resets on every rebuild, which would make battery item 15
   fail for a reason that has nothing to do with what item 15 tests.
 
   Applied by tools/presign_trollstore_ipa.sh, which fails closed if

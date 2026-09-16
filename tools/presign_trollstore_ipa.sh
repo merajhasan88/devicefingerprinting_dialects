@@ -37,6 +37,10 @@ BUNDLE_ID=com.example.devicefingerprinting_dotnet
 [ -f "$ENTS" ] || { echo "missing $ENTS" >&2; exit 2; }
 [ -f "$IN" ] || { echo "missing input .ipa: $IN" >&2; exit 2; }
 
+# Absolute, because the bundle is zipped from inside the work directory and a
+# relative output path would land there instead of where the caller asked.
+OUT=$(readlink -f "$OUT")
+
 WORK=$(mktemp -d); trap 'rm -rf "$WORK"' EXIT
 unzip -q "$IN" -d "$WORK"
 APP=$(find "$WORK/Payload" -maxdepth 1 -name '*.app' -type d | head -1)
@@ -48,12 +52,46 @@ EXE="$APP/$EXE_NAME"
 
 # Nested Mach-O objects first, then the main executable last. Signing the outer
 # binary before its dependencies would leave the bundle inconsistent.
-NESTED=$(find "$APP" -type f \( -name '*.dylib' -o -name '*.so' \) | sort || true)
+#
+# Found by magic number, not by file name. An earlier version looked for *.dylib
+# and *.so and found NOTHING in a real bundle, because the thing most likely to
+# be there is a framework binary -- Frameworks/Foo.framework/Foo -- which has no
+# extension at all. That is the silent version of this failure: the script
+# reports success, the app is installed, and it dies on launch with an invalid
+# signature on a library nobody signed.
+NESTED=$(python3 - "$APP" "$EXE" <<'PY'
+import os, struct, sys
+root, main = sys.argv[1], os.path.realpath(sys.argv[2])
+# Thin 64-bit, thin 32-bit, and fat, in both byte orders. A fat header shares
+# its magic with a Java class file, so the architecture count is sanity-checked
+# rather than trusted; ldid would abort the whole run on a false positive.
+THIN = {b'\xcf\xfa\xed\xfe', b'\xfe\xed\xfa\xcf', b'\xce\xfa\xed\xfe', b'\xfe\xed\xfa\xce'}
+FAT = {b'\xca\xfe\xba\xbe', b'\xbe\xba\xfe\xca'}
+for dirpath, _, names in os.walk(root):
+    for name in names:
+        path = os.path.join(dirpath, name)
+        if os.path.islink(path) or os.path.realpath(path) == main:
+            continue
+        try:
+            with open(path, 'rb') as handle:
+                head = handle.read(8)
+        except OSError:
+            continue
+        if len(head) < 8:
+            continue
+        if head[:4] in THIN:
+            print(path)
+        elif head[:4] in FAT and 1 <= struct.unpack('>I', head[4:8])[0] <= 16:
+            print(path)
+PY
+)
 if [ -n "$NESTED" ]; then
   echo "  signing $(echo "$NESTED" | wc -l | tr -d ' ') nested Mach-O objects"
   while IFS= read -r lib; do
     [ -n "$lib" ] && "$LDID" -S "$lib"
   done <<< "$NESTED"
+else
+  echo "  no nested Mach-O objects in the bundle"
 fi
 
 # The CodeDirectory identifier is set to the bundle id because that is what a
