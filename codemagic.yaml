@@ -106,14 +106,27 @@ workflows:
           # mismatch has already cost one run: restore and the shared library
           # both succeeded, and the version check fired afterwards, deep in a
           # targets file. The pairing is an equality, not a floor.
-          SDK_PACK=$(ls -d "$HOME"/.dotnet/packs/Microsoft.iOS.Sdk.* 2>/dev/null | head -1)
-          WANT=$(basename "$SDK_PACK" | sed 's/.*_//')
+          # Read the requirement from the workload manifest, whose version IS the
+          # Xcode version to the minor. Listing the installed packs got this
+          # wrong and failed a good build: installing the workload lays down
+          # packs for several frameworks at once, and the first one
+          # alphabetically was Microsoft.iOS.Sdk.net8.0_17.0, nothing to do with
+          # what this build uses.
+          WANT=$(dotnet workload list | awk '$1 == "ios" { print $2 }' | cut -d/ -f1 | cut -d. -f1,2)
           HAVE=$(xcodebuild -version | head -1 | awk '{print $2}' | cut -d. -f1,2)
-          echo "iOS workload wants Xcode $WANT; this image has $HAVE"
-          if [ "$WANT" != "$HAVE" ]; then
-            echo "MISMATCH. Set 'xcode: $WANT' in codemagic.yaml, or move IOS_TFM"
-            echo "to a runtime whose bindings pair with Xcode $HAVE."
-            exit 1
+          if echo "$WANT" | grep -qE '^[0-9]+\.[0-9]+$'; then
+            echo "iOS workload wants Xcode $WANT; this image has $HAVE"
+            if [ "$WANT" != "$HAVE" ]; then
+              echo "MISMATCH. Set 'xcode: $WANT' in codemagic.yaml, or move IOS_TFM"
+              echo "to a runtime whose bindings pair with Xcode $HAVE."
+              exit 1
+            fi
+          else
+            # Fail open. A guard exists to make a real mismatch cheap to
+            # diagnose; one that cannot read the versions has nothing to say,
+            # and stopping the build on its own confusion is worse than the
+            # four minutes it was meant to save.
+            echo "could not read the workload's Xcode requirement; leaving it to the build"
           fi
 
       - name: Verify the parts that can be checked without a device
