@@ -18,7 +18,14 @@
 #     builds. The free tier is 500 macOS minutes/month and an iOS build costs
 #     10-20 of them; automatic builds on every push would burn that quickly.
 #
-#   * API_BASE_URL IS PINNED HERE, deliberately, rather than set in the
+#   * API_BASE_URL IS A STABLE DNS NAME as of 2026-09-16, and no longer an IP.
+#     The instance has no Elastic IP by design, so its public address changes on
+#     every start, and this value is compiled in -- which used to mean a rebuild
+#     every session. A free DuckDNS name plus a boot-time updater on the
+#     instance turns that into a DNS record update, at no cost. This line should
+#     now change only when the deployment does.
+#
+#   * It is PINNED HERE, deliberately, rather than set in the
 #     Codemagic UI. Codemagic requires every UI environment variable to belong
 #     to a group, and a group is only visible to a workflow that declares it
 #     under `environment: groups:`. The precedence between an imported group
@@ -44,7 +51,7 @@ workflows:
         # whenever the instance is restarted. The Dart client fails loudly with
         # api_base_url_missing if it is empty, so it must be set at compile
         # time even for a smoke test.
-        API_BASE_URL: "https://35-95-150-125.nip.io"
+        API_BASE_URL: "https://devicefingerprinting.duckdns.org"
 
     scripts:
       - name: Flutter version in use
