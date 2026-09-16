@@ -11,7 +11,18 @@
   -->
 
   <PropertyGroup>
-    <TargetFramework>net8.0-ios</TargetFramework>
+    <!--
+         net9.0 rather than net8.0 because the iOS bindings are versioned against
+         Xcode, and .NET 9 is the newest runtime whose bindings this repository
+         can compile-check on Linux: tools/ioscheck builds these same sources
+         against Microsoft.iOS.Ref.net9.0_26.0, the family a current Xcode needs.
+         Building what has been checked is worth more here than building the
+         newest runtime, because the only other verification available is a
+         macOS build that costs shared minutes. The android side stays on
+         net8.0, where two physical handsets have already proved it.
+    -->
+    <TargetFramework Condition="'$(DeviceTrustIosTfm)' == ''">net9.0-ios</TargetFramework>
+    <TargetFramework Condition="'$(DeviceTrustIosTfm)' != ''">$(DeviceTrustIosTfm)</TargetFramework>
     <OutputType>Exe</OutputType>
     <Nullable>enable</Nullable>
     <ImplicitUsings>disable</ImplicitUsings>

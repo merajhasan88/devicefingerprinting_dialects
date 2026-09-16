@@ -210,9 +210,27 @@ status variable to the count parameter.
 
 They have still never **run**. Compiling is not executing: the `ios` workload cannot install on
 Linux because it needs Xcode, so producing an installable build requires a macOS build (Codemagic)
-and the physical iPhone. Treat the iOS paths as compiled and reviewed, not as working. The
-reference pack is also net9.0/iOS 18 while the package targets `net8.0-ios`, so a binding that
-changed between iOS 17 and 18 would pass locally and fail on a real build.
+and the physical iPhone. Treat the iOS paths as compiled and reviewed, not as working.
+
+The iOS target framework is `net9.0-ios`, chosen so that what Codemagic builds is what this machine
+can check. iOS bindings are versioned against Xcode: .NET 8's stop at the iOS 18 family, which a
+current Xcode has moved past, and .NET 10's iOS 26 bindings cannot be referenced from a net9.0
+compilation at all — that fails with CS1705, an error rather than a waivable warning, and only the
+.NET 9 SDK is installed here. .NET 9 has iOS 26 bindings and is checkable, so it is the one runtime
+where the compile check and the real build agree. These sources build clean against both
+`Microsoft.iOS.Ref.net9.0_26.0` and `net9.0_26.5`, which brackets whichever family the workload
+resolves on the build machine:
+
+```bash
+dotnet build tools/ioscheck                                     # 26.0, the default
+dotnet build tools/ioscheck -p:IosRefPackage=Microsoft.iOS.Ref.net9.0_26.5 \
+                            -p:IosRefVersion=26.5.9004
+```
+
+What that still does not prove: a reference assembly is an API surface, not a toolchain. It does
+not link against a real iOS SDK, run the AOT compiler, or produce a bundle, and the deployment
+target this app needs is `15.0` — the iPhone 7 cannot go past iOS 15.8.5 — which is close enough to
+a current Xcode's floor to be worth confirming rather than assuming.
 
 **Windows runtime behaviour.** `CngInstallationKeyStore` and `WindowsIntegrityCollector` compile
 for `net6.0-windows` and `net8.0-windows` but have not been executed, because this machine is

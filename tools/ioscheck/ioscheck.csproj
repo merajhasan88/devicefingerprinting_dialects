@@ -4,7 +4,7 @@
     Compile-checks the iOS sources on Linux, against Apple's real bindings.
 
     Why this exists. src/DeviceTrust.Client.Maui/Apple/*.cs can only be built
-    for net8.0-ios, and the ios workload cannot install anywhere but macOS, so
+    for net9.0-ios, and the ios workload cannot install anywhere but macOS, so
     on a Linux or Windows machine those files are never compiled by anything:
     the csproj excludes them from the android target. They sat unverified for
     weeks as a result, and when this project was first run it found four real
@@ -23,10 +23,18 @@
 
         dotnet build tools/ioscheck
 
-    Limits worth knowing. The reference pack is net9.0/iOS 18 while the Maui
-    project targets net8.0-ios, so a member added between the iOS 17 and 18
-    bindings would pass here and fail on a real macOS build. This raises
-    confidence a long way; it does not replace one Codemagic build.
+    The pack is chosen to match what the Codemagic build resolves: .NET 9 with
+    the iOS 26 bindings, which is the newest binding family that exists for a
+    runtime this machine can compile against. A net10.0 reference assembly is
+    not usable here, because a net9.0 compilation that references one fails with
+    CS1705, and CS1705 is an error rather than a warning that could be waived.
+    Override IosRefPackage and IosRefVersion to re-check against another family:
+        dotnet build tools/ioscheck -p:IosRefPackage=Microsoft.iOS.Ref.net9.0_18.0 \
+                                    -p:IosRefVersion=18.0.9617
+    Limits worth knowing. A reference assembly proves the API surface compiles;
+    it does not run the ios workload, link against a real Xcode SDK or produce a
+    bundle. This raises confidence a long way; it does not replace one Codemagic
+    build.
   -->
 
   <PropertyGroup>
@@ -37,19 +45,21 @@
     <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
     <GenerateDocumentationFile>false</GenerateDocumentationFile>
     <!-- The platform analyzer cannot help here: this is a plain net9.0 project
-         standing in for net8.0-ios, so every iOS API would be "unsupported". -->
+         standing in for net9.0-ios, so every iOS API would be "unsupported". -->
     <NoWarn>$(NoWarn);CA1416;CS0618;CS8632;CS1591</NoWarn>
     <RestorePackagesPath>$(MSBuildThisFileDirectory)packages</RestorePackagesPath>
     <IsPackable>false</IsPackable>
+    <IosRefPackage Condition="'$(IosRefPackage)' == ''">Microsoft.iOS.Ref.net9.0_26.0</IosRefPackage>
+    <IosRefVersion Condition="'$(IosRefVersion)' == ''">26.0.9785</IosRefVersion>
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageDownload Include="Microsoft.iOS.Ref.net9.0_18.0" Version="[18.0.9617]" />
+    <PackageDownload Include="$(IosRefPackage)" Version="[$(IosRefVersion)]" />
     <Compile Include="../../src/DeviceTrust.Client.Maui/Apple/*.cs" />
     <Compile Include="../../src/DeviceTrust.iOS.Harness/*.cs" />
     <ProjectReference Include="../../src/DeviceTrust.Client/DeviceTrust.Client.csproj" />
     <Reference Include="Microsoft.iOS">
-      <HintPath>$(MSBuildThisFileDirectory)packages/microsoft.ios.ref.net9.0_18.0/18.0.9617/ref/net9.0/Microsoft.iOS.dll</HintPath>
+      <HintPath>$(MSBuildThisFileDirectory)packages/$(IosRefPackage.ToLowerInvariant())/$(IosRefVersion)/ref/net9.0/Microsoft.iOS.dll</HintPath>
     </Reference>
   </ItemGroup>
 

@@ -21,6 +21,24 @@
 #     installed here. Pinning the SDK version keeps a build reproducible rather
 #     than tracking whatever is current.
 #
+#   * .NET 9, NOT 8 OR 10. The iOS bindings are versioned against Xcode, and the
+#     image's Xcode is whatever `latest` resolves to. .NET 8's newest iOS
+#     bindings are the iOS 18 family, which a current Xcode has moved past;
+#     .NET 10's are the iOS 26 family and cannot be compile-checked on the Linux
+#     workstation this was written on, because a net9.0 build referencing a
+#     net10.0 assembly fails with CS1705, an error rather than a waivable
+#     warning. .NET 9 has iOS 26 bindings AND is checkable here, so these exact
+#     sources were built against both Microsoft.iOS.Ref.net9.0_26.0 and _26.5
+#     before this workflow ran. Building what has been checked is worth more
+#     than building the newest runtime when the alternative verification costs
+#     shared macOS minutes.
+#
+#     If Xcode moves far enough that .NET 9 can no longer target it, change
+#     DOTNET_VERSION and IOS_TFM below; nothing in the source tree is pinned to
+#     a runtime version, and the first script step prints the Xcode and workload
+#     versions in use so a mismatch reads as a version pair rather than a
+#     mysterious compiler error.
+#
 #   * MANUAL TRIGGER ONLY, same as the Flutter workflow and for the same reason.
 #
 # The .ipa this produces is UNSIGNED and must be run through
@@ -38,12 +56,25 @@ workflows:
     environment:
       xcode: latest
       vars:
-        DOTNET_VERSION: "8.0"
+        DOTNET_VERSION: "9.0"
+        IOS_TFM: "net9.0-ios"
         DOTNET_CLI_TELEMETRY_OPTOUT: "1"
         DOTNET_NOLOGO: "1"
         PROJECT: "src/DeviceTrust.iOS.Harness/DeviceTrust.iOS.Harness.csproj"
 
     scripts:
+      - name: Record the version pair this machine provides
+        script: |
+          set -euo pipefail
+          # First and cheapest step. Every plausible failure of this workflow is
+          # a disagreement between the image's Xcode and the .NET iOS bindings,
+          # and that diagnosis is worth having before a 20-minute build rather
+          # than after it.
+          xcodebuild -version
+          echo "--- iOS SDKs present ---"
+          xcodebuild -showsdks 2>/dev/null | grep -i ios || true
+          sw_vers
+
       - name: Install the .NET SDK and the ios workload
         script: |
           set -euo pipefail
@@ -52,8 +83,13 @@ workflows:
           /tmp/dotnet-install.sh --channel "$DOTNET_VERSION" --install-dir "$HOME/.dotnet"
           export DOTNET_ROOT="$HOME/.dotnet"
           export PATH="$DOTNET_ROOT:$PATH"
-          dotnet --info | head -12
-          dotnet workload install ios --skip-manifest-update
+          dotnet --version
+          # No --skip-manifest-update: the manifest decides which Microsoft.iOS
+          # binding version is used, and the current one is what pairs with the
+          # image's Xcode. Print what was resolved, because that single line is
+          # the answer to "which bindings did this actually build against".
+          dotnet workload install ios
+          dotnet workload list
 
       - name: Verify the parts that can be checked without a device
         script: |
@@ -73,8 +109,15 @@ workflows:
           # target is a TrollStore device, where the signature is applied later
           # and by something else, so signing is disabled outright rather than
           # faked.
+          # DeviceTrustPlatforms narrows the shared Maui library to the one
+          # framework this build wants. Without it, restoring that
+          # cross-targeting project would also restore its net8.0-android
+          # framework and demand the android workload: about a gigabyte, for an
+          # output nobody here uses.
           dotnet publish "$PROJECT" \
-            -f net8.0-ios -c Release \
+            -f "$IOS_TFM" -c Release \
+            -p:DeviceTrustIosTfm="$IOS_TFM" \
+            -p:DeviceTrustPlatforms="$IOS_TFM" \
             -p:RuntimeIdentifier=ios-arm64 \
             -p:CodesignKey="" \
             -p:CodesignProvision="" \

@@ -9,7 +9,17 @@
          Linux or Windows, because the build needs Xcode. Android builds
          anywhere, so a Linux or Windows CI still compiles that half. -->
     <TargetFrameworks>net8.0-android</TargetFrameworks>
-    <TargetFrameworks Condition="$([MSBuild]::IsOSPlatform('OSX'))">net8.0-android;net8.0-ios</TargetFrameworks>
+    <TargetFrameworks Condition="$([MSBuild]::IsOSPlatform('OSX'))">net8.0-android;net9.0-ios</TargetFrameworks>
+    <!--
+         One knob for the CI build. Restoring a cross-targeting project restores
+         every one of its frameworks, so a Mac asked for the iOS app alone would
+         still need the android workload installed: about a gigabyte, and several
+         minutes of a 500-minute monthly budget shared with the Flutter client.
+         Passing DeviceTrustPlatforms=net9.0-ios narrows it to the one that is
+         wanted. It is also the escape hatch for the day Xcode moves on and iOS
+         has to follow it to a newer runtime.
+    -->
+    <TargetFrameworks Condition="'$(DeviceTrustPlatforms)' != ''">$(DeviceTrustPlatforms)</TargetFrameworks>
     <AssemblyName>DeviceTrust.Client.Maui</AssemblyName>
     <RootNamespace>DeviceTrust.Client.Maui</RootNamespace>
     <PackageId>DeviceTrust.Client.Maui</PackageId>
