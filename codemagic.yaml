@@ -54,7 +54,18 @@ workflows:
     max_build_duration: 45
 
     environment:
-      xcode: latest
+      # PINNED, and it has to be. .NET for iOS does not accept a range: workload
+      # 26.5.9004 demands Xcode 26.5 exactly, and refused the image's 26.6 with
+      # "requires Xcode 26.5. The current version of Xcode is 26.6". There is no
+      # iOS 26.6 binding published for any .NET version, so the newer Xcode is
+      # simply ahead of the toolchain and pinning back is the only fix.
+      #
+      # When this needs moving: the rule is that the Microsoft.iOS.Sdk version
+      # and the Xcode version match to the minor. Set this to whatever Xcode the
+      # workload then asks for, and keep IOS_TFM on a runtime that has bindings
+      # for it. If Codemagic has dropped this version, the build fails in the
+      # prepare step and lists what the image does have.
+      xcode: 26.5
       vars:
         DOTNET_VERSION: "9.0"
         IOS_TFM: "net9.0-ios"
@@ -90,6 +101,20 @@ workflows:
           # the answer to "which bindings did this actually build against".
           dotnet workload install ios
           dotnet workload list
+
+          # Fail here rather than four minutes into the build. This exact
+          # mismatch has already cost one run: restore and the shared library
+          # both succeeded, and the version check fired afterwards, deep in a
+          # targets file. The pairing is an equality, not a floor.
+          SDK_PACK=$(ls -d "$HOME"/.dotnet/packs/Microsoft.iOS.Sdk.* 2>/dev/null | head -1)
+          WANT=$(basename "$SDK_PACK" | sed 's/.*_//')
+          HAVE=$(xcodebuild -version | head -1 | awk '{print $2}' | cut -d. -f1,2)
+          echo "iOS workload wants Xcode $WANT; this image has $HAVE"
+          if [ "$WANT" != "$HAVE" ]; then
+            echo "MISMATCH. Set 'xcode: $WANT' in codemagic.yaml, or move IOS_TFM"
+            echo "to a runtime whose bindings pair with Xcode $HAVE."
+            exit 1
+          fi
 
       - name: Verify the parts that can be checked without a device
         script: |
