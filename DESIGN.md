@@ -3752,3 +3752,81 @@ So unlike items 2–8, 12 and 13, item 15 exercises no database behaviour and ca
 engine from another. Re-running it per engine family would cost device time and prove nothing new.
 Whether to record it as "run once, engine-independent" rather than "each" is a change to the battery
 and therefore not made here.
+
+## 43. Whole-`__TEXT` telemetry measured on hardware (2026-09-16)
+
+First run of the segment-wide `code_integrity` measurement added in `4bd6a78`, on the iPhone 7
+(iOS 15.8.5, TrollStore), against the EC2 server in `observe` mode with
+`INTEGRITY_SCORE_IOS_CODE_INTEGRITY` off. Build: Codemagic from `9bac726`, pre-signed with
+`tools/presign_trollstore_ipa.sh` (`get_task_allow false`, 4 entitlements), served over HTTPS from
+the instance and installed through TrollStore.
+
+### 43.1 The measurement
+
+```json
+"code_integrity": {
+    "checked": true,
+    "app_images_compared": 3,
+    "app_compared_bytes": 10505140,   "app_diff_bytes": 0,   "app_libs_diff": 0,
+    "app_segment_compared_bytes": 14811136,   "app_segment_diff_bytes": 0,
+    "core_compared_bytes": 0, "ext_compared_bytes": 0,
+    "system_bucket_reason": "dyld_shared_cache_has_no_backing_files",
+    "system_images_unreadable": 434,
+    "diffed_libs": ""
+}
+```
+
+`score 0`, `verdict trusted`, `collector_version 2`, nine probes.
+
+**`app_segment_diff_bytes` is 0 on real hardware.** That is the result §4bd6a78 was waiting for: the
+whole `__TEXT` segment — Mach-O header, `__stubs`, `__cstring`, `__unwind_info` and all — measures
+byte-identical between memory and disk on a clean device. **`mach_header_64.reserved` is therefore a
+validated safe flip target**, the Mach-O analogue of the ELF `EI_PAD` bytes used to close the app
+bucket on Android (§30.4), and battery item 16 is unblocked.
+
+### 43.2 One bundle framework is not measured at all
+
+The Python model in `4bd6a78` predicted `app_segment_compared_bytes` 14,925,824 across four bundle
+images. The device measured **14,811,136 across three**. The shortfall is exactly **114,688 bytes**,
+and the arithmetic closes without remainder:
+
+| bundle image | `__TEXT` filesize | measured? |
+|---|---|---|
+| `Runner` | 180,224 | yes |
+| `App.framework/App` | 5,914,624 | yes |
+| `Flutter.framework/Flutter` | 8,716,288 | yes |
+| **`objective_c.framework/objective_c`** | **114,688** | **no** |
+| device total | **14,811,136** | = 180,224 + 5,914,624 + 8,716,288 |
+
+`app_compared_bytes` is short by 50,840 against the model for the same reason. And nothing was
+silently dropped by a `continue`: `dyld_images.image_count` is 437, `system_images_unreadable` is
+434, `app_images_compared` is 3, and 434 + 3 = 437. **Every image dyld had loaded was accounted
+for** — `objective_c.framework` was simply not loaded at the moment the startup scan ran.
+(Inference, not measurement: it is the Dart FFI ObjC interop framework and is loaded lazily on
+first use, after the scan.)
+
+**Why this matters.** The probe measures what dyld has already mapped, not what the bundle contains,
+and it reports `checked: true` with no signal that a bundle framework went unmeasured. This is the
+§28.8 defect class in a subtler form: there the bucket was inert and read zero, here the bucket is
+populated and merely incomplete, which is harder to notice. A framework modified on disk and loaded
+after the scan is invisible to it.
+
+**Proposed, not implemented:** enumerate the Mach-O files under the bundle directory, compare that
+set against the loaded images, and report the count not loaded as its own field. A non-zero value is
+then telemetry to reason about rather than a silent omission. Whether it should ever score is a
+separate question — lazy loading is normal behaviour, not evidence of compromise.
+
+### 43.3 A stale process can serve an old collector after a reinstall
+
+The first launch after installing over the existing app produced `collector_version 1` and eight
+probes — the pre-`bf30934` collector — while `app_identity.executable_bytes` already read 427,475,
+today's build. The contradiction resolved only after **Remove App → Delete App → reinstall →
+launch**, which produced `collector_version 2` and nine probes from the same staged `.ipa`.
+The two reports carry the same `executable_bytes` and different `executable_sha256`
+(`9483a8e5…` then `3ca34db7…`), consistent with TrollStore re-signing the same input binary.
+
+The exact mechanism is **not pinned down** and is recorded here as an observation, not a diagnosis.
+The operational rule it yields is firm, though: **after installing over an existing build, delete and
+reinstall before trusting a collector-version-sensitive measurement**, because `app_identity` reads
+the new file from disk while the running process can still be executing old code — the one
+combination that makes a stale build look current.
