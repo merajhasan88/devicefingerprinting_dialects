@@ -283,7 +283,7 @@ final class IntegrityProbeManager {
             // (DESIGN.md 30.4). Until then it must not influence a verdict.
             var textDiffering = 0
             var segmentDiffering = 0
-            onDisk.withUnsafeBytes { diskBytes in
+            onDisk.withUnsafeBytes { (diskBytes: UnsafeRawBufferPointer) in
                 let liveBytes = liveBase.assumingMemoryBound(to: UInt8.self)
                 let textStart = span.textOffsetInSegment
                 let textEnd = textStart + span.textSize
