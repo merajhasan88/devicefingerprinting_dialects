@@ -31,10 +31,24 @@
     Override IosRefPackage and IosRefVersion to re-check against another family:
         dotnet build tools/ioscheck -p:IosRefPackage=Microsoft.iOS.Ref.net9.0_18.0 \
                                     -p:IosRefVersion=18.0.9617
-    Limits worth knowing. A reference assembly proves the API surface compiles;
-    it does not run the ios workload, link against a real Xcode SDK or produce a
-    bundle. This raises confidence a long way; it does not replace one Codemagic
-    build.
+    Limits worth knowing, each one paid for by a failed Codemagic build.
+
+    A reference assembly proves the API surface compiles; it does not run the ios
+    workload, link against a real Xcode SDK or produce a bundle.
+
+    The platform analysers are inert here. CA1416 and CA1422 need a platform in
+    the target framework, and this one is plain net9.0; setting
+    [assembly: SupportedOSPlatform] does not wake them, which was tried. So a
+    call to an API Apple has obsoleted on a newer iOS passes here and fails the
+    real build, as `new UIWindow(CGRect)` did. tools/obsscan reads the same
+    obsoletion metadata directly and answers the same question; docs/validation.md
+    carries the command, which cannot be written in this file because a double
+    hyphen is not legal inside an XML comment.
+
+    CS8765, a parameter whose nullability disagrees with the member it overrides,
+    is not reported here either, though the file IS compiled and the same
+    reference assembly is used. There are three overrides in the iOS sources;
+    when adding a fourth, check its signature against the binding by hand.
   -->
 
   <PropertyGroup>

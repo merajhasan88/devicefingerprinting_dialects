@@ -232,6 +232,26 @@ not link against a real iOS SDK, run the AOT compiler, or produce a bundle, and 
 target this app needs is `15.0` — the iPhone 7 cannot go past iOS 15.8.5 — which is close enough to
 a current Xcode's floor to be worth confirming rather than assuming.
 
+Two blind spots in that check are now known, both paid for by a failed build:
+
+- **The platform analysers do not run.** CA1416 and CA1422 need a platform in the target framework,
+  and `tools/ioscheck` is plain `net9.0`. Adding `[assembly: SupportedOSPlatform("ios15.0")]` does
+  not wake them; that was tried and measured. So calling an API Apple obsoleted on a newer iOS
+  passes locally and fails the real build, which is what `new UIWindow(CGRect)` did.
+  `tools/obsscan` closes it by reading the obsoletion metadata out of the reference assembly and
+  matching it against the sources; it reports one call site, suppressed in place with the reason
+  written next to it, because the only device this harness will run on is pinned at iOS 15.8.5.
+
+  ```bash
+  dotnet run --project tools/obsscan -- \
+    tools/ioscheck/packages/microsoft.ios.ref.net9.0_26.5/26.5.9004/ref/net9.0/Microsoft.iOS.dll \
+    ios26 src/DeviceTrust.iOS.Harness src/DeviceTrust.Client.Maui/Apple
+  ```
+- **CS8765 is not reported** — a parameter whose nullability disagrees with the member it overrides.
+  `AppDelegate.cs` is genuinely compiled by the tool against the same reference assembly, and the
+  diagnostic still only appeared on the real build. There are three overrides in the iOS sources;
+  a fourth needs its signature checked against the binding by hand.
+
 **The Mach-O reader and the signing script, against real binaries.** `MachOImage` and
 `EntitlementsPlist` were unit-tested against synthetic images, which proves a parser matches its
 author's belief about the format — the one thing it cannot check. Both have now been run over a
