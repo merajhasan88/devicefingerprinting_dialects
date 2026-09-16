@@ -201,11 +201,18 @@ work.
 **The Frida Gadget compromise test.** Needs a release APK with an embedded gadget on a physical
 device. The battery reports it as NOT RUN rather than skipping it silently.
 
-**iOS compilation.** The `ios` workload cannot install on Linux — it needs Xcode — so
-`SecureEnclaveInstallationKeyStore` and `AppleIntegrityCollector` have been written against the
-documented Xamarin.iOS Security and dyld APIs but **have not been compiled**. Build them on macOS
-with `dotnet workload install ios` before relying on them. The Android half of the same package is
-compiled and clean.
+**iOS runtime behaviour.** The iOS sources **now compile**, against Apple's genuine `Microsoft.iOS`
+reference assembly, via `dotnet build tools/ioscheck`. That check found four real defects in
+`SecureEnclaveInstallationKeyStore` that reading the code had not: `SecAccessControl` has a
+constructor rather than a static `Create`, and `SecKeyChain.QueryAsReference` returns an
+`INativeObject[]` and requires an explicit maximum, so the two-argument call had silently bound the
+status variable to the count parameter.
+
+They have still never **run**. Compiling is not executing: the `ios` workload cannot install on
+Linux because it needs Xcode, so producing an installable build requires a macOS build (Codemagic)
+and the physical iPhone. Treat the iOS paths as compiled and reviewed, not as working. The
+reference pack is also net9.0/iOS 18 while the package targets `net8.0-ios`, so a binding that
+changed between iOS 17 and 18 would pass locally and fail on a real build.
 
 **Windows runtime behaviour.** `CngInstallationKeyStore` and `WindowsIntegrityCollector` compile
 for `net6.0-windows` and `net8.0-windows` but have not been executed, because this machine is

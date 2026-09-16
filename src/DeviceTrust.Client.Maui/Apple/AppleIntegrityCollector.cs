@@ -56,11 +56,22 @@ namespace DeviceTrust.Client.Maui.Apple
             "/var/jb",
         };
 
+        /// <summary>Per-image ceiling for the code comparison, matching the Android probe.</summary>
+        private const int MaxBytesPerImage = 4 * 1024 * 1024;
+
         /// <inheritdoc />
         public string Platform => "ios";
 
-        /// <inheritdoc />
-        public int CollectorVersion => 1;
+        /// <summary>
+        /// Two, not one.
+        /// </summary>
+        /// <remarks>
+        /// v1 was the eight-probe baseline set. v2 adds <c>code_integrity</c>,
+        /// the dyld analogue of the Android probe, which is what battery item 16
+        /// needs. The reference Swift collector versions the same way and for the
+        /// same reason.
+        /// </remarks>
+        public int CollectorVersion => 2;
 
         /// <inheritdoc />
         public Task<IntegrityCollection> CollectAsync(
@@ -78,17 +89,35 @@ namespace DeviceTrust.Client.Maui.Apple
             var probes = new Dictionary<string, ProbeResult>(StringComparer.Ordinal);
             foreach (var name in requiredProbes.Distinct(StringComparer.Ordinal))
             {
-                try
-                {
-                    probes[name] = RunProbe(name);
-                }
-                catch (Exception error) when (error is not OutOfMemoryException)
-                {
-                    probes[name] = ProbeResult.Error(error.GetType().Name, error.Message ?? "probe failed");
-                }
+                probes[name] = SafeProbe(name);
+            }
+
+            // code_integrity is reported whether or not the server asked for it.
+            // The server tolerates probes beyond the required set but rejects a
+            // report that omits a requested one, so a new probe cannot be made
+            // mandatory without breaking every client that predates it. A server
+            // that already lists it will simply have run it in the loop above;
+            // volunteering it lets an older server score it too, and lets the two
+            // iOS clients adopt it independently. The reference collector does
+            // exactly this.
+            if (!probes.ContainsKey("code_integrity"))
+            {
+                probes["code_integrity"] = SafeProbe("code_integrity");
             }
 
             return Task.FromResult(new IntegrityCollection(Platform, CollectorVersion, challengeNonce, probes));
+        }
+
+        private static ProbeResult SafeProbe(string name)
+        {
+            try
+            {
+                return RunProbe(name);
+            }
+            catch (Exception error) when (error is not OutOfMemoryException)
+            {
+                return ProbeResult.Error(error.GetType().Name, error.Message ?? "probe failed");
+            }
         }
 
         private static ProbeResult RunProbe(string name)
@@ -103,6 +132,7 @@ namespace DeviceTrust.Client.Maui.Apple
                 "dyld_images" => ProbeDyldImages(),
                 "environment" => ProbeEnvironment(),
                 "simulator" => ProbeSimulator(),
+                "code_integrity" => ProbeCodeIntegrity(),
                 _ => ProbeResult.Unsupported("Unknown probe requested by the server: " + name),
             };
         }
@@ -130,20 +160,234 @@ namespace DeviceTrust.Client.Maui.Apple
 
         private static ProbeResult ProbeCodeSigning()
         {
-            // iOS has no public SecCodeCopySigningInformation. What an app can
-            // read about its own signature is its entitlements, and the two that
-            // matter are the team identifier and get-task-allow: the latter is
-            // set only in development builds and is what lets a debugger attach.
-            var applicationIdentifier = ReadStringEntitlement("application-identifier")
-                                        ?? ReadStringEntitlement("com.apple.application-identifier");
-            var teamIdentifier = ReadStringEntitlement("com.apple.developer.team-identifier");
-            var getTaskAllow = ReadBooleanEntitlement("get-task-allow");
+            // Read this app's own code-signing identity by parsing the Mach-O
+            // signature embedded in its executable, NOT SecTaskCopyValueForEntitlement.
+            //
+            // Two reasons. First, SecTaskCreateFromSelf is public API on macOS
+            // only; on iOS the symbol is private, and though a DllImport builds
+            // regardless it may resolve to nothing at runtime and return a clean-
+            // looking empty result -- the exact trap this probe exists to avoid.
+            // Second, and decisive: signing_identifier is a hard contract with
+            // _score_ios_integrity, and the reference client puts the CodeDirectory
+            // identifier there -- "com.example.app" -- while the application-identifier
+            // entitlement carries "TEAMID.com.example.app". Reading the entitlement
+            // would raise ios_signing_identifier_bundle_mismatch on every clean
+            // device. The CodeDirectory identifier is also the stronger measurement:
+            // it is what the signer embedded in the binary rather than what the
+            // kernel was told at launch, and an unsigned build has no signature at
+            // all, which is reported as signed=false instead of read as clean.
+            var result = ProbeResult.Ok()
+                .With("signing_identifier", string.Empty)
+                .With("team_identifier", string.Empty)
+                .With("get_task_allow", false)
+                .With("signed", false);
+
+            var executablePath = NSBundle.MainBundle?.ExecutablePath;
+            if (string.IsNullOrEmpty(executablePath) || !File.Exists(executablePath))
+            {
+                return result.With("status", "error").With("error", "The main executable could not be read.");
+            }
+
+            var bytes = File.ReadAllBytes(executablePath!);
+            var image = MachOImage.TryParse(bytes);
+            if (image is null)
+            {
+                return result.With("status", "error")
+                    .With("error", "The main executable is not a recognised 64-bit Mach-O image.");
+            }
+
+            var signature = image.ReadCodeSignature();
+            if (signature is null)
+            {
+                // No LC_CODE_SIGNATURE at all: the legitimate shape of an
+                // unsigned jailbroken-device build. Reported as unsigned, never
+                // mistaken for a clean signed app.
+                return result.With("signature_absent", true);
+            }
+
+            if (signature.ParseError is not null)
+            {
+                return result.With("signed", true).With("signature_parse_error", signature.ParseError);
+            }
+
+            result = result
+                .With("signed", true)
+                .With("signing_identifier", signature.Identifier ?? string.Empty);
+
+            if (signature.CodeDirectoryFlags is uint flags)
+            {
+                result = result.With("code_directory_flags", (long)flags);
+            }
+
+            if (signature.EntitlementsPlist is not null)
+            {
+                var entitlements = EntitlementsPlist.TryParse(signature.EntitlementsPlist);
+                if (entitlements is not null)
+                {
+                    result = result
+                        .With("team_identifier", AsString(entitlements, "com.apple.developer.team-identifier"))
+                        .With("get_task_allow", entitlements.TryGetValue("get-task-allow", out var gta) && gta is true)
+                        .With("entitlement_count", entitlements.Count);
+                }
+            }
+
+            return result;
+        }
+
+        private static string AsString(IReadOnlyDictionary<string, object?> map, string key)
+        {
+            return map.TryGetValue(key, out var value) && value is string text ? text : string.Empty;
+        }
+
+        /// <summary>
+        /// Compares each loaded image's <c>__TEXT,__text</c> in memory against
+        /// the same bytes on disk.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// The iOS analogue of the Android <c>code_integrity</c> probe, and the
+        /// field names are a hard contract with the server's iOS scorer,
+        /// mirroring the Android one.
+        /// </para>
+        /// <para>
+        /// <b>Only the app bucket can be measured on iOS, and that is a platform
+        /// fact rather than an omission.</b> Android compares libc and libart
+        /// against real files under <c>/apex</c>. iOS system libraries do not
+        /// exist as individual files at all: dyld merges them into the shared
+        /// cache, so there is nothing to open for UIKit or libobjc. Those images
+        /// are counted as <i>unreadable</i>, never as clean.
+        /// </para>
+        /// <para>
+        /// That distinction is the whole point. An implementation that skipped
+        /// them silently would report <c>ext_compared_bytes: 0,
+        /// ext_diff_bytes: 0</c>, which scores exactly like a pristine device
+        /// while having measured nothing — the same defect as an Android bucket
+        /// reading as clean because it was inert. <c>checked</c> becomes true
+        /// only if at least one bundle image really was compared.
+        /// </para>
+        /// </remarks>
+        private static ProbeResult ProbeCodeIntegrity()
+        {
+            var bundlePath = NSBundle.MainBundle?.BundlePath ?? string.Empty;
+            long appCompared = 0;
+            long appDiff = 0;
+            var appLibsDiff = 0;
+            var imagesCompared = 0;
+            var systemUnreadable = 0;
+            var diffedLibs = new List<string>();
+
+            var imageCount = (int)DyldImageCount();
+            for (var index = 0; index < imageCount; index++)
+            {
+                var namePointer = DyldGetImageName((uint)index);
+                if (namePointer == IntPtr.Zero)
+                {
+                    continue;
+                }
+
+                var path = Marshal.PtrToStringAnsi(namePointer) ?? string.Empty;
+
+                // Anything outside our own bundle lives in the shared cache.
+                // Counted, not compared, and never treated as clean.
+                if (path.Length == 0 || bundlePath.Length == 0
+                    || !path.StartsWith(bundlePath, StringComparison.Ordinal))
+                {
+                    systemUnreadable++;
+                    continue;
+                }
+
+                byte[] fileBytes;
+                try
+                {
+                    fileBytes = File.ReadAllBytes(path);
+                }
+                catch (Exception)
+                {
+                    // A bundle image we cannot read is also not clean.
+                    systemUnreadable++;
+                    continue;
+                }
+
+                var image = MachOImage.TryParse(fileBytes);
+                var text = image?.FindSection("__TEXT", "__text");
+                if (image is null || text is null || text.Value.Size <= 0)
+                {
+                    systemUnreadable++;
+                    continue;
+                }
+
+                // Cap per image, as the Android probe does, so a large binary
+                // cannot make a scan take unbounded time.
+                var length = (int)Math.Min(text.Value.Size, MaxBytesPerImage);
+                var diskOffset = image.SliceOffset + text.Value.FileOffset;
+                if (diskOffset < 0 || diskOffset + length > fileBytes.LongLength)
+                {
+                    systemUnreadable++;
+                    continue;
+                }
+
+                // The section's linked address plus dyld's slide is where the
+                // image actually sits in this process.
+                var slide = (long)DyldGetImageVmaddrSlide((uint)index);
+                var live = (IntPtr)unchecked((long)text.Value.VirtualAddress + slide);
+                if (live == IntPtr.Zero)
+                {
+                    systemUnreadable++;
+                    continue;
+                }
+
+                var fromMemory = new byte[length];
+                try
+                {
+                    Marshal.Copy(live, fromMemory, 0, length);
+                }
+                catch (Exception)
+                {
+                    systemUnreadable++;
+                    continue;
+                }
+
+                var differing = 0;
+                for (var offset = 0; offset < length; offset++)
+                {
+                    if (fromMemory[offset] != fileBytes[diskOffset + offset])
+                    {
+                        differing++;
+                    }
+                }
+
+                imagesCompared++;
+                appCompared += length;
+                if (differing > 0)
+                {
+                    appDiff += differing;
+                    appLibsDiff++;
+                    diffedLibs.Add(Path.GetFileName(path));
+                }
+            }
 
             return ProbeResult.Ok()
-                .With("signing_identifier", applicationIdentifier ?? string.Empty)
-                .With("team_identifier", teamIdentifier ?? string.Empty)
-                .With("get_task_allow", getTaskAllow ?? false)
-                .With("entitlements_readable", applicationIdentifier is not null || teamIdentifier is not null);
+                // checked means "the app bucket was genuinely compared". If no
+                // bundle image could be read, nothing was measured, and saying
+                // otherwise is the exact lie this probe exists to prevent.
+                .With("checked", imagesCompared > 0)
+                // Core and ext are the system buckets. On iOS they are
+                // structurally unmeasurable, so they are reported as zero
+                // compared WITH a reason, letting the server tell "nothing to
+                // compare" apart from "compared and clean".
+                .With("core_compared_bytes", 0)
+                .With("core_diff_bytes", 0)
+                .With("diff_bytes", 0)
+                .With("ext_compared_bytes", 0)
+                .With("ext_diff_bytes", 0)
+                .With("ext_libs_diff", 0)
+                .With("app_compared_bytes", appCompared)
+                .With("app_diff_bytes", appDiff)
+                .With("app_libs_diff", appLibsDiff)
+                .With("app_images_compared", imagesCompared)
+                .With("system_images_unreadable", systemUnreadable)
+                .With("system_bucket_reason", "dyld_shared_cache_has_no_backing_files")
+                .With("diffed_libs", string.Join(",", diffedLibs));
         }
 
         private static ProbeResult ProbeDebugger()
@@ -282,38 +526,6 @@ namespace DeviceTrust.Client.Maui.Apple
             }
         }
 
-        private static string? ReadStringEntitlement(string name)
-        {
-            using var value = CopyEntitlement(name);
-            return value is NSString text ? text.ToString() : null;
-        }
-
-        private static bool? ReadBooleanEntitlement(string name)
-        {
-            using var value = CopyEntitlement(name);
-            return value is NSNumber number ? number.BoolValue : null;
-        }
-
-        private static NSObject? CopyEntitlement(string name)
-        {
-            var task = SecTaskCreateFromSelf(IntPtr.Zero);
-            if (task == IntPtr.Zero)
-            {
-                return null;
-            }
-
-            try
-            {
-                using var key = new NSString(name);
-                var value = SecTaskCopyValueForEntitlement(task, key.Handle, IntPtr.Zero);
-                return value == IntPtr.Zero ? null : Runtime.GetNSObject(value);
-            }
-            finally
-            {
-                CFRelease(task);
-            }
-        }
-
         [DllImport("/usr/lib/libSystem.dylib", EntryPoint = "sysctl")]
         private static extern int Sysctl(int[] name, uint nameLength, IntPtr oldp, ref IntPtr oldlenp, IntPtr newp, IntPtr newlen);
 
@@ -323,13 +535,10 @@ namespace DeviceTrust.Client.Maui.Apple
         [DllImport("/usr/lib/libSystem.dylib", EntryPoint = "_dyld_get_image_name")]
         private static extern IntPtr DyldGetImageName(uint index);
 
-        [DllImport("/System/Library/Frameworks/Security.framework/Security", EntryPoint = "SecTaskCreateFromSelf")]
-        private static extern IntPtr SecTaskCreateFromSelf(IntPtr allocator);
+        [DllImport("/usr/lib/libSystem.dylib", EntryPoint = "_dyld_get_image_header")]
+        private static extern IntPtr DyldGetImageHeader(uint index);
 
-        [DllImport("/System/Library/Frameworks/Security.framework/Security", EntryPoint = "SecTaskCopyValueForEntitlement")]
-        private static extern IntPtr SecTaskCopyValueForEntitlement(IntPtr task, IntPtr entitlement, IntPtr error);
-
-        [DllImport("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation", EntryPoint = "CFRelease")]
-        private static extern void CFRelease(IntPtr handle);
+        [DllImport("/usr/lib/libSystem.dylib", EntryPoint = "_dyld_get_image_vmaddr_slide")]
+        private static extern IntPtr DyldGetImageVmaddrSlide(uint index);
     }
 }

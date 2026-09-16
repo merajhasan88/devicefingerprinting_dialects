@@ -1,0 +1,55 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Compile-checks the iOS sources on Linux, against Apple's real bindings.
+
+    Why this exists. src/DeviceTrust.Client.Maui/Apple/*.cs can only be built
+    for net8.0-ios, and the ios workload cannot install anywhere but macOS, so
+    on a Linux or Windows machine those files are never compiled by anything:
+    the csproj excludes them from the android target. They sat unverified for
+    weeks as a result, and when this project was first run it found four real
+    defects in the Secure Enclave key store that no amount of reading had
+    caught: SecAccessControl has a constructor rather than a static Create, and
+    SecKeyChain.QueryAsReference returns an INativeObject ARRAY and requires an
+    explicit maximum, so a two-argument call silently bound the status variable
+    to the count parameter.
+
+    A hand-written stub would have found none of those, because a stub encodes
+    the author's belief about the API, which is exactly the thing being
+    checked. This references the genuine Microsoft.iOS reference assembly.
+
+    Not in DeviceTrust.sln on purpose: it downloads a ~51 MB reference pack, so
+    it should be run deliberately rather than on every build.
+
+        dotnet build tools/ioscheck
+
+    Limits worth knowing. The reference pack is net9.0/iOS 18 while the Maui
+    project targets net8.0-ios, so a member added between the iOS 17 and 18
+    bindings would pass here and fail on a real macOS build. This raises
+    confidence a long way; it does not replace one Codemagic build.
+  -->
+
+  <PropertyGroup>
+    <TargetFramework>net9.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <!-- The platform analyzer cannot help here: this is a plain net9.0 project
+         standing in for net8.0-ios, so every iOS API would be "unsupported". -->
+    <NoWarn>$(NoWarn);CA1416;CS0618;CS8632;CS1591</NoWarn>
+    <RestorePackagesPath>$(MSBuildThisFileDirectory)packages</RestorePackagesPath>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageDownload Include="Microsoft.iOS.Ref.net9.0_18.0" Version="[18.0.9617]" />
+    <Compile Include="../../src/DeviceTrust.Client.Maui/Apple/*.cs" />
+    <ProjectReference Include="../../src/DeviceTrust.Client/DeviceTrust.Client.csproj" />
+    <Reference Include="Microsoft.iOS">
+      <HintPath>$(MSBuildThisFileDirectory)packages/microsoft.ios.ref.net9.0_18.0/18.0.9617/ref/net9.0/Microsoft.iOS.dll</HintPath>
+    </Reference>
+  </ItemGroup>
+
+</Project>

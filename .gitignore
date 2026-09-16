@@ -6,3 +6,4 @@ obj/
 artifacts/
 TestResults/
 devicetrust-state/
+tools/ioscheck/packages/

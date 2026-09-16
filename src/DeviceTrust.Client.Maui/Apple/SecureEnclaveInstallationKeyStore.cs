@@ -163,13 +163,19 @@ namespace DeviceTrust.Client.Maui.Apple
         private SecKey? FindExistingKey()
         {
             using var query = BuildQuery();
-            var result = SecKeyChain.QueryAsReference(query, out var status);
-            if (status != SecStatusCode.Success || result is not SecKey key)
+
+            // QueryAsReference returns an ARRAY and takes an explicit maximum;
+            // there is no single-result overload. Asking for one keeps the
+            // intent obvious -- this tag identifies exactly one installation
+            // key, and a second match would mean the keychain state is not what
+            // this class believes.
+            var matches = SecKeyChain.QueryAsReference(query, 1, out var status);
+            if (status != SecStatusCode.Success || matches is null || matches.Length == 0)
             {
                 return null;
             }
 
-            return key;
+            return matches[0] as SecKey;
         }
 
         private SecKey CreateKey()
@@ -226,7 +232,7 @@ namespace DeviceTrust.Client.Maui.Apple
                 // passcode prompt; AfterFirstUnlockThisDeviceOnly keeps the key
                 // off iCloud Keychain and out of encrypted backups, so it cannot
                 // restore onto a second device.
-                privateKeyAttributes.AccessControl = SecAccessControl.Create(
+                privateKeyAttributes.AccessControl = new SecAccessControl(
                     SecAccessible.AfterFirstUnlockThisDeviceOnly,
                     SecAccessControlCreateFlags.PrivateKeyUsage);
                 parameters.TokenID = SecTokenID.SecureEnclave;
