@@ -164,18 +164,32 @@ namespace DeviceTrust.Client.Maui.Apple
         {
             using var query = BuildQuery();
 
-            // QueryAsReference returns an ARRAY and takes an explicit maximum;
-            // there is no single-result overload. Asking for one keeps the
-            // intent obvious -- this tag identifies exactly one installation
-            // key, and a second match would mean the keychain state is not what
-            // this class believes.
-            var matches = SecKeyChain.QueryAsReference(query, 1, out var status);
-            if (status != SecStatusCode.Success || matches is null || matches.Length == 0)
+            // QueryAsConcreteType, not QueryAsReference(query, 1, ...). Both ask
+            // the keychain for one item, but they disagree at runtime in a way
+            // that only shows once a key actually exists -- which is never on a
+            // first launch, and always on the reinstall that battery item 15
+            // tests.
+            //
+            // QueryAsReference is the ARRAY-returning call. Passing max = 1 sets
+            // kSecMatchLimitOne, so SecItemCopyMatching hands back a single
+            // SecKeyRef rather than a CFArray of one; the binding then sends
+            // -count to it to build its INativeObject[], the SecKey has no such
+            // selector, and the app aborts with
+            //   -[__NSCFType count]: unrecognized selector sent to instance
+            // The compile check could not see this: the signature is correct and
+            // it is the returned shape that is wrong. Measured on the iPhone 7,
+            // on the second install, before a single line of output.
+            //
+            // QueryAsConcreteType is the single-item call. It returns the one
+            // reference already wrapped as its managed type, with no array step
+            // to misfire.
+            var match = SecKeyChain.QueryAsConcreteType(query, out var status);
+            if (status != SecStatusCode.Success)
             {
                 return null;
             }
 
-            return matches[0] as SecKey;
+            return match as SecKey;
         }
 
         private SecKey CreateKey()

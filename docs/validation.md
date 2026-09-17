@@ -286,6 +286,14 @@ Two blind spots in that check are now known, both paid for by a failed build:
   `AppDelegate.cs` is genuinely compiled by the tool against the same reference assembly, and the
   diagnostic still only appeared on the real build. There are three overrides in the iOS sources;
   a fourth needs its signature checked against the binding by hand.
+- **Runtime behaviour of a correct signature is invisible to it.** The compile check verifies that a
+  method exists with the types used; it cannot see what the method does with the values at runtime.
+  `SecKeyChain.QueryAsReference(query, 1, out status)` compiled cleanly and aborted on the device the
+  moment a key existed: `max = 1` sets `kSecMatchLimitOne`, the keychain returns a single `SecKeyRef`
+  rather than a one-element array, and the array-returning binding sends `-count` to it —
+  `-[__NSCFType count]: unrecognized selector`. The single-item `QueryAsConcreteType` is the correct
+  call. Nothing on Linux would have caught this; a keychain query that returns one item is worth
+  exercising on hardware with an item present, which by definition a first launch never does.
 
 **The Mach-O reader and the signing script, against real binaries.** `MachOImage` and
 `EntitlementsPlist` were unit-tested against synthetic images, which proves a parser matches its
