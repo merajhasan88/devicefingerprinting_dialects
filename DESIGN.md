@@ -3879,3 +3879,99 @@ not exist here as things stand. The options, none of them free:
 
 Until one of these is chosen, item 16 stays **blocked on iOS**, and §43.1's clean segment baseline is
 a prerequisite that has been met rather than the item itself.
+
+## 45. Battery item 16 on iOS — embedded gadget blocked by codesigning (2026-09-17) — INCONCLUSIVE
+
+First on-device attempt at item 16 (modify the app's own `__text` so `ios_app_code_modified` fires).
+Approach chosen with the user: embed a **real Frida Gadget**, renamed so `dyld_images` does not flag
+it, and have its script hook a function in an app-bucket module so the code_integrity probe sees a
+runtime `__text` divergence. No jailbreak, no Codemagic build — assembled locally.
+
+### 45.1 What was built
+
+From the existing Codemagic-unsigned build (`9bac726`), entirely on the Linux client:
+- **LIEF** added `LC_LOAD_DYLIB @executable_path/Frameworks/CoreSupport.dylib` to `Runner`.
+- Frida Gadget **17.18.0**, arm64 slice byte-extracted from the ios-universal dylib for the A10,
+  embedded as `CoreSupport.dylib` (renamed to dodge the suspicious-token scan: `frida`, `gadget`,
+  … ; install-id patched in place to match). `CoreSupport.config` + `CoreSupport.js` alongside it.
+- `CoreSupport.js` attaches an interceptor to a function export in Runner/App/Flutter and
+  `Interceptor.flush()`es — an inline branch into `__text`, behaviour preserved.
+- Signed with `ldid`: the four shipping entitlements **plus `dynamic-codesigning`**, no
+  `get-task-allow`. Chosen because no scoring rule reads `entitlement_count` or
+  `code_directory_flags` (only `get_task_allow`), so adding it preserves score isolation while — in
+  theory — granting the JIT right needed to write code. Verified: 5 keys, `get_task_allow` false.
+
+### 45.2 What happened — a CODESIGNING kill in the gadget's initializer
+
+The app **launches** (`runningboardd` tracks it `running-active`), then dies immediately. All three
+crash reports (one per launch attempt) are identical:
+
+```
+EXC_BAD_ACCESS (SIGKILL - CODESIGNING)      termination namespace CODESIGNING, code 2
+  0  libsystem_platform.dylib  sys_icache_invalidate
+  1..N  CoreSupport.dylib        (Frida Gum internals)
+  N+1  dyld  dyld4::Loader::findAndRunAllInitializers(...)
+faulting address in a PRV r-x/rwx page (Frida's own code buffer) next to CoreSupport.dylib __LINKEDIT
+```
+
+Two facts follow directly, and they point in opposite directions:
+
+1. **The embedded, renamed, `ldid`-signed gadget LOADED.** No `dyld`, `amfi`, "Library not loaded"
+   or "code signature invalid" line appears in the syslog around the launch; dyld ran the gadget's
+   initializers. So the signing-and-loading half of the approach works on non-jailbroken TrollStore
+   iOS — a renamed gadget can be shipped inside the app and dyld will map it.
+2. **It cannot create executable memory.** The kill is in Frida Gum's **own bootstrap** (inside the
+   gadget's initializer, before `CoreSupport.js` ever runs), the instant it flushed the icache on a
+   page it had made executable. The kernel's W^X/codesigning enforcement terminated the process.
+
+### 45.3 The conclusion: `dynamic-codesigning` self-applied is not honored
+
+`dynamic-codesigning` added with `ldid` to a CoreTrust-bypassed TrollStore app on stock iOS 15.8.5
+**does not actually grant JIT.** The entitlement is present in the signature but the kernel does not
+honour a self-asserted JIT right on a non-platform binary; genuine JIT requires the process to be in
+the `CS_DEBUGGED` state, which is set by a debugger attaching (`get-task-allow` + TrollStore's
+"Enable JIT", which runs debugserver), or by a jailbreak that disables codesign enforcement. This
+resolves the assumption recorded in §43.4 as **disproved**, on device.
+
+### 45.4 The deeper asymmetry — item 16 may have no clean-isolation form on iOS
+
+Android closed item 14/16 with a gadget on an **unrooted** OPPO/Huawei, because Android permits an
+app to modify its own code in-process. iOS does not: runtime `__text` modification is a **privileged
+operation**, and every route to it trips an *independent* sensor this server already scores:
+
+| route to modify app `__text` at runtime | independent signal it trips |
+|---|---|
+| `get-task-allow` + TrollStore "Enable JIT" (debugserver) | `ios_get_task_allow` +35, and `ios_process_traced` +50 while attached |
+| checkm8 jailbreak | `ios_jailbreak_artifact` +75 |
+| `dynamic-codesigning` alone | **none — but it does not work** (this section) |
+
+Static patching is not item 16: if the on-disk binary is patched, memory matches disk, the probe
+reads `app_diff_bytes 0`, and the tamper is instead caught by `ios_executable_hash_mismatch` /
+signing checks. So the runtime-divergence signal item 16 exists to test can only be produced under a
+condition iOS makes independently visible. The pristine "only `ios_app_code_modified` fires" result
+that item 14 achieved on Android **may be structurally unavailable on iOS** — itself a security
+finding (the OS forces the attacker to also do something detectable), not merely a test-rig
+limitation. In each contaminated route the `+90` would still dominate and drive `block`, so item 16's
+detection+enforcement can still be shown; its *isolation* cannot.
+
+### 45.5 Decision pending (the user paused here)
+
+Not decided unilaterally — narrowing or re-routing an agreed test is the user's call. The options are
+§45.4's two working routes (get-task-allow+JIT, or checkm8), each with its named contamination, or
+accepting that item 16-on-iOS is demonstrated in a non-isolated form, or recording it as
+"iOS-structurally-privileged" and moving on. Resume at §45.6.
+
+### 45.6 Resume-here state (2026-09-17)
+
+- **Server:** EC2 `i-0559685f02c4013b1` **stopped** on pause (was running at the time of test);
+  PostgreSQL 16.15 local, `observe` mode, `INTEGRITY_SCORE_IOS_CODE_INTEGRITY` **off**. The item-16
+  build never produced a report (it crashes before scanning), so nothing new is stored.
+- **Staged, left in place:** `devicetrust-item16.ipa` at `/srv/artifacts/e2a890/item16.ipa` and the
+  clean `dt.ipa` beside it, behind the temporary Caddy `/artifacts/*` block. Local copies and the
+  three crash reports are in the session scratchpad (ephemeral).
+- **Phone:** the crashing item-16 build is the currently-installed app on the iPhone 7. Identity is
+  unaffected (Secure Enclave key untouched). To restore a working app, reinstall the clean
+  `dt.ipa` (needs the server started to serve it) — deletion keeps the key.
+- **Local tooling proven this session:** LIEF in a venv adds the load command; the arm64 gadget
+  slice extracts and signs; `libimobiledevice` (`idevicecrashreport`, `idevicesyslog`) pulls crash
+  reports and streams the log over USB — the diagnostic path that produced §45.2.
