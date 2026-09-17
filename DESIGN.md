@@ -3778,11 +3778,15 @@ the instance and installed through TrollStore.
 
 `score 0`, `verdict trusted`, `collector_version 2`, nine probes.
 
-**`app_segment_diff_bytes` is 0 on real hardware.** That is the result §4bd6a78 was waiting for: the
+**`app_segment_diff_bytes` is 0 on real hardware.** That is the result `4bd6a78` was waiting for: the
 whole `__TEXT` segment — Mach-O header, `__stubs`, `__cstring`, `__unwind_info` and all — measures
 byte-identical between memory and disk on a clean device. **`mach_header_64.reserved` is therefore a
 validated safe flip target**, the Mach-O analogue of the ELF `EI_PAD` bytes used to close the app
-bucket on Android (§30.4), and battery item 16 is unblocked.
+bucket on Android (§30.4): writing to it cannot be mistaken for ordinary runtime variation, because
+there is none to be mistaken for.
+
+That is a measurement result, not a green light for battery item 16. §43.4 states what item 16
+still needs.
 
 ### 43.2 One bundle framework is not measured at all
 
@@ -3830,3 +3834,48 @@ The operational rule it yields is firm, though: **after installing over an exist
 reinstall before trusting a collector-version-sensitive measurement**, because `app_identity` reads
 the new file from disk while the running process can still be executing old code — the one
 combination that makes a stale build look current.
+
+### 43.4 What battery item 16 still needs — a correction to §43.1
+
+§43.1 first said item 16 was "unblocked". That was wrong, and the error is worth stating precisely
+because it would have cost a device session to discover.
+
+**The flip target and the scored field are not the same field.** `4bd6a78` deliberately split the
+measurement in two: `app_diff_bytes` counts differing bytes inside `__TEXT,__text` only, and
+`app_segment_diff_bytes` counts them across the whole `__TEXT` segment. `mach_header_64.reserved`
+lives in the segment but **ahead of** `__text`, which is exactly why the pre-`4bd6a78` probe could
+not see it. So flipping it increments `app_segment_diff_bytes` and leaves `app_diff_bytes` at 0.
+
+`ios_app_code_modified` reads `app_diff_bytes >= 4` and nothing else, and **no rule anywhere reads
+`app_segment_diff_bytes`** — it is telemetry by construction, as `4bd6a78` intended while it had no
+hardware baseline. Item 16's criterion is `app_diff_bytes > 0` → `ios_app_code_modified` +90 →
+`block`, so a reserved-field flip satisfies none of it. Two things are therefore outstanding, and
+they are independent:
+
+**1. A scoring decision.** The segment measurement now has the clean hardware baseline it was
+waiting for, so the question `4bd6a78` deferred is live: should the header range be scored, and if
+so as its own reason or by folding it into `app_diff_bytes`? Keeping them separate is probably
+right — a `__text` difference is an inline hook, while a header difference is not executable code
+and deserves its own weight — but that is a design call, not a measurement.
+
+**2. A way to modify the app's memory on this device, which we do not currently have.** §37 removed
+`get-task-allow` from the pre-signed build on purpose, and without it no debugger or Frida can
+attach on a device that is **not jailbroken** — the iPhone 7 runs stock iOS 15.8.5 with TrollStore,
+which is not a jailbreak (§31). Android closed item 16 with a Frida `Memory.write`; that route does
+not exist here as things stand. The options, none of them free:
+
+- **A one-off test build carrying `get-task-allow`.** Cheapest, and reversible by reinstalling the
+  normal pre-signed build. Costs isolation: `ios_get_task_allow` +35 fires alongside, so the run is
+  partly over-determined — the §25.11 warning about items 14 and 16 applies. The reason is named
+  separately in the report, so `ios_app_code_modified` is still distinguishable.
+- **checkm8 jailbreak.** The A10 bootrom is unpatchable and the jailbreak is semi-tethered, so a
+  reboot restores the clean state and the same handset gives both baselines on demand — the property
+  the device was bought for. It gives real Frida with no entitlement change, and so is the only
+  option that tests item 16 the way item 14 was tested on Android. It changes the state of a
+  physical test phone and therefore needs an explicit decision.
+- **An in-app debug fixture that modifies its own `__text`.** Rejected by default: `bf30934` left
+  iOS fixtures unimplemented deliberately, and §28 is explicit that a fixture validates the pipeline
+  and never proves that real tooling is detected. It would close the item on paper only.
+
+Until one of these is chosen, item 16 stays **blocked on iOS**, and §43.1's clean segment baseline is
+a prerequisite that has been met rather than the item itself.
