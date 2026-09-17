@@ -57,7 +57,18 @@ namespace DeviceTrust.Client.Maui.Apple
         };
 
         /// <summary>Per-image ceiling for the code comparison, matching the Android probe.</summary>
-        private const int MaxBytesPerImage = 4 * 1024 * 1024;
+        // The app bucket gets a budget large enough to hold the whole binary.
+        // On iOS the only image with a backing file to compare is the app's own
+        // executable, and there is one of it; reading all of its __TEXT,__text
+        // is a single sub-second pass. The 4 MiB per-image cap the Android probe
+        // needs -- where hundreds of system libraries are mapped and an
+        // unbounded scan would stall the app -- would here leave two thirds of a
+        // 12 MiB binary unexamined, so a patch past the 4 MiB mark would read as
+        // clean. Measured on the iPhone 7: app_compared_bytes was exactly
+        // 4194304 against a __text of 12,164,900 bytes. This is the bucket
+        // battery item 16 scores, so the cap must not be the one meant for a
+        // different problem.
+        private const int MaxBytesPerAppImage = 64 * 1024 * 1024;
 
         /// <inheritdoc />
         public string Platform => "ios";
@@ -316,9 +327,10 @@ namespace DeviceTrust.Client.Maui.Apple
                     continue;
                 }
 
-                // Cap per image, as the Android probe does, so a large binary
-                // cannot make a scan take unbounded time.
-                var length = (int)Math.Min(text.Value.Size, MaxBytesPerImage);
+                // Only bundle images reach here; everything in the shared cache
+                // was counted as unreadable above. So this cap governs the app
+                // bucket alone, and is sized to cover the whole executable.
+                var length = (int)Math.Min(text.Value.Size, MaxBytesPerAppImage);
                 var diskOffset = image.SliceOffset + text.Value.FileOffset;
                 if (diskOffset < 0 || diskOffset + length > fileBytes.LongLength)
                 {

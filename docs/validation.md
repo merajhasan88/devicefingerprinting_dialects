@@ -208,9 +208,44 @@ constructor rather than a static `Create`, and `SecKeyChain.QueryAsReference` re
 `INativeObject[]` and requires an explicit maximum, so the two-argument call had silently bound the
 status variable to the count parameter.
 
-They have still never **run**. Compiling is not executing: the `ios` workload cannot install on
-Linux because it needs Xcode, so producing an installable build requires a macOS build (Codemagic)
-and the physical iPhone. Treat the iOS paths as compiled and reviewed, not as working.
+**The iOS collector has now run on hardware** — an iPhone 7 (`iPhone9,3`, A10, iOS 15.8.5),
+TrollStore, built by Codemagic and pre-signed by `tools/presign_trollstore_ipa.sh`. This is the
+first execution of any of it; before this the sources were only compiled and reviewed. What the two
+local, endpoint-free actions reported, read over USB with `idevicesyslog`:
+
+- **Installation key** — `provider: iOS Keychain`, `security_level: secure_enclave`,
+  `hardware_backed: True`, `private_key_exportable: False`, and a real thumbprint. The Secure
+  Enclave minted the key. This is the store that had four API defects at first compile; it works.
+- **Code-signing identity** — `signed: True`, `entitlement_count: 4`, and **`get_task_allow: False`**,
+  which is the pre-sign doing its job: the TrollStore +35 floor is gone. `signing_identifier` is
+  `com.icraze.gtatracker`, not the bundle id — the CoreTrust donor identity, exactly what the Swift
+  client measured on the same phone. The server's `ios_signing_identifier_bundle_mismatch` (+90,
+  report-only until baselined) is a true positive here: this is a fake signature, and the probe
+  surfaces the tell.
+- **App identity** — `bundle_id: com.example.devicefingerprinting_dotnet`, `executable_readable: True`,
+  and an `executable_sha256` of `826211b3…`. That hash is the device's own post-rewrite value, which
+  is what `INTEGRITY_IOS_EXECUTABLE_SHA256` would be pinned to, never the file's.
+- **Code integrity (item 16)** — `checked: True`, `app_images_compared: 1`, `app_diff_bytes: 0`
+  against the app's own `__TEXT,__text`, and `system_images_unreadable: 272` with
+  `system_bucket_reason: dyld_shared_cache_has_no_backing_files`. The shared-cache images are counted,
+  never read as clean, exactly as designed.
+
+Two bugs surfaced on that first run, both now fixed for the next build:
+
+- **The harness crashed on every action** with `ArgumentOutOfRangeException` from
+  `StringBuilder.ToString`. The probe body runs on a `Task.Run` worker and appended to the transcript
+  while the main thread read it to fill the text view; `StringBuilder` is not thread-safe, so the
+  concurrent append corrupted the chunk chain mid-read. Append and snapshot now happen together under
+  a lock, and only the finished string crosses to the UI thread. This is harness plumbing, not the
+  SDK — the measurements above all completed before the crash.
+- **Item 16 compared only the first 4 MiB** of a 12 MiB binary, because the app bucket used the
+  Android per-image cap. A patch past the 4 MiB mark would have read as clean. The app-bucket cap is
+  now 64 MiB — enough to cover the whole executable in one sub-second pass, since iOS has exactly one
+  bundle image with a backing file.
+
+The server-dependent actions (enrolment, the token battery) have still never run; they need an
+endpoint, and the stack is currently down. Treat those iOS paths as compiled and reviewed, not yet
+working.
 
 The iOS target framework is `net9.0-ios`, chosen so that what Codemagic builds is what this machine
 can check. iOS bindings are versioned against Xcode: .NET 8's stop at the iOS 18 family, which a

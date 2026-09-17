@@ -37,6 +37,7 @@ namespace DeviceTrust.iOS.Harness
         private const string LogTag = "DTHARNESS";
 
         private readonly StringBuilder _transcript = new StringBuilder();
+        private readonly object _transcriptLock = new object();
         private readonly List<UIButton> _buttons = new List<UIButton>();
 
         private UITextField? _baseUrl;
@@ -239,7 +240,10 @@ namespace DeviceTrust.iOS.Harness
 
             _busy = true;
             SetButtonsEnabled(false);
-            _transcript.Clear();
+            lock (_transcriptLock)
+            {
+                _transcript.Clear();
+            }
             SetStatus("Running " + name + "...");
             SavePreferences();
 
@@ -648,12 +652,26 @@ namespace DeviceTrust.iOS.Harness
         private void Line(string text)
         {
             Console.WriteLine(LogTag + ": " + text);
-            _transcript.AppendLine(text);
+
+            // The transcript is written from the Task.Run worker in Start and
+            // read to fill the text view on the main thread. StringBuilder is
+            // not thread-safe, and an AppendLine racing a ToString corrupts the
+            // chunk chain mid-read: the app died on the very first action with
+            // ArgumentOutOfRangeException from StringBuilder.ToString. So the
+            // append and the snapshot happen together under a lock, and only the
+            // finished immutable string ever crosses to the UI thread.
+            string snapshot;
+            lock (_transcriptLock)
+            {
+                _transcript.AppendLine(text);
+                snapshot = _transcript.ToString();
+            }
+
             BeginInvokeOnMainThread(() =>
             {
                 if (_output is not null)
                 {
-                    _output.Text = _transcript.ToString();
+                    _output.Text = snapshot;
                 }
             });
         }
