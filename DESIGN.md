@@ -4149,8 +4149,11 @@ deferred hook landed.
 - Account/token battery (items 3–8, 12/13) + two-phone stolen-token: with the .NET session against this
   endpoint.
 
-### 47.5 Teardown (pending — owner's call)
+### 47.5 Teardown — completed 2026-09-20
 
-EC2 left **running** for the .NET session. When they finish: **stop** the instance (never terminate);
-optionally revert `INTEGRITY_MODE` to observe for a production-representative resting state; and to hand
-the iPhone back clean, reinstall `dt.ipa`.
+The .NET session finished. Executed: `INTEGRITY_MODE` reverted to **observe**; iPhone 7 reinstalled with
+the clean **`dt.ipa`** (verified `score 0 / trusted`, identity intact); EC2 `i-0559685f02c4013b1`
+**stopped** (not terminated; ~USD 0.64/mo EBS at rest), Elastic IPs 0, no NAT, no RDS. Resting config
+persists `INTEGRITY_MODE=observe` and `INTEGRITY_SCORE_IOS_CODE_INTEGRITY=1` for the next start; the
+DuckDNS endpoint repoints on start. To resume: start the instance, refresh the dev IP in SG 22 if it
+changed, and point clients at `https://devicefingerprinting.duckdns.org`.
