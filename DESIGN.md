@@ -3975,3 +3975,96 @@ accepting that item 16-on-iOS is demonstrated in a non-isolated form, or recordi
 - **Local tooling proven this session:** LIEF in a venv adds the load command; the arm64 gadget
   slice extracts and signs; `libimobiledevice` (`idevicecrashreport`, `idevicesyslog`) pulls crash
   reports and streams the log over USB — the diagnostic path that produced §45.2.
+
+## 46. Battery item 16 on iOS — get-task-allow + JIT route: PASS (non-isolated) (2026-09-19)
+
+Resolves §45.5. The owner chose §45.4 route 1 (recorded in `owner_decisions.md`: "item 16:
+get-task-allow + JIT"). This section records the build, the run, and the on-device result — a **PASS
+in the non-isolated form** §45.4 anticipated.
+
+### 46.1 The build — one entitlement changed
+
+The §45.1 gadget build (`item16.ipa`) already embeds a renamed Frida Gadget (`CoreSupport.dylib`)
+whose script inline-hooks a Flutter app-bucket export and `Interceptor.flush()`es. It crashed (§45.2)
+because self-applied `dynamic-codesigning` does not grant JIT (§45.3). The only change for this route
+is the entitlement: the main `Runner` executable was re-signed locally with `ldid`, swapping
+`dynamic-codesigning` for **`get-task-allow`** and keeping the four shipping entitlements — crucially
+`keychain-access-groups = [TROLLTROLL.*, com.apple.token]` — byte for byte, so the Secure Enclave key
+and the installation identity survive (§37.3). No LIEF, no Codemagic rebuild.
+
+Result: `item16-jit.ipa`, five entitlements, `get-task-allow` present, `dynamic-codesigning` gone,
+`sha256 0ba88f43…`, staged at `/srv/artifacts/e2a890/item16-jit.ipa`.
+
+### 46.2 The run and the result
+
+Installed over the crashing build via TrollStore (in-place, same bundle id → key retained), launched
+via **TrollStore "Enable JIT"** (debugserver attaches, sets `CS_DEBUGGED`), then "Run native
+integrity scan". Server: local PostgreSQL 16.15 on the EC2 instance, `observe` mode,
+`INTEGRITY_SCORE_IOS_CODE_INTEGRITY=1` (enabled this session). The stored `integrity_reports` row:
+
+    score 100, verdict block, hard_block false
+    ios_app_code_modified                   +90   "the application's own code differs in memory from its packaged image"
+    ios_get_task_allow                      +35
+    ios_signing_identifier_bundle_mismatch  +0    (report_only; proposed 90)
+    ios_known_fake_team_identifier          +0    (report_only; proposed 25)
+
+    code_integrity: checked true, app_diff_bytes 16, app_segment_diff_bytes 16,
+                    diffed_libs "Flutter", app_libs_diff 1, ext_diff_bytes 0,
+                    app_compared_bytes 24,215,520, app_images_compared 4
+
+A 16-byte runtime divergence in the Flutter app-bucket `__text` — the gadget's inline hook — detected
+exactly as designed, driving `block`.
+
+### 46.3 What it settles
+
+- **§45.3's blocker is lifted on device.** The app produced a report instead of the CODESIGNING
+  SIGKILL of §45.2, so `get-task-allow` + TrollStore "Enable JIT" genuinely grants JIT where
+  self-applied `dynamic-codesigning` did not.
+- **Detection + block-weight are proven.** `ios_app_code_modified +90` alone reaches the block band
+  and is named as its own reason, so the item-16 signal is cleanly attributable.
+- **Isolation, honestly: not achieved — and that is the finding.** `ios_get_task_allow +35` rode
+  along; the enabling condition is itself independently visible, exactly §45.4's thesis that iOS
+  makes runtime `__text` modification a privileged, separately-detectable act. One nuance in our
+  favour: `ios_process_traced +50` did **not** fire, because TrollStore's debugserver detaches after
+  setting `CS_DEBUGGED`, so the process is JIT-capable but not traced at scan time. The only
+  contamination is +35, and the verdict does not depend on it.
+- Classification: **PASS** for item 16 detection in non-isolated form. Enforcement (a protected
+  request refused with `integrity_blocked`) was not exercised here — the server was in `observe` —
+  and is a separate, already-validated property (§40). It can be shown by flipping
+  `INTEGRITY_MODE=enforce`.
+
+### 46.4 Should `ios_get_task_allow` be scored +0? — recommendation: no
+
+Raised by the owner: zero the +35 so item 16 reads in isolation. It removes the contamination but at a
+cost to the product that outweighs the cosmetic gain, and it does not change item 16's verdict (the
++90 blocks on its own):
+
+- A genuine App-Store build never carries `get-task-allow`; distribution signing strips it. In
+  production its presence means the running app is **not** the distributed app — a dev build, a
+  TrollStore/AltStore/enterprise-resigned copy, or an app a debugger can attach to. For a financial
+  client that is a signal worth keeping, and it fires **before** any code is modified, catching
+  attackers who only observe or resign rather than hook.
+- Its production false-positive cost is ~zero (legitimate users cannot have it), so +35 is almost
+  pure signal, already weighted "elevated/step-up", not a hard block.
+- The reason it contaminates *our* measurements is a **lab** artifact — every TrollStore build carries
+  it. §37 already solved that the right way: strip `get-task-allow` from the pre-signed baseline so
+  the clean phone reads trusted, rather than blinding the scorer. `INTEGRITY_ALLOW_DEBUG` was rejected
+  there for the same reason — it gates six rules including `ios_process_traced`.
+- If an isolated *measurement* is wanted for the record, the correct mechanism is a report-only toggle
+  (default scored +35), mirroring `INTEGRITY_SCORE_IOS_FAKE_SIGNATURE`, so a run can show
+  `ios_app_code_modified` alone without ever shipping +0 as policy. Not yet built; offered.
+
+Decision therefore pending owner confirmation; the recommendation is to keep +35 as policy and, if
+desired, add a report-only switch for isolated demos.
+
+### 46.5 State after this run
+
+- **Server:** EC2 `i-0559685f02c4013b1` running, local PostgreSQL 16.15, `observe`,
+  `INTEGRITY_SCORE_IOS_CODE_INTEGRITY=1`. SG port 22 now also allows the current dev IP
+  `39.58.208.8/32` (the three prior `/32`s left in place).
+- **Staged:** `item16-jit.ipa` beside `item16.ipa` and `dt.ipa` under `/srv/artifacts/e2a890/`.
+- **Phone:** iPhone 7 now runs the `get-task-allow` item-16 build (identity intact — a `+35` baseline
+  is expected on it). Restore with the clean `dt.ipa` when done; deletion keeps the key.
+- **Hygiene note:** the local Postgres password was printed to a session transcript this round (the
+  systemd drop-in ExecStart was catted); rotating `dtadmin` is advisable, though the DB is bound to
+  localhost and its SG admits 5432 only from the app SG.
