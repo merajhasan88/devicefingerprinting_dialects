@@ -26,12 +26,12 @@ the current build (at the time of writing, `664e9c8e…e3`).
 | 7 | Path + method tampering | **PASS** | **PASS** | observe |
 | 8 | Stale timestamp | **PASS** | **PASS** | observe |
 | 9 | Frida Gadget — **name-based** detection | n/a, defeated on purpose | n/a, defeated on purpose | enforce |
-| 10 | Frida Gadget — enforcement (login 403) | not run | not run | — |
+| 10 | Frida Gadget — enforcement (login 403) | not run | **PASS** `403 integrity_blocked` | **enforce** |
 | 11 | Frida Gadget — restore | **PASS** | **PASS** | enforce |
 | 12 | Device memory across a new hardware key | not run | not run | — |
 | 13 | Pristine re-enrolment (enrolment half) | **PASS** | **PASS** | enforce |
 | 14 | Structural code-integrity, **ext** bucket | **PASS** | **PASS** | **enforce** |
-| 16 | Structural code-integrity, **app** bucket | **PASS** | not run | **enforce** |
+| 16 | Structural code-integrity, **app** bucket | **PASS** | **PASS** | **enforce** |
 
 Items 3 and 4 are cross-device by construction: the Huawei minted, the OPPO replayed with its own
 keystore key. That is the property the desktop harness could only approximate with two software
@@ -227,3 +227,33 @@ once. The probe now adds `PROT_READ` for the duration of the copy and restores t
 protection immediately, and reports `xom_regions_unlocked` / `xom_regions_unreadable` so an operator
 can see the difference. The OPPO on Android 9 needs no unlocking (`unlocked=0`) and still compares
 in full, which exercises both paths.
+
+## OPPO follow-up (2026-09-19) — items 10, 14, 16 closed with a live Frida client
+
+Run in `INTEGRITY_MODE=enforce` after the OPPO's release cert was re-added to the
+allow-list on the rebuilt server. The gadget (`frida-gadget 17.17.0`, renamed
+`libhelper.so`, port 27999) was embedded in a signed release build; hooks were
+placed live over `adb forward` + a matching `frida` 17.17.0 client, since the
+harness gadget listens rather than carrying an embedded script.
+
+| run | diffed_libs | reasons | verdict |
+|---|---|---|---|
+| A — gadget idle | `libc.so` | `instrumentation_runtime_thread +90`, `code_integrity_violation +90` | block |
+| B — 8 hooks in libc++ **and** the app's own libSystem.Native.so | `libSystem.Native.so, libc++.so, libc.so` | adds `android_app_code_modified +90` | block |
+
+- **Item 14** (ext bucket): libc++ hooks → `android_code_integrity_violation`.
+- **Item 16** (app bucket): hooks in the app's own `libSystem.Native.so` →
+  `android_app_code_modified` — the OPPO gap, now closed to match the Huawei.
+- **Item 10**: login on the blocked device → `403 integrity_blocked`.
+- **Item 11**: clean reinstall → `diffed_libs=<none>`, code-integrity reasons
+  gone, back to `78/review`.
+- The renamed gadget was caught **structurally even while idle** (Gum threads +
+  Frida's libc load-patch); the name probes never fired, which is the point.
+
+**Item 12 remains blocked, and only by W^X.** Its pass criterion is
+`integrity_device_blocked_recently`, which the server checks only *after* the
+device's own current scan passes as trusted. The clean .NET reinstall scans
+`78/review` (`android_wx_memory +60`), so it fails its own gate first and returns
+`integrity_blocked` — the device-memory path is never reached. Flutter reaches it
+because its clean build scans `18/trusted`. This needs the server-side
+baseline-relative W^X scoring, not a client change.
