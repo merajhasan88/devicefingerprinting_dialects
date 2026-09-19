@@ -257,3 +257,41 @@ device's own current scan passes as trusted. The clean .NET reinstall scans
 `integrity_blocked` — the device-memory path is never reached. Flutter reaches it
 because its clean build scans `18/trusted`. This needs the server-side
 baseline-relative W^X scoring, not a client change.
+
+## iPhone 7 follow-up (2026-09-20) — items 16, 10, 12 (get-task-allow + JIT route)
+
+Resolves the iOS side, mirroring the Flutter session's §46. iOS has no ext bucket
+(the dyld shared cache has no backing file), so **item 14 is structurally
+impossible on iOS** — the collector reports `ext_compared_bytes 0` with a reason.
+Items 16/10/12 were run via the get-task-allow + JIT route §45.4 anticipated.
+
+Build: the unsigned Codemagic IPA re-signed with `ldid` adding `get-task-allow`
+to the four shipping entitlements (keychain-access-groups byte-identical, so the
+key and identity survive), no embedded gadget. JIT was granted from Linux: the
+DeveloperDiskImage was mounted with `pymobiledevice3`, then `frida` spawned the
+app (`frida.spawn` → the DDI debugserver sets `CS_DEBUGGED`), attached its own
+gadget, and placed eight inline hooks in the app-bucket image
+`DeviceTrust.iOS.Harness`. The Frida session was held open across the scan,
+because on jailed iOS detaching unloads the agent and takes the process down.
+
+| item | result |
+| --- | --- |
+| 16 app bucket | `ios_app_code_modified +90` → score 100, block |
+| 10 enforcement | login on the blocked device → `403 integrity_blocked` |
+| 12 device memory | clean build, `deleteKey` + re-enrol (new key) → login `403 integrity_device_blocked_recently` |
+
+Item 12 is the cleanest in the battery: iOS has no W^X penalty, so the new key's
+own scan reads `trusted` and passes its own gate, and the device-memory block is
+then reached — the exact path Android cannot take, where `android_wx_memory +60`
+keeps the clean re-enrol at `78/review` and it fails its own gate first.
+
+Isolation, honestly: not achieved, as §45.4 predicted. `ios_get_task_allow +35`
+rode along (the enabling condition), and because the Frida session stayed
+attached to hold the hooks, `ios_process_traced +50` also fired — more
+contamination than the Flutter §46 embedded-script route (+35 only). The
+`ios_app_code_modified +90` drives the block on its own and is named as its own
+reason, so the item-16 signal is cleanly attributable regardless.
+
+Device state after: the clean build is installed, but the device holds a blocked
+verdict in memory for ~24 h, so logins return `integrity_device_blocked_recently`
+until it ages out. The DeveloperDiskImage mount is benign and clears on reboot.

@@ -301,7 +301,17 @@ not link against a real iOS SDK, run the AOT compiler, or produce a bundle, and 
 target this app needs is `15.0` — the iPhone 7 cannot go past iOS 15.8.5 — which is close enough to
 a current Xcode's floor to be worth confirming rather than assuming.
 
-Two blind spots in that check are now known, both paid for by a failed build:
+**iOS items 16, 10 and 12 now pass on hardware** via the get-task-allow + JIT route (see
+`docs/handset-battery.md`, 2026-09-20): the app's own `__text` was inline-hooked under JIT (DDI
+debugserver via `pymobiledevice3` + `frida` spawn), raising `ios_app_code_modified +90` → block
+(item 16), a login on the blocked device returned `403 integrity_blocked` (item 10), and a new
+hardware key on the recently-blocked device returned `403 integrity_device_blocked_recently`
+(item 12 — cleaner on iOS than Android, which W^X keeps at 78/review). **Item 14 is structurally
+impossible on iOS**: there is no readable system library to hook, since the dyld shared cache has no
+backing file. Item 16's isolation is also unavailable on iOS — modifying one's own `__text` needs
+get-task-allow (+35), which always rides along; that is itself the finding, not a gap.
+
+Two blind spots in the compile check are now known, both paid for by a failed build:
 
 - **The platform analysers do not run.** CA1416 and CA1422 need a platform in the target framework,
   and `tools/ioscheck` is plain `net9.0`. Adding `[assembly: SupportedOSPlatform("ios15.0")]` does
