@@ -36,6 +36,13 @@ namespace DeviceTrust.iOS.Harness
     {
         private const string LogTag = "DTHARNESS";
 
+        // Pre-fills the endpoint field so it need not be typed on a touch
+        // keyboard. It stays a DEFAULT, not a compile-time constant: the field
+        // is still editable and persisted in NSUserDefaults, so pointing the app
+        // at another server never needs a rebuild. Safe to bake in because the
+        // DuckDNS name is stable across EC2 restarts, unlike a raw IP.
+        private const string DefaultEndpoint = "https://devicefingerprinting.duckdns.org";
+
         private readonly StringBuilder _transcript = new StringBuilder();
         private readonly object _transcriptLock = new object();
         private readonly List<UIButton> _buttons = new List<UIButton>();
@@ -77,7 +84,7 @@ namespace DeviceTrust.iOS.Harness
             stack.AddArrangedSubview(_status);
 
             stack.AddArrangedSubview(Label("Endpoint", bold: true, size: 13));
-            _baseUrl = Field("https://<host>.nip.io", Preference("api_base_url", string.Empty));
+            _baseUrl = Field("https://<host>.nip.io", Preference("api_base_url", DefaultEndpoint));
             stack.AddArrangedSubview(_baseUrl);
 
             stack.AddArrangedSubview(Label("Installation and device record", bold: true, size: 13));
@@ -153,6 +160,14 @@ namespace DeviceTrust.iOS.Harness
                 stack.LeadingAnchor.ConstraintEqualTo(scroll.ContentLayoutGuide.LeadingAnchor),
                 stack.WidthAnchor.ConstraintEqualTo(scroll.FrameLayoutGuide.WidthAnchor),
             });
+
+            // Tap anywhere off a field to dismiss the keyboard. CancelsTouchesInView
+            // stays false so the same tap still reaches the buttons underneath.
+            var dismiss = new UITapGestureRecognizer(() => View!.EndEditing(true))
+            {
+                CancelsTouchesInView = false,
+            };
+            View!.AddGestureRecognizer(dismiss);
         }
 
         private UILabel Label(string text, bool bold, float size)
@@ -177,6 +192,15 @@ namespace DeviceTrust.iOS.Harness
                 AutocapitalizationType = UITextAutocapitalizationType.None,
                 Font = UIFont.SystemFontOfSize(12),
                 TranslatesAutoresizingMaskIntoConstraints = false,
+                ReturnKeyType = UIReturnKeyType.Done,
+            };
+            // Without this the Done key does nothing and, with no scroll room
+            // below a focused field, the keyboard cannot be dismissed at all --
+            // which is what stranded the endpoint field on the device.
+            field.ShouldReturn = textField =>
+            {
+                textField.ResignFirstResponder();
+                return true;
             };
             field.HeightAnchor.ConstraintEqualTo(32).Active = true;
             return field;
