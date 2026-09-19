@@ -4028,10 +4028,8 @@ exactly as designed, driving `block`.
   favour: `ios_process_traced +50` did **not** fire, because TrollStore's debugserver detaches after
   setting `CS_DEBUGGED`, so the process is JIT-capable but not traced at scan time. The only
   contamination is +35, and the verdict does not depend on it.
-- Classification: **PASS** for item 16 detection in non-isolated form. Enforcement (a protected
-  request refused with `integrity_blocked`) was not exercised here — the server was in `observe` —
-  and is a separate, already-validated property (§40). It can be shown by flipping
-  `INTEGRITY_MODE=enforce`.
+- Classification: **PASS** for item 16 detection in non-isolated form. Enforcement was then confirmed
+  on hardware in enforce mode — see §46.6.
 
 ### 46.4 Should `ios_get_task_allow` be scored +0? — recommendation: no
 
@@ -4054,12 +4052,15 @@ cost to the product that outweighs the cosmetic gain, and it does not change ite
   (default scored +35), mirroring `INTEGRITY_SCORE_IOS_FAKE_SIGNATURE`, so a run can show
   `ios_app_code_modified` alone without ever shipping +0 as policy. Not yet built; offered.
 
-Decision therefore pending owner confirmation; the recommendation is to keep +35 as policy and, if
-desired, add a report-only switch for isolated demos.
+Owner confirmed on 2026-09-19: **keep +35**. The stated concern was legitimate users being penalised,
+which does not arise — an App-Store build never carries `get-task-allow`, so only sideloaded / resigned
+/ debuggable copies trip it. A report-only switch for isolated demos remains available if wanted, not
+yet built.
 
 ### 46.5 State after this run
 
-- **Server:** EC2 `i-0559685f02c4013b1` running, local PostgreSQL 16.15, `observe`,
+- **Server:** EC2 `i-0559685f02c4013b1` running, local PostgreSQL 16.15, **`enforce`** (flipped from
+  `observe` for §46.6; revert to `observe` for a production-representative resting state),
   `INTEGRITY_SCORE_IOS_CODE_INTEGRITY=1`. SG port 22 now also allows the current dev IP
   `39.58.208.8/32` (the three prior `/32`s left in place).
 - **Staged:** `item16-jit.ipa` beside `item16.ipa` and `dt.ipa` under `/srv/artifacts/e2a890/`.
@@ -4068,3 +4069,23 @@ desired, add a report-only switch for isolated demos.
 - **Hygiene note:** the local Postgres password was printed to a session transcript this round (the
   systemd drop-in ExecStart was catted); rotating `dtadmin` is advisable, though the DB is bound to
   localhost and its SG admits 5432 only from the app SG.
+
+### 46.6 Enforcement confirmed on hardware (enforce mode)
+
+With `INTEGRITY_MODE=enforce`, the item-16 build (launched via TrollStore "Enable JIT" so the gadget
+hooks) attempted `POST /v1/accounts/register`. The server ran the full possession + integrity flow and
+refused it:
+
+    15:57:37  POST /v1/installations/challenge  200
+    15:57:38  POST /v1/installations/verify     200
+    15:57:38  POST /v1/integrity/challenge      200
+    15:57:39  POST /v1/integrity/report         200   (score 100, verdict block, ios_app_code_modified +90)
+    15:57:39  POST /v1/accounts/register        403   integrity_blocked
+
+The `403` code is `integrity_blocked` by construction, not inference: `_enforce_integrity_gate` maps
+`verdict == "block"` to `integrity_blocked`, and the report persisted in the same second is
+`verdict = block`. So a device that had just proven possession of its installation key was still
+refused a protected operation solely because its live scan detected the in-memory `__text`
+modification — detection and enforcement, on hardware. Item 16 is therefore **PASS** for both, in the
+non-isolated form of §45.4. (The werkzeug access log records only the HTTP status; the JSON error code
+is not logged, which is why the mapping was confirmed from source.)
