@@ -4089,3 +4089,68 @@ refused a protected operation solely because its live scan detected the in-memor
 modification — detection and enforcement, on hardware. Item 16 is therefore **PASS** for both, in the
 non-isolated form of §45.4. (The werkzeug access log records only the HTTP status; the JSON error code
 is not logged, which is why the mapping was confirmed from source.)
+
+## 47. Operational state and the confirmed iOS JIT-arming recipe (2026-09-20)
+
+State save. Item 16 (§46) was reproduced by the .NET session on the same iPhone 7; this section records
+the reusable JIT recipe that emerged and the exact server/device/repo state at the save point.
+
+### 47.1 The iOS JIT-arming recipe that reproduces item 16 (confirmed twice)
+
+1. **The build must carry `get-task-allow`.** A pre-signed clean build (`tools/presign_trollstore_ipa.sh`)
+   has it stripped (§37), and TrollStore preserves that absence — so "Enable JIT" fails with
+   **`trollstorehelper returned 3`**. Verify with `ldid -e <Runner>` → `get-task-allow: true`.
+   `item16-jit.ipa` carries it; `dt.ipa` does not.
+2. Install via TrollStore; **launch via TrollStore "Enable JIT"**, not the home icon — this attaches
+   debugserver and sets `CS_DEBUGGED`, without which the embedded gadget's Frida-Gum bootstrap hits
+   W^X and is SIGKILLed (§45.2).
+3. **Wait ~10–15 s** after launch before scanning — the gadget defers its inline hook. Scanning too
+   early gives `score 35 / app_diff_bytes 0` (only `ios_get_task_allow`, no `ios_app_code_modified`),
+   with a non-scoring `app_segment_diff_bytes` (a `__TEXT`-segment, non-`__text` diff — telemetry
+   only, §43.4).
+4. Run the native integrity scan → `app_diff_bytes ≥ 4` (Flutter) → `ios_app_code_modified +90` → block.
+
+Failure-mode map: `returned 3` = missing get-task-allow; `+35 only / app_diff 0` = scanned before the
+deferred hook landed.
+
+### 47.2 Server / infrastructure state
+
+- EC2 `i-0559685f02c4013b1` **running** (t4g.micro, us-west-2). Endpoint
+  `https://devicefingerprinting.duckdns.org` (DuckDNS, auto-updated on start).
+- Local **PostgreSQL 16.15** + Redis on the instance; **no RDS**.
+- `INTEGRITY_MODE=enforce`, `DEVICE_POLICY_MODE=observe`, `INTEGRITY_SCORE_IOS_CODE_INTEGRITY=1`,
+  `INTEGRITY_SCORE_IOS_FAKE_SIGNATURE=0`, `INTEGRITY_ALLOW_DEBUG=0`. Left in **enforce** for the .NET
+  session's battery.
+- Android cert allow-list: **3 certs** — the two prior handset certs plus the .NET client's
+  `664e9c8e…de3` (added this session).
+- `dtadmin` DB password **rotated** this session (root-600 drop-in + Postgres role; never printed).
+  The previously-leaked password is dead.
+- SG `sg-0a7e35ab397d765e8`: port 22 now also allows dev IP `39.58.208.8/32` (the three prior `/32`s
+  remain).
+- Staged under `/srv/artifacts/e2a890/`: `dt.ipa` (clean), `item16.ipa` (crashing dynamic-codesigning
+  build, §45), `item16-jit.ipa` (get-task-allow build, §46 — the working item-16 build).
+
+### 47.3 Device state (iPhone 7)
+
+- Currently runs **`item16-jit.ipa`** (the get-task-allow item-16 build) — the .NET session reinstalled
+  it to reproduce item 16. **Not** the clean `dt.ipa`. Identity intact (Secure Enclave key preserved;
+  keychain group unchanged).
+- Latest verdict `100/block` (`ios_app_code_modified`). Block reports sit on the device's `device_id`
+  for 24 h — in enforce, the clean `dt.ipa` would be refused `integrity_device_blocked_recently` until
+  they age out or the server returns to observe. To restore a clean baseline: reinstall `dt.ipa`, then
+  wait out the window or run in observe.
+
+### 47.4 Repo / battery state
+
+- DESIGN.md §46 (item 16 PASS) and `NEXT_BATTERY_ITEM.md` are committed **and pushed** (origin/main was
+  current before this section; this §47 commit is a new local one to push).
+- Next battery item (`NEXT_BATTERY_ITEM.md`): item 17 (iOS clean baseline) already satisfied by the
+  2026-09-19 restore; item 18 (iOS fake-signature enforcement) is the next test, gated by §39.5.
+- Account/token battery (items 3–8, 12/13) + two-phone stolen-token: with the .NET session against this
+  endpoint.
+
+### 47.5 Teardown (pending — owner's call)
+
+EC2 left **running** for the .NET session. When they finish: **stop** the instance (never terminate);
+optionally revert `INTEGRITY_MODE` to observe for a production-representative resting state; and to hand
+the iPhone back clean, reinstall `dt.ipa`.
