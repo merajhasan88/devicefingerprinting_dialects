@@ -243,9 +243,36 @@ Two bugs surfaced on that first run, both now fixed for the next build:
   now 64 MiB — enough to cover the whole executable in one sub-second pass, since iOS has exactly one
   bundle image with a backing file.
 
-The server-dependent actions (enrolment, the token battery) have still never run; they need an
-endpoint, and the stack is currently down. Treat those iOS paths as compiled and reviewed, not yet
-working.
+**The full battery has now run against a live server** (`https://devicefingerprinting.duckdns.org`,
+PostgreSQL 16.15, both modes `observe`), read off the iPhone over USB:
+
+| item | result |
+| --- | --- |
+| enrol / native scan | score 0, `trusted` |
+| account register / login | created and logged in |
+| risk evaluation | score 10, `allow` |
+| 5 exact replay | 401 `access_proof_replay` |
+| 6 body tampering | 401 `access_proof_body_mismatch` |
+| 7a/7b path & method | 401 `access_proof_path_mismatch` / `_method_mismatch` |
+| 8 stale timestamp | 401 `access_proof_timestamp_outside_window` |
+| bound refresh | rotated; new access token works |
+| 3 stolen access (iPhone→Android) | 401 `invalid_installation_signature` |
+| 4 stolen refresh (iPhone→Android) | challenge 200, then 401 `invalid_installation_signature` |
+| 12/13 delete key → new identity | `8c80ea71…` became `91725560…`, new thumbprint, `created_this_launch` |
+| 15 reinstall keeps identity | `8c80ea71…` survived the session's TrollStore reinstalls |
+| 16 app bucket | `app_diff_bytes 0` over the whole executable |
+
+The cross-device tests are genuine two-device runs: the iPhone minted, the Huawei replayed. Token
+entry went through Android intent extras over adb (`am start --es stolen_access_token …`), not
+`adb shell input text`, which silently truncated a 639-character token to 414 and produced a
+misleading `invalid_token` rather than the signature rejection. The truncation was caught by dumping
+the field with `uiautomator` and comparing lengths; the binder carries the full value. The CLI
+`battery --stolen-access-token …` reaches the same verdict from this machine, since the server cannot
+distinguish a second device from any other key that did not mint the token.
+
+Only the two enforcement checks remain unrun, because the server is in `observe` mode: a blocked
+device cannot reach protected endpoints, and reinstalling does not clear a block. They need
+`DEVICE_POLICY_MODE=enforce`.
 
 The iOS target framework is `net9.0-ios`, chosen so that what Codemagic builds is what this machine
 can check. iOS bindings are versioned against Xcode: .NET 8's stop at the iOS 18 family, which a
