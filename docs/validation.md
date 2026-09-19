@@ -270,9 +270,16 @@ the field with `uiautomator` and comparing lengths; the binder carries the full 
 `battery --stolen-access-token …` reaches the same verdict from this machine, since the server cannot
 distinguish a second device from any other key that did not mint the token.
 
-Only the two enforcement checks remain unrun, because the server is in `observe` mode: a blocked
-device cannot reach protected endpoints, and reinstalling does not clear a block. They need
-`DEVICE_POLICY_MODE=enforce`.
+With the server flipped to `integrity_mode: enforce`, the CLI conformance suite runs all 24 checks
+with none skipped — including the two enforcement checks that observe mode cannot exercise: a blocked
+device cannot reach protected endpoints, and reinstalling does not clear a block. These are driven
+from this machine with software keys, since the server cannot distinguish that from any other client.
+
+One consequence of enforce, relevant only to the physical Android handset: the cert allow-list
+(`INTEGRITY_ANDROID_CERT_SHA256`) is active, so enrolling that handset now requires a release build
+whose signing certificate is allow-listed, or the report hard-blocks with
+`android_signing_certificate_mismatch` (+100) and a debug build additionally trips `ro.debuggable`
+(+35). The iPhone and the CLI are unaffected.
 
 The iOS target framework is `net9.0-ios`, chosen so that what Codemagic builds is what this machine
 can check. iOS bindings are versioned against Xcode: .NET 8's stop at the iOS 18 family, which a
