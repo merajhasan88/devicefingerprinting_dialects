@@ -4236,3 +4236,102 @@ independent, and remains the false-positive-free part.
 **Before this ships:** a conformance-suite check (`null → no penalty`, `advisory → +30`,
 `required → block`) and a suite run; deferred here because the server is stopped. Deploy also needs
 the usual `diff -u` of `device_trust_server.py` against `/opt` in case of a hand-edit.
+
+## 51. Spec — step-up authentication and server-side behavioral signals (2026-09-23)
+
+Design blueprint agreed with the owner; **not yet implemented**. Two independent strands that both
+harden the §2 boundary — a fully compromised device holding a genuine hardware key and invoking it as
+a silent signing oracle. Neither makes the device trustworthy; both raise the attacker's cost and
+narrow the window. Key attestation was considered and **ruled out** (vendor root of trust, §50/§2).
+
+### 51.1 Step-up authentication — the problem
+
+The installation key currently signs unattended (§35.7: usable with no passcode set), so on a
+compromised OS it can be driven as a silent oracle. Step-up binds the *sensitive* operations to a
+fresh device authentication, so the key cannot sign those without the user present. Routine PoP and
+login stay unattended and frictionless.
+
+### 51.2 Auth factor — passcode default, biometric optional, configured both sides
+
+- **Default factor is the device passcode**, not biometric: a passcode always exists once device
+  security is set up, whereas biometric may be unenrolled or hardware-absent. Biometric is an opt-in
+  stronger-UX alternative.
+- The factor is **configurable on both sides and must map** (passcode↔passcode, biometric↔biometric):
+  a Flutter-plugin setting the integrating app sets, and a server-side policy value.
+- **Enforcement and its honest limit.** The factor is enforced *in the client secure hardware* — the
+  step-up key is generated so it cannot sign without the configured factor (Android
+  `setUserAuthenticationRequired(true)` + auth type; iOS `SecAccessControl` `.devicePasscode` /
+  `.biometryCurrentSet`). The server-side setting *declares and requires* the expected factor so the
+  client build and server policy stay consistent. **Without key attestation (deliberately excluded),
+  the server cannot cryptographically re-verify which factor fired** — the mapping is a
+  hardware-enforced-on-device + policy-declared-on-server contract, not a server proof, and on a fully
+  compromised device even the on-device enforcement can be bypassed.
+
+### 51.3 Mode — (a) per-use and (b) hardware-enforced window, both configurable
+
+- **(a) per-use** — every sensitive op requires a fresh authentication; no window. Strongest, more
+  prompts. **Default for crown-jewel operations.**
+- **(b) windowed** — one authentication unlocks the step-up key for N seconds; sensitive ops within
+  the window do not re-prompt. Fewer prompts; leaves an N-second oracle window. **Must be the
+  hardware-enforced flavor** (Android `setUserAuthenticationValidityDurationSeconds` /
+  `setUserAuthenticationParameters`; iOS `LAContext.touchIDAuthenticationAllowableReuseDuration`),
+  never an app-level "unlocked recently?" check, which a compromised OS forges.
+- Mode and window N are **configurable on both sides, matched** (plugin setting + server policy).
+  Guidance: (a) for crown jewels; (b) only as a friction-relief valve for a lower tier, and only if
+  prompt fatigue proves real.
+
+### 51.4 Which operations are gated
+
+The server defines the sensitive set (the client mirrors it for UX); a step-up-signed proof is
+required to execute them.
+- **Crown jewels — gate with (a):** money movement, adding/changing a payee, password / phone / email
+  change, adding a device.
+- **Reclassify as sensitive** (easy to leave ungated, but attack *enablers*): disabling transaction
+  alerts/notifications, changing an allow-listed payee, and **the step-up config itself**
+  (factor/mode/key) — which must be **self-gated**: changing the lock requires passing the lock.
+- **Cumulative/velocity trigger:** a running per-window sum so *many sub-threshold* transfers also
+  trip step-up, closing the structuring band a single amount threshold leaves open.
+
+### 51.5 Ungated paths and how they are covered
+
+Gating everything is UX death, so reads and session persistence stay ungated and remain exposed on a
+compromised device: **data reads / exfiltration** (balances, history, PII, payees, pay stubs),
+**session persistence** (the oracle re-signs PoP for a durable foothold), and volume abuse of any
+ungated op. These are covered not by more prompts but by the server-side signals in 51.6 plus
+server-side alerting. Honest limit: step-up closes the *silent* oracle for gated ops; a compromised
+device can still act on ungated paths and can strike the instant the user does authenticate.
+
+### 51.6 Server-side behavioral anomaly signals (device cannot falsify)
+
+The score lives server-side, so these survive full device compromise. Both feed the relationship-risk
+layer as **advisory / step-up, never a hard block** (the standing false-positive rule — legitimate
+bursts and outliers exist), and both are **consumer-tunable**:
+- **Per-key request-rate anomaly** — reuse the existing Redis counters; flag when a key's rate over a
+  window exceeds a DBA-set threshold. Caveat: legit bursts (refresh loops, catch-up after offline) →
+  use a window + burst allowance tuned to the app's real traffic.
+- **Population-baseline deviation** — periodically compute population stats (e.g. p95 of
+  requests-per-key-per-day, installations-per-device) and flag a key beyond a DBA-set deviation.
+  Caveats: **cold-start** — meaningless on a new or small deployment, so default permissive below a
+  configurable minimum sample size; and recompute on a **rolling window** so the baseline tracks a
+  growing user base rather than freezing on launch-week behaviour.
+
+**Explicitly excluded: any geolocation signal.** Geo / impossible-travel and the IP-velocity proxy
+both false-positive on CGNAT, VPNs, dual-SIM↔WiFi handoff and real travel — indefensible against the
+lockout bar. Dropped by decision.
+
+### 51.7 Configuration surface — the DBA-tunable settings table
+
+The tunable values — factor, mode, window N, the sensitive-op thresholds, rate limits/windows,
+population deviation and minimum sample size — live in a **`risk_policy_settings` table** that the
+**versioned migration handoff scripts create and seed with safe defaults** (§24.2), which the
+consumer's DBA edits. The server reads it cached, re-reading on change. This is the "consumer sets
+their own base" mechanism: no code change per deployment, DBA-owned config rows, shipped *as* the
+database handoff deliverable.
+
+### 51.8 Status and sequencing
+
+Not implemented. It is client + server + schema, so it lands in pieces, each its own commit and each
+behind the conformance suite: (1) `risk_policy_settings` table + migration + server read path;
+(2) the two behavioral signals wired into relationship-risk; (3) the server step-up policy
+(sensitive-op set, step-up-proof verification, factor/mode declaration); (4) the Flutter-plugin
+step-up key + settings; (5) the other SDKs. Testing is deferred until the server is up.
