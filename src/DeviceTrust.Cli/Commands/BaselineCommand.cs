@@ -104,7 +104,8 @@ namespace DeviceTrust.Cli.Commands
             Report.Field("Agreeing runs", baseline.Observations);
 
             Console.WriteLine();
-            Console.WriteLine("# Pin these alongside the APK hash for this build.");
+            Console.WriteLine("# Pin these for this build. On a server that already lists other builds,");
+            Console.WriteLine("# append each value to the existing comma-separated list instead of replacing it.");
             Console.WriteLine(baseline.ToEnvironmentSettings(apkSha256 ?? "<apk-sha256>"));
             return 0;
         }

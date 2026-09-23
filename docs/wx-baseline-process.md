@@ -32,9 +32,14 @@ the settings to pin next to the APK hash the release already computes:
 
 ```
 INTEGRITY_ANDROID_APK_SHA256=1509183a…18ee
-INTEGRITY_ANDROID_WX_BASELINE_BYTES=1048576
-INTEGRITY_ANDROID_WX_GRANULARITY=65536
+INTEGRITY_ANDROID_WX_BASELINES=1509183a…18ee:1048576:65536
 ```
+
+The baseline is a map entry keyed on the APK hash, not a global setting, because one server commonly
+serves several builds; the Flutter and .NET clients share a deployment today. On such a server, append
+each value to the existing comma-separated list rather than replacing it. A build with no entry keeps
+the unchanged `+60` rule. The server-side rule itself is described in
+`DESIGN_UPDATE_FROM_DOTNET.md` in the reference repository; adopting it was approved on 2026-09-23.
 
 ## Three things the command does deliberately
 

@@ -185,18 +185,44 @@ namespace DeviceTrust.Client.Integrity
                 (int)Math.Min(int.MaxValue, sizes.Min()));
         }
 
-        /// <summary>Renders the baseline as the server environment settings that pin it.</summary>
-        public string ToEnvironmentSettings(string apkSha256)
+        /// <summary>
+        /// Renders this baseline as one <c>sha256:bytes:granularity</c> entry for
+        /// the server's <c>INTEGRITY_ANDROID_WX_BASELINES</c> map.
+        /// </summary>
+        /// <remarks>
+        /// A map keyed on the APK hash, not a single global value, because one
+        /// server commonly serves several builds - the Flutter and .NET clients
+        /// share a deployment today. A global baseline would extend the .NET
+        /// allowance to every Android build on that server; a keyed one leaves any
+        /// build without an entry on the unchanged +60 rule.
+        /// </remarks>
+        public string ToBaselineEntry(string apkSha256)
         {
             if (!IsUsable)
             {
                 throw new InvalidOperationException("No baseline was derived: " + Rejection);
             }
 
-            return "INTEGRITY_ANDROID_APK_SHA256=" + apkSha256 + Environment.NewLine
-                   + "INTEGRITY_ANDROID_WX_BASELINE_BYTES=" + Bytes.ToString(CultureInfo.InvariantCulture)
-                   + Environment.NewLine
-                   + "INTEGRITY_ANDROID_WX_GRANULARITY=" + Granularity.ToString(CultureInfo.InvariantCulture);
+            if (string.IsNullOrWhiteSpace(apkSha256))
+            {
+                throw new ArgumentException("The APK hash is required to key the baseline.", nameof(apkSha256));
+            }
+
+            // Lower-case to match how the server normalises a reported apk_sha256.
+            return apkSha256.Trim().ToLowerInvariant()
+                   + ":" + Bytes.ToString(CultureInfo.InvariantCulture)
+                   + ":" + Granularity.ToString(CultureInfo.InvariantCulture);
+        }
+
+        /// <summary>
+        /// Renders the baseline as the server environment settings that pin it,
+        /// written for a deployment serving this one build.
+        /// </summary>
+        public string ToEnvironmentSettings(string apkSha256)
+        {
+            var entry = ToBaselineEntry(apkSha256);
+            return "INTEGRITY_ANDROID_APK_SHA256=" + apkSha256.Trim().ToLowerInvariant() + Environment.NewLine
+                   + "INTEGRITY_ANDROID_WX_BASELINES=" + entry;
         }
 
         private static IEnumerable<long> ParseSizeClasses(string sizeClasses)

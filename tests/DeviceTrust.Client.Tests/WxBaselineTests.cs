@@ -133,8 +133,29 @@ namespace DeviceTrust.Client.Tests
                 .ToEnvironmentSettings("d0d0d0");
 
             Assert.Contains("INTEGRITY_ANDROID_APK_SHA256=d0d0d0", settings, System.StringComparison.Ordinal);
-            Assert.Contains("INTEGRITY_ANDROID_WX_BASELINE_BYTES=1114112", settings, System.StringComparison.Ordinal);
-            Assert.Contains("INTEGRITY_ANDROID_WX_GRANULARITY=65536", settings, System.StringComparison.Ordinal);
+            Assert.Contains("INTEGRITY_ANDROID_WX_BASELINES=d0d0d0:1114112:65536", settings, System.StringComparison.Ordinal);
+        }
+
+        [Fact]
+        public void ToBaselineEntry_KeysOnTheLowerCasedApkHash()
+        {
+            // The server lower-cases the reported apk_sha256 before comparing,
+            // so an upper-case pin would silently never match.
+            var baseline = WritableExecutableBaseline.Compute(
+                Enumerable.Repeat(Observation(MonoLike(16)), 4).ToList());
+
+            Assert.Equal("abcdef:1048576:65536", baseline.ToBaselineEntry("  ABCDEF "));
+        }
+
+        [Fact]
+        public void ToBaselineEntry_RefusesAMissingHash()
+        {
+            // An entry with no key would either be unparseable or, worse, match
+            // nothing and look configured.
+            var baseline = WritableExecutableBaseline.Compute(
+                Enumerable.Repeat(Observation(MonoLike(16)), 4).ToList());
+
+            Assert.Throws<System.ArgumentException>(() => baseline.ToBaselineEntry(" "));
         }
 
         [Fact]
