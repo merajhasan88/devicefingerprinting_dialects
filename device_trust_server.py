@@ -137,6 +137,21 @@ INTEGRITY_MODE = os.environ.get("INTEGRITY_MODE", "observe").strip().lower()
 if INTEGRITY_MODE not in ("observe", "enforce"):
     raise RuntimeError("INTEGRITY_MODE must be 'observe' or 'enforce'.")
 
+# Per-deployment policy for a software-backed installation key (Secure Enclave /
+# StrongBox generation failed and the client fell back to a software keychain).
+# It is a client claim, never proof (a compromised client can lie), so the
+# operator opts in. "off" (default) scores nothing and changes no verdict;
+# "advisory" adds a moderate weight so a software-backed key trends to step-up;
+# "required" hard-blocks it. A NULL measurement (client did not report it) is
+# never treated as software.
+INTEGRITY_HARDWARE_BACKING_POLICY = os.environ.get(
+    "INTEGRITY_HARDWARE_BACKING_POLICY", "off"
+).strip().lower()
+if INTEGRITY_HARDWARE_BACKING_POLICY not in ("off", "advisory", "required"):
+    raise RuntimeError(
+        "INTEGRITY_HARDWARE_BACKING_POLICY must be 'off', 'advisory', or 'required'."
+    )
+
 INTEGRITY_CHALLENGE_LIFETIME = timedelta(
     seconds=int(os.environ.get("INTEGRITY_CHALLENGE_LIFETIME_SECONDS", "60"))
 )
@@ -1390,6 +1405,50 @@ def _integrity_verdict(score, hard_block=False):
     if score >= 30:
         return "elevated"
     return "trusted"
+
+
+def _apply_hardware_backing_policy(cursor, installation_id, scored):
+    """Fold the per-deployment hardware-backing policy into an integrity result.
+
+    A software-backed installation key is only ever a client claim, never proof,
+    so it is applied per INTEGRITY_HARDWARE_BACKING_POLICY. key_hardware_backed is
+    NULL when the client did not report it (old clients, the Kotlin and .NET
+    collectors); an absent measurement must never be read as software, so only an
+    explicit False is acted on. The score is re-derived from the reasons so it
+    stays the sum of advertised points, as _score_integrity does.
+    """
+    if INTEGRITY_HARDWARE_BACKING_POLICY == "off":
+        return
+    cursor.execute(
+        "SELECT key_hardware_backed FROM app_installations WHERE installation_id = %s",
+        (installation_id,),
+    )
+    row = cursor.fetchone()
+    if not row or row[0] is None or bool(row[0]):
+        return
+    if INTEGRITY_HARDWARE_BACKING_POLICY == "required":
+        _integrity_reason(
+            scored["reasons"],
+            "key_software_backed",
+            100,
+            "The installation key is software-backed; this deployment requires a "
+            "hardware-backed key.",
+            hard=True,
+        )
+        scored["hard_block"] = True
+    else:
+        _integrity_reason(
+            scored["reasons"],
+            "key_software_backed",
+            30,
+            "The installation key is software-backed rather than hardware-backed.",
+        )
+    scored["score"] = min(
+        100, sum(max(0, int(r.get("points", 0))) for r in scored["reasons"])
+    )
+    scored["verdict"] = _integrity_verdict(
+        scored["score"], hard_block=scored["hard_block"]
+    )
 
 
 def _score_android_integrity(probes):
@@ -3031,6 +3090,7 @@ def health_ready():
                 "extended_libs": INTEGRITY_SCORE_EXTENDED_LIBS,
                 "ios_fake_signature": INTEGRITY_SCORE_IOS_FAKE_SIGNATURE,
                 "ios_code_integrity": INTEGRITY_SCORE_IOS_CODE_INTEGRITY,
+                "hardware_backing_policy": INTEGRITY_HARDWARE_BACKING_POLICY,
             },
             "remote_attestation": "not_used",
             "redis": _redis_status(),
@@ -3596,6 +3656,7 @@ def integrity_report():
                 hard_block=scored["hard_block"],
             )
 
+        _apply_hardware_backing_policy(cursor, installation_id, scored)
         cursor.execute(
             "UPDATE integrity_challenges SET used_at = NOW() WHERE challenge_id = %s",
             (challenge_id,),

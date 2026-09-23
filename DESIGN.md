@@ -4207,3 +4207,32 @@ This run demonstrates the capability without shipping it.
 
 This closes the iOS-side battery (items 1 and 12/13 iOS variants, 15, 16, 17, 18; the account/token
 battery 3–8 / 12/13 was run by the .NET session).
+
+## 50. Hardware-backing policy — per-deployment, default off (2026-09-23)
+
+Resolves the open policy decision in §35.7 (and §39.5's second point). A software-backed installation
+key (Secure Enclave / StrongBox generation failed → software-keychain fallback) is now governed by a
+per-deployment operator knob, `INTEGRITY_HARDWARE_BACKING_POLICY`, exposed on `/health/ready` as
+`hardware_backing_policy`:
+
+- **`off`** (default) — no scoring; no verdict change for anyone. Chosen as default so no existing
+  deployment changes behaviour on upgrade and no legitimate user gains friction unasked. Flipping the
+  default is a one-line change.
+- **`advisory`** — adds `key_software_backed +30`, so a software-backed key trends to elevated /
+  step-up, never a standalone block. Recommended production setting.
+- **`required`** — `key_software_backed +100`, hard block; a software-backed key is refused. For
+  deployments with a known all-hardware fleet.
+
+Applied server-side in the integrity report path (`_apply_hardware_backing_policy`), reading the
+stored `app_installations.key_hardware_backed`. **NULL — the client did not report it (old clients,
+the Kotlin and .NET collectors) — is never read as software**; only an explicit `False` is acted on,
+preserving the §35.7 nullable principle so legitimate non-reporting clients are never penalised. The
+score is re-derived as the sum of reason points, consistent with `_score_integrity`. It is a client
+claim, never proof (§2): `required` is bypassable by a lying client and by a genuine hardware-key
+oracle, so it raises assurance for honest software/emulator environments, not against a sophisticated
+attacker. The downgrade-refusal (a thumbprint can't drop hardware→software) is unchanged and
+independent, and remains the false-positive-free part.
+
+**Before this ships:** a conformance-suite check (`null → no penalty`, `advisory → +30`,
+`required → block`) and a suite run; deferred here because the server is stopped. Deploy also needs
+the usual `diff -u` of `device_trust_server.py` against `/opt` in case of a hand-edit.
