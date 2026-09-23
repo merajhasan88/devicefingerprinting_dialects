@@ -30,6 +30,8 @@ restore + 2026-09-20 teardown). No new build or server change was required.
 
 ## Item 18 — iOS fake-signature enforcement (iOS only) — the next test, but gated
 
+**Status: PASS (scoped report-only demo), 2026-09-23 — recorded in DESIGN.md §49. iOS battery complete.**
+
 **Goal.** Prove the fake-signature rule blocks a resigned / TrollStore build once it is scored (not
 merely report-only).
 

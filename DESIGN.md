@@ -4172,3 +4172,38 @@ Satisfied and verified **twice** on the iPhone 7 with the clean `dt.ipa` (the pr
 
 Every clause met. **PASS.** This closes item 17. The remaining iOS-side battery item is 18
 (fake-signature enforcement), gated by §39.5 — see `NEXT_BATTERY_ITEM.md`.
+
+## 49. Battery item 18 — iOS fake-signature enforcement: PASS (scoped demo, 2026-09-23)
+
+The proposed iOS-only item 18 (§40.3), run as the **scoped report-only demo** §39.5 called for:
+`INTEGRITY_SCORE_IOS_FAKE_SIGNATURE` was flipped to `1` for this single run and returned to `0`
+afterwards — never shipped as policy.
+
+No new build. The clean `dt.ipa` already on the iPhone 7 is TrollStore-signed, so it reports the
+CoreTrust-bypass donor identifier (`signing_identifier com.icraze.gtatracker` ≠ bundle id) and team
+`TROLLTROLL` (§35.4 / §39.1). With the flag off these are the two report-only `+0` reasons in every
+clean scan; with it on they score.
+
+Detection (observe, flag on):
+
+    score 100, verdict block
+    ios_signing_identifier_bundle_mismatch +90
+    ios_known_fake_team_identifier         +25
+
+Enforcement (enforce):
+
+    POST /v1/integrity/challenge 200 → /v1/integrity/report 200 (block) → POST /v1/accounts/register 403 integrity_blocked
+
+The `403` is `integrity_blocked` by the same `_enforce_integrity_gate` mapping proven in §46.6
+(`verdict == "block"` → `integrity_blocked`), with the fresh block report persisted at the same
+second. **PASS** for both detection and enforcement.
+
+**False-positive safety** (the standing owner concern): the rule cannot fire on a legitimately
+Apple-signed app — `signing_identifier` equals the bundle id (or the accepted `TEAMID.bundleid` .NET
+shape, §41) and the team id is the real developer team, never `TROLLTROLL`. §39.5's open point is
+unchanged: the guard has been validated against a conformance fixture and this TrollStore build, not
+against a real Apple-signed build, so the flag stays `0` as policy until such a build is observed.
+This run demonstrates the capability without shipping it.
+
+This closes the iOS-side battery (items 1 and 12/13 iOS variants, 15, 16, 17, 18; the account/token
+battery 3–8 / 12/13 was run by the .NET session).
