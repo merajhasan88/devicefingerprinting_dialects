@@ -4292,6 +4292,12 @@ required to execute them.
 - **Cumulative/velocity trigger:** a running per-window sum so *many sub-threshold* transfers also
   trip step-up, closing the structuring band a single amount threshold leaves open.
 
+**Guidance (the principle).** Don't gate everything — that is UX death. Gate the crown jewels with
+(a); reclassify the enablers above (alerts / security-settings / step-up-config) as sensitive since
+they are enablers; accept reads and session as ungated but cover them with the server-side anomaly
+signals (51.6) plus server-side alerting; and use the cumulative/velocity trigger so "many small
+transfers" also trips step-up, closing the sub-threshold band.
+
 ### 51.5 Ungated paths and how they are covered
 
 Gating everything is UX death, so reads and session persistence stay ungated and remain exposed on a
