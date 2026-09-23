@@ -23,8 +23,8 @@ two report-only `+0` reasons (`ios_signing_identifier_bundle_mismatch`, `ios_kno
 and **no** `ios_get_task_allow` (so get-task-allow was false). Server config at the time:
 `INTEGRITY_ALLOW_DEBUG=0`, `INTEGRITY_SCORE_IOS_FAKE_SIGNATURE=0`. Every clause of the criterion is met.
 
-**Action.** Record item 17 as PASS in DESIGN.md, or do one clean re-scan for the record. No new build
-or server change required.
+**Action.** Done — recorded as **PASS** in DESIGN.md §48 (2026-09-20), verified twice (2026-09-19
+restore + 2026-09-20 teardown). No new build or server change was required.
 
 ---
 

@@ -4157,3 +4157,18 @@ the clean **`dt.ipa`** (verified `score 0 / trusted`, identity intact); EC2 `i-0
 persists `INTEGRITY_MODE=observe` and `INTEGRITY_SCORE_IOS_CODE_INTEGRITY=1` for the next start; the
 DuckDNS endpoint repoints on start. To resume: start the instance, refresh the dev IP in SG 22 if it
 changed, and point clients at `https://devicefingerprinting.duckdns.org`.
+
+## 48. Battery item 17 — iOS clean baseline: PASS (2026-09-20)
+
+The proposed iOS-only item 17 (§40.3) — the iOS counterpart of item 1. Criterion: on a build put
+through `tools/presign_trollstore_ipa.sh`, with `INTEGRITY_ALLOW_DEBUG=0` and
+`INTEGRITY_SCORE_IOS_FAKE_SIGNATURE=0` → `get_task_allow: false`, `score 0`, `verdict trusted`.
+
+Satisfied and verified **twice** on the iPhone 7 with the clean `dt.ipa` (the pre-signed build):
+- **2026-09-19**, restoring the phone after item 16: `score 0, verdict trusted`, reasons only the two
+  report-only `+0` fake-sig codes — **no `ios_get_task_allow`** (so get-task-allow was false, the §37
+  pre-sign having stripped it) and no `ios_app_code_modified`.
+- **2026-09-20**, at teardown, re-confirmed identical: `score 0, verdict trusted`, same reasons.
+
+Every clause met. **PASS.** This closes item 17. The remaining iOS-side battery item is 18
+(fake-signature enforcement), gated by §39.5 — see `NEXT_BATTERY_ITEM.md`.
