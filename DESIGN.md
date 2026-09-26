@@ -4315,11 +4315,13 @@ bursts and outliers exist), and both are **consumer-tunable**:
 - **Per-key request-rate anomaly** — reuse the existing Redis counters; flag when a key's rate over a
   window exceeds a DBA-set threshold. Caveat: legit bursts (refresh loops, catch-up after offline) →
   use a window + burst allowance tuned to the app's real traffic.
-- **Population-baseline deviation** — periodically compute population stats (e.g. p95 of
-  requests-per-key-per-day, installations-per-device) and flag a key beyond a DBA-set deviation.
-  Caveats: **cold-start** — meaningless on a new or small deployment, so default permissive below a
-  configurable minimum sample size; and recompute on a **rolling window** so the baseline tracks a
-  growing user base rather than freezing on launch-week behaviour.
+- **Population-baseline deviation** — implemented as a **DBA-set absolute threshold** (Option A,
+  chosen 2026-09-26) on a relationship metric (`accounts_per_device` or `installations_per_device`):
+  advisory `population_outlier` points when the metric exceeds the consumer-set base in
+  `risk_policy_settings` (reusing counts already computed in `_evaluate_risk_policy`). Portable
+  (plain `COUNT`, no dialect-specific percentile) and directly "the consumer sets the base". A
+  computed-percentile baseline (system computes p95, DBA sets the multiplier) was considered and
+  deferred: `percentile_cont` is dialect-specific and a real population is hard to seed and test.
 
 **Explicitly excluded: any geolocation signal.** Geo / impossible-travel and the IP-velocity proxy
 both false-positive on CGNAT, VPNs, dual-SIM↔WiFi handoff and real travel — indefensible against the

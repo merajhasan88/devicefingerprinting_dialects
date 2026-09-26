@@ -2381,6 +2381,28 @@ def _evaluate_risk_policy(
             )
             score += rate_points
 
+    # Population-baseline deviation (DESIGN.md 51.6, Option A: DBA-set absolute
+    # threshold on a relationship metric). Advisory, opt-in; reuses counts already
+    # computed above, so it adds no query and is portable across engines.
+    if _risk_setting_bool("population_baseline_enabled", False):
+        pop_metric = _risk_setting_str("population_baseline_metric", "accounts_per_device")
+        pop_threshold = _risk_setting_int("population_baseline_threshold", 10)
+        if pop_metric == "installations_per_device":
+            pop_value = device_installation_count
+        else:
+            pop_metric = "accounts_per_device"
+            pop_value = projected_device_account_count
+        if pop_threshold > 0 and pop_value > pop_threshold:
+            pop_points = _risk_setting_int("population_points", 30)
+            _policy_reason(
+                reasons,
+                "population_outlier",
+                pop_points,
+                "This device's %s (%d) exceeds the configured population threshold "
+                "(%d)." % (pop_metric, pop_value, pop_threshold),
+            )
+            score += pop_points
+
     recommended_action = _policy_action(score, hard_block=hard_block)
     effective_action = (
         recommended_action if DEVICE_POLICY_MODE == "enforce" else "allow"

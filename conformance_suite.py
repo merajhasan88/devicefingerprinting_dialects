@@ -1441,7 +1441,8 @@ def check_request_rate_anomaly(api, ctx):
     /health and skips when it is off, exactly like the enforce-mode checks. Uses
     an isolated session so the per-key counter cannot pollute other checks."""
     _, health = api.call("GET", "/health/ready")
-    settings = health.get("risk_policy_settings", {}) if isinstance(health, dict) else {}
+    scoring = health.get("scoring_flags", {}) if isinstance(health, dict) else {}
+    settings = scoring.get("risk_policy_settings", {})
     if settings.get("rate_anomaly_enabled") != "1":
         raise Skip("rate_anomaly_enabled is off; set it to 1 with a low max to run this check")
     limit = int(settings.get("rate_anomaly_max_requests", "120") or "120")
@@ -1463,6 +1464,44 @@ def check_request_rate_anomaly(api, ctx):
             seen = True
             break
     expect(seen, "expected request_rate_anomaly after >%d calls; last=%s" % (limit, last))
+
+
+@check("risk: a population-baseline outlier is scored when enabled")
+def check_population_baseline(api, ctx):
+    """Opt-in DBA-set threshold on a relationship metric. Skips unless enabled
+    with a low threshold; builds threshold+1 of the metric on ONE device via a
+    shared reinstall hint, then verifies the advisory reason fires."""
+    _, health = api.call("GET", "/health/ready")
+    scoring = health.get("scoring_flags", {}) if isinstance(health, dict) else {}
+    settings = scoring.get("risk_policy_settings", {})
+    if settings.get("population_baseline_enabled") != "1":
+        raise Skip("population_baseline_enabled is off; set it with a low threshold to run this check")
+    metric = settings.get("population_baseline_metric", "accounts_per_device")
+    threshold = int(settings.get("population_baseline_threshold", "10") or "10")
+    if threshold > 10:
+        raise Skip("population_baseline_threshold=%s is too high for a bounded test run" % threshold)
+    inst1, tok1, hint = integrity_session(api)
+    sessions = [(inst1, tok1)]
+    for _ in range(threshold):
+        inst = Installation()
+        st, pl = enrol(api, inst, hint)
+        expect(st in (200, 201), "enrol failed: %s %s" % (st, pl))
+        sessions.append((inst, device_token(api, inst)))
+    if metric == "accounts_per_device":
+        for inst, tok in sessions:
+            submit_report(api, inst, tok)
+            open_account(api, inst, tok, "pop-%s" % secrets.token_hex(4))
+    inst, tok = sessions[-1]
+    submit_report(api, inst, tok)
+    st, pl = open_account(api, inst, tok, "popc-%s" % secrets.token_hex(4))
+    expect(st in (200, 201), "account open failed: %s %s" % (st, pl))
+    st2, pl2 = protected(api, inst, "GET", "/v1/policy/me", pl["access_token"])
+    expect(st2 == 200, "policy/me failed: %s %s" % (st2, pl2))
+    expect(
+        "population_outlier" in codes(pl2.get("policy", {})),
+        "expected population_outlier (%s>%d); reasons=%s"
+        % (metric, threshold, codes(pl2.get("policy", {}))),
+    )
 
 
 def main():

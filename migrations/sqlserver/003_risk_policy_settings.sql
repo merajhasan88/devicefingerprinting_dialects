@@ -32,8 +32,8 @@ USING (VALUES
     ('rate_anomaly_window_seconds', '60', 'Window length for the request-rate anomaly signal.'),
     ('rate_anomaly_points', '30', 'Advisory risk points added when the rate signal trips.'),
     ('population_baseline_enabled', '0', 'Enable population-baseline deviation signal (advisory).'),
-    ('population_min_sample', '500', 'Minimum installations before the baseline applies (cold-start guard).'),
-    ('population_deviation_multiplier', '5', 'Flag a key beyond this multiple of the population p95.'),
+    ('population_baseline_metric', 'accounts_per_device', 'Relationship metric to threshold: accounts_per_device or installations_per_device.'),
+    ('population_baseline_threshold', '10', 'Advisory when the chosen metric exceeds this consumer-set base.'),
     ('population_points', '30', 'Advisory risk points added when the population signal trips.')
 ) AS s(setting_key, setting_value, description)
 ON t.setting_key = s.setting_key
