@@ -227,7 +227,7 @@ def protected(api, installation, method, path, bearer, body_obj=None, **kwargs):
 
 
 def enrol(api, installation, reinstall_hint=None, platform="android",
-          key_security=None, stepup_public_key=None):
+          key_security=None, stepup_public_key=None, stepup_key_auth=None):
     body = {
         "installation_id": installation.submitted_id,
         "platform": platform,
@@ -236,6 +236,8 @@ def enrol(api, installation, reinstall_hint=None, platform="android",
     }
     if stepup_public_key is not None:
         body["stepup_public_key"] = stepup_public_key
+    if stepup_key_auth is not None:
+        body["stepup_key_auth"] = stepup_key_auth
     # Omitted entirely when not supplied, which is what the Kotlin and .NET
     # collectors do. The server must record that as "not reported", never as
     # "software" -- see check_key_security_absent_is_null.
@@ -1525,27 +1527,94 @@ def check_population_baseline(api, ctx):
     )
 
 
-@check("step-up: an optional step-up key registers, and is absent by default")
-def check_stepup_key_registration(api, ctx):
-    inst = Installation()
-    sk = ec.generate_private_key(ec.SECP256R1())
-    nums = sk.public_key().public_numbers()
-    stepup_jwk = {
+def stepup_jwk_pair():
+    """A software P-256 step-up key pair: (private key, public JWK)."""
+    priv = ec.generate_private_key(ec.SECP256R1())
+    nums = priv.public_key().public_numbers()
+    return priv, {
         "kty": "EC", "crv": "P-256", "alg": "ES256",
         "x": b64u(nums.x.to_bytes(32, "big")),
         "y": b64u(nums.y.to_bytes(32, "big")),
     }
-    hint = {"kind": "android_id_sha256", "value": sha256_hex(secrets.token_bytes(16))}
-    st, pl = enrol(api, inst, hint, stepup_public_key=stepup_jwk)
+
+
+def fresh_hint():
+    return {"kind": "android_id_sha256", "value": sha256_hex(secrets.token_bytes(16))}
+
+
+@check("step-up: an optional step-up key registers with its reported auth, absent by default")
+def check_stepup_key_registration(api, ctx):
+    """The Android 9/10 shape (passcode, 30 s hardware window) registers, is
+    echoed back, and is flagged as a downgrade exactly when policy says per_use.
+    A malformed auth block is refused; a plain enrol registers nothing."""
+    _, health = api.call("GET", "/health/ready")
+    settings = (health.get("scoring_flags", {}) if isinstance(health, dict) else {}).get(
+        "risk_policy_settings", {})
+    policy_mode = settings.get("stepup_mode", "per_use")
+    policy_window = int(settings.get("stepup_window_seconds", "0") or 0)
+    windowed = {"factor": "passcode", "mode": "windowed", "window_seconds": 30}
+    inst = Installation()
+    _, stepup_jwk = stepup_jwk_pair()
+    st, pl = enrol(api, inst, fresh_hint(), stepup_public_key=stepup_jwk,
+                   stepup_key_auth=windowed)
     expect(st in (200, 201), "enrol with step-up key failed: %s %s" % (st, pl))
     expect(pl.get("stepup_key_registered") is True,
            "expected stepup_key_registered=true, got %s" % pl.get("stepup_key_registered"))
-    inst2 = Installation()
-    hint2 = {"kind": "android_id_sha256", "value": sha256_hex(secrets.token_bytes(16))}
-    st2, pl2 = enrol(api, inst2, hint2)
+    expect(pl.get("stepup_key_auth") == windowed,
+           "reported auth not echoed: %s" % pl.get("stepup_key_auth"))
+    want = True if policy_mode == "per_use" else 30 > policy_window
+    expect(pl.get("stepup_policy_downgrade") is want,
+           "stepup_policy_downgrade expected %s under policy %s/%s, got %s"
+           % (want, policy_mode, policy_window, pl.get("stepup_policy_downgrade")))
+
+    _, jwk_bad = stepup_jwk_pair()
+    st, pl = enrol(api, Installation(), fresh_hint(), stepup_public_key=jwk_bad,
+                   stepup_key_auth={"factor": "passcode", "mode": "per_use", "window_seconds": 30})
+    expect(st == 400 and error_code(pl) == "invalid_stepup_key_auth",
+           "per_use with a window expected 400 invalid_stepup_key_auth, got %s %s"
+           % (st, error_code(pl)))
+
+    st2, pl2 = enrol(api, Installation(), fresh_hint())
     expect(st2 in (200, 201), "plain enrol failed: %s %s" % (st2, pl2))
     expect(not pl2.get("stepup_key_registered"),
            "a plain enrol must not register a step-up key")
+    expect(pl2.get("stepup_key_auth") is None,
+           "a plain enrol must report no step-up auth, got %s" % pl2.get("stepup_key_auth"))
+
+
+@check("step-up: re-registration can never attach or replace a step-up key")
+def check_stepup_key_immutable(api, ctx):
+    """Registration is unauthenticated, so a step-up key binds only with a new
+    installation key. Re-registering a known key with a different step-up key
+    must leave the bound one in place (matches=false); an installation enrolled
+    without one must stay without one."""
+    auth = {"factor": "passcode", "mode": "per_use", "window_seconds": 0}
+    inst = Installation()
+    _, bound = stepup_jwk_pair()
+    st, pl = enrol(api, inst, fresh_hint(), stepup_public_key=bound, stepup_key_auth=auth)
+    expect(st in (200, 201) and pl.get("stepup_key_registered") is True,
+           "initial enrol failed: %s %s" % (st, pl))
+    _, attacker = stepup_jwk_pair()
+    st, pl = enrol(api, inst, fresh_hint(), stepup_public_key=attacker,
+                   stepup_key_auth={"factor": "passcode", "mode": "windowed", "window_seconds": 3600})
+    expect(st == 200, "re-registration expected 200, got %s %s" % (st, pl))
+    expect(pl.get("stepup_key_registered") is True and pl.get("stepup_key_matches") is False,
+           "a different step-up key must not replace the bound one: registered=%s matches=%s"
+           % (pl.get("stepup_key_registered"), pl.get("stepup_key_matches")))
+    expect(pl.get("stepup_key_auth") == auth,
+           "the bound key's auth must be unchanged, got %s" % pl.get("stepup_key_auth"))
+    st, pl = enrol(api, inst, fresh_hint(), stepup_public_key=bound, stepup_key_auth=auth)
+    expect(st == 200 and pl.get("stepup_key_matches") is True,
+           "the bound step-up key must match on re-registration: %s %s" % (st, pl))
+
+    plain = Installation()
+    st, pl = enrol(api, plain, fresh_hint())
+    expect(st in (200, 201), "plain enrol failed: %s %s" % (st, pl))
+    st, pl = enrol(api, plain, fresh_hint(), stepup_public_key=attacker, stepup_key_auth=auth)
+    expect(st == 200, "re-registration expected 200, got %s %s" % (st, pl))
+    expect(pl.get("stepup_key_registered") is False and pl.get("stepup_key_matches") is False,
+           "re-registration must not attach a step-up key: registered=%s matches=%s"
+           % (pl.get("stepup_key_registered"), pl.get("stepup_key_matches")))
 
 
 @check("step-up: a sensitive path requires a valid step-up proof")
@@ -1560,14 +1629,10 @@ def check_step_up(api, ctx):
         raise Skip("sensitive-echo not in stepup_required_paths; set it to run this check")
     factor = settings.get("stepup_factor", "passcode")
     inst = Installation()
-    stepup_priv = ec.generate_private_key(ec.SECP256R1())
-    nums = stepup_priv.public_key().public_numbers()
-    stepup_jwk = {
-        "kty": "EC", "crv": "P-256", "alg": "ES256",
-        "x": b64u(nums.x.to_bytes(32, "big")), "y": b64u(nums.y.to_bytes(32, "big")),
-    }
-    hint = {"kind": "android_id_sha256", "value": sha256_hex(secrets.token_bytes(16))}
-    st, pl = enrol(api, inst, hint, stepup_public_key=stepup_jwk)
+    stepup_priv, stepup_jwk = stepup_jwk_pair()
+    key_auth = {"factor": factor, "mode": "per_use", "window_seconds": 0}
+    st, pl = enrol(api, inst, fresh_hint(), stepup_public_key=stepup_jwk,
+                   stepup_key_auth=key_auth)
     expect(st in (200, 201), "enrol failed: %s %s" % (st, pl))
     tok = device_token(api, inst)
     submit_report(api, inst, tok)
@@ -1580,6 +1645,11 @@ def check_step_up(api, ctx):
            "no-proof expected 403 stepup_required, got %s %s" % (st, error_code(pl)))
     st, pl = stepup_call(api, inst, stepup_priv, "POST", "/v1/account/sensitive-echo", access, body, factor)
     expect(st == 200, "valid step-up expected 200, got %s %s" % (st, pl))
+    expect(pl.get("step_up") == "verified"
+           and (pl.get("step_up_key") or {}).get("key_auth") == key_auth
+           and (pl.get("step_up_key") or {}).get("policy_downgrade") is False,
+           "verified response must carry the key's auth, got %s %s"
+           % (pl.get("step_up"), pl.get("step_up_key")))
     wrong = "biometric" if factor != "biometric" else "passcode"
     st, pl = stepup_call(api, inst, stepup_priv, "POST", "/v1/account/sensitive-echo", access, body, wrong)
     expect(st == 403 and error_code(pl) == "stepup_factor_mismatch",

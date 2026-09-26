@@ -34,6 +34,7 @@ Apply migrations **in ascending version order**; each one records its own row in
 | 2 | `002_key_security.sql` | `app_installations.key_security_level` / `key_hardware_backed` / `key_provider` |
 | 3 | `003_risk_policy_settings.sql` | DBA-tunable `risk_policy_settings` (step-up + behavioural-signal knobs) |
 | 4 | `004_stepup_key.sql` | optional per-installation `stepup_public_key_jwk` / `stepup_key_algorithm` |
+| 5 | `005_stepup_key_auth.sql` | reported step-up key `stepup_key_factor` / `stepup_key_mode` / `stepup_key_window_seconds` |
 
 All scripts are guarded and safe to re-run.
 

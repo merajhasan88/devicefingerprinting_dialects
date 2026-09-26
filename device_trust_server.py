@@ -45,7 +45,7 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 
 import bcrypt
-from flask import Flask, jsonify, request
+from flask import Flask, g, jsonify, request
 from flask_jwt_extended import (
     JWTManager,
     create_access_token,
@@ -908,7 +908,7 @@ def _get_backend_identity():
 # against a schema it does not understand. /health/* still answers so operators
 # can see why.
 
-REQUIRED_SCHEMA_VERSION = 4
+REQUIRED_SCHEMA_VERSION = 5
 
 _schema_state = None
 _schema_lock = threading.Lock()
@@ -2502,27 +2502,141 @@ def _enforce_risk_policy(decision):
     )
 
 
+STEPUP_FACTORS = ("passcode", "biometric")
+STEPUP_MODES = ("per_use", "windowed")
+STEPUP_MAX_WINDOW_SECONDS = 3600
+STEPUP_AUTH_NOT_REPORTED = {"factor": None, "mode": None, "window_seconds": None}
+
+
+def _parse_stepup_key_auth(body):
+    """Read the optional stepup_key_auth block sent alongside a step-up key.
+
+    It states how the key was created: the device factor that unlocks it, and
+    whether every signature needs a fresh authentication (per_use) or one
+    authentication covers a hardware-enforced window (windowed). Like
+    key_security it is a client claim the server cannot re-verify without key
+    attestation (51.2), so it is recorded and compared with policy, never
+    treated as proof. Absent means "not reported", never "per_use".
+    """
+    block = body.get("stepup_key_auth")
+    if block is None:
+        return dict(STEPUP_AUTH_NOT_REPORTED)
+    if not isinstance(block, dict):
+        raise ApiProblem(
+            "stepup_key_auth must be an object when present.",
+            400,
+            "invalid_stepup_key_auth",
+        )
+    factor = block.get("factor")
+    mode = block.get("mode")
+    window = block.get("window_seconds")
+    if factor not in STEPUP_FACTORS:
+        raise ApiProblem(
+            "stepup_key_auth.factor must be passcode or biometric.",
+            400,
+            "invalid_stepup_key_auth",
+        )
+    if mode not in STEPUP_MODES:
+        raise ApiProblem(
+            "stepup_key_auth.mode must be per_use or windowed.",
+            400,
+            "invalid_stepup_key_auth",
+        )
+    if isinstance(window, bool) or not isinstance(window, int):
+        raise ApiProblem(
+            "stepup_key_auth.window_seconds must be an integer.",
+            400,
+            "invalid_stepup_key_auth",
+        )
+    if mode == "per_use" and window != 0:
+        raise ApiProblem(
+            "A per_use step-up key has window_seconds 0.",
+            400,
+            "invalid_stepup_key_auth",
+        )
+    if mode == "windowed" and not 1 <= window <= STEPUP_MAX_WINDOW_SECONDS:
+        raise ApiProblem(
+            "A windowed step-up key needs window_seconds between 1 and %d."
+            % STEPUP_MAX_WINDOW_SECONDS,
+            400,
+            "invalid_stepup_key_auth",
+        )
+    return {"factor": factor, "mode": mode, "window_seconds": window}
+
+
+def _stepup_policy_downgrade(key_auth):
+    """Whether a step-up key is weaker than the deployment's declared mode.
+
+    Under a per_use policy any windowed key is a downgrade; under windowed(N) a
+    window longer than N is. None when the client did not report, which is not
+    evidence either way. A downgrade is accepted, recorded and surfaced rather
+    than refused: Android 9/10 cannot bind a passcode to each signature, and
+    refusing those keys would lock legitimate users out of sensitive
+    operations (DESIGN.md 53).
+    """
+    if not key_auth or key_auth.get("mode") is None:
+        return None
+    if key_auth["mode"] == "per_use":
+        return False
+    if _risk_setting_str("stepup_mode", "per_use") == "per_use":
+        return True
+    return (key_auth.get("window_seconds") or 0) > _risk_setting_int(
+        "stepup_window_seconds", 0
+    )
+
+
 def _stepup_required_paths():
     raw = _risk_setting_str("stepup_required_paths", "")
     return {p.strip() for p in raw.replace(";", ",").split(",") if p.strip()}
 
 
 def _enforce_step_up(installation_id):
-    """Require a valid step-up proof on DBA-designated sensitive paths.
+    """Gate DBA-designated sensitive paths on a valid step-up proof.
+
+    Every decision is logged with its outcome code, so an operator can see
+    step-up activity, and a downgraded key in use, without a new table.
+    Sensitive paths default to none, so this is inert until a deployment opts in.
+    """
+    if request.path not in _stepup_required_paths():
+        return
+    try:
+        key_auth = _verify_step_up(installation_id)
+    except ApiProblem as problem:
+        logger.info(
+            "Step-up refused: installation=%s path=%s code=%s",
+            installation_id,
+            request.path,
+            problem.code,
+        )
+        raise
+    downgrade = _stepup_policy_downgrade(key_auth)
+    g.step_up = {"key_auth": key_auth, "policy_downgrade": downgrade}
+    logger.info(
+        "Step-up verified: installation=%s path=%s factor=%s key_mode=%s "
+        "window_seconds=%s policy_downgrade=%s",
+        installation_id,
+        request.path,
+        key_auth.get("factor"),
+        key_auth.get("mode"),
+        key_auth.get("window_seconds"),
+        downgrade,
+    )
+
+
+def _verify_step_up(installation_id):
+    """Verify the step-up proof on a sensitive path; return the key's auth.
 
     The proof is a step-up-key signature over {installation_id, factor, nonce,
     timestamp}; the nonce binds it to THIS request's access proof (already
     replay-protected), so no separate step-up challenge or table is needed. The
     factor is a client claim checked against policy -- the honest limit of 51.2 --
-    and per-use vs windowed is the client's hardware auth cadence, not a server
-    knob. Sensitive paths default to none, so this is inert until a deployment
-    opts in.
+    and per-use vs windowed is the client's hardware auth cadence, reported at
+    enrolment (stepup_key_auth) rather than proven here.
     """
-    if request.path not in _stepup_required_paths():
-        return
     with _cursor() as cursor:
         cursor.execute(
-            "SELECT stepup_public_key_jwk, stepup_key_algorithm "
+            "SELECT stepup_public_key_jwk, stepup_key_algorithm, "
+            "stepup_key_factor, stepup_key_mode, stepup_key_window_seconds "
             "FROM app_installations WHERE installation_id = %s",
             (installation_id,),
         )
@@ -2590,6 +2704,7 @@ def _enforce_step_up(installation_id):
             403,
             "stepup_timestamp_outside_window",
         )
+    return {"factor": row[2], "mode": row[3], "window_seconds": row[4]}
 
 
 def _require_trusted_account_request(event_type="protected_request"):
@@ -3344,6 +3459,9 @@ def register_installation():
                 "invalid_stepup_key",
             )
         stepup_key = parsed_stepup
+    stepup_auth = (
+        _parse_stepup_key_auth(body) if stepup_key else dict(STEPUP_AUTH_NOT_REPORTED)
+    )
 
     with _cursor(commit=True) as cursor:
         # The public key is the authoritative installation identity. This also
@@ -3352,7 +3470,9 @@ def register_installation():
             """
             SELECT installation_id, device_id, registration_method,
                    registration_confidence, key_algorithm,
-                   key_security_level, key_hardware_backed, key_provider
+                   key_security_level, key_hardware_backed, key_provider,
+                   stepup_public_key_jwk, stepup_key_factor, stepup_key_mode,
+                   stepup_key_window_seconds
             FROM app_installations
             WHERE key_thumbprint = %s
             """,
@@ -3363,6 +3483,28 @@ def register_installation():
             canonical_installation_id = str(row[0])
             device_id = str(row[1])
             stored_level, stored_backed, stored_provider = row[5], row[6], row[7]
+
+            # A step-up key binds only when the installation is first
+            # registered, never here. Registration is unauthenticated, so
+            # attaching or replacing a step-up key on this path would let
+            # anyone holding the public installation key -- or a silent signing
+            # oracle on a compromised device -- swap in a key it controls and
+            # pass step-up. Changing the lock must require passing the lock
+            # (51.4). Report whether the offered key is the bound one instead.
+            stored_stepup_jwk = (
+                DIALECT.json_value(row[8]) if row[8] is not None else None
+            )
+            stored_stepup_auth = {
+                "factor": row[9],
+                "mode": row[10],
+                "window_seconds": row[11],
+            }
+            stepup_matches = None
+            if stepup_key is not None:
+                stepup_matches = bool(stored_stepup_jwk) and (
+                    _parse_public_key(stored_stepup_jwk)["thumbprint"]
+                    == stepup_key["thumbprint"]
+                )
 
             # A non-exportable hardware key cannot migrate into software. The
             # thumbprint is the authoritative identity, so the same key later
@@ -3435,6 +3577,16 @@ def register_installation():
                         "provider": stored_provider,
                         "downgrade_reported": downgraded,
                     },
+                    "stepup_key_registered": bool(stored_stepup_jwk),
+                    "stepup_key_matches": stepup_matches,
+                    "stepup_key_auth": (
+                        stored_stepup_auth if stored_stepup_jwk else None
+                    ),
+                    "stepup_policy_downgrade": (
+                        _stepup_policy_downgrade(stored_stepup_auth)
+                        if stored_stepup_jwk
+                        else None
+                    ),
                 }
             )
 
@@ -3506,8 +3658,10 @@ def register_installation():
                  public_key_n, public_key_e, key_thumbprint,
                  registration_method, registration_confidence,
                  key_security_level, key_hardware_backed, key_provider,
-                 stepup_public_key_jwk, stepup_key_algorithm)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                 stepup_public_key_jwk, stepup_key_algorithm,
+                 stepup_key_factor, stepup_key_mode, stepup_key_window_seconds)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                    %s, %s, %s)
             """,
             (
                 submitted_installation_id,
@@ -3524,7 +3678,22 @@ def register_installation():
                 key_security["provider"],
                 DIALECT.json_param(stepup_key["jwk"]) if stepup_key else None,
                 stepup_key["algorithm"] if stepup_key else None,
+                stepup_auth["factor"],
+                stepup_auth["mode"],
+                stepup_auth["window_seconds"],
             ),
+        )
+
+    stepup_downgrade = _stepup_policy_downgrade(stepup_auth) if stepup_key else None
+    if stepup_downgrade:
+        logger.info(
+            "Installation %s registered a step-up key weaker than policy "
+            "(factor=%s mode=%s window_seconds=%s; policy stepup_mode=%s)",
+            submitted_installation_id,
+            stepup_auth["factor"],
+            stepup_auth["mode"],
+            stepup_auth["window_seconds"],
+            _risk_setting_str("stepup_mode", "per_use"),
         )
 
     return (
@@ -3546,6 +3715,8 @@ def register_installation():
                     "downgrade_reported": False,
                 },
                 "stepup_key_registered": bool(stepup_key),
+                "stepup_key_auth": stepup_auth if stepup_key else None,
+                "stepup_policy_downgrade": stepup_downgrade,
             }
         ),
         201,
@@ -4104,7 +4275,14 @@ def account_sensitive_echo():
     # protected-echo.
     claims, policy, integrity = _require_trusted_account_request("sensitive_echo")
     body = _json_body()
-    return jsonify({"sensitive_echo": body, "step_up": "verified"})
+    step_up = g.get("step_up")
+    return jsonify(
+        {
+            "sensitive_echo": body,
+            "step_up": "verified" if step_up else "not_required",
+            "step_up_key": step_up,
+        }
+    )
 
 
 @app.post("/v1/account/protected-echo")
