@@ -208,13 +208,15 @@ def protected(api, installation, method, path, bearer, body_obj=None, **kwargs):
 
 
 def enrol(api, installation, reinstall_hint=None, platform="android",
-          key_security=None):
+          key_security=None, stepup_public_key=None):
     body = {
         "installation_id": installation.submitted_id,
         "platform": platform,
         "public_key": installation.jwk,
         "reinstall_hint": reinstall_hint,
     }
+    if stepup_public_key is not None:
+        body["stepup_public_key"] = stepup_public_key
     # Omitted entirely when not supplied, which is what the Kotlin and .NET
     # collectors do. The server must record that as "not reported", never as
     # "software" -- see check_key_security_absent_is_null.
@@ -1502,6 +1504,29 @@ def check_population_baseline(api, ctx):
         "expected population_outlier (%s>%d); reasons=%s"
         % (metric, threshold, codes(pl2.get("policy", {}))),
     )
+
+
+@check("step-up: an optional step-up key registers, and is absent by default")
+def check_stepup_key_registration(api, ctx):
+    inst = Installation()
+    sk = ec.generate_private_key(ec.SECP256R1())
+    nums = sk.public_key().public_numbers()
+    stepup_jwk = {
+        "kty": "EC", "crv": "P-256", "alg": "ES256",
+        "x": b64u(nums.x.to_bytes(32, "big")),
+        "y": b64u(nums.y.to_bytes(32, "big")),
+    }
+    hint = {"kind": "android_id_sha256", "value": sha256_hex(secrets.token_bytes(16))}
+    st, pl = enrol(api, inst, hint, stepup_public_key=stepup_jwk)
+    expect(st in (200, 201), "enrol with step-up key failed: %s %s" % (st, pl))
+    expect(pl.get("stepup_key_registered") is True,
+           "expected stepup_key_registered=true, got %s" % pl.get("stepup_key_registered"))
+    inst2 = Installation()
+    hint2 = {"kind": "android_id_sha256", "value": sha256_hex(secrets.token_bytes(16))}
+    st2, pl2 = enrol(api, inst2, hint2)
+    expect(st2 in (200, 201), "plain enrol failed: %s %s" % (st2, pl2))
+    expect(not pl2.get("stepup_key_registered"),
+           "a plain enrol must not register a step-up key")
 
 
 def main():

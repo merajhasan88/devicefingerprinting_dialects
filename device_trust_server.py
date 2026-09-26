@@ -908,7 +908,7 @@ def _get_backend_identity():
 # against a schema it does not understand. /health/* still answers so operators
 # can see why.
 
-REQUIRED_SCHEMA_VERSION = 3
+REQUIRED_SCHEMA_VERSION = 4
 
 _schema_state = None
 _schema_lock = threading.Lock()
@@ -3243,6 +3243,16 @@ def register_installation():
     key_thumbprint = parsed_key["thumbprint"]
     hint_hash = _reinstall_hint_hash(platform, body.get("reinstall_hint"))
     key_security = _parse_key_security(body)
+    stepup_key = None
+    if body.get("stepup_public_key") is not None:
+        parsed_stepup = _parse_public_key(body.get("stepup_public_key"))
+        if parsed_stepup["algorithm"] != "ES256":
+            raise ApiProblem(
+                "The step-up key must be an ES256 P-256 key.",
+                400,
+                "invalid_stepup_key",
+            )
+        stepup_key = parsed_stepup
 
     with _cursor(commit=True) as cursor:
         # The public key is the authoritative installation identity. This also
@@ -3404,8 +3414,9 @@ def register_installation():
                 (installation_id, device_id, key_algorithm, public_key_jwk,
                  public_key_n, public_key_e, key_thumbprint,
                  registration_method, registration_confidence,
-                 key_security_level, key_hardware_backed, key_provider)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                 key_security_level, key_hardware_backed, key_provider,
+                 stepup_public_key_jwk, stepup_key_algorithm)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """,
             (
                 submitted_installation_id,
@@ -3420,6 +3431,8 @@ def register_installation():
                 key_security["security_level"],
                 key_security["hardware_backed"],
                 key_security["provider"],
+                DIALECT.json_param(stepup_key["jwk"]) if stepup_key else None,
+                stepup_key["algorithm"] if stepup_key else None,
             ),
         )
 
@@ -3441,6 +3454,7 @@ def register_installation():
                     "provider": key_security["provider"],
                     "downgrade_reported": False,
                 },
+                "stepup_key_registered": bool(stepup_key),
             }
         ),
         201,
