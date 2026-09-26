@@ -1,6 +1,7 @@
 // IMPORTANT: Keep this package line identical to your existing MainActivity package.
 package com.example.devicefingerprinting
 
+import android.content.Intent
 import android.os.Handler
 import android.os.Looper
 import io.flutter.embedding.android.FlutterActivity
@@ -14,17 +15,20 @@ class MainActivity : FlutterActivity() {
     companion object {
         private const val KEY_CHANNEL = "devicefingerprinting/installation_key_v2"
         private const val INTEGRITY_CHANNEL = "devicefingerprinting/integrity_v1"
+        private const val STEPUP_CHANNEL = "devicefingerprinting/stepup_key_v1"
     }
 
     private val worker: ExecutorService = Executors.newSingleThreadExecutor()
     private val mainHandler = Handler(Looper.getMainLooper())
     private lateinit var installationKeys: InstallationKeyManager
     private lateinit var integrityProbes: IntegrityProbeManager
+    private lateinit var stepUpKeys: StepUpKeyManager
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
         installationKeys = InstallationKeyManager(applicationContext)
         integrityProbes = IntegrityProbeManager(applicationContext)
+        stepUpKeys = StepUpKeyManager(applicationContext)
 
         MethodChannel(
             flutterEngine.dartExecutor.binaryMessenger,
@@ -67,6 +71,60 @@ class MainActivity : FlutterActivity() {
                 else -> result.notImplemented()
             }
         }
+
+        MethodChannel(
+            flutterEngine.dartExecutor.binaryMessenger,
+            STEPUP_CHANNEL,
+        ).setMethodCallHandler { call, result ->
+            when (call.method) {
+                "getOrCreateKey" -> runOffMainThread(result) {
+                    stepUpKeys.getOrCreateKey(
+                        requiredString(call, "factor"),
+                        requiredString(call, "mode"),
+                        call.argument<Int>("window_seconds") ?: 0,
+                    )
+                }
+
+                // Stays on the main thread: it shows the system prompt, and
+                // the keystore signs inside the prompt's callback.
+                "sign" -> try {
+                    stepUpKeys.sign(
+                        this,
+                        requiredString(call, "payload"),
+                        call.argument<String>("reason") ?: "Approve this operation",
+                        call.argument<String>("mode") ?: StepUpKeyManager.MODE_PER_USE,
+                    ) { outcome ->
+                        outcome.fold(
+                            { signature -> result.success(signature) },
+                            { error ->
+                                val failure = error as? InstallationKeyFailure
+                                result.error(
+                                    failure?.errorCode ?: "NATIVE_STEPUP_ERROR",
+                                    error.message ?: "The step-up signature failed.",
+                                    null,
+                                )
+                            },
+                        )
+                    }
+                } catch (error: InstallationKeyFailure) {
+                    result.error(error.errorCode, error.message, null)
+                }
+
+                "deleteKey" -> runOffMainThread(result) {
+                    stepUpKeys.deleteKey()
+                }
+
+                else -> result.notImplemented()
+            }
+        }
+    }
+
+    // Delivers the confirm-credential result the step-up key uses on API < 30.
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        if (::stepUpKeys.isInitialized && stepUpKeys.onActivityResult(requestCode, resultCode)) {
+            return
+        }
+        super.onActivityResult(requestCode, resultCode, data)
     }
 
     override fun onDestroy() {

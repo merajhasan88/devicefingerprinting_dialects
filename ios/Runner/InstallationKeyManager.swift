@@ -1,4 +1,5 @@
 import Foundation
+import LocalAuthentication
 import Security
 
 /// Failure carrying the same error-code vocabulary the Android host uses, so
@@ -299,6 +300,322 @@ final class InstallationKeyManager {
             throw InstallationKeyFailure(
                 code: "INVALID_PAYLOAD",
                 message: "The challenge payload is not valid base64url."
+            )
+        }
+        return data
+    }
+
+    private func describe(_ error: Unmanaged<CFError>?) -> String {
+        guard let error = error?.takeRetainedValue() else { return "unknown error" }
+        return CFErrorCopyDescription(error) as String? ?? "unknown error"
+    }
+}
+
+/// Owns the OPTIONAL step-up key (DESIGN.md 51 and 53): a second Secure Enclave
+/// P-256 key whose access control demands the device passcode (default) or
+/// the current biometric set for EVERY signature.
+///
+/// The installation key above stays unattended for routine proof of
+/// possession; this key approves only sensitive operations, so a compromised
+/// app process cannot drive it as a silent signing oracle for them.
+///
+/// iOS always gets per-use: each signature runs with a fresh `LAContext`, so an
+/// earlier authentication is never reused. A windowed mode is not offered here
+/// because iOS has no hardware-enforced reuse window for a passcode-gated key,
+/// and an app-level "authenticated recently?" check is exactly what DESIGN.md
+/// 51.3 rules out.
+///
+/// The key requires a passcode to exist
+/// (`kSecAttrAccessibleWhenPasscodeSetThisDeviceOnly`): without one it cannot
+/// be created, and removing the passcode deletes it. The factor is recorded in
+/// the key's label at creation so what is reported is what the key enforces.
+final class StepUpKeyManager {
+    private static let maxPayloadBytes = 65536
+    private static let labelPrefix = "stepup:"
+
+    private let alias: String
+    private let tag: Data
+
+    init(bundleIdentifier: String) {
+        alias = "\(bundleIdentifier).device_recognition.stepup_key.v1"
+        tag = Data(alias.utf8)
+    }
+
+    // MARK: - Channel operations
+
+    func getOrCreateKey(factor: String) throws -> [String: Any] {
+        guard factor == "passcode" || factor == "biometric" else {
+            throw InstallationKeyFailure(
+                code: "INVALID_ARGUMENT",
+                message: "factor must be passcode or biometric."
+            )
+        }
+
+        var created = false
+        var key = try loadKey(context: nil)
+        if key == nil {
+            try requireFactorAvailable(factor)
+            key = try generateKey(factor: factor)
+            created = true
+        }
+        guard let privateKey = key, let publicKey = SecKeyCopyPublicKey(privateKey) else {
+            throw InstallationKeyFailure(
+                code: "STEPUP_KEY_NOT_FOUND",
+                message: "The step-up key could not be created or loaded."
+            )
+        }
+
+        var exportError: Unmanaged<CFError>?
+        guard let representation =
+            SecKeyCopyExternalRepresentation(publicKey, &exportError) as Data?,
+            representation.count == 65, representation.first == 0x04 else {
+            throw InstallationKeyFailure(
+                code: "INVALID_PUBLIC_KEY",
+                message: "The step-up public key is not an uncompressed P-256 point."
+            )
+        }
+
+        return [
+            "key_alias": alias,
+            "algorithm": "ES256",
+            "signature_format": "asn1_der",
+            "provider": "SecureEnclave",
+            "security_level": "secure_enclave",
+            "hardware_backed": true,
+            "private_key_exportable": false,
+            "created": created,
+            "public_key": [
+                "kty": "EC",
+                "crv": "P-256",
+                "alg": "ES256",
+                "x": base64Url(representation.subdata(in: 1..<33)),
+                "y": base64Url(representation.subdata(in: 33..<65)),
+            ],
+            "auth": [
+                "factor": storedFactor() ?? factor,
+                "mode": "per_use",
+                "window_seconds": 0,
+            ] as [String: Any],
+        ]
+    }
+
+    /// Blocks until the user answers the system prompt, so it must run off the
+    /// platform thread (AppDelegate's worker queue).
+    func signPayload(_ payloadBase64Url: String, reason: String) throws -> String {
+        let payload = try decodeBase64Url(payloadBase64Url)
+        guard payload.count <= StepUpKeyManager.maxPayloadBytes else {
+            throw InstallationKeyFailure(
+                code: "PAYLOAD_TOO_LARGE",
+                message: "The step-up payload is larger than \(StepUpKeyManager.maxPayloadBytes) bytes."
+            )
+        }
+
+        // A fresh context per signature: an already-evaluated context would be
+        // reused silently, and per-use is the whole point.
+        let context = LAContext()
+        context.localizedReason = reason
+        context.touchIDAuthenticationAllowableReuseDuration = 0
+
+        guard let privateKey = try loadKey(context: context) else {
+            throw InstallationKeyFailure(
+                code: "STEPUP_KEY_NOT_FOUND",
+                message: "No step-up key exists on this installation."
+            )
+        }
+
+        var signError: Unmanaged<CFError>?
+        guard let signature = SecKeyCreateSignature(
+            privateKey,
+            .ecdsaSignatureMessageX962SHA256,
+            payload as CFData,
+            &signError
+        ) as Data? else {
+            throw signFailure(signError?.takeRetainedValue())
+        }
+        return base64Url(signature)
+    }
+
+    @discardableResult
+    func deleteKey() throws -> Bool {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassKey,
+            kSecAttrApplicationTag as String: tag,
+            kSecAttrKeyType as String: kSecAttrKeyTypeECSECPrimeRandom,
+        ]
+        let status = SecItemDelete(query as CFDictionary)
+        if status == errSecSuccess { return true }
+        if status == errSecItemNotFound { return false }
+        throw InstallationKeyFailure(
+            code: "KEY_DELETE_FAILED",
+            message: "The keychain could not delete the step-up key (OSStatus \(status))."
+        )
+    }
+
+    // MARK: - Key material
+
+    private func requireFactorAvailable(_ factor: String) throws {
+        let context = LAContext()
+        var policyError: NSError?
+        let policy: LAPolicy = factor == "biometric"
+            ? .deviceOwnerAuthenticationWithBiometrics
+            : .deviceOwnerAuthentication
+        if !context.canEvaluatePolicy(policy, error: &policyError) {
+            throw InstallationKeyFailure(
+                code: factor == "biometric" ? "STEPUP_NO_BIOMETRIC" : "STEPUP_NO_DEVICE_CREDENTIAL",
+                message: factor == "biometric"
+                    ? "Enrol Touch ID or Face ID to enable biometric step-up."
+                    : "Set a device passcode to enable step-up."
+            )
+        }
+    }
+
+    private func generateKey(factor: String) throws -> SecKey {
+        let flags: SecAccessControlCreateFlags = factor == "biometric"
+            ? [.privateKeyUsage, .biometryCurrentSet]
+            : [.privateKeyUsage, .devicePasscode]
+        var accessError: Unmanaged<CFError>?
+        guard let access = SecAccessControlCreateWithFlags(
+            kCFAllocatorDefault,
+            kSecAttrAccessibleWhenPasscodeSetThisDeviceOnly,
+            flags,
+            &accessError
+        ) else {
+            throw InstallationKeyFailure(
+                code: "STEPUP_KEY_GENERATION_FAILED",
+                message: "Could not build the step-up access control: \(describe(accessError))"
+            )
+        }
+
+        let privateKeyAttributes: [String: Any] = [
+            kSecAttrIsPermanent as String: true,
+            kSecAttrApplicationTag as String: tag,
+            kSecAttrLabel as String: StepUpKeyManager.labelPrefix + factor,
+            kSecAttrAccessControl as String: access,
+        ]
+        let attributes: [String: Any] = [
+            kSecAttrKeyType as String: kSecAttrKeyTypeECSECPrimeRandom,
+            kSecAttrKeySizeInBits as String: 256,
+            kSecAttrTokenID as String: kSecAttrTokenIDSecureEnclave,
+            kSecPrivateKeyAttrs as String: privateKeyAttributes,
+        ]
+
+        var error: Unmanaged<CFError>?
+        guard let key = SecKeyCreateRandomKey(attributes as CFDictionary, &error) else {
+            throw InstallationKeyFailure(
+                code: "STEPUP_KEY_GENERATION_FAILED",
+                message: "The Secure Enclave could not create the step-up key: \(describe(error))"
+            )
+        }
+        return key
+    }
+
+    private func loadKey(context: LAContext?) throws -> SecKey? {
+        var query: [String: Any] = [
+            kSecClass as String: kSecClassKey,
+            kSecAttrApplicationTag as String: tag,
+            kSecAttrKeyType as String: kSecAttrKeyTypeECSECPrimeRandom,
+            kSecReturnRef as String: true,
+        ]
+        if let context = context {
+            query[kSecUseAuthenticationContext as String] = context
+        }
+        var item: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &item)
+        if status == errSecItemNotFound { return nil }
+        guard status == errSecSuccess else {
+            throw InstallationKeyFailure(
+                code: "KEY_LOOKUP_FAILED",
+                message: "The keychain could not load the step-up key (OSStatus \(status))."
+            )
+        }
+        guard let result = item, CFGetTypeID(result) == SecKeyGetTypeID() else {
+            throw InstallationKeyFailure(
+                code: "KEY_LOOKUP_FAILED",
+                message: "The keychain returned an item that is not a key."
+            )
+        }
+        // swiftlint:disable:next force_cast
+        return (result as! SecKey)
+    }
+
+    private func storedFactor() -> String? {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassKey,
+            kSecAttrApplicationTag as String: tag,
+            kSecAttrKeyType as String: kSecAttrKeyTypeECSECPrimeRandom,
+            kSecReturnAttributes as String: true,
+        ]
+        var item: CFTypeRef?
+        guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
+              let attributes = item as? [String: Any],
+              let label = attributes[kSecAttrLabel as String] as? String,
+              label.hasPrefix(StepUpKeyManager.labelPrefix) else {
+            return nil
+        }
+        return String(label.dropFirst(StepUpKeyManager.labelPrefix.count))
+    }
+
+    private func signFailure(_ error: CFError?) -> InstallationKeyFailure {
+        guard let error = error else {
+            return InstallationKeyFailure(
+                code: "STEPUP_SIGNING_FAILED",
+                message: "The Secure Enclave could not sign with the step-up key."
+            )
+        }
+        let domain = CFErrorGetDomain(error) as String
+        let code = CFErrorGetCode(error)
+        let text = CFErrorCopyDescription(error) as String? ?? "unknown error"
+        let laCancel = [
+            LAError.Code.userCancel.rawValue,
+            LAError.Code.appCancel.rawValue,
+            LAError.Code.systemCancel.rawValue,
+        ]
+        if (domain == NSOSStatusErrorDomain && code == Int(errSecUserCanceled))
+            || (domain == LAErrorDomain && laCancel.contains(code)) {
+            return InstallationKeyFailure(
+                code: "STEPUP_CANCELLED",
+                message: "Step-up authentication was cancelled: \(text)"
+            )
+        }
+        if (domain == NSOSStatusErrorDomain && code == Int(errSecAuthFailed))
+            || domain == LAErrorDomain {
+            return InstallationKeyFailure(
+                code: "STEPUP_AUTH_FAILED",
+                message: "Step-up authentication failed: \(text)"
+            )
+        }
+        return InstallationKeyFailure(
+            code: "STEPUP_SIGNING_FAILED",
+            message: "The Secure Enclave could not sign with the step-up key: \(text)"
+        )
+    }
+
+    // MARK: - Encoding (mirrors InstallationKeyManager)
+
+    private func base64Url(_ value: Data) -> String {
+        var text = value.base64EncodedString()
+        text = text.replacingOccurrences(of: "+", with: "-")
+        text = text.replacingOccurrences(of: "/", with: "_")
+        text = text.replacingOccurrences(of: "=", with: "")
+        return text
+    }
+
+    private func decodeBase64Url(_ value: String) throws -> Data {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            throw InstallationKeyFailure(code: "INVALID_PAYLOAD", message: "The step-up payload is empty.")
+        }
+        var text = trimmed
+            .replacingOccurrences(of: "-", with: "+")
+            .replacingOccurrences(of: "_", with: "/")
+        let remainder = text.count % 4
+        if remainder > 0 {
+            text.append(String(repeating: "=", count: 4 - remainder))
+        }
+        guard let data = Data(base64Encoded: text) else {
+            throw InstallationKeyFailure(
+                code: "INVALID_PAYLOAD",
+                message: "The step-up payload is not valid base64url."
             )
         }
         return data

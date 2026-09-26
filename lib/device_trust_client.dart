@@ -33,6 +33,21 @@ const String injectedStolenAccessToken = String.fromEnvironment(
   defaultValue: '',
 );
 
+// Step-up for sensitive operations (DESIGN.md 51 and 53). Optional: an
+// integrating app opts in; this lab build enables it so the flow can be
+// tested. Factor and mode must match the server's risk_policy_settings.
+//   --dart-define=STEPUP_ENABLED=false
+//   --dart-define=STEPUP_FACTOR=biometric
+//   --dart-define=STEPUP_MODE=windowed --dart-define=STEPUP_WINDOW_SECONDS=60
+const bool stepUpEnabled =
+    bool.fromEnvironment('STEPUP_ENABLED', defaultValue: true);
+const String stepUpFactor =
+    String.fromEnvironment('STEPUP_FACTOR', defaultValue: 'passcode');
+const String stepUpMode =
+    String.fromEnvironment('STEPUP_MODE', defaultValue: 'per_use');
+const int stepUpWindowSeconds =
+    int.fromEnvironment('STEPUP_WINDOW_SECONDS', defaultValue: 0);
+
 const Duration _networkTimeout = Duration(seconds: 15);
 
 class NativeKeyException implements Exception {
@@ -195,6 +210,164 @@ class NativeInstallationKey {
   }
 }
 
+/// The optional step-up key as the native side reports it. [factor], [mode]
+/// and [windowSeconds] describe what the platform keystore actually enforces
+/// (read back from KeyInfo on Android, from the key's label on iOS), which on
+/// Android 9/10 is a short hardware window rather than per-use.
+class StepUpKeyMetadata {
+  StepUpKeyMetadata({
+    required this.publicKey,
+    required this.factor,
+    required this.mode,
+    required this.windowSeconds,
+    required this.securityLevel,
+    required this.hardwareBacked,
+    required this.created,
+  });
+
+  final Map<String, dynamic> publicKey;
+  final String factor;
+  final String mode;
+  final int windowSeconds;
+  final String securityLevel;
+  final bool hardwareBacked;
+  final bool created;
+
+  Map<String, dynamic> get authJson => <String, dynamic>{
+        'factor': factor,
+        'mode': mode,
+        'window_seconds': windowSeconds,
+      };
+
+  String get description => mode == 'per_use'
+      ? '$factor, per-use'
+      : '$factor, ${windowSeconds}s hardware window';
+
+  factory StepUpKeyMetadata.fromPlatform(Map<String, dynamic> value) {
+    final Object? rawPublicKey = value['public_key'];
+    final Object? rawAuth = value['auth'];
+    if (rawPublicKey is! Map || rawAuth is! Map) {
+      throw const FormatException(
+        'The native step-up key provider returned no public key or auth.',
+      );
+    }
+    final Map<String, dynamic> publicKey =
+        Map<String, dynamic>.from(rawPublicKey);
+    final Map<String, dynamic> auth = Map<String, dynamic>.from(rawAuth);
+    if (publicKey['kty'] != 'EC' ||
+        publicKey['crv'] != 'P-256' ||
+        publicKey['alg'] != 'ES256' ||
+        publicKey['x'] is! String ||
+        publicKey['y'] is! String) {
+      throw const FormatException(
+        'The native step-up key provider did not return an EC P-256 public JWK.',
+      );
+    }
+    final Object? factor = auth['factor'];
+    final Object? mode = auth['mode'];
+    final Object? window = auth['window_seconds'];
+    if (factor is! String || mode is! String || window is! int) {
+      throw const FormatException(
+        'The native step-up key provider returned an invalid auth description.',
+      );
+    }
+    return StepUpKeyMetadata(
+      publicKey: publicKey,
+      factor: factor,
+      mode: mode,
+      windowSeconds: window,
+      securityLevel: value['security_level'] as String? ?? 'unknown',
+      hardwareBacked: value['hardware_backed'] == true,
+      created: value['created'] == true,
+    );
+  }
+}
+
+class NativeStepUpKey {
+  static const MethodChannel _channel = MethodChannel(
+    'devicefingerprinting/stepup_key_v1',
+  );
+
+  Future<StepUpKeyMetadata> getOrCreateKey() async {
+    try {
+      final Map<String, dynamic>? value =
+          await _channel.invokeMapMethod<String, dynamic>(
+        'getOrCreateKey',
+        <String, dynamic>{
+          'factor': stepUpFactor,
+          'mode': stepUpMode,
+          'window_seconds': stepUpWindowSeconds,
+        },
+      );
+      if (value == null) {
+        throw NativeKeyException(
+          'EMPTY_NATIVE_RESPONSE',
+          'The native step-up key provider returned no key metadata.',
+        );
+      }
+      return StepUpKeyMetadata.fromPlatform(value);
+    } on MissingPluginException {
+      throw NativeKeyException(
+        'NATIVE_STEPUP_PLUGIN_MISSING',
+        'The step-up key channel is not registered in this native build.',
+      );
+    } on PlatformException catch (error) {
+      throw NativeKeyException(
+        error.code,
+        error.message ?? 'The native step-up key provider failed.',
+      );
+    }
+  }
+
+  /// Shows the system passcode (or biometric) prompt and completes when the
+  /// user answers it. A cancelled prompt is STEPUP_CANCELLED.
+  Future<String> sign(String payloadBase64Url, {required String reason}) async {
+    try {
+      final String? signature = await _channel.invokeMethod<String>(
+        'sign',
+        <String, dynamic>{
+          'payload': payloadBase64Url,
+          'reason': reason,
+          'mode': stepUpMode,
+        },
+      );
+      if (signature == null || signature.isEmpty) {
+        throw NativeKeyException(
+          'EMPTY_NATIVE_SIGNATURE',
+          'The step-up key returned no signature.',
+        );
+      }
+      return signature;
+    } on MissingPluginException {
+      throw NativeKeyException(
+        'NATIVE_STEPUP_PLUGIN_MISSING',
+        'The step-up key channel is not registered in this native build.',
+      );
+    } on PlatformException catch (error) {
+      throw NativeKeyException(
+        error.code,
+        error.message ?? 'The step-up key could not sign.',
+      );
+    }
+  }
+
+  Future<void> deleteKey() async {
+    try {
+      await _channel.invokeMethod<bool>('deleteKey');
+    } on MissingPluginException {
+      throw NativeKeyException(
+        'NATIVE_STEPUP_PLUGIN_MISSING',
+        'The step-up key channel is not registered in this native build.',
+      );
+    } on PlatformException catch (error) {
+      throw NativeKeyException(
+        error.code,
+        error.message ?? 'The step-up key could not be deleted.',
+      );
+    }
+  }
+}
+
 class NativeIntegrityCollector {
   static const MethodChannel _channel = MethodChannel(
     'devicefingerprinting/integrity_v1',
@@ -308,6 +481,10 @@ class RegistrationState {
     required this.method,
     required this.confidence,
     required this.isReinstallCorrelation,
+    this.stepupKeyRegistered = false,
+    this.stepupKeyMatches,
+    this.stepupKeyAuth,
+    this.stepupPolicyDowngrade,
   });
 
   final String installationId;
@@ -317,6 +494,16 @@ class RegistrationState {
   final String method;
   final String confidence;
   final bool isReinstallCorrelation;
+
+  // The server's view of the step-up key. A step-up key binds only when the
+  // installation is first registered; matches is null when none was offered.
+  final bool stepupKeyRegistered;
+  final bool? stepupKeyMatches;
+  final Map<String, dynamic>? stepupKeyAuth;
+  final bool? stepupPolicyDowngrade;
+
+  static Map<String, dynamic>? _optionalMap(Object? value) =>
+      value is Map ? Map<String, dynamic>.from(value) : null;
 
   factory RegistrationState.fromJson(Map<String, dynamic> value) {
     final Map<String, dynamic> recognition =
@@ -330,6 +517,10 @@ class RegistrationState {
       confidence: recognition['confidence'] as String,
       isReinstallCorrelation:
           recognition['is_reinstall_correlation'] as bool? ?? false,
+      stepupKeyRegistered: value['stepup_key_registered'] as bool? ?? false,
+      stepupKeyMatches: value['stepup_key_matches'] as bool?,
+      stepupKeyAuth: _optionalMap(value['stepup_key_auth']),
+      stepupPolicyDowngrade: value['stepup_policy_downgrade'] as bool?,
     );
   }
 
@@ -341,6 +532,10 @@ class RegistrationState {
         'method': method,
         'confidence': confidence,
         'is_reinstall_correlation': isReinstallCorrelation,
+        'stepup_key_registered': stepupKeyRegistered,
+        'stepup_key_matches': stepupKeyMatches,
+        'stepup_key_auth': stepupKeyAuth,
+        'stepup_policy_downgrade': stepupPolicyDowngrade,
       };
 
   factory RegistrationState.fromStoredJson(Map<String, dynamic> value) {
@@ -353,6 +548,10 @@ class RegistrationState {
       confidence: value['confidence'] as String,
       isReinstallCorrelation:
           value['is_reinstall_correlation'] as bool? ?? false,
+      stepupKeyRegistered: value['stepup_key_registered'] as bool? ?? false,
+      stepupKeyMatches: value['stepup_key_matches'] as bool?,
+      stepupKeyAuth: _optionalMap(value['stepup_key_auth']),
+      stepupPolicyDowngrade: value['stepup_policy_downgrade'] as bool?,
     );
   }
 }
@@ -635,8 +834,11 @@ class DeviceSummary {
 }
 
 class SecureIdentityStore {
-  SecureIdentityStore({NativeInstallationKey? nativeKey})
-      : _nativeKey = nativeKey ?? NativeInstallationKey(),
+  SecureIdentityStore({
+    NativeInstallationKey? nativeKey,
+    NativeStepUpKey? stepUpKey,
+  })  : _nativeKey = nativeKey ?? NativeInstallationKey(),
+        _stepUpKey = stepUpKey ?? NativeStepUpKey(),
         _storage = const FlutterSecureStorage();
 
   // The first prototype serialized an RSA private key under this name. It is
@@ -658,7 +860,18 @@ class SecureIdentityStore {
   );
 
   final NativeInstallationKey _nativeKey;
+  final NativeStepUpKey _stepUpKey;
   final FlutterSecureStorage _storage;
+
+  /// Step-up is optional: failing to remove its key must never block the
+  /// installation identity.
+  Future<void> _deleteStepUpKeyQuietly() async {
+    try {
+      await _stepUpKey.deleteKey();
+    } on NativeKeyException catch (error) {
+      debugPrint('STEPUP: could not delete the step-up key: $error');
+    }
+  }
 
   Future<String?> _read(String key) {
     return _storage.read(key: key, iOptions: _iosOptions);
@@ -704,6 +917,12 @@ class SecureIdentityStore {
     final bool hadInstallationId =
         installationId != null && installationId.isNotEmpty;
     final NativeKeyMetadata metadata = await _nativeKey.getOrCreateKey();
+    if (metadata.created) {
+      // A new installation key is a new server installation, and a step-up
+      // key binds only at first registration: rotate it so the new
+      // installation enrols its own.
+      await _deleteStepUpKeyQuietly();
+    }
 
     if (!hadInstallationId) {
       installationId = Uuid().v4();
@@ -768,6 +987,7 @@ class SecureIdentityStore {
 
   Future<void> clearLocalInstallation() async {
     await _nativeKey.deleteKey();
+    await _deleteStepUpKeyQuietly();
     await Future.wait(<Future<void>>[
       _delete(_legacyIdentityKey),
       _delete(_legacyRegistrationKey),
@@ -1047,8 +1267,9 @@ class DeviceApi {
 
   Future<RegistrationState> registerInstallation(
     InstallationIdentity identity,
-    ReinstallHint? hint,
-  ) async {
+    ReinstallHint? hint, {
+    StepUpKeyMetadata? stepUpKey,
+  }) async {
     final Map<String, dynamic> response = await _request(
       'POST',
       '/v1/installations/register',
@@ -1072,6 +1293,11 @@ class DeviceApi {
           'hardware_backed': identity.hardwareBacked,
           'provider': identity.provider,
         },
+        // The optional step-up key and how the keystore protects it. The server
+        // binds it only when this installation key is new, and records the
+        // factor/mode/window so a weaker-than-policy key is visible.
+        if (stepUpKey != null) 'stepup_public_key': stepUpKey.publicKey,
+        if (stepUpKey != null) 'stepup_key_auth': stepUpKey.authJson,
       },
     );
     return RegistrationState.fromJson(response);
@@ -1224,6 +1450,41 @@ class DeviceApi {
     );
   }
 
+  /// The demo crown-jewel endpoint. [stepUpHeaders] receives this request's
+  /// access-proof nonce and returns the step-up headers. It runs BEFORE the
+  /// access proof is signed: the user may take a while at the prompt, and the
+  /// access proof's timestamp window should start after that.
+  Future<Map<String, dynamic>> sensitiveEcho({
+    required String accessToken,
+    required InstallationIdentity signingIdentity,
+    required Map<String, dynamic> body,
+    Future<Map<String, String>> Function(String nonce)? stepUpHeaders,
+  }) async {
+    final List<int> nonceBytes = _freshNonce();
+    final Map<String, String> stepUp = stepUpHeaders == null
+        ? const <String, String>{}
+        : await stepUpHeaders(_b64UrlNoPadding(nonceBytes));
+    final AccessProofFixture fixture = await buildAccessProofFixture(
+      'POST',
+      '/v1/account/sensitive-echo',
+      body: body,
+      bearerToken: accessToken,
+      signingIdentity: signingIdentity,
+      nonceBytes: nonceBytes,
+    );
+    return _request(
+      'POST',
+      fixture.signedPath,
+      bearerToken: fixture.bearerToken,
+      encodedBody: fixture.encodedBody,
+      extraHeaders: <String, String>{
+        'X-Access-Proof': fixture.proofPayload,
+        'X-Access-Signature': fixture.signature,
+        ...stepUp,
+      },
+    );
+  }
+
   Future<RiskPolicyDecision> currentPolicy({
     required String accessToken,
     required InstallationIdentity signingIdentity,
@@ -1281,15 +1542,18 @@ class DeviceRecognitionController extends ChangeNotifier {
     ReinstallHintReader? hintReader,
     DeviceApi? api,
     NativeIntegrityCollector? integrityCollector,
+    NativeStepUpKey? stepUpKeyProvider,
   })  : _store = store ?? SecureIdentityStore(),
         _hintReader = hintReader ?? ReinstallHintReader(),
         _api = api ?? DeviceApi(),
-        _integrityCollector = integrityCollector ?? NativeIntegrityCollector();
+        _integrityCollector = integrityCollector ?? NativeIntegrityCollector(),
+        _stepUpKeyProvider = stepUpKeyProvider ?? NativeStepUpKey();
 
   final SecureIdentityStore _store;
   final ReinstallHintReader _hintReader;
   final DeviceApi _api;
   final NativeIntegrityCollector _integrityCollector;
+  final NativeStepUpKey _stepUpKeyProvider;
 
   InstallationIdentity? identity;
   RegistrationState? registration;
@@ -1311,6 +1575,9 @@ class DeviceRecognitionController extends ChangeNotifier {
   List<String> lastIntegrityProbes = <String>[];
   String? lastIntegrityTestFixture;
   String? integrityAttackTestResult;
+  StepUpKeyMetadata? stepUpKey;
+  String? stepUpUnavailable;
+  String? stepUpTestResult;
   String status = 'Not started';
   bool busy = false;
 
@@ -1380,13 +1647,66 @@ class DeviceRecognitionController extends ChangeNotifier {
     });
   }
 
+  Future<void> _prepareStepUpKey() async {
+    stepUpKey = null;
+    stepUpUnavailable = null;
+    if (!stepUpEnabled) {
+      stepUpUnavailable = 'disabled in this build (STEPUP_ENABLED=false)';
+      return;
+    }
+    try {
+      final StepUpKeyMetadata key = await _stepUpKeyProvider.getOrCreateKey();
+      stepUpKey = key;
+      debugPrint(
+        'STEPUP: key ${key.description}, ${key.securityLevel}, '
+        'created=${key.created}',
+      );
+    } on NativeKeyException catch (error) {
+      // Optional by design: no passcode, no biometric or an old OS must never
+      // stop the installation from enrolling. The server then refuses
+      // sensitive operations with stepup_key_not_registered.
+      stepUpUnavailable = '${error.message} [${error.code}]';
+      debugPrint('STEPUP: key unavailable: $stepUpUnavailable');
+    } on FormatException catch (error) {
+      stepUpUnavailable = error.message;
+      debugPrint('STEPUP: key unavailable: $stepUpUnavailable');
+    }
+  }
+
+  String get stepUpStatusLine {
+    final StepUpKeyMetadata? key = stepUpKey;
+    if (key == null) {
+      return 'Step-up key: unavailable - ${stepUpUnavailable ?? 'not prepared yet'}';
+    }
+    final RegistrationState? current = registration;
+    final String server;
+    if (current == null) {
+      server = 'not registered yet';
+    } else if (!current.stepupKeyRegistered) {
+      server = 'not bound on the server (a step-up key binds only to a new '
+          'installation: use "Simulate fresh installation")';
+    } else if (current.stepupKeyMatches == false) {
+      server = 'the server holds a different step-up key (re-enrol with '
+          '"Simulate fresh installation")';
+    } else {
+      server = 'bound on the server';
+    }
+    final String downgrade = current?.stepupPolicyDowngrade == true
+        ? '; weaker than server policy (downgrade recorded)'
+        : '';
+    return 'Step-up key: ${key.description}, ${key.securityLevel}; '
+        '$server$downgrade';
+  }
+
   Future<void> _registerAndProve() async {
     InstallationIdentity currentIdentity = identity!;
     RegistrationState currentRegistration;
+    await _prepareStepUpKey();
     try {
       currentRegistration = await _api.registerInstallation(
         currentIdentity,
         reinstallHint,
+        stepUpKey: stepUpKey,
       );
     } on ApiException catch (error) {
       if (error.code != 'registration_race_retry') {
@@ -1395,8 +1715,15 @@ class DeviceRecognitionController extends ChangeNotifier {
       currentRegistration = await _api.registerInstallation(
         currentIdentity,
         reinstallHint,
+        stepUpKey: stepUpKey,
       );
     }
+    debugPrint(
+      'STEPUP: server registered=${currentRegistration.stepupKeyRegistered} '
+      'matches=${currentRegistration.stepupKeyMatches} '
+      'auth=${currentRegistration.stepupKeyAuth} '
+      'policy_downgrade=${currentRegistration.stepupPolicyDowngrade}',
+    );
 
     if (currentRegistration.installationId != currentIdentity.installationId) {
       currentIdentity = currentIdentity.withInstallationId(
@@ -2466,6 +2793,135 @@ class DeviceRecognitionController extends ChangeNotifier {
     });
   }
 
+  void _recordStepUp(List<String> lines) {
+    stepUpTestResult = lines.join('\n');
+    status = lines.first;
+    for (final String line in lines) {
+      debugPrint('STEPUP: $line');
+    }
+  }
+
+  /// The gate: without a step-up proof a gated sensitive path must be refused.
+  Future<void> testSensitiveWithoutStepUp() {
+    stepUpTestResult = null;
+    return _run('Calling the sensitive operation without step-up…', () async {
+      final AccountSession? session = accountSession;
+      final InstallationIdentity? currentIdentity = identity;
+      if (session == null || currentIdentity == null) {
+        throw ApiException('Create or log in to an account first.');
+      }
+      final String deviceProofToken = await _freshDeviceToken();
+      deviceToken = deviceProofToken;
+      await _collectIntegrityWithToken(deviceProofToken, currentIdentity);
+      try {
+        final Map<String, dynamic> value = await _api.sensitiveEcho(
+          accessToken: session.accessToken,
+          signingIdentity: currentIdentity,
+          body: <String, dynamic>{
+            'operation': 'transfer',
+            'probe_id': Uuid().v4(),
+          },
+        );
+        _recordStepUp(<String>[
+          value['step_up'] == 'not_required'
+              ? 'INFO: the server does not gate this path (stepup_required_paths)'
+              : 'FAIL: accepted without a step-up proof',
+          'POST /v1/account/sensitive-echo: 200 step_up=${value['step_up']}',
+        ]);
+      } on ApiException catch (error) {
+        final bool refused = error.statusCode == 403 &&
+            (error.code == 'stepup_required' ||
+                error.code == 'stepup_key_not_registered');
+        _recordStepUp(<String>[
+          refused
+              ? 'PASS: sensitive operation refused without step-up'
+              : 'FAIL: unexpected rejection',
+          'POST /v1/account/sensitive-echo: ${error.statusCode} ${error.code}',
+        ]);
+      }
+    });
+  }
+
+  /// The legitimate path: the user authenticates, the step-up key signs a
+  /// proof bound to this request's access-proof nonce, and the server allows it.
+  Future<void> testSensitiveWithStepUp() {
+    stepUpTestResult = null;
+    return _run('Waiting for step-up authentication…', () async {
+      final AccountSession? session = accountSession;
+      final InstallationIdentity? currentIdentity = identity;
+      final StepUpKeyMetadata? key = stepUpKey;
+      if (session == null || currentIdentity == null) {
+        throw ApiException('Create or log in to an account first.');
+      }
+      if (key == null) {
+        throw ApiException(
+          'No step-up key on this device: ${stepUpUnavailable ?? 'unknown'}',
+        );
+      }
+      final String deviceProofToken = await _freshDeviceToken();
+      deviceToken = deviceProofToken;
+      await _collectIntegrityWithToken(deviceProofToken, currentIdentity);
+      final Stopwatch prompt = Stopwatch();
+      try {
+        final Map<String, dynamic> value = await _api.sensitiveEcho(
+          accessToken: session.accessToken,
+          signingIdentity: currentIdentity,
+          body: <String, dynamic>{
+            'operation': 'transfer',
+            'probe_id': Uuid().v4(),
+          },
+          stepUpHeaders: (String nonce) async {
+            final String payload = _base64UrlNoPadding(
+              utf8.encode(jsonEncode(<String, dynamic>{
+                'version': 1,
+                'installation_id': currentIdentity.installationId,
+                'factor': key.factor,
+                'nonce': nonce,
+                'timestamp':
+                    DateTime.now().toUtc().millisecondsSinceEpoch ~/ 1000,
+              })),
+            );
+            prompt.start();
+            final String signature = await _stepUpKeyProvider.sign(
+              payload,
+              reason: 'Approve a sensitive operation (step-up test)',
+            );
+            prompt.stop();
+            return <String, String>{
+              'X-Step-Up-Proof': payload,
+              'X-Step-Up-Signature': signature,
+            };
+          },
+        );
+        final Map<String, dynamic>? seen = value['step_up_key'] is Map
+            ? Map<String, dynamic>.from(value['step_up_key'] as Map)
+            : null;
+        _recordStepUp(<String>[
+          value['step_up'] == 'verified'
+              ? 'PASS: step-up verified, sensitive operation allowed'
+              : 'INFO: 200 but the path is not gated (step_up=${value['step_up']})',
+          'POST /v1/account/sensitive-echo: 200',
+          'Prompt answered in ${prompt.elapsedMilliseconds} ms',
+          'Key: ${key.description} (${key.securityLevel})',
+          'Server saw key auth: ${seen?['key_auth']}',
+          'Policy downgrade: ${seen?['policy_downgrade']}',
+        ]);
+      } on NativeKeyException catch (error) {
+        _recordStepUp(<String>[
+          error.code == 'STEPUP_CANCELLED'
+              ? 'CANCELLED: no step-up signature was produced; nothing was sent'
+              : 'FAIL: the step-up key could not sign',
+          '${error.message} [${error.code}]',
+        ]);
+      } on ApiException catch (error) {
+        _recordStepUp(<String>[
+          'FAIL: the server refused the step-up proof',
+          'POST /v1/account/sensitive-echo: ${error.statusCode} ${error.code}',
+        ]);
+      }
+    });
+  }
+
   Future<void> clearAccountSession() {
     return _run('Clearing local account tokens…', () async {
       await _store.clearAccountSession();
@@ -3121,6 +3577,49 @@ class _DeviceRecognitionPageState extends State<DeviceRecognitionPage> {
               _testResultPanel(
                 'Stolen access-token attack result',
                 _controller.stolenAccessTestResult!,
+              ),
+            ],
+            const Divider(height: 36),
+            Text(
+              'Step-up for sensitive operations',
+              style: Theme.of(context).textTheme.titleMedium,
+            ),
+            const SizedBox(height: 8),
+            const Text(
+              'A second, optional key that cannot sign without the device '
+              'passcode. A gated operation needs its signature over this '
+              "request's nonce, so a hijacked app process cannot approve it "
+              'silently.',
+            ),
+            const SizedBox(height: 8),
+            Text(_controller.stepUpStatusLine),
+            const SizedBox(height: 12),
+            Wrap(
+              spacing: 10,
+              runSpacing: 10,
+              children: <Widget>[
+                OutlinedButton(
+                  onPressed: _controller.busy ||
+                          _controller.accountSession == null
+                      ? null
+                      : _controller.testSensitiveWithoutStepUp,
+                  child: const Text('Sensitive op without step-up'),
+                ),
+                FilledButton.tonal(
+                  onPressed: _controller.busy ||
+                          _controller.accountSession == null ||
+                          _controller.stepUpKey == null
+                      ? null
+                      : _controller.testSensitiveWithStepUp,
+                  child: const Text('Sensitive op with step-up'),
+                ),
+              ],
+            ),
+            if (_controller.stepUpTestResult != null) ...<Widget>[
+              const SizedBox(height: 12),
+              _testResultPanel(
+                'Step-up result',
+                _controller.stepUpTestResult!,
               ),
             ],
             const Divider(height: 36),
