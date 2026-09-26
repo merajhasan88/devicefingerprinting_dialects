@@ -41,7 +41,7 @@ import threading
 import time
 import unicodedata
 import uuid
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timedelta, timezone
 
 import bcrypt
@@ -449,8 +449,9 @@ class Dialect(object):
     def connect(self):
         raise NotImplementedError
 
-    def disconnect(self, connection):
-        connection.close()
+    def unit_lock(self):
+        """Held for a whole unit of work (connect .. close); none by default."""
+        return nullcontext()
 
     def sql(self, text):
         """Translate a statement written in the canonical (PostgreSQL) form."""
@@ -540,11 +541,17 @@ class SqlServerDialect(Dialect):
     # below is what makes datetimeoffset usable.
     _SQL_SS_TIMESTAMPOFFSET = -155
 
-    _handle_lock = threading.Lock()
+    # DESIGN.md 55. On the reference host (unixODBC 2.3.12, msodbcsql18
+    # 18.6.2.1, arm64) the ODBC stack is not safe to drive from concurrent
+    # threads, even on separate connections: parallel clients reproduced heap
+    # corruption, a SIGSEGV inside cursor.execute, and a deadlock between
+    # connect and close. Every unit of work therefore runs under one
+    # process-wide re-entrant lock (re-entrant because units nest); scale a
+    # SQL Server deployment with worker processes, not threads.
+    _unit_lock = threading.RLock()
 
-    def disconnect(self, connection):
-        with self._handle_lock:
-            connection.close()
+    def unit_lock(self):
+        return self._unit_lock
 
     @staticmethod
     def _decode_datetimeoffset(raw):
@@ -588,13 +595,7 @@ class SqlServerDialect(Dialect):
             "TrustServerCertificate=no",
             "LoginTimeout=%s" % os.environ.get("DB_CONNECT_TIMEOUT", "5"),
         ]
-        # Opening and closing are serialized (DESIGN.md 55): with pooling off,
-        # a close racing concurrent connects still deadlocked the process
-        # inside the ODBC stack (every request thread stuck in pyodbc.connect,
-        # one in connection.close). Statements on distinct connections still
-        # run concurrently.
-        with self._handle_lock:
-            connection = pyodbc.connect(";".join(parts))
+        connection = pyodbc.connect(";".join(parts))
         connection.add_output_converter(
             self._SQL_SS_TIMESTAMPOFFSET, self._decode_datetimeoffset
         )
@@ -843,18 +844,20 @@ def _connect_db():
 
 @contextmanager
 def _cursor(commit=False):
-    connection = _connect_db()
-    cursor = _DialectCursor(connection.cursor())
-    try:
-        yield cursor
-        if commit:
-            connection.commit()
-    except Exception:
-        connection.rollback()
-        raise
-    finally:
-        cursor.close()
-        DIALECT.disconnect(connection)
+    # A no-op for PostgreSQL; serializes units of work for SQL Server (55).
+    with DIALECT.unit_lock():
+        connection = _connect_db()
+        cursor = _DialectCursor(connection.cursor())
+        try:
+            yield cursor
+            if commit:
+                connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            cursor.close()
+            connection.close()
 
 
 # ---------------------------------------------------------------------------
@@ -902,7 +905,7 @@ def _get_backend_identity():
     global _backend_identity
     if _backend_identity is not None:
         return _backend_identity
-    with _backend_identity_lock:
+    with DIALECT.unit_lock(), _backend_identity_lock:  # lock order: unit first
         if _backend_identity is None:
             with _cursor() as cursor:
                 identity = _read_backend_identity(cursor)
@@ -958,7 +961,7 @@ def _get_schema_state():
     global _schema_state
     if _schema_state is not None:
         return _schema_state
-    with _schema_lock:
+    with DIALECT.unit_lock(), _schema_lock:  # lock order: unit first
         if _schema_state is None:
             with _cursor() as cursor:
                 found = _read_schema_version(cursor)
@@ -1022,7 +1025,7 @@ def _risk_policy_settings():
         time.monotonic() - cache["at"]
     ) < RISK_SETTINGS_CACHE_TTL_SECONDS:
         return cache["values"]
-    with _risk_settings_lock:
+    with DIALECT.unit_lock(), _risk_settings_lock:  # lock order: unit first
         if cache["values"] is not None and (
             time.monotonic() - cache["at"]
         ) < RISK_SETTINGS_CACHE_TTL_SECONDS:
