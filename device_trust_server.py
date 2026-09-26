@@ -449,6 +449,9 @@ class Dialect(object):
     def connect(self):
         raise NotImplementedError
 
+    def disconnect(self, connection):
+        connection.close()
+
     def sql(self, text):
         """Translate a statement written in the canonical (PostgreSQL) form."""
         return text
@@ -537,6 +540,12 @@ class SqlServerDialect(Dialect):
     # below is what makes datetimeoffset usable.
     _SQL_SS_TIMESTAMPOFFSET = -155
 
+    _handle_lock = threading.Lock()
+
+    def disconnect(self, connection):
+        with self._handle_lock:
+            connection.close()
+
     @staticmethod
     def _decode_datetimeoffset(raw):
         if raw is None:
@@ -579,7 +588,13 @@ class SqlServerDialect(Dialect):
             "TrustServerCertificate=no",
             "LoginTimeout=%s" % os.environ.get("DB_CONNECT_TIMEOUT", "5"),
         ]
-        connection = pyodbc.connect(";".join(parts))
+        # Opening and closing are serialized (DESIGN.md 55): with pooling off,
+        # a close racing concurrent connects still deadlocked the process
+        # inside the ODBC stack (every request thread stuck in pyodbc.connect,
+        # one in connection.close). Statements on distinct connections still
+        # run concurrently.
+        with self._handle_lock:
+            connection = pyodbc.connect(";".join(parts))
         connection.add_output_converter(
             self._SQL_SS_TIMESTAMPOFFSET, self._decode_datetimeoffset
         )
@@ -839,7 +854,7 @@ def _cursor(commit=False):
         raise
     finally:
         cursor.close()
-        connection.close()
+        DIALECT.disconnect(connection)
 
 
 # ---------------------------------------------------------------------------
