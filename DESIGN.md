@@ -4404,3 +4404,83 @@ server reached SQL Server with validated TLS (`TrustServerCertificate=no`).
 - The conformance certificate is still in the Android allow-list for further suite runs. It is a
   synthetic digest (no real signing cert can match it), but remove it before production use.
 - Item 4 (Flutter plugin step-up key + settings) not started.
+
+## 53. Item 4 — the step-up key in the Flutter client, and the server's view of it (2026-09-26)
+
+§51.8 item 4, built to the owner's **Option 1**: passcode on every use wherever the platform can bind
+it to a single signature (iPhone, Android 11+); on Android 9/10 a passcode with a short window
+enforced by the key hardware; the plugin reports what it actually got, so a downgrade is visible.
+
+### 53.1 What shipped (each its own commit)
+
+- **Server** (`931bb65`, migration 005, schema 5). Registration records the step-up key's
+  `stepup_key_auth` — `factor`, `mode` (`per_use` / `windowed`), `window_seconds` — and computes
+  `stepup_policy_downgrade` against `risk_policy_settings.stepup_mode`. A downgrade is **accepted,
+  recorded and logged, never refused**: refusing Android 9/10 keys would lock legitimate users out of
+  sensitive operations. The exact-key re-registration path **never attaches or replaces** a step-up
+  key: registration is unauthenticated, so doing so would let anyone holding the public installation
+  key — or a silent signing oracle on a compromised device — swap in a key it controls and pass
+  step-up (§51.4, "changing the lock requires passing the lock"). It reports
+  `stepup_key_registered` / `stepup_key_matches` / `stepup_key_auth` instead. Every step-up decision
+  is logged with its outcome code; `/v1/account/sensitive-echo` now says `step_up: verified` or
+  `not_required` truthfully and echoes the key's auth.
+- **Client** (`974d415`), channel `devicefingerprinting/stepup_key_v1`:
+  - Android `StepUpKeyManager.kt`. API 30+: `setUserAuthenticationParameters(0,
+    AUTH_DEVICE_CREDENTIAL)` and a `BiometricPrompt` with a `CryptoObject` per signature — per-use.
+    API 28–29, passcode: `setUserAuthenticationValidityDurationSeconds(30)` plus the system
+    confirm-credential screen before **every** signature. Factor, mode and window are **read back
+    from `KeyInfo`**, i.e. what the keystore enforces, not what was requested.
+  - iOS `StepUpKeyManager` (in `InstallationKeyManager.swift`). Secure Enclave, `.devicePasscode`
+    (or `.biometryCurrentSet`), `kSecAttrAccessibleWhenPasscodeSetThisDeviceOnly`, a fresh
+    `LAContext` per signature — always per-use. No windowed mode on iOS: there is no
+    hardware-enforced reuse window for a passcode-gated key, and an app-level one is what §51.3 rules
+    out.
+  - Dart: the step-up key and its auth go out with registration; the key rotates with the
+    installation key; **no passcode means no step-up key, never a failed enrolment**. The step-up proof
+    is signed before the access proof, so time spent at the prompt does not eat the access proof's
+    ±120 s window. Lab UI: "Sensitive op without step-up" / "Sensitive op with step-up".
+
+### 53.2 The Android 9/10 downgrade, stated plainly
+
+Before API 30, Keystore cannot bind a device credential to one operation, and a validity-window key
+accepts **any** lock-screen authentication inside the window — a fingerprint, or the device unlock
+itself. The plugin shows the passcode screen before every signature, but that prompt is enforced by
+the app; the hardware guarantees only "the user authenticated in the last 30 s". A compromised app
+process could therefore sign without a prompt within 30 s of any unlock. That is the downgrade the
+server records as `mode=windowed, window_seconds=30, stepup_policy_downgrade=true`.
+
+### 53.3 Conformance — schema 5, same suite, backend swapped
+
+| | PostgreSQL 16.15 | SQL Server 2019 (RDS, 15.0.4480) |
+|---|---|---|
+| Production defaults | **45 / 0 / 5** | **45 / 0 / 5** |
+| Enforce mode (defaults) | **47 / 0 / 3** | **47 / 0 / 3** |
+| Every signal + step-up enabled | **48 / 0 / 2** | **48 / 0 / 2** |
+
+New: `check_stepup_key_immutable` (re-registration can neither attach nor replace a step-up key), and
+the registration check now asserts the echoed auth, the downgrade flag and a refused malformed block.
+The SQL Server enforce-mode run closes the gap left in §52 (only observe had been run there).
+
+### 53.4 On hardware — OPPO CPH2083, Android 9 (API 28), PostgreSQL, observe
+
+- **No screen lock:** `STEPUP_NO_DEVICE_CREDENTIAL`, enrolment proceeds without a step-up key
+  (`stepup_key_registered=false`), integrity reads the usual baseline `score 18, trusted`. A user
+  without a passcode is not blocked. **PASS** (false-positive safety).
+- **PIN set, "Simulate fresh installation":** new installation `693b9c8a…`, correlated to the same
+  device by reinstall hint; the stored step-up key is `ES256, passcode, windowed, 30`, and the server
+  logged it as weaker than policy.
+- **Sensitive op without step-up:** `403 stepup_required`. **PASS.**
+- **Sensitive op with step-up:** confirm-credential PIN screen → `200`, `step_up: verified`; the
+  server logged `factor=passcode key_mode=windowed window_seconds=30 policy_downgrade=True`; the prompt
+  was answered in ~5 s. **PASS.**
+
+### 53.5 Limits and open items
+
+- **Existing installations must re-enrol to get a step-up key** — a direct consequence of the
+  immutability rule. Rolling step-up out to a fleet that is already enrolled needs an authenticated
+  enrolment path that an oracle attacker cannot satisfy (password re-entry or an out-of-band
+  confirmation). Not built.
+- Factor and mode remain **client claims** (§51.2): without key attestation the server cannot
+  re-verify them.
+- Still to run on hardware: the Android 11+ per-use path (Vivo, Android 12) and iOS (first Codemagic
+  compile of the Swift code).
