@@ -4498,6 +4498,29 @@ as `dt-stepup.ipa` (`sha256 db7e9afa…`).
   `trusted_execution_environment`, no step-up key; integrity `score 18, trusted` (developer options +8,
   ADB +10). Enrolment unaffected. **PASS** (false-positive safety). This Vivo writes nothing to logcat
   (the buffer is empty system-wide), so its evidence is read from the server.
+- **PIN set, "Simulate fresh installation":** installation `d88418bb…`, correlated by reinstall hint;
+  step-up key stored as `ES256, passcode, per_use, 0` — the API 30+ path, read back from `KeyInfo`.
+- **Sensitive op without step-up:** `403 stepup_required`. **PASS.**
+- **Sensitive op with step-up:** the system device-credential prompt (`BiometricPrompt` +
+  `CryptoObject`) → `200`; the server logged `factor=passcode key_mode=per_use window_seconds=0
+  policy_downgrade=False`. **PASS.** First on-hardware run of the Android 11+ per-use path.
+
+### 53.4c Device memory and the behavioural signals on real handset traffic
+
+- The app's device summary matched the server on all three: OPPO and Vivo **2 installations, 1
+  account** each (the no-PIN install plus the fresh one); iPhone **4 and 4** — three installations and
+  three accounts from the 2026-09-19 battery plus today's. The iPhone's IDFV hint has correlated every
+  TrollStore reinstall to one device for a week.
+- **Population baseline** (test setting: `installations_per_device`, threshold 2, strictly greater)
+  fired `population_outlier +30` on the iPhone (4) and correctly not on the OPPO or Vivo (2).
+- **Request-rate anomaly** (test setting: more than 3 in 60 s) did not fire on any handset. It counts
+  **risk evaluations** per installation, not HTTP requests, and no installation reached four
+  evaluations inside a minute in normal use — correct behaviour, not a miss.
+- Observe mode hid one thing worth knowing: the iPhone's relationship risk is `105 → recommended
+  block` (`device_has_many_accounts +60`, `population_outlier +30`, `known_device_new_installation +15`),
+  effective `allow`. With `DEVICE_POLICY_MODE=enforce` this test-worn device would be refused on
+  accumulated test accounts. `device_has_many_accounts` predates today and deserves a false-positive
+  review (shared family devices) before enforce is ever enabled.
 
 ### 53.5 Limits and open items
 
@@ -4507,8 +4530,8 @@ as `dt-stepup.ipa` (`sha256 db7e9afa…`).
   confirmation). Not built.
 - Factor and mode remain **client claims** (§51.2): without key attestation the server cannot
   re-verify them.
-- Still to run on hardware: the Android 11+ per-use path with a PIN set (Vivo), and the whole handset
-  battery again on SQL Server (§53.6).
+- Still to run on hardware: the whole handset battery again on SQL Server (§53.6), and the deferred
+  OPPO check of what removing the screen lock does to the step-up key.
 
 ### 53.6 Agreed plan for the handset battery (owner, 2026-09-26)
 
