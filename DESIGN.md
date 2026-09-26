@@ -4513,9 +4513,15 @@ as `dt-stepup.ipa` (`sha256 db7e9afa…`).
   TrollStore reinstall to one device for a week.
 - **Population baseline** (test setting: `installations_per_device`, threshold 2, strictly greater)
   fired `population_outlier +30` on the iPhone (4) and correctly not on the OPPO or Vivo (2).
-- **Request-rate anomaly** (test setting: more than 3 in 60 s) did not fire on any handset. It counts
-  **risk evaluations** per installation, not HTTP requests, and no installation reached four
-  evaluations inside a minute in normal use — correct behaviour, not a miss.
+- **Request-rate anomaly** (test setting: more than 3 in 60 s) did not fire in normal use on any
+  handset. It counts **risk evaluations** per installation, not HTTP requests, and no installation
+  reached four evaluations inside a minute — correct behaviour, not a miss. Driven deliberately on the
+  iPhone ("Test bound refresh", then "Evaluate current account risk" six times): the refresh and
+  `account_me` evaluations plus the first policy check stayed at 105; the **fourth evaluation inside
+  the window** added `request_rate_anomaly +30` (105 → **135**), and every later one in the window kept
+  it. Recommended `block`, effective `allow` (observe). **PASS** on hardware. (A first attempt with an
+  expired 10-minute access token was refused `401` at the JWT layer, before any evaluation, so it
+  correctly counted nothing.)
 - Observe mode hid one thing worth knowing: the iPhone's relationship risk is `105 → recommended
   block` (`device_has_many_accounts +60`, `population_outlier +30`, `known_device_new_installation +15`),
   effective `allow`. With `DEVICE_POLICY_MODE=enforce` this test-worn device would be refused on
