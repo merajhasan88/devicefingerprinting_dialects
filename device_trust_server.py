@@ -2543,8 +2543,9 @@ def _enforce_step_up(installation_id):
             "This operation requires step-up verification.", 403, "stepup_required"
         )
     proof_bytes = _b64url_decode(proof_b64, "stepup_proof", 8192)
+    signature_bytes = _b64url_decode(signature_b64, "stepup_signature", 1024)
     try:
-        _verify_installation_signature(stepup_alg, stepup_jwk, proof_bytes, signature_b64)
+        _verify_installation_signature(stepup_alg, stepup_jwk, proof_bytes, signature_bytes)
     except ApiProblem:
         raise ApiProblem(
             "The step-up signature did not verify.", 403, "stepup_signature_invalid"
