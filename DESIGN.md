@@ -4641,3 +4641,62 @@ verified, `per_use`, no downgrade); OPPO **PASS** (`403`, then verified, `window
 flagged). The +10 `new_device` on both is correct: to the fresh database each phone was first seen
 minutes earlier. **Vivo: owner decision** — not available; its EC2-PostgreSQL result (§53.4b) stands
 for the Android 11+ path.
+
+## 56. State at end of session and where to resume (2026-09-26)
+
+### 56.1 Infrastructure
+
+- **EC2** `i-0559685f02c4013b1` **stopped** (never terminated). Server `/opt/device_trust_server.py` =
+  commit `d208be4` (md5 `caef50c0fd58…`); earlier copies kept as `/opt/device_trust_server.py.bak-*`.
+  Backend **PostgreSQL 16.15** (EC2-local), **schema 6**, `INTEGRITY_MODE=observe`,
+  `DEVICE_POLICY_MODE=observe`. `risk_policy_settings` at **production defaults**: both behavioural
+  signals off, `stepup_required_paths` empty, accounts-per-device at the owner defaults (§54).
+  `PYTHONFAULTHANDLER` is not set (it was only on the SQL Server drop-in, now gone).
+- **SQL Server RDS**: both of today's instances (2019, `sqlserver-ex`) **deleted** with no final
+  snapshot and no automated backups; manual snapshots 0, Elastic IPs 0, NAT gateways 0.
+- The public IP changes on the next start; DuckDNS updates itself, but the dev box's `/etc/hosts` pin
+  (`44.251.13.79 devicefingerprinting.duckdns.org`, §52.3) goes stale — update or remove it
+  (needs sudo). Port 22 is IP-allow-listed in `sg-0a7e35ab397d765e8`; add the current IP if it changed.
+- The synthetic conformance certificate is still in the Android allow-list (§52.4) — needed for suite
+  runs, remove before production.
+
+### 56.2 Code and results
+
+Unpushed commits on `main` (the owner pushes): `a69ee66` … `07e2879` (14). Today delivered §51.8
+items 1–4: settings table, both behavioural signals, server step-up, and the Flutter plugin step-up
+key on Android and iOS — validated by the conformance suite on PostgreSQL and SQL Server 2019 and on
+three handsets (OPPO Android 9, Vivo Android 12, iPhone 7 iOS 15.8.5; §53.4, §55). Final code on
+PostgreSQL at production defaults: **47 / 0 / 5**, including the new parallel-clients check.
+
+### 56.3 Handsets as left
+
+- **OPPO CPH2083** (Android 9): screen-lock PIN now set; release build with step-up installed.
+- **Vivo V2118** (Android 12, new test device): PIN set; release build installed. Its logcat is empty
+  system-wide — read results from the server. adb only listed it after `adb kill-server`.
+- **iPhone 7**: passcode now on; `dt-stepup.ipa` (`sha256 db7e9afa…`, from `974d415`) installed through
+  TrollStore and staged at `/srv/artifacts/e2a890/dt-stepup.ipa`. lockdown's `PasswordProtected`
+  reads `false` regardless — do not trust it.
+- Removing a phone's PIN/passcode should invalidate (Android) or delete (iOS) only the step-up key and
+  leave the installation identity alone — documented platform behaviour, **not yet observed** here.
+
+### 56.4 Open items, in suggested order
+
+1. **§51.8 item 5 — the other SDKs' step-up key** (.NET and others). The server contract is fixed
+   (§53.1). The .NET repository belongs to another session: hand over by document only, and only with
+   the owner's explicit permission.
+2. **SQL Server beyond 2019.** The step-up handset round ran on 2019 only; 2017/2022/2025 were covered
+   earlier by the conformance matrix, not by this feature. Owner declined a 2025 round today.
+3. **PostgreSQL integrity-enforce run at schema 6** — not yet run (SQL Server's was, 48/0/3).
+4. **SQL Server in production:** the per-process lock (§55) means scaling with worker processes; the
+   exact faulty library in the ODBC stack was not isolated (x86_64 or a newer msodbcsql18 would be the
+   comparison), and a few post-load 15 s timeouts in `_verify_challenge` were not explained.
+5. **Deferred OPPO check:** what turning the screen lock off does to the step-up key. The current
+   build checks for a lock screen before it looks at the key, so it cannot tell "deleted" from
+   "invalidated" while the lock is off; an offered, not-yet-built Kotlin change would log the key's
+   state and replace an invalidated key eagerly.
+6. **Step-up for already-enrolled installations** (§53.5): needs an enrolment path an oracle attacker
+   cannot satisfy (password re-entry or out-of-band confirmation). Not built.
+7. **Advisory signals can still escalate.** `request_rate_anomaly` and `population_outlier` add
+   points to the same score, so in combination they can push a device into review or block (the
+   iPhone reached 135 with both). §51.6 calls them "advisory, never a hard block"; decide whether
+   their contribution should be capped below the review band.
