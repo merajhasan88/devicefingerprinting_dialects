@@ -46,6 +46,7 @@ import hashlib
 import json
 import secrets
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -1744,6 +1745,58 @@ def check_device_account_bands(api, ctx):
            and pol.get("recommended_action") == "block",
            "account %d must be scored block, got %s %s %s"
            % (block, st, pol.get("recommended_action"), sorted(_reason_codes(pol))))
+
+
+@check("concurrency: parallel clients neither crash nor stall the server", db_sensitive=True)
+def check_parallel_clients(api, ctx):
+    """Four phone-like clients enrol, prove possession, report integrity and read
+    /v1/device/me at the same time, three rounds. Every other check is
+    sequential, which is how a heap-corrupting ODBC driver-manager pool on SQL
+    Server went unseen until two handsets bootstrapped together (DESIGN.md 55).
+    Every flow must succeed and no step may approach the handset client's 15 s
+    timeout."""
+    failures, slowest, lock = [], [0.0, ""], threading.Lock()
+
+    def flow(tag):
+        client = Api(api.base_url)
+        try:
+            inst = Installation()
+            steps = []
+            started = time.time()
+            status, payload = enrol(client, inst, fresh_hint())
+            steps.append(("register", time.time() - started))
+            if status not in (200, 201):
+                raise AssertionError("register %s" % status)
+            started = time.time()
+            token = device_token(client, inst)
+            steps.append(("challenge+verify", time.time() - started))
+            started = time.time()
+            submit_report(client, inst, token)
+            steps.append(("integrity", time.time() - started))
+            started = time.time()
+            status, payload = protected(client, inst, "GET", "/v1/device/me", token)
+            steps.append(("device/me", time.time() - started))
+            if status != 200:
+                raise AssertionError("device/me %s %s" % (status, error_code(payload)))
+            with lock:
+                for step, seconds in steps:
+                    if seconds > slowest[0]:
+                        slowest[0], slowest[1] = seconds, step
+        except BaseException as error:  # SystemExit/TimeoutError end a thread silently
+            with lock:
+                failures.append("%s: %s" % (tag, str(error)[:100]))
+
+    for round_number in range(3):
+        threads = [threading.Thread(target=flow, args=("r%d-c%d" % (round_number, i),))
+                   for i in range(4)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+    expect(not failures, "%d of 12 parallel flows failed: %s" % (len(failures), "; ".join(failures[:3])))
+    expect(slowest[0] < 10.0,
+           "slowest step %s took %.1fs under parallel load (handset timeout is 15s)"
+           % (slowest[1], slowest[0]))
 
 def main():
     global VERBOSE
