@@ -38,6 +38,7 @@ import re
 import secrets
 import struct
 import threading
+import time
 import unicodedata
 import uuid
 from contextlib import contextmanager
@@ -886,7 +887,7 @@ def _get_backend_identity():
 # against a schema it does not understand. /health/* still answers so operators
 # can see why.
 
-REQUIRED_SCHEMA_VERSION = 2
+REQUIRED_SCHEMA_VERSION = 3
 
 _schema_state = None
 _schema_lock = threading.Lock()
@@ -954,6 +955,69 @@ def schema_guard():
             details={"schema": state},
         )
     return None
+
+
+# ---------------------------------------------------------------------------
+# DBA-tunable risk policy settings (migration 003)
+# ---------------------------------------------------------------------------
+# risk_policy_settings is owned by the consumer's DBA and read -- never written
+# -- by the server. Values are cached with a short TTL so a DBA UPDATE takes
+# effect without a restart. The read fails closed to an empty dict, so a
+# database still on schema < 3 (table absent) simply yields defaults everywhere.
+
+RISK_SETTINGS_CACHE_TTL_SECONDS = int(
+    os.environ.get("RISK_SETTINGS_CACHE_TTL_SECONDS", "30")
+)
+_risk_settings_cache = {"at": 0.0, "values": None}
+_risk_settings_lock = threading.Lock()
+
+
+def _risk_policy_settings():
+    cache = _risk_settings_cache
+    if cache["values"] is not None and (
+        time.monotonic() - cache["at"]
+    ) < RISK_SETTINGS_CACHE_TTL_SECONDS:
+        return cache["values"]
+    with _risk_settings_lock:
+        if cache["values"] is not None and (
+            time.monotonic() - cache["at"]
+        ) < RISK_SETTINGS_CACHE_TTL_SECONDS:
+            return cache["values"]
+        values = {}
+        try:
+            with _cursor() as cursor:
+                cursor.execute(
+                    "SELECT setting_key, setting_value FROM risk_policy_settings"
+                )
+                for row in cursor.fetchall():
+                    values[str(row[0])] = str(row[1])
+        except Exception:
+            logger.exception(
+                "Could not read risk_policy_settings; using defaults this cycle"
+            )
+            values = cache["values"] if cache["values"] is not None else {}
+        cache["values"] = values
+        cache["at"] = time.monotonic()
+        return values
+
+
+def _risk_setting_str(key, default):
+    value = _risk_policy_settings().get(key)
+    return value if value is not None else default
+
+
+def _risk_setting_int(key, default):
+    try:
+        return int(_risk_policy_settings().get(key, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _risk_setting_bool(key, default=False):
+    value = _risk_policy_settings().get(key)
+    if value is None:
+        return default
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
 
 
 # ---------------------------------------------------------------------------
@@ -3091,6 +3155,7 @@ def health_ready():
                 "ios_fake_signature": INTEGRITY_SCORE_IOS_FAKE_SIGNATURE,
                 "ios_code_integrity": INTEGRITY_SCORE_IOS_CODE_INTEGRITY,
                 "hardware_backing_policy": INTEGRITY_HARDWARE_BACKING_POLICY,
+                "risk_policy_settings": _risk_policy_settings(),
             },
             "remote_attestation": "not_used",
             "redis": _redis_status(),
