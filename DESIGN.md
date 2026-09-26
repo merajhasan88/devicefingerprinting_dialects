@@ -4652,11 +4652,15 @@ for the Android 11+ path.
   `DEVICE_POLICY_MODE=observe`. `risk_policy_settings` at **production defaults**: both behavioural
   signals off, `stepup_required_paths` empty, accounts-per-device at the owner defaults (§54).
   `PYTHONFAULTHANDLER` is not set (it was only on the SQL Server drop-in, now gone).
-- **SQL Server RDS**: both of today's instances (2019, `sqlserver-ex`) **deleted** with no final
-  snapshot and no automated backups; manual snapshots 0, Elastic IPs 0, NAT gateways 0.
+- **SQL Server RDS**: both of today's instances (2019, `sqlserver-ex`) **deleted** — deletion confirmed
+  complete (no RDS instances), no final snapshot, 0 automated backups, 0 manual snapshots; Elastic IPs
+  0, NAT gateways 0.
+- **Lesson recorded:** the second SQL Server instance ran about four hours for a round that should
+  have taken minutes, because concurrency on SQL Server was discovered on hardware (§55). Run
+  `check_parallel_clients` against any new backend before handset or paid-database time.
 - The public IP changes on the next start; DuckDNS updates itself, but the dev box's `/etc/hosts` pin
   (`44.251.13.79 devicefingerprinting.duckdns.org`, §52.3) goes stale — update or remove it
-  (needs sudo). Port 22 is IP-allow-listed in `sg-0a7e35ab397d765e8`; add the current IP if it changed.
+  (needs sudo — the owner removed it after the session). Port 22 is IP-allow-listed in `sg-0a7e35ab397d765e8`; add the current IP if it changed.
 - The synthetic conformance certificate is still in the Android allow-list (§52.4) — needed for suite
   runs, remove before production.
 
@@ -4676,8 +4680,9 @@ PostgreSQL at production defaults: **47 / 0 / 5**, including the new parallel-cl
 - **iPhone 7**: passcode now on; `dt-stepup.ipa` (`sha256 db7e9afa…`, from `974d415`) installed through
   TrollStore and staged at `/srv/artifacts/e2a890/dt-stepup.ipa`. lockdown's `PasswordProtected`
   reads `false` regardless — do not trust it.
-- Removing a phone's PIN/passcode should invalidate (Android) or delete (iOS) only the step-up key and
-  leave the installation identity alone — documented platform behaviour, **not yet observed** here.
+- **After the session the owner removed the PIN/passcode on all three phones.** Removing it should
+  invalidate (Android) or delete (iOS) only the step-up key and leave the installation identity alone —
+  documented platform behaviour, **not yet observed** here. That is now a test (open item 5).
 
 ### 56.4 Open items, in suggested order
 
@@ -4690,10 +4695,21 @@ PostgreSQL at production defaults: **47 / 0 / 5**, including the new parallel-cl
 4. **SQL Server in production:** the per-process lock (§55) means scaling with worker processes; the
    exact faulty library in the ODBC stack was not isolated (x86_64 or a newer msodbcsql18 would be the
    comparison), and a few post-load 15 s timeouts in `_verify_challenge` were not explained.
-5. **Deferred OPPO check:** what turning the screen lock off does to the step-up key. The current
-   build checks for a lock screen before it looks at the key, so it cannot tell "deleted" from
-   "invalidated" while the lock is off; an offered, not-yet-built Kotlin change would log the key's
-   state and replace an invalidated key eagerly.
+5. **Screen lock removed — was only the step-up key affected? (owner, first thing next session.)** The
+   PIN/passcode is already off on all three phones. Check on each: the installation key and identity
+   are unchanged (re-registration takes the exact-key path, same installation id, clean integrity scan),
+   step-up is unavailable (`STEPUP_NO_DEVICE_CREDENTIAL`), a sensitive op without step-up is still
+   `403 stepup_required`, and nothing else broke. Then set a PIN again and see whether the old step-up
+   key was deleted (`created=true`, server `stepup_key_matches=false`) or survived invalidated
+   (`STEPUP_KEY_INVALIDATED` on signing). The current Android build checks for a lock screen before it
+   looks at the key, so it cannot tell those apart while the lock is off; the offered Kotlin change that
+   logs the key's state and replaces an invalidated key eagerly would make it direct.
+8. **The intermittent 15 s statement timeouts on SQL Server (owner: check next time).** After the load
+   tests, some `_verify_challenge` SELECTs hit the new 15 s timeout (`HYT00`) even at one client, while
+   other runs were clean at 1–3 s per step. The cause was not captured: poll `sys.dm_exec_requests` /
+   `sys.dm_exec_query_memory_grants` **during a failing request**, compare with the RDS maintenance
+   queue (`RdsAdminService` `DBCC CHECKDB` waiting on `RESOURCE_SEMAPHORE`), and run
+   `check_parallel_clients` first on any new SQL Server instance.
 6. **Step-up for already-enrolled installations** (§53.5): needs an enrolment path an oracle attacker
    cannot satisfy (password re-entry or out-of-band confirmation). Not built.
 7. **Advisory signals can still escalate.** `request_rate_anomaly` and `population_outlier` add
