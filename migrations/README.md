@@ -49,6 +49,20 @@ ALTER ROLE db_datareader ADD MEMBER app_user;
 ALTER ROLE db_datawriter ADD MEMBER app_user;
 ```
 
+**New tables from later migrations.** On **PostgreSQL** the grant above is point-in-time — it does
+**not** cover tables a later migration adds (this bit `risk_policy_settings` in migration 003). Set it
+once with default privileges, run as the migration/DDL role:
+
+```sql
+ALTER DEFAULT PRIVILEGES IN SCHEMA public
+    GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO app_user;
+```
+
+or re-run `GRANT ... ON ALL TABLES` after each migration. On **SQL Server**, `db_datareader` /
+`db_datawriter` membership already covers future tables, so nothing extra is needed.
+`risk_policy_settings` is **read-only** for the application (the DBA writes it), so `SELECT` alone
+suffices there.
+
 ## Version contract
 
 `schema_migrations(version, applied_at, description)` holds one row per applied
