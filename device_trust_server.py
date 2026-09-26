@@ -558,6 +558,12 @@ class SqlServerDialect(Dialect):
     def connect(self):
         import pyodbc  # imported lazily so PostgreSQL deployments need no ODBC
 
+        # The server is threaded and opens a connection per unit of work. With
+        # pyodbc's default driver-manager pooling on, concurrent requests
+        # corrupted the heap and killed the process (DESIGN.md 55). Pooling is a
+        # process-wide setting read when the first connection is made.
+        pyodbc.pooling = False
+
         parts = [
             "DRIVER={ODBC Driver 18 for SQL Server}",
             "SERVER=%s,%s" % (
