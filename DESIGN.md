@@ -4484,3 +4484,12 @@ The SQL Server enforce-mode run closes the gap left in §52 (only observe had be
   re-verify them.
 - Still to run on hardware: the Android 11+ per-use path (Vivo, Android 12) and iOS (first Codemagic
   compile of the Swift code).
+
+### 53.6 Agreed plan for the handset battery (owner, 2026-09-26)
+
+The step-up handset battery runs on **both engine families**: first on the EC2-local PostgreSQL on all
+three handsets — OPPO (Android 9), Vivo (Android 12, the per-use path) and iPhone 7 — then the SQL
+Server RDS is re-created (`--backup-retention-period 0`) and the same battery is repeated on all
+three. The first SQL Server RDS of the day was deleted after its conformance runs (§53.3) with
+`--skip-final-snapshot --delete-automated-backups`, at the owner's instruction, while the PostgreSQL
+handset runs proceed.
