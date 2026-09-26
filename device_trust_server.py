@@ -596,6 +596,11 @@ class SqlServerDialect(Dialect):
             "LoginTimeout=%s" % os.environ.get("DB_CONNECT_TIMEOUT", "5"),
         ]
         connection = pyodbc.connect(";".join(parts))
+        # A statement must fail rather than wait forever: units of work are
+        # serialized (above), so one statement stuck behind the server -- e.g.
+        # queued for a memory grant on a small instance (DESIGN.md 55) -- would
+        # otherwise stall every request in the process.
+        connection.timeout = int(os.environ.get("DB_QUERY_TIMEOUT", "15"))
         connection.add_output_converter(
             self._SQL_SS_TIMESTAMPOFFSET, self._decode_datetimeoffset
         )
