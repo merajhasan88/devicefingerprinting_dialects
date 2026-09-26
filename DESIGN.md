@@ -4343,3 +4343,64 @@ behind the conformance suite: (1) `risk_policy_settings` table + migration + ser
 (2) the two behavioral signals wired into relationship-risk; (3) the server step-up policy
 (sensitive-op set, step-up-proof verification, factor/mode declaration); (4) the Flutter-plugin
 step-up key + settings; (5) the other SDKs. Testing is deferred until the server is up.
+
+## 52. Implemented: settings, behavioural signals and step-up — validated on both engines (2026-09-26)
+
+DESIGN.md §51 built end to end server-side and validated on PostgreSQL 16.15 (EC2-local) and SQL
+Server 2019 (RDS `sqlserver-ex` 15.0.4480, created and deleted in-session). Item 4 — the Flutter
+step-up key on hardware — is the separate on-device track; its server contract is now fixed.
+
+### 52.1 What shipped (each its own commit)
+
+- **Item 1** (`ab6c28e`) — `risk_policy_settings`, a DBA-owned key/value table (migration 003, both
+  dialects), schema 3, read with a short-TTL cache and surfaced under
+  `/health/ready.scoring_flags.risk_policy_settings`. The app principal has SELECT only, so it cannot
+  rewrite its own policy.
+- **Item 2a** (`a7398fc`) — per-key request-rate anomaly: opt-in, advisory, a Redis counter in
+  `_evaluate_risk_policy`, DBA-tunable, fails open.
+- **Item 2b** (`bde3475`) — population-baseline as a DBA-set absolute threshold (Option A) on
+  `accounts_per_device` or `installations_per_device`; reuses already-computed counts, portable.
+- **Item 3a** (`f13a468`) — optional per-installation step-up key (migration 004, schema 4).
+- **Item 3b+3c** (`e6f6f7d`, fix `294eb85`) — a step-up proof signed by that key and **bound to the
+  request's access-proof nonce**, so no separate challenge or table is needed (replay protection is the
+  existing nonce store); DBA path-gated sensitive ops (`stepup_required_paths`); factor checked against
+  policy (a client claim, per 51.2); demo endpoint `/v1/account/sensitive-echo`. Per-use vs windowed is
+  the client's hardware auth cadence, not a server knob.
+
+Every signal and the step-up gate ship **off**, so a default deployment behaves exactly as before.
+
+### 52.2 Results — same suite, same HTTPS endpoint, backend swapped
+
+| | PostgreSQL 16.15 | SQL Server 2019 |
+|---|---|---|
+| Production defaults | **44 / 0 / 5** | **44 / 0 / 5** |
+| All signals + step-up enabled | **47 / 0 / 2** | **47 / 0 / 2** |
+
+(passed / failed / skipped.) At defaults the five skips are the three opt-in checks plus the two
+enforce-mode checks; enabled, only the enforce-mode checks skip (server in observe). Every `[db]`
+check — JSON round-trip, replay duplicate-key, timestamp `datetimeoffset`, refresh `UPDLOCK`, device
+memory — passed on SQL Server, so the dialect-critical paths hold for the new table and columns. The
+server reached SQL Server with validated TLS (`TrustServerCertificate=no`).
+
+### 52.3 Findings from testing
+
+- **Postgres new-table grant gap.** `GRANT ... ON ALL TABLES` is point-in-time; the app user could not
+  read `risk_policy_settings` (added by a later migration) until granted. Documented in
+  migrations/README with `ALTER DEFAULT PRIVILEGES`; SQL Server role membership already covers future
+  tables (`4ff9aeb`).
+- **Step-up signature decode.** The first cut passed the base64url signature to a verifier that needs
+  raw DER bytes; the suite caught it (`stepup_signature_invalid`) before it shipped (`294eb85`).
+- **SQL Server cold start.** A suite run started seconds after a restart reached the service before its
+  SQL Server connection pool and TLS handshakes had warmed, and a burst of early requests failed; an
+  immediate re-run was clean. Let a SQL Server-backed service warm before running the suite.
+- **Local DNS.** The DuckDNS name resolves intermittently through this dev box's systemd-resolved stub
+  (~12% of rapid lookups); the suite re-resolves on every request, so one miss aborts a run. Pinning the
+  name in `/etc/hosts` for the session removed it — per EC2 IP, so it needs updating on each start.
+
+### 52.4 State
+
+- EC2 running; server on PostgreSQL 16.15, schema 4, every signal off (production-representative).
+- SQL Server RDS deleted in-session; no manual or automated snapshot retained.
+- The conformance certificate is still in the Android allow-list for further suite runs. It is a
+  synthetic digest (no real signing cert can match it), but remove it before production use.
+- Item 4 (Flutter plugin step-up key + settings) not started.
