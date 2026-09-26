@@ -4519,8 +4519,15 @@ as `dt-stepup.ipa` (`sha256 db7e9afa…`).
 - Observe mode hid one thing worth knowing: the iPhone's relationship risk is `105 → recommended
   block` (`device_has_many_accounts +60`, `population_outlier +30`, `known_device_new_installation +15`),
   effective `allow`. With `DEVICE_POLICY_MODE=enforce` this test-worn device would be refused on
-  accumulated test accounts. `device_has_many_accounts` predates today and deserves a false-positive
-  review (shared family devices) before enforce is ever enabled.
+  accumulated test accounts.
+- **Owner's calibration (2026-09-26):** four accounts on one phone is illegitimate for a professional
+  financial app — families have their own phones, or at most two people share one. So
+  `device_has_many_accounts` (three or more, +60 → review) stands and is not a false-positive concern.
+  By the same bar a **two-person shared phone is legitimate**, and today
+  `device_has_multiple_accounts` (+35) alone puts it in the elevated band, whose enforced action
+  (`_enforce_risk_policy`) is a flat `403 risk_step_up_required` with **no way to satisfy it** — the
+  relationship-risk "step-up" is not yet wired to the §53 step-up proof. Open decision before
+  `DEVICE_POLICY_MODE=enforce`.
 
 ### 53.5 Limits and open items
 
