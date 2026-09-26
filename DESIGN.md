@@ -4596,3 +4596,48 @@ relationship-risk enforcement on**:
 
 (PostgreSQL's plain-defaults and integrity-enforce runs at schema 6 are to be repeated when the server
 returns to PostgreSQL after the SQL Server handset round.)
+
+## 55. SQL Server under concurrent requests — a crash the sequential suite never saw (2026-09-26)
+
+**Symptom.** The first time two handsets hit a SQL Server-backed server within seconds (OPPO and
+iPhone, 14:30 UTC), both requests to `/v1/device/me` stalled 16–23 s and completed together; the
+handsets' 15 s timeout fired. Every earlier SQL Server run had been sequential — the conformance
+suite sends one request at a time.
+
+**Reproduction** (four to eight parallel phone-like flows: enrol → prove → integrity → `device/me`):
+
+- Default configuration: the process aborted within seconds, twice — glibc
+  `corrupted size vs. prev_size while consolidating` and `double free or corruption (!prev)`.
+- pyodbc driver-manager pooling off (`2e7b853`): rarer, but still a `SIGSEGV` inside
+  `cursor.execute`, and one full hang. A `faulthandler` dump of the hung process showed 24 request
+  threads blocked in `pyodbc.connect()` and one in `connection.close()` — a deadlock inside the ODBC
+  stack.
+- Stack: pyodbc 5.3.0, unixODBC 2.3.12, msodbcsql18 18.6.2.1, OpenSSL 3.0.13, Python 3.12.3, arm64
+  (t4g.micro), Werkzeug's threaded server. Each thread used its own connection; nothing was shared.
+
+**Fix.** Pooling off; one process-wide **re-entrant lock per unit of work** (connect … close) for
+SQL Server, taken in `_cursor()`, with the three module locks that open a unit inside them now taking
+it first so the lock order is uniform (`b9c3967`); a **15 s statement timeout** (`DB_QUERY_TIMEOUT`)
+so one stuck statement cannot stall the serialized process (`d208be4`). PostgreSQL is unchanged (a
+`nullcontext`). After the lock: 3 × 32 parallel flows, 0 failures, no crash. The trade-off is real: a
+SQL Server deployment serializes database work per process, so it **scales with worker processes, not
+threads**.
+
+**Guard.** New `[db]` check `check_parallel_clients` (`db72c1c`): four concurrent flows, three rounds,
+must neither fail nor take 10 s a step. It failed once on the pooling-off build (the SIGSEGV) and
+passed on the locked build.
+
+**Load side effect, and a correction.** The repeated load tests, crashes and restarts drove the
+db.t3.micro instance hard (CPU credit balance 0 for the whole hour, ~60 MB freeable memory, SQL Server
+committing ~121 MB with a 2.8 MB query-memory target, RDS's own `DBCC CHECKDB` queued for a 23 MB
+grant). At the peak a bare login took 25 s; with the load stopped it took 0.1 s and two parallel
+clients ran clean. An instance upgrade was suggested at the peak and withdrawn — the slowness was
+mostly self-inflicted. A few intermittent 15 s timeouts in `_verify_challenge` after the load were not
+pinned down.
+
+**Handset round on SQL Server 2019** (RDS `sqlserver-ex` 15.00.4480.2 — the RDS default version; both
+of today's SQL Server instances were 2019, not 2025): iPhone **PASS** (`403 stepup_required`, then
+verified, `per_use`, no downgrade); OPPO **PASS** (`403`, then verified, `windowed 30`, downgrade
+flagged). The +10 `new_device` on both is correct: to the fresh database each phone was first seen
+minutes earlier. **Vivo: owner decision** — not available; its EC2-PostgreSQL result (§53.4b) stands
+for the Android 11+ path.
