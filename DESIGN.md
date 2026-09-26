@@ -4474,6 +4474,31 @@ The SQL Server enforce-mode run closes the gap left in §52 (only observe had be
   server logged `factor=passcode key_mode=windowed window_seconds=30 policy_downgrade=True`; the prompt
   was answered in ~5 s. **PASS.**
 
+### 53.4a On hardware — iPhone 7, iOS 15.8.5, PostgreSQL, observe
+
+Build: Codemagic from `974d415` (the first compile of the Swift step-up code — clean), pre-signed with
+`tools/presign_trollstore_ipa.sh` (4 entitlements, no `get-task-allow`), installed through TrollStore
+as `dt-stepup.ipa` (`sha256 db7e9afa…`).
+
+- Passcode on, "Simulate fresh installation": new installation `582c166e…`, correlated to the same
+  device by reinstall hint; installation key `secure_enclave`; step-up key stored as
+  `ES256, passcode, per_use, 0`.
+- **Sensitive op without step-up:** `403 stepup_required`. **PASS.**
+- **Sensitive op with step-up:** the system passcode prompt → `200`; the server logged
+  `factor=passcode key_mode=per_use window_seconds=0 policy_downgrade=False`. **PASS.**
+- Integrity throughout: five reports, all `score 0, trusted` (only the two report-only `+0` fake-signature
+  reasons) — the pre-signed build keeps the §48 clean baseline.
+- Note: lockdown's `PasswordProtected` (read with `ideviceinfo`) still said `false` after the passcode was
+  set, although a `WhenPasscodeSetThisDeviceOnly` key cannot exist without one. That flag is not a
+  reliable live indicator; do not use it to check the passcode.
+
+### 53.4b On hardware — Vivo V2118, Android 12 (API 31), PostgreSQL, observe
+
+- **No screen lock** (fresh install): installation `ab7a1792…`, `new_device`, installation key
+  `trusted_execution_environment`, no step-up key; integrity `score 18, trusted` (developer options +8,
+  ADB +10). Enrolment unaffected. **PASS** (false-positive safety). This Vivo writes nothing to logcat
+  (the buffer is empty system-wide), so its evidence is read from the server.
+
 ### 53.5 Limits and open items
 
 - **Existing installations must re-enrol to get a step-up key** — a direct consequence of the
@@ -4482,8 +4507,8 @@ The SQL Server enforce-mode run closes the gap left in §52 (only observe had be
   confirmation). Not built.
 - Factor and mode remain **client claims** (§51.2): without key attestation the server cannot
   re-verify them.
-- Still to run on hardware: the Android 11+ per-use path (Vivo, Android 12) and iOS (first Codemagic
-  compile of the Swift code).
+- Still to run on hardware: the Android 11+ per-use path with a PIN set (Vivo), and the whole handset
+  battery again on SQL Server (§53.6).
 
 ### 53.6 Agreed plan for the handset battery (owner, 2026-09-26)
 
