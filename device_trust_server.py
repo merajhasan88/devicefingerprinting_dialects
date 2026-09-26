@@ -793,6 +793,27 @@ def _enforce_rate_limit(bucket, identity):
         )
 
 
+def _key_request_rate(installation_id, window_seconds):
+    """Requests seen for one installation in the current window.
+
+    A per-installation Redis counter, incremented once per risk evaluation. It
+    fails open to 0 (no Redis, or Redis unreachable) so a transient cache outage
+    can never itself become a lockout.
+    """
+    if not REDIS_URL:
+        return 0
+    key = "dt:reqrate:%s" % installation_id
+    try:
+        client = _redis()
+        count = client.incr(key)
+        if count == 1:
+            client.expire(key, max(1, int(window_seconds)))
+        return int(count)
+    except Exception:
+        logger.exception("Request-rate counter unreachable; treating rate as 0.")
+        return 0
+
+
 def _connect_db():
     return DIALECT.connect()
 
@@ -2340,6 +2361,25 @@ def _evaluate_risk_policy(
                 "integrity inside the device memory window.",
             )
             score += 50
+
+    # Server-side request-rate anomaly (DESIGN.md 51.6): opt-in, advisory, and
+    # device-unfalsifiable. Only counts when the DBA has enabled it, so it costs
+    # nothing on a default deployment.
+    if _risk_setting_bool("rate_anomaly_enabled", False):
+        rate_limit = _risk_setting_int("rate_anomaly_max_requests", 120)
+        rate_count = _key_request_rate(
+            installation_id, _risk_setting_int("rate_anomaly_window_seconds", 60)
+        )
+        if rate_limit > 0 and rate_count > rate_limit:
+            rate_points = _risk_setting_int("rate_anomaly_points", 30)
+            _policy_reason(
+                reasons,
+                "request_rate_anomaly",
+                rate_points,
+                "This installation's request rate exceeds the configured anomaly "
+                "threshold.",
+            )
+            score += rate_points
 
     recommended_action = _policy_action(score, hard_block=hard_block)
     effective_action = (

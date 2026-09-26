@@ -1434,6 +1434,37 @@ def check_key_security_recorded(api, ctx):
            "hardware_backed round-tripped as %r" % block.get("hardware_backed"))
 
 
+@check("risk: a per-key request-rate anomaly is scored when enabled")
+def check_request_rate_anomaly(api, ctx):
+    """Opt-in server-side signal. The DBA enables it in risk_policy_settings and
+    sets a low max for the test run; the suite reads the live config from
+    /health and skips when it is off, exactly like the enforce-mode checks. Uses
+    an isolated session so the per-key counter cannot pollute other checks."""
+    _, health = api.call("GET", "/health/ready")
+    settings = health.get("risk_policy_settings", {}) if isinstance(health, dict) else {}
+    if settings.get("rate_anomaly_enabled") != "1":
+        raise Skip("rate_anomaly_enabled is off; set it to 1 with a low max to run this check")
+    limit = int(settings.get("rate_anomaly_max_requests", "120") or "120")
+    if limit > 20:
+        raise Skip("rate_anomaly_max_requests=%s is too high for a bounded test run" % limit)
+    installation, token, _ = integrity_session(api)
+    submit_report(api, installation, token)
+    status, payload = open_account(
+        api, installation, token, "rate-%s" % secrets.token_hex(4)
+    )
+    expect(status in (200, 201), "account open failed: %s %s" % (status, payload))
+    access = payload["access_token"]
+    seen = False
+    last = None
+    for _ in range(limit + 3):
+        st, pl = protected(api, installation, "GET", "/v1/policy/me", access)
+        last = (st, pl)
+        if st == 200 and "request_rate_anomaly" in codes(pl.get("policy", {})):
+            seen = True
+            break
+    expect(seen, "expected request_rate_anomaly after >%d calls; last=%s" % (limit, last))
+
+
 def main():
     global VERBOSE
     parser = argparse.ArgumentParser(description=__doc__)
