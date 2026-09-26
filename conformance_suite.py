@@ -1656,6 +1656,95 @@ def check_step_up(api, ctx):
            "wrong-factor expected 403 stepup_factor_mismatch, got %s %s" % (st, error_code(pl)))
 
 
+
+def _policy_of(payload):
+    """The risk decision from a success body or from a refusal's details."""
+    if not isinstance(payload, dict):
+        return {}
+    if isinstance(payload.get("policy"), dict):
+        return payload["policy"]
+    details = (payload.get("error") or {}).get("details") or {}
+    return details.get("policy") or {}
+
+
+def _reason_codes(policy):
+    return {r.get("code") for r in (policy.get("reasons") or []) if isinstance(r, dict)}
+
+
+@check("risk: accounts per device follow the DBA policy (defaults 2 elevated, 3 review, 4 block)")
+def check_device_account_bands(api, ctx):
+    """Owner defaults (DESIGN.md 54), DBA-tunable in risk_policy_settings. A phone
+    shared by two people is legitimate: the elevated account count is scored but,
+    unless elevated_risk_refuses=1, neither user is refused. The review count is
+    held for review and the block count is blocked. Expectations come from the
+    live settings, so the check stays valid after a DBA retunes; the refusal half
+    runs when DEVICE_POLICY_MODE=enforce."""
+    _, health = api.call("GET", "/health/ready")
+    health = health if isinstance(health, dict) else {}
+    enforce = health.get("device_policy_mode") == "enforce"
+    settings = (health.get("scoring_flags") or {}).get("risk_policy_settings") or {}
+
+    def setting(key, default):
+        try:
+            return int(settings.get(key, default))
+        except (TypeError, ValueError):
+            return default
+
+    elevated = setting("device_accounts_elevated_count", 2)
+    review = setting("device_accounts_review_count", 3)
+    block = setting("device_accounts_block_count", 4)
+    refuses = str(settings.get("elevated_risk_refuses", "0")).strip().lower() in (
+        "1", "true", "yes", "on")
+    if not 1 < elevated < review < block <= 10:
+        raise Skip("band layout %s/%s/%s is not ordered within 10 accounts" % (elevated, review, block))
+
+    inst = Installation()
+    st, pl = enrol(api, inst, fresh_hint())
+    expect(st in (200, 201), "enrol failed: %s %s" % (st, pl))
+    tok = device_token(api, inst)
+    submit_report(api, inst, tok)
+    results = {}
+    for n in range(1, block + 1):
+        st, pl = open_account(api, inst, tok, "band%d-%s" % (n, secrets.token_hex(4)))
+        results[n] = (st, pl, _policy_of(pl))
+        if st not in (200, 201):
+            break
+
+    st, pl, pol = results[elevated]
+    expect("device_has_multiple_accounts" in _reason_codes(pol),
+           "account %d must be scored device_has_multiple_accounts, got %s"
+           % (elevated, sorted(_reason_codes(pol))))
+    if enforce and refuses:
+        expect(st == 403 and error_code(pl) == "risk_step_up_required",
+               "elevated_risk_refuses=1: account %d expected 403 risk_step_up_required, got %s %s"
+               % (elevated, st, error_code(pl)))
+        return
+    for n in range(elevated, review):
+        expect(results[n][0] in (200, 201),
+               "account %d (elevated band) must never be refused, got %s %s"
+               % (n, results[n][0], error_code(results[n][1])))
+    for n in range(1, review):
+        st, pl = protected(api, inst, "GET", "/v1/account/me", results[n][1].get("access_token"))
+        expect(st == 200, "account %d on the shared device must keep working, got %s %s"
+               % (n, st, error_code(pl)))
+
+    st, pl, pol = results[review]
+    expect("device_has_many_accounts" in _reason_codes(pol)
+           and pol.get("recommended_action") in ("review", "block"),
+           "account %d must be scored for review, got %s %s"
+           % (review, pol.get("recommended_action"), sorted(_reason_codes(pol))))
+    if enforce:
+        expect(st == 403 and error_code(pl) in ("risk_review_required", "risk_policy_blocked"),
+               "enforce: account %d must be held for review, got %s %s"
+               % (review, st, error_code(pl)))
+        return
+    st, pl, pol = results[block]
+    expect(st in (200, 201)
+           and "device_account_count_block_threshold" in _reason_codes(pol)
+           and pol.get("recommended_action") == "block",
+           "account %d must be scored block, got %s %s %s"
+           % (block, st, pol.get("recommended_action"), sorted(_reason_codes(pol))))
+
 def main():
     global VERBOSE
     parser = argparse.ArgumentParser(description=__doc__)

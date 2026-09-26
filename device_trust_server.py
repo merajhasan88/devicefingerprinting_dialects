@@ -117,8 +117,10 @@ POLICY_BLOCK_SCORE = int(os.environ.get("POLICY_BLOCK_SCORE", "90"))
 POLICY_REINSTALL_WINDOW_HOURS = int(
     os.environ.get("POLICY_REINSTALL_WINDOW_HOURS", "24")
 )
+# Fallback only: the live value is risk_policy_settings.device_accounts_block_count
+# (DBA-tunable, seeded by migration 006 with the owner's default of 4).
 POLICY_DEVICE_ACCOUNT_BLOCK_COUNT = int(
-    os.environ.get("POLICY_DEVICE_ACCOUNT_BLOCK_COUNT", "5")
+    os.environ.get("POLICY_DEVICE_ACCOUNT_BLOCK_COUNT", "4")
 )
 POLICY_ACCOUNT_DEVICE_BLOCK_COUNT = int(
     os.environ.get("POLICY_ACCOUNT_DEVICE_BLOCK_COUNT", "5")
@@ -908,7 +910,7 @@ def _get_backend_identity():
 # against a schema it does not understand. /health/* still answers so operators
 # can see why.
 
-REQUIRED_SCHEMA_VERSION = 5
+REQUIRED_SCHEMA_VERSION = 6
 
 _schema_state = None
 _schema_lock = threading.Lock()
@@ -2234,31 +2236,44 @@ def _evaluate_risk_policy(
         )
         score += 15
 
-    # Accounts sharing one recognized physical device.
-    if projected_device_account_count >= POLICY_DEVICE_ACCOUNT_BLOCK_COUNT:
+    # Accounts sharing one recognized physical device. DBA-tunable in
+    # risk_policy_settings; the owner's defaults (DESIGN.md 54) treat a phone
+    # shared by two people as legitimate -- elevated, never refused by itself --
+    # hold a third account for review, and block a fourth.
+    accounts_block = _risk_setting_int(
+        "device_accounts_block_count", POLICY_DEVICE_ACCOUNT_BLOCK_COUNT
+    )
+    accounts_review = _risk_setting_int("device_accounts_review_count", 3)
+    accounts_elevated = _risk_setting_int("device_accounts_elevated_count", 2)
+    if accounts_block > 0 and projected_device_account_count >= accounts_block:
         _policy_reason(
             reasons,
             "device_account_count_block_threshold",
             100,
-            "This device is linked to too many unique accounts for the configured policy.",
+            "This device is linked to %d unique accounts; the configured policy "
+            "blocks at %d." % (projected_device_account_count, accounts_block),
         )
         hard_block = True
-    elif projected_device_account_count >= 3:
+    elif accounts_review > 0 and projected_device_account_count >= accounts_review:
+        review_points = _risk_setting_int("device_accounts_review_points", 60)
         _policy_reason(
             reasons,
             "device_has_many_accounts",
-            60,
-            "This device is linked to three or more unique accounts.",
+            review_points,
+            "This device is linked to %d unique accounts; the configured policy "
+            "reviews at %d." % (projected_device_account_count, accounts_review),
         )
-        score += 60
-    elif projected_device_account_count == 2:
+        score += review_points
+    elif accounts_elevated > 0 and projected_device_account_count >= accounts_elevated:
+        elevated_points = _risk_setting_int("device_accounts_elevated_points", 35)
         _policy_reason(
             reasons,
             "device_has_multiple_accounts",
-            35,
-            "This device is linked to a second unique account.",
+            elevated_points,
+            "This device is linked to %d unique accounts."
+            % projected_device_account_count,
         )
-        score += 35
+        score += elevated_points
 
     # One account appearing on several recognized physical devices.
     if account_id is not None:
@@ -2480,8 +2495,19 @@ def _evaluate_risk_policy(
 
 
 def _enforce_risk_policy(decision):
+    """Refuse review and block; refuse elevated (step_up) only if a DBA opts in.
+
+    By default an elevated decision is recorded and returned but does not
+    refuse (owner decision, DESIGN.md 54): a phone legitimately shared by two
+    people must keep working for both. Its points still count, so combined with
+    other risk it escalates to review or block. Step-up itself is enforced where
+    it has meaning -- the DBA-designated sensitive paths (_enforce_step_up).
+    risk_policy_settings.elevated_risk_refuses = 1 restores a flat refusal.
+    """
     action = decision.get("effective_action")
     if action == "allow":
+        return
+    if action == "step_up" and not _risk_setting_bool("elevated_risk_refuses", False):
         return
 
     if action == "step_up":
