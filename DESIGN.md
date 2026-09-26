@@ -4554,3 +4554,45 @@ Server RDS is re-created (`--backup-retention-period 0`) and the same battery is
 three. The first SQL Server RDS of the day was deleted after its conformance runs (§53.3) with
 `--skip-final-snapshot --delete-automated-backups`, at the owner's instruction, while the PostgreSQL
 handset runs proceed.
+
+## 54. Accounts per device — owner policy, DBA-tunable (2026-09-26)
+
+**Owner decision.** For a professional financial app, two people sharing one phone is legitimate;
+more is not ("each would have their own phone or at most 2 people using it"). Required behaviour:
+two accounts on a device get **some score, an elevation, but no blockage for either user**; three a
+higher score; four a block. And, restated as a standing rule: **every such value is a default the
+consumer's DBA can change** — not a constant.
+
+**What changed** (`2e7d2dd`, migration 006, schema 6). `risk_policy_settings` is seeded with the owner
+defaults, read through the cached settings helpers:
+
+| setting | default | effect |
+|---|---|---|
+| `device_accounts_elevated_count` / `_points` | 2 / 35 | `device_has_multiple_accounts`, elevated band |
+| `device_accounts_review_count` / `_points` | 3 / 60 | `device_has_many_accounts`, review band |
+| `device_accounts_block_count` | 4 | `device_account_count_block_threshold`, hard block |
+| `elevated_risk_refuses` | 0 | whether an elevated (`step_up`) decision refuses in enforce mode |
+
+Before this, the elevated band's enforced action was a flat `403 risk_step_up_required` that nothing
+could satisfy — so a second person on a shared phone was, in effect, blocked — and the block count was
+an env var defaulting to 5. Now an elevated decision is recorded and returned but does not refuse;
+its points still count, so combined with other risk it escalates to review or block. Step-up itself
+stays where it has meaning, on the DBA-designated sensitive paths (§53). A DBA can restore the old
+refusal with `elevated_risk_refuses = 1`. `POLICY_DEVICE_ACCOUNT_BLOCK_COUNT` remains only as the
+fallback when the row is missing.
+
+**Conformance.** New `check_device_account_bands` reads the live settings: the second account must be
+scored `device_has_multiple_accounts` and never refused, and both accounts must keep working; the third
+is scored for review, and under `DEVICE_POLICY_MODE=enforce` held with `403 risk_review_required`; in
+observe the fourth is scored `block`. This is also the **first run of the whole suite with
+relationship-risk enforcement on**:
+
+| schema 6 | PostgreSQL 16.15 | SQL Server 2019 (fresh RDS) |
+|---|---|---|
+| Production defaults (observe) | — | **46 / 0 / 5** |
+| Integrity enforce | — | **48 / 0 / 3** |
+| `DEVICE_POLICY_MODE=enforce` (defaults) | **46 / 0 / 5** | **46 / 0 / 5** |
+| Every signal + step-up enabled | **49 / 0 / 2** | **49 / 0 / 2** |
+
+(PostgreSQL's plain-defaults and integrity-enforce runs at schema 6 are to be repeated when the server
+returns to PostgreSQL after the SQL Server handset round.)
