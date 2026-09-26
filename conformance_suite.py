@@ -193,6 +193,25 @@ def build_proof(
     return headers, (None if method == "GET" else body_text)
 
 
+def stepup_call(api, installation, stepup_priv, method, path, bearer, body_obj, factor):
+    """A protected call that also carries a step-up proof bound to this request's
+    access-proof nonce, signed by the separate step-up key."""
+    headers, body_text = build_proof(installation, method, path, bearer, body_obj)
+    access_proof = json.loads(b64u_decode(headers["X-Access-Proof"]).decode("utf-8"))
+    proof = {
+        "version": 1,
+        "installation_id": installation.installation_id,
+        "factor": factor,
+        "nonce": access_proof["nonce"],
+        "timestamp": int(time.time()),
+    }
+    proof_b64 = b64u(json.dumps(proof).encode("utf-8"))
+    sig = stepup_priv.sign(b64u_decode(proof_b64), ec.ECDSA(hashes.SHA256()))
+    headers["X-Step-Up-Proof"] = proof_b64
+    headers["X-Step-Up-Signature"] = b64u(sig)
+    return api.call(method, path, body_text=body_text, bearer=bearer, headers=headers)
+
+
 def protected(api, installation, method, path, bearer, body_obj=None, **kwargs):
     headers, body_text = build_proof(
         installation, method, path, bearer, body_obj, **kwargs
@@ -1527,6 +1546,44 @@ def check_stepup_key_registration(api, ctx):
     expect(st2 in (200, 201), "plain enrol failed: %s %s" % (st2, pl2))
     expect(not pl2.get("stepup_key_registered"),
            "a plain enrol must not register a step-up key")
+
+
+@check("step-up: a sensitive path requires a valid step-up proof")
+def check_step_up(api, ctx):
+    """Opt-in: skips unless the demo sensitive path is in stepup_required_paths.
+    No proof -> 403 stepup_required; a valid step-up proof -> 200; wrong factor
+    -> 403 stepup_factor_mismatch."""
+    _, health = api.call("GET", "/health/ready")
+    scoring = health.get("scoring_flags", {}) if isinstance(health, dict) else {}
+    settings = scoring.get("risk_policy_settings", {})
+    if "/v1/account/sensitive-echo" not in (settings.get("stepup_required_paths") or ""):
+        raise Skip("sensitive-echo not in stepup_required_paths; set it to run this check")
+    factor = settings.get("stepup_factor", "passcode")
+    inst = Installation()
+    stepup_priv = ec.generate_private_key(ec.SECP256R1())
+    nums = stepup_priv.public_key().public_numbers()
+    stepup_jwk = {
+        "kty": "EC", "crv": "P-256", "alg": "ES256",
+        "x": b64u(nums.x.to_bytes(32, "big")), "y": b64u(nums.y.to_bytes(32, "big")),
+    }
+    hint = {"kind": "android_id_sha256", "value": sha256_hex(secrets.token_bytes(16))}
+    st, pl = enrol(api, inst, hint, stepup_public_key=stepup_jwk)
+    expect(st in (200, 201), "enrol failed: %s %s" % (st, pl))
+    tok = device_token(api, inst)
+    submit_report(api, inst, tok)
+    st, pl = open_account(api, inst, tok, "su-%s" % secrets.token_hex(4))
+    expect(st in (200, 201), "account open failed: %s %s" % (st, pl))
+    access = pl["access_token"]
+    body = {"move": "money"}
+    st, pl = protected(api, inst, "POST", "/v1/account/sensitive-echo", access, body)
+    expect(st == 403 and error_code(pl) == "stepup_required",
+           "no-proof expected 403 stepup_required, got %s %s" % (st, error_code(pl)))
+    st, pl = stepup_call(api, inst, stepup_priv, "POST", "/v1/account/sensitive-echo", access, body, factor)
+    expect(st == 200, "valid step-up expected 200, got %s %s" % (st, pl))
+    wrong = "biometric" if factor != "biometric" else "passcode"
+    st, pl = stepup_call(api, inst, stepup_priv, "POST", "/v1/account/sensitive-echo", access, body, wrong)
+    expect(st == 403 and error_code(pl) == "stepup_factor_mismatch",
+           "wrong-factor expected 403 stepup_factor_mismatch, got %s %s" % (st, error_code(pl)))
 
 
 def main():

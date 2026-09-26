@@ -26,6 +26,7 @@ INSERT INTO risk_policy_settings (setting_key, setting_value, description) VALUE
     ('stepup_mode', 'per_use', 'Step-up mode for sensitive ops: per_use (a) or windowed (b).'),
     ('stepup_window_seconds', '0', 'Hardware-enforced reuse window for windowed step-up; 0 = per-use.'),
     ('stepup_factor', 'passcode', 'Required device auth factor: passcode or biometric.'),
+    ('stepup_required_paths', '', 'Comma-separated request paths requiring a valid step-up proof (empty = none).'),
     ('rate_anomaly_enabled', '0', 'Enable per-key request-rate anomaly signal (advisory).'),
     ('rate_anomaly_max_requests', '120', 'Requests per key per window before the signal trips.'),
     ('rate_anomaly_window_seconds', '60', 'Window length for the request-rate anomaly signal.'),

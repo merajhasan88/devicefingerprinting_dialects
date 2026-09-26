@@ -2502,6 +2502,95 @@ def _enforce_risk_policy(decision):
     )
 
 
+def _stepup_required_paths():
+    raw = _risk_setting_str("stepup_required_paths", "")
+    return {p.strip() for p in raw.replace(";", ",").split(",") if p.strip()}
+
+
+def _enforce_step_up(installation_id):
+    """Require a valid step-up proof on DBA-designated sensitive paths.
+
+    The proof is a step-up-key signature over {installation_id, factor, nonce,
+    timestamp}; the nonce binds it to THIS request's access proof (already
+    replay-protected), so no separate step-up challenge or table is needed. The
+    factor is a client claim checked against policy -- the honest limit of 51.2 --
+    and per-use vs windowed is the client's hardware auth cadence, not a server
+    knob. Sensitive paths default to none, so this is inert until a deployment
+    opts in.
+    """
+    if request.path not in _stepup_required_paths():
+        return
+    with _cursor() as cursor:
+        cursor.execute(
+            "SELECT stepup_public_key_jwk, stepup_key_algorithm "
+            "FROM app_installations WHERE installation_id = %s",
+            (installation_id,),
+        )
+        row = cursor.fetchone()
+    stepup_jwk = DIALECT.json_value(row[0]) if row and row[0] is not None else None
+    stepup_alg = row[1] if row else None
+    if not stepup_jwk:
+        raise ApiProblem(
+            "This operation requires step-up verification, but no step-up key is "
+            "registered for this installation.",
+            403,
+            "stepup_key_not_registered",
+        )
+    proof_b64 = request.headers.get("X-Step-Up-Proof")
+    signature_b64 = request.headers.get("X-Step-Up-Signature")
+    if not proof_b64 or not signature_b64:
+        raise ApiProblem(
+            "This operation requires step-up verification.", 403, "stepup_required"
+        )
+    proof_bytes = _b64url_decode(proof_b64, "stepup_proof", 8192)
+    try:
+        _verify_installation_signature(stepup_alg, stepup_jwk, proof_bytes, signature_b64)
+    except ApiProblem:
+        raise ApiProblem(
+            "The step-up signature did not verify.", 403, "stepup_signature_invalid"
+        )
+    try:
+        proof = json.loads(proof_bytes.decode("utf-8"))
+    except Exception:
+        raise ApiProblem("The step-up proof is not valid JSON.", 400, "stepup_proof_invalid")
+    if not isinstance(proof, dict) or proof.get("installation_id") != installation_id:
+        raise ApiProblem(
+            "The step-up proof installation does not match.",
+            403,
+            "stepup_installation_mismatch",
+        )
+    try:
+        access_proof = json.loads(
+            _b64url_decode(request.headers.get("X-Access-Proof"), "access_proof", 8192).decode("utf-8")
+        )
+    except Exception:
+        access_proof = {}
+    if not proof.get("nonce") or proof.get("nonce") != access_proof.get("nonce"):
+        raise ApiProblem(
+            "The step-up proof is not bound to this request.",
+            403,
+            "stepup_binding_mismatch",
+        )
+    required_factor = _risk_setting_str("stepup_factor", "passcode")
+    if proof.get("factor") != required_factor:
+        raise ApiProblem(
+            "The step-up proof factor does not match the deployment policy.",
+            403,
+            "stepup_factor_mismatch",
+        )
+    timestamp = proof.get("timestamp")
+    if isinstance(timestamp, bool) or not isinstance(timestamp, int):
+        raise ApiProblem(
+            "The step-up proof timestamp is invalid.", 403, "stepup_timestamp_invalid"
+        )
+    if abs(int(_utc_now().timestamp()) - timestamp) > ACCESS_PROOF_MAX_SKEW_SECONDS:
+        raise ApiProblem(
+            "The step-up proof timestamp is outside the allowed window.",
+            403,
+            "stepup_timestamp_outside_window",
+        )
+
+
 def _require_trusted_account_request(event_type="protected_request"):
     """One server-owned gate for normal authenticated Payactiv-style APIs.
 
@@ -2510,6 +2599,7 @@ def _require_trusted_account_request(event_type="protected_request"):
     server-side device/account policy and enforce its effective action.
     """
     claims = _require_access_proof("account")
+    _enforce_step_up(claims.get("iid"))
     integrity = _enforce_integrity_gate(claims.get("did"), claims.get("iid"))
     policy = _evaluate_risk_policy(
         event_type,
@@ -4002,6 +4092,18 @@ def policy_me():
         persist=True,
     )
     return jsonify({"policy": decision})
+
+
+@app.post("/v1/account/sensitive-echo")
+@jwt_required()
+def account_sensitive_echo():
+    # Demo crown-jewel endpoint. Step-up is enforced inside
+    # _require_trusted_account_request only when a deployment lists this path in
+    # risk_policy_settings.stepup_required_paths; otherwise it behaves like
+    # protected-echo.
+    claims, policy, integrity = _require_trusted_account_request("sensitive_echo")
+    body = _json_body()
+    return jsonify({"sensitive_echo": body, "step_up": "verified"})
 
 
 @app.post("/v1/account/protected-echo")
