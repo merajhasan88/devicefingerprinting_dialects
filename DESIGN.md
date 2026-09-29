@@ -4823,3 +4823,54 @@ Rough extrapolation, not a measurement: ~1,500 sign-in flows an hour per server 
 thousands to millions of users needs many worker processes (which also sidesteps the driver's thread
 unsafety), pooled connections per process, horizontal app servers, and a production SQL Server edition
 and instance class — Express's documented 10 GB database cap alone rules it out.
+
+## 60. Production-style serving: worker processes + pooled connections, measured on four backends (2026-09-29)
+
+**What changed.** (1) A per-process, fork-safe connection pool (`3cea32f`, `DB_POOL_SIZE` default 4,
+`0` disables): `_cursor()` reuses an idle connection instead of paying TCP + TLS + login per unit of
+work; read units roll back before check-in; a connection idle over 30 s is pinged before reuse; a
+forked worker starts with an empty pool. (2) **gunicorn with 4 sync worker processes** instead of
+Werkzeug's threaded development server. gunicorn is a deployment choice, not an import: it is installed
+in the EC2 venv and started from the systemd drop-in (`ExecStart=… gunicorn --workers 4 --bind
+127.0.0.1:5000 --chdir /opt --access-logfile - --timeout 60 device_trust_server:app`). Single-threaded
+workers also sidestep the SQL Server driver's thread unsafety (§55) — its per-process lock is now
+uncontended.
+
+**Method.** Same EC2 t4g.micro application host; each backend on RDS/EC2 as noted; a load generator on
+the dev box (keep-alive HTTPS per client, DuckDNS address pinned in-process so the local resolver does
+not add noise), 64 clients each looping phone-like flows (enrol → prove → integrity challenge + report
+→ `device/me`, six requests) for 60 s. The network round trip from the dev box is ~0.3 s, the floor of
+every latency below.
+
+| 64 clients | old: threaded dev server, no pool | new: gunicorn ×4 + pool |
+|---|---|---|
+| PostgreSQL 16.15 (EC2-local) | 40.5 req/s, p50 1.48 s, p95 2.49 s, EC2 load 11.4 | **199.6 req/s**, p50 **0.30 s**, p95 0.38 s, 0 failures |
+| SQL Server 2019 (db.t3.micro Express) | **2.6 req/s, 61 failures**, p50 11.1 s, p95 19.5 s | **53.4 req/s**, p50 1.07 s, p95 2.14 s, 0 failures |
+| SQL Server 2022 (db.t3.micro Express) | — | **63.5 req/s**, p50 0.95 s, p95 1.73 s, 0 failures |
+| SQL Server 2025 (db.t3.micro Express) | — | 33.0 req/s, **32 failures** (15 s query timeouts, see below) |
+
+PostgreSQL: ~5× the throughput at a fifth of the latency, and the new numbers sit on the network floor
+(64 clients ÷ 0.31 s ≈ 206 req/s offered), so the server's ceiling on this 2-vCPU host is above what
+64 remote clients can generate. SQL Server 2019: ~20× — the old setup collapsed at 64 clients. The
+conformance suite passed on the new setup on PostgreSQL (49/0/4), SQL Server 2019 (48/0/5) and 2022
+(48/0/5), and the parallel-clients check passed on 2019, 2022 and 2025.
+
+**The intermittent 15 s timeouts, explained (§56 item 8 closed).** They reproduced on the 2025 instance
+under load (48 `HYT00` query timeouts → 24 × `500`; the suite could not finish there), and this time
+the cause was caught live. RDS's own maintenance session (`RdsAdminService`) was running
+`DBCC CHECKDB`, waiting on `RESOURCE_SEMAPHORE` for a **22–25 MB** memory grant that this instance can
+never give (SQL Server commits only ~130 MB of the 1 GiB; its query-memory target is ~3 MB). The grant
+queue is FIFO, so RDS's own 1 MB queries — **and ours** (`python3.12`, 1 MB grants, polled in the same
+queue behind it) — waited too, until our 15 s statement timeout fired. A small follow-up load on 2025
+ran at 1.6 req/s with p95 20.6 s while the DBCC sat at the head of the queue. It is not our code: the
+same statements run in ~1 s when the queue is clear (2019, 2022 today). It is the instance class — on
+db.t3.micro, RDS's routine consistency check can starve every query that needs memory, whenever RDS
+schedules it. Production needs an instance with real memory (this one gives SQL Server ~130 MB).
+
+**Answer to "how far can this be stretched".** On this test stack the application side now scales with
+worker processes, and the database becomes the limit: ~55–65 req/s on SQL Server db.t3.micro Express
+when RDS maintenance is quiet, and far less when it is not; PostgreSQL on the same app host is beyond
+~200 req/s at 64 clients. Thousands-to-millions of users needs, in order: more app hosts behind a load
+balancer (the app tier is now horizontally scalable), a production database class with memory to spare
+(and for SQL Server a non-Express edition — Express caps the database at 10 GB), and a load test from
+inside the region to find the real ceiling, which 64 clients across a 0.3 s link cannot reach.
