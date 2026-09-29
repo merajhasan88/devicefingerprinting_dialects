@@ -327,7 +327,8 @@ final class InstallationKeyManager {
 ///
 /// The key requires a passcode to exist
 /// (`kSecAttrAccessibleWhenPasscodeSetThisDeviceOnly`): without one it cannot
-/// be created, and removing the passcode deletes it. The factor is recorded in
+/// be created. Removing the passcode did NOT delete it on the iPhone 7 (iOS
+/// 15.8.5): the item stayed and could never sign again (DESIGN.md 57). The factor is recorded in
 /// the key's label at creation so what is reported is what the key enforces.
 final class StepUpKeyManager {
     private static let maxPayloadBytes = 65536

@@ -4681,7 +4681,7 @@ PostgreSQL at production defaults: **47 / 0 / 5**, including the new parallel-cl
   TrollStore and staged at `/srv/artifacts/e2a890/dt-stepup.ipa`. lockdown's `PasswordProtected`
   reads `false` regardless — do not trust it.
 - **After the session the owner removed the PIN/passcode on all three phones.** Removing it should
-  invalidate (Android) or delete (iOS) only the step-up key and leave the installation identity alone —
+  affect only the step-up key and leave the installation identity alone (outcome: §57) —
   documented platform behaviour, **not yet observed** here. That is now a test (open item 5).
 
 ### 56.4 Open items, in suggested order
@@ -4716,3 +4716,38 @@ PostgreSQL at production defaults: **47 / 0 / 5**, including the new parallel-cl
    points to the same score, so in combination they can push a device into review or block (the
    iPhone reached 135 with both). §51.6 calls them "advisory, never a hard block"; decide whether
    their contribution should be capped below the review band.
+
+## 57. Screen lock removed — what happens to the step-up key (2026-09-29)
+
+§56 open item 5, run on PostgreSQL. A server log line (`11c9b8d`) now records, on every exact-key
+re-registration, whether a step-up key was offered, whether one is bound, and whether they match.
+
+**OPPO, Android 9.** With the lock off: same installation re-registered on the exact-key path,
+integrity `18, trusted`, sensitive op without step-up `403 stepup_required`. The step-up key's alias
+survived but its entry could no longer be loaded (`UnrecoverableKeyException`); the app reported a
+generic `KEY_LOOKUP_FAILED` on every launch and never recovered. **Fix** (`6ded9ae`, `5aae413`): a key
+that is unrecoverable, has no private key, or throws `KeyPermanentlyInvalidatedException` at `initSign`
+is dead — delete it and report `STEPUP_KEY_INVALIDATED`, saying truthfully whether removal worked; an
+existing key is checked before the screen-lock requirement. Observed with the fix: lock off → detected,
+but Android 9 would **not** remove the alias (`deleteEntry` raised nothing, alias still present); PIN
+restored → "has been removed"; next launch → fresh key, server `matches=False`. Re-enrolment ("Simulate
+fresh installation") restored step-up: new installation `da95b434…`, `200 verified`. A healthy key is
+left alone (checked before the test: `created=false`, `matches=True`).
+
+**iPhone 7, iOS 15.8.5.** Same installation re-registered on the exact-key path, integrity `0, trusted`
+in all eight reports, sensitive op without step-up `403 stepup_required`. But iOS did **not** delete the
+step-up key: its public key stayed readable (server `matches=True`) while every signature failed
+(`STEPUP_SIGNING_FAILED`), both with the passcode off and after it was set again. So the app keeps
+offering a dead key, and the "with step-up" button stays enabled. **Correction:** earlier statements
+that iOS deletes the key on passcode removal came from documentation, not observation, and are wrong
+for this device. **iOS fix not built yet**: the same dead-key handling, detected without a prompt
+(e.g. a signature attempt with `LAContext.interactionNotAllowed`, where a live key fails with
+`errSecInteractionNotAllowed` and a dead one with something else — the dead-key error code is still to
+be captured).
+
+**Vivo, Android 12**: not run (not available).
+
+Conclusion on all three runs: removing the screen lock affects **only** the step-up key; the
+installation identity, integrity and the server's refusal of unsigned sensitive operations are
+unchanged, and a lost step-up key can only be replaced by re-enrolling.
+
