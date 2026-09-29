@@ -241,6 +241,41 @@ def _env_values(name):
 EXPECTED_ANDROID_PACKAGE = os.environ.get("INTEGRITY_ANDROID_PACKAGE", "").strip()
 EXPECTED_ANDROID_CERT_SHA256 = _env_values("INTEGRITY_ANDROID_CERT_SHA256")
 EXPECTED_ANDROID_APK_SHA256 = _env_values("INTEGRITY_ANDROID_APK_SHA256")
+
+
+def _parse_wx_baselines(raw):
+    """INTEGRITY_ANDROID_WX_BASELINES: "<apk_sha256>:<bytes>:<granularity>,..."
+
+    The writable-and-executable memory a given build is known to reserve
+    (DESIGN.md 62), measured per build by the .NET SDK's `baseline` command and
+    keyed on the APK hash the operator pins -- never on a runtime name the
+    client reports, which a compromised process could claim. A malformed entry
+    stops the server at start-up rather than silently scoring without it.
+    """
+    baselines = {}
+    for item in raw.replace(";", ",").split(","):
+        item = item.strip()
+        if not item:
+            continue
+        parts = [part.strip() for part in item.split(":")]
+        if (
+            len(parts) != 3
+            or not re.fullmatch(r"[0-9a-fA-F]{64}", parts[0])
+            or not parts[1].isdigit()
+            or not parts[2].isdigit()
+            or int(parts[2]) < 1
+        ):
+            raise RuntimeError(
+                "INTEGRITY_ANDROID_WX_BASELINES entries must be "
+                "<apk_sha256>:<bytes>:<granularity>; got %r" % item
+            )
+        baselines[parts[0].lower()] = (int(parts[1]), int(parts[2]))
+    return baselines
+
+
+ANDROID_WX_BASELINES = _parse_wx_baselines(
+    os.environ.get("INTEGRITY_ANDROID_WX_BASELINES", "")
+)
 EXPECTED_IOS_BUNDLE_ID = os.environ.get("INTEGRITY_IOS_BUNDLE_ID", "").strip()
 EXPECTED_IOS_SIGNING_ID = os.environ.get("INTEGRITY_IOS_SIGNING_ID", "").strip()
 EXPECTED_IOS_TEAM_ID = os.environ.get("INTEGRITY_IOS_TEAM_ID", "").strip()
@@ -1649,6 +1684,71 @@ def _apply_hardware_backing_policy(cursor, installation_id, scored):
     )
 
 
+def _wx_size_classes(exec_maps):
+    """Sizes of the writable-executable mappings, or None if not described.
+
+    From wx_size_classes ("<bytes>:<count>,..." largest first, at most twelve
+    classes) plus wx_smallest_bytes and wx_largest_bytes, so a small foreign
+    size cut off the list is still seen. Anything malformed is None.
+    """
+    raw = exec_maps.get("wx_size_classes")
+    if not isinstance(raw, str):
+        return None
+    sizes = set()
+    for part in raw.split(","):
+        size = part.strip().partition(":")[0].strip()
+        if not size:
+            continue
+        if not size.isdigit():
+            return None
+        sizes.add(int(size))
+    for key in ("wx_smallest_bytes", "wx_largest_bytes"):
+        value = exec_maps.get(key)
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            sizes.add(value)
+    return sizes or None
+
+
+def _score_wx_memory(reasons, exec_maps, apk_hash):
+    """Writable-and-executable memory, scored against the build's baseline.
+
+    Today's rule -- +60 whenever such memory is mapped -- stays for every build
+    without a pinned baseline and for every report that does not carry
+    wx_bytes and its size classes (DESIGN.md 62). An absent measurement is
+    never read as zero: the Flutter/Kotlin collector does not send wx_bytes,
+    and treating that as "0 bytes over baseline" would switch W^X scoring off
+    for a device with a live injected gadget (DESIGN_UPDATE_FROM_DOTNET.md).
+    """
+    wx_count = int(exec_maps.get("wx_mappings") or 0)
+    wx_bytes = exec_maps.get("wx_bytes")
+    if isinstance(wx_bytes, bool) or not isinstance(wx_bytes, int) or wx_bytes < 0:
+        wx_bytes = None
+    if wx_count <= 0 and not wx_bytes:
+        return 0
+    baseline = ANDROID_WX_BASELINES.get(apk_hash)
+    sizes = _wx_size_classes(exec_maps)
+    if baseline is None or baseline[0] <= 0 or wx_bytes is None or sizes is None:
+        _integrity_reason(reasons, "android_wx_memory", 60,
+                          "Writable-and-executable memory is mapped into the process.")
+        return 60
+    baseline_bytes, granularity = baseline
+    points = 0
+    if any(size % granularity for size in sizes):
+        _integrity_reason(reasons, "android_wx_foreign_allocator", 45,
+                          "Writable-executable memory of a size this build's runtime "
+                          "never allocates is mapped into the process.")
+        points += 45
+    if wx_bytes > 2 * baseline_bytes:
+        _integrity_reason(reasons, "android_wx_far_above_baseline", 40,
+                          "Writable-executable memory is more than twice this build's baseline.")
+        points += 40
+    elif wx_bytes > baseline_bytes:
+        _integrity_reason(reasons, "android_wx_above_baseline", 15,
+                          "Writable-executable memory exceeds this build's baseline.")
+        points += 15
+    return points
+
+
 def _score_android_integrity(probes):
     reasons = []
     score = 0
@@ -1849,10 +1949,7 @@ def _score_android_integrity(probes):
         score += 90
 
     exec_maps = _probe(probes, "exec_mappings")
-    if int(exec_maps.get("wx_mappings") or 0) > 0:
-        _integrity_reason(reasons, "android_wx_memory", 60,
-                          "Writable-and-executable memory is mapped into the process.")
-        score += 60
+    score += _score_wx_memory(reasons, exec_maps, apk_hash)
     if int(exec_maps.get("deleted_exec_mappings") or 0) > 0:
         # The ART JIT cache is excluded client-side; what remains is an
         # executable region backed by a deleted file, a classic injection shape.
@@ -3570,6 +3667,7 @@ def health_ready():
                 "ios_fake_signature": INTEGRITY_SCORE_IOS_FAKE_SIGNATURE,
                 "ios_code_integrity": INTEGRITY_SCORE_IOS_CODE_INTEGRITY,
                 "hardware_backing_policy": INTEGRITY_HARDWARE_BACKING_POLICY,
+                "android_wx_baselines": len(ANDROID_WX_BASELINES),
                 "risk_policy_settings": _risk_policy_settings(),
             },
             "remote_attestation": "not_used",

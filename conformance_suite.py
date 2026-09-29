@@ -1059,6 +1059,58 @@ def check_wx_absent_field_still_scores(api, ctx):
     )
 
 
+
+CONFORMANCE_APK_SHA256 = hashlib.sha256(b"conformance-apk").hexdigest()
+CONFORMANCE_WX_BASELINE = (1048576, 65536)  # the .NET build's measured shape (DESIGN.md 62)
+
+
+@check("integrity: writable-executable memory is scored against the build's pinned baseline")
+def check_wx_baseline(api, ctx):
+    """DESIGN.md 62. With a baseline pinned for the conformance APK, a report at
+    the baseline in whole granules scores nothing; a size the runtime never
+    allocates scores the foreign-allocator reason; above and far above the
+    baseline score their own reasons; and a report without wx_bytes still
+    scores today's +60 even for a baselined build. Skips unless the server pins
+    INTEGRITY_ANDROID_WX_BASELINES=<conformance apk sha256>:1048576:65536."""
+    installation, token, _ = integrity_context(ctx)
+    total, granule = CONFORMANCE_WX_BASELINE
+
+    def shape(wx_bytes, classes, drop_bytes=False):
+        def mutate(probes):
+            em = probes["exec_mappings"]
+            em.update({"wx_mappings": sum(int(c.split(":")[1]) for c in classes.split(",")),
+                       "wx_bytes": wx_bytes, "wx_size_classes": classes})
+            if drop_bytes:
+                em.pop("wx_bytes", None)
+        return codes(submit_report(api, installation, token, mutate))
+
+    wx_codes = {"android_wx_memory", "android_wx_foreign_allocator",
+                "android_wx_above_baseline", "android_wx_far_above_baseline"}
+    clean = shape(total, "%d:%d" % (granule, total // granule))
+    if "android_wx_memory" in clean:
+        raise Skip("no baseline pinned for the conformance APK; set "
+                   "INTEGRITY_ANDROID_WX_BASELINES=%s:%d:%d to run this check"
+                   % (CONFORMANCE_APK_SHA256, total, granule))
+    expect(not (wx_codes & set(clean)),
+           "a report at the baseline in whole granules must score no W^X reason, got %s"
+           % sorted(wx_codes & set(clean)))
+    foreign = shape(total - granule + 4096, "%d:%d,4096:1" % (granule, total // granule - 1))
+    expect("android_wx_foreign_allocator" in foreign and "android_wx_memory" not in foreign,
+           "a 4096-byte W^X region must score android_wx_foreign_allocator, got %s"
+           % sorted(wx_codes & set(foreign)))
+    above = shape(total + granule, "%d:%d" % (granule, total // granule + 1))
+    expect("android_wx_above_baseline" in above,
+           "W^X above the baseline must score android_wx_above_baseline, got %s"
+           % sorted(wx_codes & set(above)))
+    far = shape(2 * total + granule, "%d:%d" % (granule, 2 * total // granule + 1))
+    expect("android_wx_far_above_baseline" in far,
+           "W^X beyond twice the baseline must score android_wx_far_above_baseline, got %s"
+           % sorted(wx_codes & set(far)))
+    absent = shape(total, "%d:%d" % (granule, total // granule), drop_bytes=True)
+    expect("android_wx_memory" in absent,
+           "a baselined build's report without wx_bytes must still score android_wx_memory, got %s"
+           % sorted(wx_codes & set(absent)))
+
 @check("integrity: the ART JIT code cache is not mistaken for injection")
 def check_jit_not_flagged(api, ctx):
     """deleted_exec_jit is the legitimate JIT cache; it must never score."""
