@@ -96,7 +96,7 @@ may change — never hard-code a policy value.
 ## Commands
 
 ```bash
-# Conformance suite — the gate. 53 checks; needs `cryptography` (harness only).
+# Conformance suite — the gate. 54 checks; needs `cryptography` (harness only).
 python3 conformance_suite.py --base-url https://<endpoint>
 #   Scoring checks need the server started with INTEGRITY_ANDROID_CERT_SHA256 set to the
 #   certificate the suite prints, or empty to disable the allow-list.

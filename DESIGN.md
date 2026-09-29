@@ -4888,7 +4888,7 @@ inside the region to find the real ceiling, which 64 clients across a 0.3 s link
   re-enrolled; iPhone — passcode on, `dt-stepup3.ipa` (`a0d4e4a`), installation `3702678e…` re-enrolled
   (scoped to its account). The OPPO device now has four linked accounts on PostgreSQL, so its
   account-risk decisions read `block` (observe hides it) — an artefact of repeated test resets.
-- **Owed to the .NET client (server side, ours):** baseline-relative W^X scoring — the owner approved
+- **Done later the same day (§62):** ~~Owed to the .NET client~~ — baseline-relative W^X scoring — the owner approved
   it on 2026-09-23 and the .NET session already prints `sha256:bytes:granularity` entries for an
   `INTEGRITY_ANDROID_WX_BASELINES` map (their commit `9d3a992`), but this server does not implement
   the map yet, so the .NET Android client still reads 78/review on the OPPO. Read
@@ -4897,3 +4897,45 @@ inside the region to find the real ceiling, which 64 clients across a 0.3 s link
   load test from inside AWS to find the real ceiling; a larger SQL Server instance class if SQL Server
   stays in scope (db.t3.micro Express starves under RDS's own `DBCC CHECKDB`, §60); Vivo (Android 12)
   screen-lock and recovery runs when the phone is available.
+
+## 62. Baseline-relative W^X scoring per APK — implemented (2026-09-29)
+
+The owner approved the rule in `DESIGN_UPDATE_FROM_DOTNET.md` on 2026-09-23; the .NET session asked for it
+as a per-APK map. Implemented in `2427e11`.
+
+**Configuration.** `INTEGRITY_ANDROID_WX_BASELINES=<apk_sha256>:<bytes>:<granularity>[,…]` — one entry
+per build, keyed on the APK hash the operator pins (never on a runtime name the client reports, which
+a compromised process could claim). The .NET SDK's `baseline` command measures and prints the entry;
+on a shared server, append rather than replace. A malformed entry stops the server at start-up.
+`/health/ready.scoring_flags.android_wx_baselines` reports how many builds are pinned.
+
+**Rule** (`_score_wx_memory`):
+
+| report | points |
+|---|---|
+| no W^X at all | 0 |
+| no baseline for this APK, or a baseline of 0 | `android_wx_memory` **+60**, unchanged |
+| `wx_bytes` absent or malformed, or no usable size classes | `android_wx_memory` **+60** — absence is never read as zero |
+| baselined, ≤ baseline, every size a multiple of the granularity | **0** |
+| a size (from `wx_size_classes`, `wx_smallest_bytes`, `wx_largest_bytes`) not a multiple of the granularity | `android_wx_foreign_allocator` **+45** |
+| above the baseline / beyond twice it | `android_wx_above_baseline` **+15** / `android_wx_far_above_baseline` **+40** |
+
+The foreign-allocator and excess reasons add up: the gadget shape the .NET session measured (1,175,552
+bytes against 1,048,576, with 4,096 and 28,672-byte regions) scores 45 + 15 = 60.
+
+**The trap is closed.** The Flutter/Kotlin collector sends no `wx_bytes`, so every Flutter report takes
+the unchanged +60 path whenever W^X is present — a naive `wx_bytes or 0` would have switched W^X scoring
+off for a Flutter device with an injected gadget. Covered by the existing
+"w^x still scores when the client sends no wx_bytes" check, which still passes.
+
+**Validation.** Offline unit test of the rule (nine cases, including the trap, a zero baseline, missing
+size classes and a foreign size visible only in `wx_smallest_bytes`); new `check_wx_baseline` (clean at
+baseline, foreign allocator, above, far above, and a baselined report without `wx_bytes` still +60);
+full suite on PostgreSQL **49 / 0 / 5** (54 checks); on hardware, the OPPO's Flutter scan still reads
+`18, trusted`.
+
+**Server state.** `/etc/devicetrust.env` pins one entry, for the synthetic conformance APK
+(`1b536aea46be…:1048576:65536`, `sha256("conformance-apk")`, which no real build can match — like the
+conformance certificate, remove before production). The .NET build's own entry is **not** configured yet:
+the .NET session must append `<their apk sha256>:1048576:65536` (from their `baseline` command) to that
+line; until then the .NET Android client still scores +60.
