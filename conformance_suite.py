@@ -1747,6 +1747,70 @@ def check_device_account_bands(api, ctx):
            % (block, st, pol.get("recommended_action"), sorted(_reason_codes(pol))))
 
 
+
+def jwk_thumbprint(jwk):
+    """The server's key thumbprint: SHA-256 hex of the sorted canonical JWK."""
+    canonical = json.dumps({"crv": jwk["crv"], "kty": "EC", "x": jwk["x"], "y": jwk["y"]},
+                           sort_keys=True, separators=(",", ":"))
+    return sha256_hex(canonical.encode("utf-8"))
+
+
+@check("step-up: re-enrolment needs the password and the new key's own proof")
+def check_stepup_reenrol(api, ctx):
+    """DESIGN.md 58. An installation that lost its step-up key binds a new one
+    only with the access proof, the account password and a signature by the new
+    key bound to this request. A wrong password or a proof signed by another key
+    is refused and changes nothing; the right one replaces the bound key."""
+    auth = {"factor": "passcode", "mode": "per_use", "window_seconds": 0}
+    inst = Installation()
+    old_priv, old_jwk = stepup_jwk_pair()
+    st, pl = enrol(api, inst, fresh_hint(), stepup_public_key=old_jwk, stepup_key_auth=auth)
+    expect(st in (200, 201), "enrol failed: %s %s" % (st, pl))
+    tok = device_token(api, inst)
+    submit_report(api, inst, tok)
+    password = "Passw0rd123"
+    st, pl = open_account(api, inst, tok, "re-%s" % secrets.token_hex(4), password)
+    expect(st in (200, 201), "account open failed: %s %s" % (st, pl))
+    access = pl["access_token"]
+    new_priv, new_jwk = stepup_jwk_pair()
+    other_priv, _ = stepup_jwk_pair()
+
+    def reenrol(pw, signer):
+        nonce_bytes = secrets.token_bytes(32)
+        key_proof = b64u(json.dumps({
+            "version": 1, "purpose": "stepup_reenrol",
+            "installation_id": inst.installation_id,
+            "stepup_key_thumbprint": jwk_thumbprint(new_jwk),
+            "nonce": b64u(nonce_bytes), "timestamp": int(time.time()),
+        }).encode("utf-8"))
+        body = {"password": pw, "stepup_public_key": new_jwk, "stepup_key_auth": auth,
+                "stepup_key_proof": key_proof,
+                "stepup_key_signature": b64u(signer.sign(b64u_decode(key_proof),
+                                                         ec.ECDSA(hashes.SHA256())))}
+        headers, body_text = build_proof(inst, "POST", "/v1/installations/stepup-key",
+                                         access, body, nonce_bytes=nonce_bytes)
+        return api.call("POST", "/v1/installations/stepup-key", body_text=body_text,
+                        bearer=access, headers=headers)
+
+    def matches(jwk):
+        st, pl = enrol(api, inst, fresh_hint(), stepup_public_key=jwk, stepup_key_auth=auth)
+        expect(st == 200, "re-registration expected 200, got %s %s" % (st, pl))
+        return pl.get("stepup_key_matches")
+
+    st, pl = reenrol("wrong-" + password, new_priv)
+    expect(st == 401 and error_code(pl) == "invalid_credentials",
+           "wrong password expected 401 invalid_credentials, got %s %s" % (st, error_code(pl)))
+    st, pl = reenrol(password, other_priv)
+    expect(st == 403 and error_code(pl) == "stepup_reenrol_proof_invalid",
+           "a proof by another key expected 403 stepup_reenrol_proof_invalid, got %s %s"
+           % (st, error_code(pl)))
+    expect(matches(new_jwk) is False, "refused re-enrolments must not change the bound key")
+    st, pl = reenrol(password, new_priv)
+    expect(st == 200 and pl.get("stepup_key_registered") is True,
+           "valid re-enrolment expected 200, got %s %s" % (st, pl))
+    expect(matches(new_jwk) is True and matches(old_jwk) is False,
+           "after re-enrolment the new key must be bound and the old one not")
+
 @check("concurrency: parallel clients neither crash nor stall the server", db_sensitive=True)
 def check_parallel_clients(api, ctx):
     """Four phone-like clients enrol, prove possession, report integrity and read

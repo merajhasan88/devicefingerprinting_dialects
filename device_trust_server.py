@@ -4351,6 +4351,125 @@ def account_sensitive_echo():
     )
 
 
+@app.post("/v1/installations/stepup-key")
+@jwt_required()
+def reenrol_stepup_key():
+    """Re-enrol the step-up key of an existing installation (DESIGN.md 58).
+
+    A step-up key binds only at first registration, so an installation whose
+    key died (screen lock removed, 57) had no way back short of a new
+    installation. This path accepts a new key only with all three of:
+    possession of the installation key (the access proof), the account password
+    re-entered now, and a signature by the new step-up key itself -- which the
+    device grants only after the user passes the new screen lock. A signing
+    oracle on a compromised device holds the first but not the password, so it
+    cannot swap in a key of its own; an attacker who also holds the password
+    could already enrol a fresh installation, so this grants nothing new. As in
+    login, every gate runs before the password check, so the endpoint cannot
+    serve as a credential oracle.
+    """
+    _enforce_rate_limit("stepup_reenrol", get_jwt().get("iid") or request.remote_addr)
+    claims, policy, integrity = _require_trusted_account_request("stepup_reenrol")
+    installation_id = claims.get("iid")
+    account_id = str(get_jwt_identity())
+    body = _json_body()
+    password = _password_bytes(body.get("password"))
+    parsed = _parse_public_key(body.get("stepup_public_key"))
+    if parsed["algorithm"] != "ES256":
+        raise ApiProblem(
+            "The step-up key must be an ES256 P-256 key.", 400, "invalid_stepup_key"
+        )
+    stepup_auth = _parse_stepup_key_auth(body)
+
+    def refuse(message, code, status=403):
+        logger.info(
+            "Step-up re-enrolment refused: installation=%s code=%s",
+            installation_id,
+            code,
+        )
+        return ApiProblem(message, status, code)
+
+    proof_bytes = _b64url_decode(body.get("stepup_key_proof"), "stepup_key_proof", 4096)
+    signature = _b64url_decode(
+        body.get("stepup_key_signature"), "stepup_key_signature", 1024
+    )
+    try:
+        _verify_installation_signature("ES256", parsed["jwk"], proof_bytes, signature)
+        proof = json.loads(proof_bytes.decode("utf-8"))
+        access_nonce = json.loads(
+            _b64url_decode(
+                request.headers.get("X-Access-Proof"), "access_proof", 8192
+            ).decode("utf-8")
+        ).get("nonce")
+    except Exception:
+        raise refuse(
+            "The new step-up key's proof did not verify.", "stepup_reenrol_proof_invalid"
+        )
+    timestamp = proof.get("timestamp") if isinstance(proof, dict) else None
+    if (
+        not isinstance(proof, dict)
+        or proof.get("purpose") != "stepup_reenrol"
+        or proof.get("installation_id") != installation_id
+        or proof.get("stepup_key_thumbprint") != parsed["thumbprint"]
+        or not proof.get("nonce")
+        or proof.get("nonce") != access_nonce
+        or isinstance(timestamp, bool)
+        or not isinstance(timestamp, int)
+        or abs(int(_utc_now().timestamp()) - timestamp) > ACCESS_PROOF_MAX_SKEW_SECONDS
+    ):
+        raise refuse(
+            "The new step-up key's proof is not bound to this request.",
+            "stepup_reenrol_proof_invalid",
+        )
+
+    with _cursor() as cursor:
+        cursor.execute(
+            "SELECT password_hash FROM demo_accounts WHERE account_id = %s",
+            (account_id,),
+        )
+        row = cursor.fetchone()
+    if row is None or not bcrypt.checkpw(password, _bcrypt_db_bytes(row[0])):
+        raise refuse("The account credentials are invalid.", "invalid_credentials", 401)
+
+    with _cursor(commit=True) as cursor:
+        cursor.execute(
+            """
+            UPDATE app_installations
+            SET stepup_public_key_jwk = %s,
+                stepup_key_algorithm = %s,
+                stepup_key_factor = %s,
+                stepup_key_mode = %s,
+                stepup_key_window_seconds = %s
+            WHERE installation_id = %s
+            """,
+            (
+                DIALECT.json_param(parsed["jwk"]),
+                parsed["algorithm"],
+                stepup_auth["factor"],
+                stepup_auth["mode"],
+                stepup_auth["window_seconds"],
+                installation_id,
+            ),
+        )
+    downgrade = _stepup_policy_downgrade(stepup_auth)
+    logger.info(
+        "Step-up key re-enrolled: installation=%s factor=%s mode=%s "
+        "window_seconds=%s policy_downgrade=%s",
+        installation_id,
+        stepup_auth["factor"],
+        stepup_auth["mode"],
+        stepup_auth["window_seconds"],
+        downgrade,
+    )
+    return jsonify(
+        {
+            "stepup_key_registered": True,
+            "stepup_key_auth": stepup_auth,
+            "stepup_policy_downgrade": downgrade,
+        }
+    )
+
+
 @app.post("/v1/account/protected-echo")
 @jwt_required()
 def account_protected_echo():
