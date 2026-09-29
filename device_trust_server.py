@@ -3560,6 +3560,17 @@ def register_installation():
                     _parse_public_key(stored_stepup_jwk)["thumbprint"]
                     == stepup_key["thumbprint"]
                 )
+            if stepup_key is not None or stored_stepup_jwk:
+                # What happened to a device's step-up key is otherwise invisible
+                # server-side (e.g. after the screen lock is removed, DESIGN.md 56).
+                logger.info(
+                    "Re-registration: installation=%s stepup_offered=%s "
+                    "stepup_bound=%s stepup_matches=%s",
+                    canonical_installation_id,
+                    stepup_key is not None,
+                    bool(stored_stepup_jwk),
+                    stepup_matches,
+                )
 
             # A non-exportable hardware key cannot migrate into software. The
             # thumbprint is the authoritative identity, so the same key later
