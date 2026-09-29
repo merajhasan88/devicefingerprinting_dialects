@@ -354,6 +354,12 @@ final class StepUpKeyManager {
 
         var created = false
         var key = try loadKey(context: nil)
+        if key != nil && !devicePasscodeSet() {
+            // A passcode-bound key cannot outlive the passcode: its protection
+            // is destroyed when the passcode is removed, but on the iPhone 7
+            // (iOS 15.8.5) the item itself stayed behind (DESIGN.md 57).
+            throw discardDeadKey(because: "the device passcode was removed")
+        }
         if key == nil {
             try requireFactorAvailable(factor)
             key = try generateKey(factor: factor)
@@ -431,9 +437,55 @@ final class StepUpKeyManager {
             payload as CFData,
             &signError
         ) as Data? else {
-            throw signFailure(signError?.takeRetainedValue())
+            let error = signError?.takeRetainedValue()
+            if let error = error, isDeadKeyError(error) {
+                throw discardDeadKey(because: "the Secure Enclave can no longer use it")
+            }
+            throw signFailure(error)
         }
         return base64Url(signature)
+    }
+
+    // MARK: - Dead keys
+
+    /// CryptoTokenKit error -3 (corrupted data): the Secure Enclave can no
+    /// longer unwrap the key. Seen on the iPhone 7 after the passcode was
+    /// removed, and still after it was set again (DESIGN.md 57).
+    private func isDeadKeyError(_ error: CFError) -> Bool {
+        return (CFErrorGetDomain(error) as String) == "CryptoTokenKit" && CFErrorGetCode(error) == -3
+    }
+
+    /// False only when iOS reports that no passcode is set; any other answer
+    /// is treated as "set", so a live key is never removed on a guess.
+    private func devicePasscodeSet() -> Bool {
+        let context = LAContext()
+        var policyError: NSError?
+        if context.canEvaluatePolicy(.deviceOwnerAuthentication, error: &policyError) {
+            return true
+        }
+        return policyError?.code != LAError.Code.passcodeNotSet.rawValue
+    }
+
+    /// Deletes a step-up key that can never sign again and reports it,
+    /// saying truthfully whether the removal worked. The installation must
+    /// then re-enrol: the server never accepts a replacement step-up key.
+    private func discardDeadKey(because reason: String) -> InstallationKeyFailure {
+        var removal = "has been removed"
+        do {
+            try deleteKey()
+            if try loadKey(context: nil) != nil {
+                removal = "could not be removed (still present)"
+            }
+        } catch let failure as InstallationKeyFailure {
+            removal = "could not be removed (\(failure.message))"
+        } catch {
+            removal = "could not be removed (\(error.localizedDescription))"
+        }
+        return InstallationKeyFailure(
+            code: "STEPUP_KEY_INVALIDATED",
+            message: "The step-up key was invalidated (\(reason)) and \(removal). "
+                + "Re-enrol the installation to get a new one."
+        )
     }
 
     @discardableResult

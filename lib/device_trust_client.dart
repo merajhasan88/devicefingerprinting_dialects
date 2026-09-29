@@ -2907,10 +2907,19 @@ class DeviceRecognitionController extends ChangeNotifier {
           'Policy downgrade: ${seen?['policy_downgrade']}',
         ]);
       } on NativeKeyException catch (error) {
+        if (error.code == 'STEPUP_KEY_INVALIDATED') {
+          // The native side has removed the dead key; stop offering it.
+          stepUpKey = null;
+          stepUpUnavailable = '${error.message} [${error.code}]';
+        }
         _recordStepUp(<String>[
-          error.code == 'STEPUP_CANCELLED'
-              ? 'CANCELLED: no step-up signature was produced; nothing was sent'
-              : 'FAIL: the step-up key could not sign',
+          switch (error.code) {
+            'STEPUP_CANCELLED' =>
+              'CANCELLED: no step-up signature was produced; nothing was sent',
+            'STEPUP_KEY_INVALIDATED' =>
+              'FAIL: the step-up key is dead; re-enrol ("Simulate fresh installation")',
+            _ => 'FAIL: the step-up key could not sign',
+          },
           '${error.message} [${error.code}]',
         ]);
       } on ApiException catch (error) {
