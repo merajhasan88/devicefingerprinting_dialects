@@ -4939,3 +4939,17 @@ full suite on PostgreSQL **49 / 0 / 5** (54 checks); on hardware, the OPPO's Flu
 conformance certificate, remove before production). The .NET build's own entry is **not** configured yet:
 the .NET session must append `<their apk sha256>:1048576:65536` (from their `baseline` command) to that
 line; until then the .NET Android client still scores +60.
+
+### 62.1 The .NET build pinned (2026-09-29, reported by the .NET session, spot-checked here)
+
+The owner added the .NET harness build's entry, `834a5a23…:3735552:65536`, next to the conformance APK's
+(`1b536aea…:1048576:65536`); `/health/ready` reports `android_wx_baselines: 2`. The .NET session reports
+the OPPO's clean .NET scan now reads **18 / trusted** instead of 78 / review, and its own conformance run
+against this server **28 / 0 / 3** (two enforce-mode checks and the gated step-up check skipped). The .NET
+client now sends `key_security` and implements the step-up key, step-up proofs, dead-key handling and
+re-enrolment. Checked here before stopping EC2: server code unchanged (`2427e11`), both modes `observe`,
+no `risk_policy_settings` row changed, `stepup_required_paths` empty.
+
+**Next .NET session needs:** `stepup_required_paths` set to `/v1/account/sensitive-echo` for the gated
+checks, and a baseline entry for their new harness APK before step-up is tested on the OPPO (each new
+build needs its own entry).
