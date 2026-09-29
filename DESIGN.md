@@ -4740,10 +4740,17 @@ step-up key: its public key stayed readable (server `matches=True`) while every 
 (`STEPUP_SIGNING_FAILED`), both with the passcode off and after it was set again. So the app keeps
 offering a dead key, and the "with step-up" button stays enabled. **Correction:** earlier statements
 that iOS deletes the key on passcode removal came from documentation, not observation, and are wrong
-for this device. **iOS fix not built yet**: the same dead-key handling, detected without a prompt
-(e.g. a signature attempt with `LAContext.interactionNotAllowed`, where a live key fails with
-`errSecInteractionNotAllowed` and a dead one with something else — the dead-key error code is still to
-be captured).
+for this device. The failure text was `CryptoTokenKit error -3` (corrupted data: the Secure Enclave can
+no longer unwrap the key).
+
+**iOS fix** (`9bf705e`, Codemagic build `dt-stepup2.ipa`, `sha256 0209adf3…`): a key found while iOS
+reports no passcode set is dead (checked at launch); a signature failing with CryptoTokenKit -3 marks the
+key dead (checked at use); either way it is deleted and `STEPUP_KEY_INVALIDATED` reported, and Dart stops
+offering it. Verified on the iPhone with the passcode on: the launch still offered the old key (server
+`matches=True`, as designed — with a passcode set a dead key is only caught at use); "Sensitive op with
+step-up" sent nothing to the server; the next "Prove installation again" offered a **different** key
+(server `matches=False`) — the dead key was removed and a fresh, unbound one created. Re-enrolment is
+required to bind it. The launch-time path (passcode off) is written but not yet observed.
 
 **Vivo, Android 12**: not run (not available).
 
