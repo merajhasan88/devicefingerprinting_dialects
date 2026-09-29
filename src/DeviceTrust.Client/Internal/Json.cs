@@ -93,6 +93,25 @@ namespace DeviceTrust.Client.Internal
             };
         }
 
+        /// <summary>
+        /// Reads a boolean property that is allowed to be absent or null, and
+        /// keeps that distinction: null means "not reported", which is not false.
+        /// </summary>
+        public static bool? GetNullableBoolean(JsonElement element, string name)
+        {
+            if (element.ValueKind != JsonValueKind.Object || !element.TryGetProperty(name, out var value))
+            {
+                return null;
+            }
+
+            return value.ValueKind switch
+            {
+                JsonValueKind.True => true,
+                JsonValueKind.False => false,
+                _ => null,
+            };
+        }
+
         /// <summary>Reads an object property, or null when it is missing or not an object.</summary>
         public static JsonElement? GetObject(JsonElement element, string name)
         {

@@ -188,9 +188,46 @@ first time, among them `IECPublicKey.GetW()` being a method rather than a `W` pr
 `Android.Provider.AggregateException` shadowing `System.AggregateException`, and every
 version-gated call needing the analyzer-visible guard form.
 
+## 7. Catch-up with the reference session: key_security, step-up, re-enrolment (2026-09-29)
+
+What changed: the client now reports `key_security` at registration, supports the optional step-up
+key (`IStepUpKeyStore`: `AndroidStepUpKeyStore`, `SecureEnclaveStepUpKeyStore`, and the test-only
+`SoftwareStepUpKeyStore`), sends step-up proofs bound to the access-proof nonce, handles dead keys,
+and re-enrols (DESIGN.md 50-58). The Android and iOS harnesses have the three step-up buttons the
+Flutter app has. `DESIGN.md` here was replaced by the reference copy (to section 62).
+
+Target: `https://devicefingerprinting.duckdns.org`, PostgreSQL 16.15, schema 7,
+`INTEGRITY_MODE=observe`, `DEVICE_POLICY_MODE=observe`, every `risk_policy_settings` row at its
+default (step-up gate empty).
+
+| What | Result |
+|---|---|
+| Offline tests (`dotnet test`) | **106 passed** on net6.0 and net8.0, including 17 new step-up tests (wire shape, nonce binding, signature by the step-up key and not the installation key, dead-key handling, re-enrolment proof, `unknown` level sent as null) |
+| .NET conformance (`conformance`) | **28 passed, 0 failed, 3 skipped**. New and passing: key_security recorded, step-up key registration (the Android 9 windowed shape, downgrade flag), step-up immutability, re-enrolment (wrong password 401, foreign-key proof 403, valid 200, old key unbound), account bands (2 elevated and never refused, 3 review, 4 block), parallel clients. Skipped: the two enforce-mode checks, and the gated step-up check because `stepup_required_paths` is empty |
+| `DeviceTrust.Client.Maui` (net8.0-android) and the Android harness (Release) | build clean, warnings as errors |
+| iOS sources, `tools/ioscheck` + `tools/obsscan` | compile clean; no new obsoleted call sites |
+| W^X baseline for build `834a5a23…` | `3735552:65536`, four agreeing cold starts on the OPPO; pinned on the server by the owner; the OPPO's scan then read **18/100 trusted** (developer options +8, adb +10) with `android_wx_memory` gone |
+
 ## Not covered
 
 These are gaps, not oversights.
+
+**Step-up on hardware.** `AndroidStepUpKeyStore` and `SecureEnclaveStepUpKeyStore` have been
+compiled, not run. Neither the BiometricPrompt path (API 30+), the confirm-credential path
+(Android 9/10), the Secure Enclave passcode prompt, nor the dead-key handling has been exercised on a
+phone. The conformance run proves the wire contract with software step-up keys only, which sign
+with nobody present.
+
+**Step-up with the gate on.** `stepup_required_paths` was empty on the shared server, so
+`403 stepup_required`, a verified step-up, `stepup_factor_mismatch` and the second-account
+`stepup_key_other_account` attack have not been run against it from .NET.
+
+**The biometric factor.** Not exercised anywhere; the iOS harness also lacks the
+`NSFaceIDUsageDescription` a Face ID device would need.
+
+**A new APK needs a new W^X baseline.** Any rebuild of the Android harness changes its APK hash, so
+the pinned `834a5a23…` entry no longer applies and the device reads 78/review until the new build's
+entry is appended.
 
 **Key non-exportability.** The cross-device checks use two *software* keys in two directories. They
 establish the protocol property — the server refuses a token presented with a signature from the

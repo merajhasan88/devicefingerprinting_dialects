@@ -186,12 +186,43 @@ namespace DeviceTrust.Client.Protocol
             return SendAsync("GET", "/health/ready", cancellationToken: cancellationToken);
         }
 
-        /// <summary>Registers an installation's public key.</summary>
+        /// <summary>Registers an installation's public key, reporting nothing about its protection.</summary>
+        public Task<RegistrationState> RegisterInstallationAsync(
+            string installationId,
+            string platform,
+            EcPublicJsonWebKey publicKey,
+            ReinstallHint? reinstallHint,
+            CancellationToken cancellationToken = default)
+        {
+            return RegisterInstallationAsync(
+                installationId, platform, publicKey, reinstallHint, null, null, cancellationToken);
+        }
+
+        /// <summary>
+        /// Registers an installation's public key, with the key store's
+        /// description of it and, optionally, a step-up key.
+        /// </summary>
+        /// <param name="installationId">The UUID to register.</param>
+        /// <param name="platform"><c>android</c> or <c>ios</c>.</param>
+        /// <param name="publicKey">The installation key's public JWK.</param>
+        /// <param name="reinstallHint">The reinstall correlation hint, if any.</param>
+        /// <param name="keySecurity">
+        /// The installation key's metadata, sent as <c>key_security</c>. Null
+        /// omits the block, which the server records as "not reported".
+        /// </param>
+        /// <param name="stepUpKey">
+        /// The step-up key to bind. The server binds it only when the
+        /// installation key is new; on re-registration it reports whether the
+        /// offered key matches the bound one instead.
+        /// </param>
+        /// <param name="cancellationToken">Cancellation.</param>
         public async Task<RegistrationState> RegisterInstallationAsync(
             string installationId,
             string platform,
             EcPublicJsonWebKey publicKey,
             ReinstallHint? reinstallHint,
+            InstallationKeyMetadata? keySecurity,
+            StepUpKeyMetadata? stepUpKey,
             CancellationToken cancellationToken = default)
         {
             if (publicKey is null)
@@ -215,6 +246,20 @@ namespace DeviceTrust.Client.Protocol
                 else
                 {
                     reinstallHint.Write(writer);
+                }
+
+                if (keySecurity is not null)
+                {
+                    writer.WritePropertyName("key_security");
+                    WriteKeySecurity(writer, keySecurity);
+                }
+
+                if (stepUpKey is not null)
+                {
+                    writer.WritePropertyName("stepup_public_key");
+                    stepUpKey.PublicKey.Write(writer);
+                    writer.WritePropertyName("stepup_key_auth");
+                    stepUpKey.Auth.Write(writer);
                 }
 
                 writer.WriteEndObject();
@@ -297,6 +342,45 @@ namespace DeviceTrust.Client.Protocol
             {
                 _httpClient.Dispose();
             }
+        }
+
+        /// <summary>
+        /// Writes the <c>key_security</c> block from what the key store reported.
+        /// </summary>
+        /// <remarks>
+        /// A level the store could not determine is sent as null together with
+        /// a null <c>hardware_backed</c>. Sending <c>false</c> for "unknown" would
+        /// be a claim of software backing on no evidence, which a server with
+        /// <c>INTEGRITY_HARDWARE_BACKING_POLICY=advisory</c> scores +30 — the
+        /// exact collapse DESIGN.md 50 forbids on the server side.
+        /// </remarks>
+        public static void WriteKeySecurity(Utf8JsonWriter writer, InstallationKeyMetadata metadata)
+        {
+            var known = !string.IsNullOrWhiteSpace(metadata.SecurityLevel)
+                        && !string.Equals(metadata.SecurityLevel, "unknown", StringComparison.OrdinalIgnoreCase);
+
+            writer.WriteStartObject();
+            if (known)
+            {
+                writer.WriteString("security_level", metadata.SecurityLevel);
+                writer.WriteBoolean("hardware_backed", metadata.HardwareBacked);
+            }
+            else
+            {
+                writer.WriteNull("security_level");
+                writer.WriteNull("hardware_backed");
+            }
+
+            if (string.IsNullOrWhiteSpace(metadata.Provider))
+            {
+                writer.WriteNull("provider");
+            }
+            else
+            {
+                writer.WriteString("provider", metadata.Provider);
+            }
+
+            writer.WriteEndObject();
         }
 
         private static DeviceTrustApiException BuildApiException(int status, JsonElement parsed, bool hasBody)

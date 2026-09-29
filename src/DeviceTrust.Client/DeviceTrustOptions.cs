@@ -1,4 +1,5 @@
 using System;
+using DeviceTrust.Client.Keys;
 
 namespace DeviceTrust.Client
 {
@@ -44,6 +45,15 @@ namespace DeviceTrust.Client
 
         /// <summary>How long any single HTTP call may take. Defaults to 15 seconds, as in the Flutter client.</summary>
         public TimeSpan NetworkTimeout { get; set; } = TimeSpan.FromSeconds(15);
+
+        /// <summary>
+        /// How the step-up key should be protected, when a step-up key store is
+        /// supplied. Defaults to the passcode on every use (DESIGN.md 51.2 and
+        /// 51.3). It is a request: the key store reports what the platform
+        /// actually enforces, and Android 9/10 downgrades per-use to a 30-second
+        /// hardware window, which the server records.
+        /// </summary>
+        public StepUpKeyAuth StepUp { get; set; } = StepUpKeyAuth.PasscodePerUse;
 
         /// <summary>
         /// A foreign access token injected for the stolen-token boundary test,

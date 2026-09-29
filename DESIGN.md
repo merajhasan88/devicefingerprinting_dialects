@@ -1809,7 +1809,7 @@ after the original four groups and are folded in here so this list is the single
 
 | # | Item | Pass criterion | Phones |
 |---|---|---|---|
-| 1 | Clean baseline scan | `score=18 verdict=trusted` (dev options +8, adb +10) | each |
+| 1 | Clean baseline scan | **Android:** `score=18 verdict=trusted` (dev options +8, adb +10). **iOS:** `score=0 verdict=trusted` on a build put through `tools/presign_trollstore_ipa.sh`, with `INTEGRITY_ALLOW_DEBUG=0` and `INTEGRITY_SCORE_IOS_FAKE_SIGNATURE=0` | each |
 | 2 | Account creation through the enforce gate | `POST /v1/accounts/register` 201 | each |
 | 3 | Stolen access token | `invalid_installation_signature`, refused *after* reaching proof verification | **both, simultaneously** |
 | 4 | Stolen refresh token | refresh challenge 200 (token genuine) **then** refresh 401 | **both, simultaneously** |
@@ -1817,29 +1817,46 @@ after the original four groups and are folded in here so this list is the single
 | 6 | Boundary: body tampering | 401 `access_proof_body_mismatch` | each |
 | 7 | Boundary: path + method tampering | 401 `access_proof_path_mismatch` and `_method_mismatch` | each |
 | 8 | Boundary: stale timestamp | 401 `access_proof_timestamp_outside_window` | each |
-| 9 | Frida Gadget — **name-based** detection (gadget left named `libfrida-gadget.so` on port 27042) | `score=100 verdict=block`, `frida_runtime_artifact` +90 | each |
+| 9 | Frida Gadget — **name-based** detection (gadget left named `libfrida-gadget.so`, port 27042) | `score=100 verdict=block`, `frida_runtime_artifact` +90 | each |
 | 10 | Frida Gadget — enforcement | `POST /v1/accounts/login` 403 `integrity_blocked` | each |
 | 11 | Frida Gadget — restore | clean APK (0 frida entries) returns `18/trusted` | each |
 | 12 | Device memory across a new hardware key | **Android:** full uninstall + reinstall. **iOS:** `deleteKey` then re-enrol (see below). Either way a new hardware key → 403 `integrity_device_blocked_recently` | each |
 | 13 | Pristine re-enrolment (recognition) | **Android:** uninstall + reinstall. **iOS:** `deleteKey` then re-enrol. `devices` unchanged, `installations` +1, same `device_id`, **login 200** | each |
 | 14 | Structural code-integrity (ext bucket) | deferred libc++ hook → `ext_diff_bytes > 0` → `android_code_integrity_violation` +90 → `block` | each |
 | 15 | Key survives app reinstall (**iOS only**) | uninstall + reinstall **without** `deleteKey` → `getOrCreateKey` returns `created: false`, the **same** key thumbprint, and the same `installation_id` | iPhone |
-| 16 | Structural code-integrity (**app bucket**) | hook the app's **own** native code → `app_diff_bytes > 0` → `android_app_code_modified` +90 → `block` | each |
+| 16 | Structural code-integrity (**app bucket**) | hook or modify the app's **own** native code → `app_diff_bytes > 0` → `android_app_code_modified` +90 → `block` | each |
 
-**Item 9 is the weakest item in the list, and is named to say so.** It tests detection by *filename*,
-which DESIGN.md 27.11 already proved defeatable: a real gadget renamed to `libhelper.so` and moved
-off port 27042 scored `18/trusted` while fully active. It is retained because an attacker who does
-not bother to rename should still be caught cheaply, but a passing item 9 says much less than a
-passing item 14 or 16. When running 14 and 16, rename the gadget and move its port deliberately, so
-that only the structural signals can fire — otherwise those items are not testing what they claim.
+**Item 9 is the weakest item in the list, and is now named to say so.** It tests detection by
+*filename*, which §27.11 proved defeatable — a real gadget renamed `libhelper.so` and moved off port
+27042 scored `18/trusted` while fully active. It is kept because an attacker who does not bother to
+rename should still be caught cheaply, but a passing item 9 proves far less than a passing item 14
+or 16.
 
-**Item 16 is item 14 aimed at the application's own code rather than a system library.** It is
-separated because the two catch different attacks and are configured by different server settings:
-14 raises `android_code_integrity_violation` from the ext bucket, 16 raises
-`android_app_code_modified` from the app bucket, and both are gated behind
-`INTEGRITY_SCORE_EXTENDED_LIBS`. For a customer, 16 is the more directly meaningful of the two —
-it is *their* code an attacker wants to patch — and an app bucket reporting
-`app_compared_bytes: 0` is inert rather than clean, which is invisible in the score.
+**When running items 14 and 16, rename the gadget and move its port deliberately.** Otherwise the
+name-based signals fire, the verdict is over-determined, and those items pass for the wrong reason
+without testing the structural probes at all. This is a correction to how item 14 was first run in
+§30.3: `android_frida_runtime_artifact` fired alongside the structural reasons, so the block was
+over-determined. The bucket evidence (`ext_diff_bytes 100`) was still unambiguous, but the run did
+not isolate what it claimed to. The .NET session ran it correctly — gadget renamed, port 27999 —
+and saw only `android_code_integrity_violation` and `android_instrumentation_runtime_thread` fire.
+
+**Item 16 is item 14 aimed at the application's own code rather than a system library.** They are
+separated because they catch different attacks and report through different reasons: 14 raises
+`android_code_integrity_violation` from the ext bucket, 16 raises `android_app_code_modified` from
+the app bucket. For a customer, 16 is the more directly meaningful — it is *their* code an attacker
+wants to patch. An app bucket reporting `app_compared_bytes: 0` is inert rather than clean, and that
+is invisible in the score.
+
+**Item 1's two criteria are not arbitrary.** The Android figure is 18 because the test handsets run
+with developer options and ADB enabled, which are real signals the server is right to score. The iOS
+figure is 0 because an iPhone has no equivalent pair of switches — but only on a **pre-signed** build.
+TrollStore grants `get-task-allow` to everything it installs, which is `ios_get_task_allow` +35, and
+before §37 that made `trusted` unreachable on iOS at all. Both flag states are named in the criterion
+because each changes the expected number: `INTEGRITY_ALLOW_DEBUG=1` would mask the +35 rather than
+remove it (and would also disable `ios_process_traced`), and
+`INTEGRITY_SCORE_IOS_FAKE_SIGNATURE=1` scores the same clean device at 100, since a TrollStore
+install trips the fake-signature rules by construction. A bare "score 0" would therefore be
+unreproducible.
 
 **Items 12, 13 and 15 differ by platform, deliberately.** Android Keystore entries are destroyed
 when the app is uninstalled, so a reinstall necessarily enrols a new hardware key — which is exactly
@@ -2903,3 +2920,2022 @@ There is no `/proc/self/maps` and no readable `/proc/self/mem` on iOS. The equiv
 against the same range of the on-disk Mach-O — including the `slide` returned by
 `_dyld_get_image_vmaddr_slide`. That is a genuinely different design from the Linux version rather
 than a port, and it is the natural `collector_version` 2 for iOS.
+
+---
+
+# 34. Adopting the .NET session's findings, and first iOS scoring checks (2026-09-07)
+
+`DESIGN_UPDATE_FROM_DOTNET.md` arrived from the .NET SDK session. Its battery edits were adopted
+(§25.11), and it found a genuine defect here.
+
+## 34.1 A latent crash in the native code-integrity probe
+
+Android 10+ maps system libraries **execute-only** (`--xp`). The native probe selected mappings on
+the executable bit and then read through the pointer, so on any device using XOM it would have
+segfaulted. It had not fired on the OPPO (Android 9, no XOM) or the Huawei only by luck. The .NET
+implementation hit it directly: **283 of 336 executable mappings on the Huawei are `--xp`**.
+
+The probe now lifts `PROT_READ` for the duration of the copy and restores the original protection on
+every exit path. Where `mprotect` is refused it skips the mapping and **counts** it, reporting
+`xom_regions_unlocked` and `xom_regions_unreadable`. Skipping silently is exactly how a bucket ends
+up inert while still reading as clean — the failure mode §28.8 records shipping once already.
+
+**Not yet verified on hardware.** The AWS stack is down, so this compiles but has not run on a
+handset. It must be re-baselined on both phones before it is trusted.
+
+## 34.2 Item 9 was over-claiming, and items 14/16 were run wrongly
+
+Item 9 tests detection **by filename**, which §27.11 proved defeatable. It is renamed to say so.
+
+More important operationally: when items 14 and 16 are run with the gadget left named
+`libfrida-gadget.so` on port 27042, the name-based signals fire too and the verdict is
+over-determined — the item passes without demonstrating the structural probes. **That is how item 14
+was first run here** (§30.3): `android_frida_runtime_artifact` fired alongside the structural
+reasons. The bucket evidence (`ext_diff_bytes 100`) was still unambiguous, so the conclusion holds,
+but the run did not isolate what it claimed. The .NET session ran it properly — gadget renamed, port
+27999 — and saw only the two structural reasons fire.
+
+## 34.3 The W^X trap, guarded before it can be introduced
+
+A clean .NET Android device scores `android_wx_memory +60` and is refused: Mono maps
+writable-and-executable memory by design and there is no client-side fix. ART, which also has a JIT,
+contributes zero because it never grants write and execute on the same mapping — so "trust managed
+runtimes" is the wrong rule; the property that differs is the allocator's W^X policy.
+
+The proposed fix scores W^X against an operator-pinned per-build baseline keyed on `apk_sha256`
+— correctly **not** on a runtime name the client reports, since a compromised app could then claim
+the allowance. **That rule is not implemented here; it is a security-posture change and belongs to
+the owner.**
+
+What *is* implemented is the guard against its trap. `wx_bytes` is a field only the .NET collector
+sends. A naive `int(probe.get("wx_bytes") or 0)` reads **absent as zero**, computes no excess, and
+silently switches off W^X scoring for every Flutter report — a Flutter device with a live injected
+gadget would score nothing. A conformance check now asserts that a report with `wx_mappings > 0` and
+**no** `wx_bytes` still scores `android_wx_memory`. Same class of defect as a bucket reporting
+`compared_bytes: 0` and reading as clean.
+
+## 34.4 First checks for the iOS scoring rules
+
+`_score_ios_integrity` had **never been executed**. Seven checks now exercise it against crafted
+reports: pristine iPhone scores zero, jailbreak artifacts, Frida in dyld images, a hooking
+framework, sandbox escape as a hard block, `DYLD_INSERT_LIBRARIES`, and a traced process. The suite
+gains an iOS registration path and an iOS clean probe set, and `clean_probes` now dispatches on
+platform because the two collectors report entirely different measurements.
+
+This proves the server half before any iPhone exists. The collector half still needs hardware.
+
+## 34.5 A Simulator false positive, closed
+
+The iOS Simulator's filesystem is the **Mac's** filesystem, and macOS genuinely ships `/bin/bash`,
+`/bin/sh`, `/usr/bin/ssh` and `/usr/sbin/sshd` — four entries in `jailbreakPaths`. Running the probe
+there would report a confident jailbreak on a clean machine. It now returns `unsupported` with the
+reason `simulator_filesystem_is_the_host` rather than a fabricated clean result or a false positive.
+
+## 34.6 Independent agreement is evidence
+
+The .NET `code_integrity`, implemented in pure C# with `Marshal.Copy` and no NDK component,
+reproduces this repository's Huawei figures exactly: core 4,808,704, ext 4,943,872, the recurring
+`core_diff=71` from Frida's own libc patch, and `ext_diff_bytes=105` / `ext_libs_diff=1` under a
+libc++ hook. Two independent implementations agreeing to the byte is meaningful evidence that both
+are right.
+
+# 35. First iOS run on hardware, and what TrollStore's signature revealed (2026-09-09)
+
+Everything up to this point on iOS was written blind. `InstallationKeyManager.swift` and
+`IntegrityProbeManager.swift` had never been compiled by Xcode, never run on an ARM device, and
+never spoken to the server. This section records the first end-to-end run on a physical iPhone, the
+one compile error that mattered, and two findings that came out of it — one of which is a defect in
+this repository that had been present since the beginning.
+
+Hardware: **iPhone 7 (iPhone9,3, A10 Fusion, arm64), iOS 15.8.5 (19H394)**, no passcode, no Apple ID
+signed in at purchase. Backend: the AWS stack, PostgreSQL 18.3, `INTEGRITY_MODE=observe`.
+
+## 35.1 Getting an unsigned build onto a stock iPhone, without a Mac
+
+The constraint that shaped this whole path is that there is no Mac and no paid Apple Developer
+account. The chain that worked, all of it from Linux:
+
+1. **Codemagic** builds `flutter build ios --release --no-codesign` and packages `Runner.app` into
+   `Payload/` by hand, because `flutter build ipa` demands signing. Free tier, manual trigger only.
+2. A **free Apple ID**, created in a browser. This is the step with a trap: an Apple ID created only
+   in a browser is not fully activated, and developer-session creation fails with
+   **`-22411 "This action cannot be completed at this time"`**. Apple completes account setup on
+   first sign-in *on a device*, when the iCloud terms are accepted. Signing in on the phone and then
+   immediately turning **Find My off** activates the account without creating an Activation Lock,
+   which would otherwise bind the device to that Apple ID for every future restore.
+3. **Sideloader** (Dadoum) signs and installs `TrollInstallerX.ipa` over `usbmuxd`. It ships a
+   prebuilt Linux x86_64 binary; PlumeImpactor is source-only and AltServer-Linux is dated.
+4. **TrollInstallerX** exploits the kernel (`kfd`/physical use-after-free), installs a persistence
+   helper into **Tips** — a stock app with no system function — and installs **TrollStore**.
+5. TrollStore installs our unsigned `.ipa` permanently, served over HTTPS from the EC2 host via
+   `apple-magnifier://install?url=…`.
+
+The device is **not jailbroken**. It runs stock iOS 15.8.5, and DFU restore remains available
+because the A10 bootrom is checkm8-vulnerable and unpatchable. The only irreversible element is the
+firmware version: Apple no longer signs 15.8.5, so a restore lands on 15.8.8, which is still inside
+both the TrollStore and TrollRestore version windows.
+
+**The signing defect worth recording.** The first install of TrollInstallerX crashed instantly at
+launch with no visible error. The device crash report named it exactly:
+
+```
+termination: DYLD "Library missing"
+  Library not loaded: '@loader_path/libxpf.dylib'
+  Reason: code signature invalid (errno=1) sliceOffset=0x00004000
+```
+
+`libxpf.dylib` sits at the **bundle root**, not in `Frameworks/`, and signing tools walk
+`Frameworks/` and `PlugIns/`. It kept its original signature, invalid under our certificate. Thinning
+it to `arm64`, moving it into `Frameworks/`, and patching the load command with
+`llvm-install-name-tool` fixed it. Worth remembering generally: a sideloaded app that flashes and
+closes is usually an unsigned nested binary, and the crash report says so precisely.
+
+## 35.2 `SecTask` is macOS-only, so read our own Mach-O instead
+
+The `code_signing` probe was written against `SecTaskCreateFromSelf`,
+`SecTaskCopySigningIdentifier` and `SecTaskCopyValueForEntitlement`. Those are declared in
+`Security/SecTask.h`, which Apple ships as public API on **macOS only** — on iOS the symbols are
+private, and the build failed with three `Cannot find … in scope` errors.
+
+The replacement reads the app's **own executable** and walks `LC_CODE_SIGNATURE` into the embedded
+signature SuperBlob: the signing identifier comes from the CodeDirectory's `identOffset`, and the
+team identifier and `get-task-allow` from the entitlements plist. Fat images resolve to their arm64
+slice, and integers are assembled byte by byte because the offsets are not guaranteed to be aligned
+and `loadUnaligned` is unavailable at the iOS 15.0 deployment target.
+
+This is a better measurement than the API it replaces, for exactly the reason the Android buckets
+report `compared_bytes`: it describes **what is actually in the file** rather than what the kernel
+was told at launch. It also degrades honestly — an unsigned build carries no `LC_CODE_SIGNATURE`
+at all and now reports `signed: false, signature_absent: true`, rather than presenting as a signed
+app whose fields happen to be empty.
+
+## 35.3 The run
+
+Every step of the critical path worked on the first attempt:
+
+| step | result |
+|---|---|
+| `POST /v1/installations/register` | `201` — ES256, EC P-256, `new_device`/`new` |
+| `POST /v1/installations/challenge` → `/verify` | `200` — **Secure Enclave DER signature accepted** |
+| `POST /v1/integrity/challenge` → `/report` | `200` — `collector_version 1`, all 8 probes `status: ok` |
+| `GET /v1/device/me` | `200` |
+| score | **35, `elevated`**, `hard_block: false` |
+
+The signature interop is the result that mattered most. Android produces its signature through
+`SHA256withECDSA` and iOS through `ecdsaSignatureMessageX962SHA256`; both are ASN.1 DER, and the
+server's PyCryptodome verification accepted the iOS one with **no server change**. The decision
+recorded in §4 — sign the transmitted bytes, never a canonically re-serialised structure — is what
+made that possible.
+
+Every other probe read correctly: sandbox write refused, not traced, not a simulator, 437 dyld
+images with zero suspicious tokens, no `DYLD_INSERT_LIBRARIES`, and no jailbreak files. That last
+one is the *right* answer: TrollStore is not a jailbreak, and there is no Cydia, Sileo or `/var/jb`
+on this device.
+
+## 35.4 What TrollStore's signature looks like from inside the app
+
+The `.ipa` we built had **zero** `LC_CODE_SIGNATURE`. TrollStore adds one during installation, and
+the new parser read it back out of the installed binary:
+
+```json
+"code_signing": {
+    "signed": true,
+    "get_task_allow": true,
+    "team_identifier": "TROLLTROLL",
+    "signing_identifier": "com.icraze.gtatracker",
+    "entitlement_count": 5,
+    "code_directory_flags": 0
+}
+```
+
+Two things are visible here that no baseline was needed to see.
+
+**`team_identifier` is literally `TROLLTROLL`** — a hardcoded fake team.
+
+**`signing_identifier` is `com.icraze.gtatracker`, not our bundle identifier.**
+
+That sentence is the measurement. The paragraph that originally followed it was not, and has been
+replaced, because it described the wrong bug. CVE-2023-41991 is a **multiple-signer confusion**
+vulnerability: a single CMS blob carries two signers, and CoreTrust decides the binary is
+Apple-signed from the *first* signer's certificate chain while validating the binary against the
+*second* signer's CodeDirectory hashes ([The Apple Wiki][ct]). TrollStore supplies a real App Store
+binary's signature as the first signer.
+
+What has **not** been established is which part of that assembly produces the identifier our probe
+reads. The probe reads slot 0 of the SuperBlob; whether the donor identifier reliably lands there
+across TrollStore versions and donor binaries is unknown. So the rule in §35.5 may be keying on an
+artifact of how TrollStore builds the blob rather than on something intrinsic to the exploit — which
+is a further reason, beyond the missing clean baseline, for it to stay report-only.
+
+Settling it needs the collector to report the full SuperBlob slot inventory rather than slot 0
+alone, which is a probe change and a rebuild.
+
+[ct]: https://theapplewiki.com/wiki/CoreTrust_Multiple_Signer_Validation_Vulnerability
+
+Only `get-task-allow` scored, for `+35`. The far stronger signals were sitting in the same probe
+output unscored, which is what the observe run was for.
+
+## 35.5 Action item 1 — a structural fake-signature rule
+
+**Proposed:** `ios_signing_identifier_bundle_mismatch`, raised when
+`code_signing.signing_identifier` is non-empty and differs from `app_identity.bundle_id`.
+
+A legitimately signed iOS application always has CodeDirectory identifier equal to its bundle
+identifier; Xcode derives one from the other. A mismatch is an **invariant violation**, not a
+heuristic. It requires no configured baseline, which matters because
+`ios_signing_identifier_mismatch` and `ios_team_identifier_mismatch` already exist but fire only
+when `EXPECTED_IOS_SIGNING_ID` / `EXPECTED_IOS_TEAM_ID` are set — and an unconfigured deployment
+therefore scores a fake-signed app at zero for this.
+
+Suggested weight `+90`, not a hard block on its own, pending observation on a legitimately signed
+build. **This rule cannot be adopted until a normally signed iOS build has been observed**, because
+the entire evidence base for it is one TrollStore installation; the discipline in §28 applies —
+ship report-only, baseline on real hardware, only then score.
+
+**Action — DONE (report-only), 2026-09-14.** Implemented as `ios_signing_identifier_bundle_mismatch`, gated behind `INTEGRITY_SCORE_IOS_FAKE_SIGNATURE` (default `0`). **Still open:** observe one legitimately signed iOS build not raising it, then flip the default.
+
+## 35.6 Action item 2 — the `TROLLTROLL` marker, and why it is the weaker rule
+
+**Proposed:** `ios_known_fake_team_identifier`, raised when `team_identifier` matches a known
+fake-signing marker such as `TROLLTROLL`.
+
+This is deliberately recorded as the *secondary* rule, because it is a **name match**, and §27.11
+already proved on Android exactly how that ends: a Frida gadget renamed to `libhelper.so` and moved
+off port 27042 scored `18/trusted` while fully active. One patched constant in a TrollStore fork
+defeats this rule completely, and it is a one-line change in a public repository.
+
+It is still worth having — an attacker who does not bother to change it should be caught cheaply —
+but it must be weighted and documented as corroborating evidence, not as the detection. Suggested
+weight `+25`, never a hard block, and §25.11 should say plainly that a passing test of this rule
+proves much less than a passing test of 35.5.
+
+**Action — DONE (report-only), 2026-09-14.** Implemented as `ios_known_fake_team_identifier`, weight 25, never a hard block, behind the same flag. `IOS_KNOWN_FAKE_TEAM_IDS` currently holds one entry, `TROLLTROLL`.
+
+## 35.7 The defect this run exposed: hardware backing was never recorded
+
+The run enrolled successfully with a Secure Enclave key — and that fact was **unprovable from the
+server**, because the server never stored it.
+
+`InstallationKeyManager` on both platforms reports `security_level`, `hardware_backed` and
+`provider`. The Dart client parses all three and *requires* them to be present and correctly typed
+(`NativeKeyMetadata.fromPlatform` throws otherwise). It then never sent them. `device_trust_server.py`
+referenced none of the three names anywhere, and `app_installations` had no column for them.
+
+The consequence is worth stating plainly. `InstallationKeyManager` falls back to a software
+keychain key when the Secure Enclave path fails, and reports that honestly — but a software-backed
+installation and a Secure Enclave installation were **indistinguishable to the server**. A
+successful enrolment proved that *a* P-256 key existed, not that it was hardware-protected. The
+same held for StrongBox versus a software fallback on Android.
+
+**Fixed in migration 002 and the accompanying server and client changes:**
+
+- `app_installations` gains `key_security_level`, `key_hardware_backed` and `key_provider`.
+- The Dart client sends a `key_security` block at registration.
+- The server parses, validates and persists it, and returns it in the registration response.
+
+**Every column is nullable, and that is the load-bearing part.** `NULL` means *this client did not
+report it* and must never be read as `software`. The Kotlin and .NET collectors do not send the
+block at all, and a server that collapsed a missing `hardware_backed` to `False` would mark every
+Android installation software-backed on no evidence. This is the third appearance of one defect
+class in this project — an absent measurement mistaken for a benign one — after the integrity
+bucket reporting `compared_bytes: 0` and scoring as clean (§28.8), and the .NET session's `wx_bytes`
+field being absent on Flutter reports and computing to a harmless zero (§34.3). It is worth naming
+as a recurring hazard rather than three coincidences.
+
+**What this value is and is not.** It is a *client claim* about its own keystore. A compromised
+client can lie about it, so it is a risk input and never proof — the boundary in §2 is unchanged.
+Its value is comparative: the key thumbprint is the authoritative identity, and a non-exportable
+hardware key cannot migrate into software. The same thumbprint later claiming a weaker level is
+therefore a contradiction, and the server logs it, refuses to downgrade the stored value, and
+returns `key_security.downgrade_reported`. Re-registration otherwise uses `COALESCE`, so a client
+that does not report the block cannot erase a value another one recorded.
+
+**Deliberately not done:** no scoring weight is attached to a software-backed key yet. That changes
+verdicts and needs a decision about whether hardware backing is required, advisory, or
+policy-driven per deployment. The measurement is now recorded; the policy is a separate choice.
+
+**Action — conformance check DONE, 2026-09-14** (`identity: an absent key_security records null,
+never false`, plus its positive counterpart). **Still open:** the policy decision on what, if
+anything, a software-backed key should score.
+
+### Verified on hardware, 2026-09-09
+
+Three registrations, exercising all three paths on the iPhone 7:
+
+| time | call | path | stored |
+|---|---|---|---|
+| 19:35:02 | `201` | first enrolment, old client | `NULL / NULL / NULL` |
+| 19:49:25 | `201` | fresh install, old client, `INSERT` | `NULL / NULL / NULL` |
+| 20:10:53 | `200` | rebuilt client, `COALESCE` update | `secure_enclave / true / SecureEnclave` |
+
+The middle row is the one that matters for correctness: a genuine `INSERT` through the new code
+with the block absent stored `NULL`, not `false`. Across the table, `null_not_reported: 1`,
+`false_software: 0`, `true_hardware: 1` — a not-reported installation and a hardware-backed one
+coexisting, with nothing wrongly claiming software.
+
+**The substantive answer: the key is genuinely Secure Enclave-backed.** The graceful fallback in
+`InstallationKeyManager.generateKey` did not fire, `kSecAttrTokenIDSecureEnclave` was accepted with
+`.privateKeyUsage` and `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`, and the key remained
+usable unattended with no passcode set on the device. That last point had been reasoned about but
+never demonstrated.
+
+Incidentally confirmed in the same sequence: the Secure Enclave key **survives a TrollStore app
+upgrade** — the 20:10:53 call returned `200` on the existing thumbprint rather than enrolling a new
+installation — and **iOS reinstall correlation works on hardware**. The 19:49:25 registration
+produced a second, genuinely distinct key thumbprint that the IDFV-derived hint correlated back onto
+the same `device_id`, giving one device with two installations. The key stayed authoritative
+throughout; the hint only merged the device record.
+
+
+# 36. The two fake-signature rules, and a way to test scoring for free (2026-09-14)
+
+§35 left three action items. Two are now implemented, both **report-only by default**, and the
+third — the conformance check — is written. What remains open is deliberate and recorded at the end.
+
+## 36.1 What shipped
+
+| rule | weight | fires when | hard block |
+|---|---|---|---|
+| `ios_signing_identifier_bundle_mismatch` | 90 | CodeDirectory identifier ≠ bundle identifier, both non-empty | no |
+| `ios_known_fake_team_identifier` | 25 | team identifier is in `IOS_KNOWN_FAKE_TEAM_IDS` | never |
+
+Both sit behind `INTEGRITY_SCORE_IOS_FAKE_SIGNATURE`, default `0`. Neither needs `EXPECTED_IOS_*`
+to be configured, which is the point: an unconfigured deployment previously scored a fake-signed
+application at **zero** for its signature.
+
+`_integrity_reason` gained a `report_only` parameter. A report-only reason appears in the stored
+report and the API response with `points: 0` and `hard: false`, plus two extra keys —
+`report_only: true` and `proposed_points` — so an operator can see what enabling the rule *would*
+cost before enabling it. Those two keys appear **only** in the report-only case, so a rule that is
+actually scoring produces output byte-identical to every other rule and nothing downstream changes
+shape when the flag is flipped. `/health/ready` now reports `scoring_flags`, because a reader
+looking at a low score needs to distinguish a signal that was absent from one that was merely inert.
+
+## 36.2 Why they ship inert
+
+The entire evidence base for §35.5 is one TrollStore installation. **No legitimately signed iOS
+build has ever been observed by this server** — the rig cannot produce one, since a properly signed
+build needs a paid Apple Developer account, which is precisely what the Mac-free path exists to
+avoid. The invariant claimed in §35.5 (Xcode derives the CodeDirectory identifier from the bundle
+identifier, so they always match) is well founded, but "well founded" is not "observed", and §28
+exists because this project has previously shipped a signal that read as clean when it was
+measuring nothing at all.
+
+`ios_known_fake_team_identifier` could safely be scored today — no legitimate application has team
+identifier `TROLLTROLL` — but it is held behind the same flag so the pair is enabled together, after
+one clean baseline, rather than leaving a half-armed rule to be forgotten.
+
+## 36.3 Scoring changes are now testable without spending money
+
+Previously the only way to exercise a scoring rule was `conformance_suite.py`, which needs a running
+server and therefore a live RDS instance. That made the cheapest possible check of a pure function
+cost real money and several minutes — the wrong shape for something with no I/O in it.
+
+`tools/check_ios_scoring_rules.py` calls `_score_ios_integrity` directly, with the server's
+third-party imports stubbed out, so it runs on the **system interpreter with no virtualenv and no
+installed dependencies** — like the other tools in that directory. Twenty-three assertions, well
+under a second.
+
+The assertions that earn their keep are the false-positive guards, not the detections:
+
+- a correctly signed application does **not** raise the invariant rule;
+- an **unsigned** build, which honestly reports an empty signing identifier, is not mistaken for a
+  fake signature;
+- a client that omits the fields entirely raises nothing.
+
+That third one is the recurring hazard named in §35.7 — absence read as a finding — approached from
+the opposite direction to the `compared_bytes: 0` and `wx_bytes` cases. There, an absent measurement
+was mistaken for a *benign* value; here it could be mistaken for a *damning* one. Both are the same
+error, and both are now pinned by a test.
+
+The tool also pins the arithmetic on the real device, in both flag states: the observed iPhone 7
+scores **35** today and would score **150** (35 + 90 + 25) with the rules enabled. That number is
+the actual cost of flipping the flag, stated before anyone flips it.
+
+## 36.4 Still open
+
+- **Observe a legitimately signed iOS build.** Until then `INTEGRITY_SCORE_IOS_FAKE_SIGNATURE`
+  stays `0`. This is the only thing standing between these rules and being scored.
+- **Decide what a software-backed key should score** (§35.7). The measurement is recorded; the
+  policy is not, and it changes verdicts.
+- **The rig's permanent +35 floor.** Every iOS measurement from this device carries
+  `ios_get_task_allow`, because TrollStore grants that entitlement to everything it installs. A
+  genuinely trusted iOS reading is not obtainable here at all.
+
+# 37. Removing the rig's +35 floor at the source (2026-09-14)
+
+§36.4 listed the permanent `+35` on every iOS measurement as an accepted limitation of the test rig.
+It was not a limitation; it was a thing nobody had tried to remove. This section records removing it,
+and the two claims that had to be checked rather than assumed along the way.
+
+## 37.1 Why `INTEGRITY_ALLOW_DEBUG` was the wrong answer
+
+The obvious workaround — the one used for the enforce-mode test in §35 — is to set
+`INTEGRITY_ALLOW_DEBUG=1`. Measured rather than assumed, that flag gates **six** rules, not one:
+
+```
+android_debuggable          android_debugger_connected / waiting_for_debugger
+android_tracer_pid          ro.debuggable
+ios_get_task_allow (+35)    ios_process_traced (+50)
+```
+
+So clearing the +35 that way also blinds the server to a debugger actually attaching to the
+process. That makes it usable for a single controlled test and unusable as the rig's normal state,
+which is not how it was presented in §35 when it was proposed.
+
+## 37.2 The entitlement is TrollStore's, not ours
+
+Our Codemagic artifact ships with **zero** `LC_CODE_SIGNATURE` and no entitlements file — there is
+no `CODE_SIGN_ENTITLEMENTS` in the Xcode project and no `.entitlements` in the bundle. So
+`get-task-allow` is not something the build asks for. TrollStore adds it, along with four others, so
+its JIT option works.
+
+Read off the device rather than guessed, TrollStore granted exactly five:
+
+```
+application-identifier                          TROLLTROLL.*
+com.apple.developer.team-identifier             TROLLTROLL
+com.apple.private.security.container-required   com.example.devicefingerprinting
+get-task-allow                                  true          <- the +35
+keychain-access-groups                          [TROLLTROLL.*, com.apple.token]
+```
+
+TrollStore's documentation states that it **preserves** entitlements already present in a binary
+instead of applying its defaults. That is the whole mechanism this rests on, and it was confirmed on
+device rather than taken on trust.
+
+## 37.3 What was done
+
+`ldid -S<entitlements> -I<bundle-id>` pseudo-signs the main executable with those same four
+entitlements minus `get-task-allow`, before the `.ipa` reaches TrollStore.
+
+`keychain-access-groups` is reproduced **byte for byte**, and that is the load-bearing detail. The
+Secure Enclave key lives in the `TROLLTROLL.*` access group; change that value and the existing key
+becomes unreachable, the app silently generates a new one, and the installation identity resets on
+every rebuild — turning a one-line entitlement change into a device-identity reset.
+
+The CodeDirectory identifier is set explicitly to the bundle identifier, because that is what a
+legitimately signed application has and because leaving `ldid` to derive it from the file name would
+produce `Runner`.
+
+## 37.4 Measured on the device
+
+| | before | after |
+|---|---|---|
+| entitlement count | 5 | **4** |
+| `get-task-allow` | `true` | **absent** |
+| other four entitlements | — | **unchanged** |
+| `Key created this launch` | — | **No** |
+| provider / security level | — | `SecureEnclave` / `secure_enclave` |
+
+Entitlements are embedded in the code signature, so they cannot change unless the binary was
+replaced — which is what establishes that the install landed. TrollStore reported nothing and the
+Apps list looked identical, because it was an in-place upgrade onto the same bundle identifier and
+the same container path.
+
+`Key created this launch: No` is the result that matters beyond the score: the existing Secure
+Enclave key was **loaded, not regenerated**, so this is still the same installation with the same
+hardware key. The +35 is gone with no server-side suppression and `ios_process_traced` fully live.
+
+Reproducible via `tools/presign_trollstore_ipa.sh`, which fails closed if `get-task-allow` survives
+signing or the entitlements do not match the checked-in plist exactly. It was verified by running it
+against the same Codemagic artifact and confirming it produces a byte-identical signed executable to
+the one installed by hand — `sha256 c019a07e…`.
+
+## 37.5 What this does not settle
+
+The device now carries a CodeDirectory identifier of `com.example.devicefingerprinting`, written by
+`ldid` **before** TrollStore resigned it. Whether TrollStore left that alone or replaced it with the
+donor binary's identifier is unknown, and it decides something important: if ours survived, then
+`ios_signing_identifier_bundle_mismatch` (§35.5) does **not** detect a TrollStore installation in
+the general case, and the rule is considerably weaker than §35.4 claimed.
+
+Reading it needs the `code_signing` probe, which needs a server. No prediction is recorded here on
+purpose; the last one in this document was wrong.
+
+Also unresolved: the app's executable hash has necessarily changed, from
+`2cd1903b…` (425,171 bytes) to `c019a07e…` (386,384 bytes), because the signature is part of the
+file. Any deployment that pins `INTEGRITY_IOS_EXECUTABLE_SHA256` must be updated whenever the
+pre-signing step runs.
+
+# 38. A shared-fixture bug the new checks exposed (2026-09-14)
+
+Running the seven checks from §36 for the first time produced two failures, both reporting a score of
+100 where 0 was expected. The cause was not in the new checks.
+
+`clean_probes()` builds the Android fixture as a dict literal, fresh on every call. The iOS branch
+did not:
+
+```python
+if platform == "ios":
+    return {name: IOS_CLEAN[name] for name in required if name in IOS_CLEAN}
+```
+
+That hands out **references into the module-level `IOS_CLEAN`**. Every iOS check that does
+`probes["jailbreak_files"].update({...})` to simulate a compromise was therefore mutating the shared
+fixture permanently, and each later iOS check ran against a progressively dirtier "pristine" device.
+By the end of the iOS block the accumulated penalties exceeded the cap, which is where the 100 came
+from.
+
+Demonstrated directly rather than inferred:
+
+```
+IOS_CLEAN jailbreak found_paths before : []
+                            AFTER      : ['/Applications/Cydia.app']
+a FRESH "clean" probe set now returns  : ['/Applications/Cydia.app']
+same object? True
+```
+
+**Why it survived until now.** Every pre-existing iOS check asserts only that a particular reason
+code is *present*. That assertion still holds on a dirty fixture — an extra `ios_jailbreak_artifact`
+does not stop `ios_process_traced` from appearing. Only a check asserting an **exact score** can see
+the pollution, and until §36 no iOS check did. `check_ios_clean` asserts `score == 0` and passed
+throughout, because it runs before any mutating iOS check.
+
+So the earlier iOS results in §34.4 were not wrong, but they were weaker than they read: from the
+second mutating check onward, each was verifying its signal on a device that also had every previous
+check's compromise applied. Fixed with `copy.deepcopy`, after which the suite is **43 passed, 0
+failed, 2 skipped** — the two skips being the enforcement checks, which correctly skip in observe
+mode.
+
+The general lesson is worth keeping separate from the specific bug: **a test that only asserts
+"the signal fired" cannot detect contamination of its own fixture.** Asserting the exact score is
+what made the suite able to see this, and it is cheap to do wherever a fixture is meant to be clean.
+
+# 39. The device answers both open questions (2026-09-14)
+
+§37.5 left one question open and deliberately recorded no prediction. The device has now answered it,
+along with confirming the +35 removal end to end. Backend for this run was **PostgreSQL 16.15 local
+to the EC2 instance**, not RDS — chosen because neither question is a database question and RDS
+bills by the hour. Results that are meant as portability evidence should still be taken on RDS.
+
+## 39.1 The identifier mismatch is TrollStore's, not an artifact
+
+`ldid` wrote `com.example.devicefingerprinting` into slot 0 of the SuperBlob before the `.ipa`
+reached TrollStore. The device reports:
+
+```json
+"code_signing": {
+    "signed": true,
+    "get_task_allow": false,
+    "team_identifier": "TROLLTROLL",
+    "signing_identifier": "com.icraze.gtatracker",
+    "entitlement_count": 4
+}
+```
+
+Our identifier **did not survive**. So `ios_signing_identifier_bundle_mismatch` (§35.5) does detect a
+TrollStore installation, and the doubt raised in §37.5 — that the rule might be keying on an artifact
+of default entitlements — is resolved in the rule's favour. It survives the strongest test available
+here: everything a legitimate signer would do was done first, and the mismatch reappeared anyway.
+
+This also states TrollStore's behaviour more precisely than §37.2 could. It is not simply that
+TrollStore "preserves entitlements": **it preserves the entitlements supplied to it — four, exactly
+ours — while replacing the CodeDirectory.** Entitlements and CodeDirectory are handled differently,
+which is why the +35 fix works and the detection rule survives it.
+
+## 39.2 The +35 removal, confirmed end to end
+
+```
+get_task_allow  false          entitlement_count  4
+score           0              verdict  trusted          hard_block  false
+```
+
+Taken with `INTEGRITY_ALLOW_DEBUG=0`, so nothing is suppressed and `ios_process_traced` stays live.
+This is the first genuinely trusted iOS reading this rig has produced, and it retires the "permanent
++35 floor" recorded as an accepted limitation in §36.4.
+
+**Trusted under the rules currently enabled**, and the qualifier matters. Both fake-signature rules
+fired and contributed nothing by design:
+
+```json
+{"code": "ios_signing_identifier_bundle_mismatch", "points": 0, "report_only": true, "proposed_points": 90}
+{"code": "ios_known_fake_team_identifier",         "points": 0, "report_only": true, "proposed_points": 25}
+```
+
+With `INTEGRITY_SCORE_IOS_FAKE_SIGNATURE=1` this device scores **115**, which is the block band. So
+the rig can now produce either a clean baseline or a caught-red-handed reading from the same
+hardware, depending on one flag — which is considerably more useful than a device permanently stuck
+at 35.
+
+## 39.3 Identity survived everything
+
+```
+installation 39f14bc7   thumbprint 06163520a5d2   secure_enclave / true / SecureEnclave
+```
+
+The same thumbprint and the same installation id as the 2026-09-09 run, across a **fresh database**,
+a Codemagic rebuild, an `ldid` re-sign and a TrollStore reinstall. The installation id persists
+because the client stores it; the thumbprint persists because `keychain-access-groups` was
+reproduced byte for byte (§37.3). Had that value drifted, every rebuild would have silently minted a
+new device identity.
+
+## 39.4 The executable hash baseline cannot come from the build
+
+| stage | bytes | sha256 |
+|---|---|---|
+| Codemagic, unsigned | 382,016 | `33331b93…` |
+| after `ldid` pre-sign, shipped | 386,384 | `c019a07e…` |
+| **on device, as reported** | **425,123** | **`07b56611…`** |
+
+TrollStore rewrites the binary during installation, so the artifact hash and the installed hash are
+necessarily different. **Any deployment setting `INTEGRITY_IOS_EXECUTABLE_SHA256` must use the
+device-reported value, not the hash of the `.ipa` it built.** Pinning the build artifact's hash
+would hard-block every device on first contact.
+
+Incidentally confirmed: the Codemagic iOS host build is **reproducible**. `Runner` was byte-identical
+between two separate builds (`33331b93…`), because no Swift source changed between them; only the
+Dart snapshot in `App.framework` differed, carrying the new server URL. So a pinned hash is stable
+across rebuilds that do not touch the Swift host — though it still has to be taken from the device.
+
+## 39.5 What is still open
+
+- **`INTEGRITY_SCORE_IOS_FAKE_SIGNATURE` stays `0`.** §39.1 removed one of the two reasons for that,
+  but not the other: no legitimately signed iOS build has been observed, and the false-positive
+  guard for the rule is still only a conformance fixture rather than a real Apple-signed app.
+- **The policy decision on software-backed keys** (§35.7) is unchanged.
+- **The enforcement checks** skip in observe mode; the suite has not been run in enforce against this
+  backend.
+
+# 40. The fake-signature rule, proven on hardware in enforce mode (2026-09-14)
+
+§39 measured the rules report-only. This records enabling them and running the whole thing for real,
+plus a scoring detail that a prediction in this session got wrong.
+
+## 40.1 The run
+
+`INTEGRITY_SCORE_IOS_FAKE_SIGNATURE=1`, `INTEGRITY_MODE=enforce`, `INTEGRITY_ALLOW_DEBUG=0`,
+PostgreSQL 16.15 local to the instance.
+
+| | result |
+|---|---|
+| conformance suite | **44 passed, 0 failed, 1 skipped** |
+| device report | `score 100`, `verdict block`, `hard_block false` |
+| reasons | `ios_signing_identifier_bundle_mismatch +90`, `ios_known_fake_team_identifier +25` |
+| `POST /v1/accounts/register` | **403 `integrity_blocked`** |
+
+Across the two configurations run today, **every one of the 45 checks has passed**:
+
+```
+observe + scoring off   43 passed, 0 failed, 2 skipped   (the enforcement checks skip)
+enforce + scoring on    44 passed, 0 failed, 1 skipped   (the report-only check skips)
+```
+
+The single skip in each case is a check correctly standing down because its precondition is absent,
+which is the behaviour those checks were written to have.
+
+**This is the part that matters.** The rule caught a *real* TrollStore installation, on real
+hardware, in enforce mode, and the gate refused a session holding a valid device token, a valid
+access proof and a genuine Secure Enclave key. Every previous demonstration of these two rules was
+against a conformance fixture. §28 exists to insist on exactly this distinction.
+
+## 40.2 The score is capped, and the cap is not the hard-block flag
+
+The prediction recorded before the run was `115`. The device reported **`100`**, and the reasons
+show `+90` and `+25` exactly as expected. The difference is the cap in `_score_integrity`:
+
+```python
+score = min(sum(max(0, int(reason.get("points", 0))) for reason in reasons), 100)
+```
+
+Worth reading the stored row carefully, because two things that look like one thing are not:
+
+```
+score 100    verdict block    hard_block FALSE
+```
+
+Neither rule is a hard block — deliberately, since §35.6 requires a name match never to be one. The
+`block` verdict comes purely from the numeric band (100 ≥ 90). Score and `hard_block` are
+independent controls, and this is a clean instance of the band alone doing the work with no
+fail-closed override involved.
+
+A consequence worth stating for anyone tuning weights: **once the total exceeds 100, additional
+points are invisible.** Two rules at 90 and 25 present identically to one rule at 100. Weights are
+therefore an ordering over which combinations reach a band, not a quantity that keeps accumulating.
+
+## 40.3 The battery is 16 items, and two more are proposed
+
+Confirmed against both `§25.11` here and `docs/handset-battery.md` in the .NET repository: the
+canonical battery is **16 items**. Today's work suggests two additions, recorded as proposals rather
+than folded in, because adding to the battery changes what every future engine run must cover.
+
+```
+| 17 | iOS clean baseline (**iOS only**) | pre-signed TrollStore build → `get_task_allow: false`, `score 0`, `trusted`, with INTEGRITY_ALLOW_DEBUG=0 | iPhone |
+| 18 | iOS fake-signature detection (**iOS only**) | INTEGRITY_SCORE_IOS_FAKE_SIGNATURE=1 → `ios_signing_identifier_bundle_mismatch` +90 → `score 100`, `block`, login 403 | iPhone |
+```
+
+Item 17 is the iOS counterpart of item 1, which is written in Android terms (`18/trusted`, from
+developer options and ADB). It is only meaningful on a build that has been through
+`tools/presign_trollstore_ipa.sh`; without that step the device sits at `35` and can never be
+`trusted`, which is what §37 removed.
+
+Item 18 depends on a flag that is **off by default** and should stay off until §39.5's open item is
+closed, so it would have to be marked as conditional in the battery rather than unconditional.
+
+## 40.4 Corrections to earlier sections
+
+- §36.4 listed "the rig's permanent +35 floor" under *Still open* and described it as a property of
+  the rig. §37 removed it. That entry is superseded.
+- §35.4 stated the CoreTrust mechanism incorrectly; corrected in place with a citation, and §39.1
+  supplies what was actually measured.
+
+# 41. Two clients, one field, and a false positive caught before it shipped (2026-09-14)
+
+Reviewing the .NET SDK's `AppleIntegrityCollector` while preparing its iOS handoff exposed a defect
+in the rule added earlier the same day.
+
+**The two collectors put different values into `code_signing.signing_identifier`.**
+
+| client | source | value on a *legitimately signed* app |
+|---|---|---|
+| Swift (`IntegrityProbeManager.swift`) | CodeDirectory `identOffset` | `com.example.app` |
+| .NET (`AppleIntegrityCollector.cs`) | `application-identifier` entitlement | `ABCDE12345.com.example.app` |
+
+`ios_signing_identifier_bundle_mismatch` compared that field to `bundle_id` for **exact** equality.
+Under the Swift convention that is the invariant §35.5 describes. Under the .NET convention the two
+values are never equal, because the entitlement is always `TEAMID.` + bundle id — so the rule would
+have raised `+90` on **every clean .NET iOS device**, and at `90` that is the block band.
+
+Neither client is wrong. Both values are reasonable readings of "the signing identifier", and the
+field name did not say which was meant.
+
+**Fixed** by accepting either shape:
+
+```python
+identifier_is_consistent = signing_id == bundle_id or signing_id.endswith("." + bundle_id)
+```
+
+A fake signature matches neither, which the offline tool now pins in both directions: a
+`TEAMID.`-prefixed identifier belonging to *this* bundle is accepted, and a `TEAMID.`-prefixed
+identifier belonging to a *different* bundle (`TROLLTROLL.com.someone.else`) is still caught. The
+rule therefore cannot be evaded by adopting the prefixed shape.
+
+**The general point.** A probe field is a contract between two independently written collectors, and
+a name alone does not pin it down. This was caught only because the two implementations were read
+side by side; the conformance suite could not have caught it, because its iOS fixtures were written
+from the Swift client's convention and would have agreed with themselves forever. §34.6 noted that
+two independent implementations agreeing to the byte is good evidence — this is the same coin's
+other face: where they silently *disagree*, only reading both finds it.
+
+Recorded in the .NET handoff as a contract item, with the field defined as the CodeDirectory
+identifier where a collector can read it.
+
+# 42. Battery item 15 — PASS on the iPhone 7 (2026-09-14)
+
+The first item of §25.11 formally executed on iOS. Item 15 exists because Android and iOS diverge on
+what an app uninstall destroys, and that divergence is a property worth asserting rather than
+assuming.
+
+## 42.1 The run
+
+| | before | after |
+|---|---|---|
+| Installation ID | `28a07714-ed32-4774-80a2-b60304f58f36` | **identical** |
+| Key thumbprint | `c0063a46887778dc78d6b93c2399c00b8538785f4d982cea5f20560294b4cbae` | **identical** |
+| Key created this launch | `No` | **`No`** |
+
+The app was removed through the home screen (**Remove App → Delete App**) and reinstalled from a
+pre-signed `.ipa` via TrollStore. `deleteKey` was **not** called, which is the whole point: item 12
+and item 13 use `deleteKey` to force a new key, and item 15 asserts that an ordinary uninstall does
+not.
+
+**PASS.**
+
+## 42.2 What makes the evidence strong
+
+The reinstall was genuine, not an in-place upgrade, and both container identifiers prove it:
+
+```
+bundle container   228B6059-5358-434D-8D48-9BD4C93E5DA2  →  9429B222-9E7A-4B31-B1A2-0D61FCC9BBDD
+data container     (previous)                            →  AE1820C2-692D-4F39-AC71-03B8E1917432
+```
+
+The **data container** is the one that matters. It is the app's entire sandbox — Documents,
+`UserDefaults`, caches — and iOS assigned a new one, so everything stored there was destroyed.
+Anything that survived can only have come from the Keychain.
+
+So the run pins two properties, not one:
+
+1. **The Secure Enclave key survives app deletion.** `created this launch: No` means
+   `getOrCreateKey` *loaded* the existing key rather than generating one, and the thumbprint proves
+   it is the same key.
+2. **`flutter_secure_storage` genuinely backs onto the Keychain, not the sandbox.** The installation
+   id survived a wiped data container, which it could not have done from `UserDefaults` or a file.
+   Nothing had previously checked this, and it is load-bearing: if that storage were sandbox-backed,
+   every reinstall would mint a new installation id while reusing the same key, and the two would
+   disagree.
+
+## 42.3 A control ran by accident, and it helps
+
+At 16:06 the same day, **Simulate fresh installation** was pressed on the same device. That is the
+opposite operation — it calls `deleteKey`, destroying the Secure Enclave key — and the database
+records exactly what item 15 says must *not* happen on an ordinary uninstall:
+
+```
+39f14bc7 | 06163520a5d2 | secure_enclave | new_device      | 15:51:32
+28a07714 | c0063a468877 | secure_enclave | reinstall_hint  | 16:06:21
+```
+
+A genuinely new key, a new installation, correlated back onto the same `device_id` by the
+IDFV-derived reinstall hint. Set beside §42.1, the pair shows the mechanism is discriminating rather
+than simply inert: **deleting the key changes identity, deleting the app does not.** A test that only
+showed the second could not distinguish "the key survived" from "the client never re-checks".
+
+## 42.4 Item 15 is engine-independent
+
+Worth recording because it affects how the battery is scheduled: **every pass criterion for item 15
+is read from the device**, and this run touched no server at all. The instance was running only to
+serve the `.ipa` over HTTPS, and the app's baked-in `API_BASE_URL` still pointed at a previous
+public IP throughout.
+
+So unlike items 2–8, 12 and 13, item 15 exercises no database behaviour and cannot distinguish one
+engine from another. Re-running it per engine family would cost device time and prove nothing new.
+Whether to record it as "run once, engine-independent" rather than "each" is a change to the battery
+and therefore not made here.
+
+## 43. Whole-`__TEXT` telemetry measured on hardware (2026-09-16)
+
+First run of the segment-wide `code_integrity` measurement added in `4bd6a78`, on the iPhone 7
+(iOS 15.8.5, TrollStore), against the EC2 server in `observe` mode with
+`INTEGRITY_SCORE_IOS_CODE_INTEGRITY` off. Build: Codemagic from `9bac726`, pre-signed with
+`tools/presign_trollstore_ipa.sh` (`get_task_allow false`, 4 entitlements), served over HTTPS from
+the instance and installed through TrollStore.
+
+### 43.1 The measurement
+
+```json
+"code_integrity": {
+    "checked": true,
+    "app_images_compared": 3,
+    "app_compared_bytes": 10505140,   "app_diff_bytes": 0,   "app_libs_diff": 0,
+    "app_segment_compared_bytes": 14811136,   "app_segment_diff_bytes": 0,
+    "core_compared_bytes": 0, "ext_compared_bytes": 0,
+    "system_bucket_reason": "dyld_shared_cache_has_no_backing_files",
+    "system_images_unreadable": 434,
+    "diffed_libs": ""
+}
+```
+
+`score 0`, `verdict trusted`, `collector_version 2`, nine probes.
+
+**`app_segment_diff_bytes` is 0 on real hardware.** That is the result `4bd6a78` was waiting for: the
+whole `__TEXT` segment — Mach-O header, `__stubs`, `__cstring`, `__unwind_info` and all — measures
+byte-identical between memory and disk on a clean device. **`mach_header_64.reserved` is therefore a
+validated safe flip target**, the Mach-O analogue of the ELF `EI_PAD` bytes used to close the app
+bucket on Android (§30.4): writing to it cannot be mistaken for ordinary runtime variation, because
+there is none to be mistaken for.
+
+That is a measurement result, not a green light for battery item 16. §43.4 states what item 16
+still needs.
+
+### 43.2 One bundle framework is not measured at all
+
+The Python model in `4bd6a78` predicted `app_segment_compared_bytes` 14,925,824 across four bundle
+images. The device measured **14,811,136 across three**. The shortfall is exactly **114,688 bytes**,
+and the arithmetic closes without remainder:
+
+| bundle image | `__TEXT` filesize | measured? |
+|---|---|---|
+| `Runner` | 180,224 | yes |
+| `App.framework/App` | 5,914,624 | yes |
+| `Flutter.framework/Flutter` | 8,716,288 | yes |
+| **`objective_c.framework/objective_c`** | **114,688** | **no** |
+| device total | **14,811,136** | = 180,224 + 5,914,624 + 8,716,288 |
+
+`app_compared_bytes` is short by 50,840 against the model for the same reason. And nothing was
+silently dropped by a `continue`: `dyld_images.image_count` is 437, `system_images_unreadable` is
+434, `app_images_compared` is 3, and 434 + 3 = 437. **Every image dyld had loaded was accounted
+for** — `objective_c.framework` was simply not loaded at the moment the startup scan ran.
+(Inference, not measurement: it is the Dart FFI ObjC interop framework and is loaded lazily on
+first use, after the scan.)
+
+**Why this matters.** The probe measures what dyld has already mapped, not what the bundle contains,
+and it reports `checked: true` with no signal that a bundle framework went unmeasured. This is the
+§28.8 defect class in a subtler form: there the bucket was inert and read zero, here the bucket is
+populated and merely incomplete, which is harder to notice. A framework modified on disk and loaded
+after the scan is invisible to it.
+
+**Proposed, not implemented:** enumerate the Mach-O files under the bundle directory, compare that
+set against the loaded images, and report the count not loaded as its own field. A non-zero value is
+then telemetry to reason about rather than a silent omission. Whether it should ever score is a
+separate question — lazy loading is normal behaviour, not evidence of compromise.
+
+### 43.3 A stale process can serve an old collector after a reinstall
+
+The first launch after installing over the existing app produced `collector_version 1` and eight
+probes — the pre-`bf30934` collector — while `app_identity.executable_bytes` already read 427,475,
+today's build. The contradiction resolved only after **Remove App → Delete App → reinstall →
+launch**, which produced `collector_version 2` and nine probes from the same staged `.ipa`.
+The two reports carry the same `executable_bytes` and different `executable_sha256`
+(`9483a8e5…` then `3ca34db7…`), consistent with TrollStore re-signing the same input binary.
+
+The exact mechanism is **not pinned down** and is recorded here as an observation, not a diagnosis.
+The operational rule it yields is firm, though: **after installing over an existing build, delete and
+reinstall before trusting a collector-version-sensitive measurement**, because `app_identity` reads
+the new file from disk while the running process can still be executing old code — the one
+combination that makes a stale build look current.
+
+### 43.4 What battery item 16 still needs — a correction to §43.1
+
+§43.1 first said item 16 was "unblocked". That was wrong, and the error is worth stating precisely
+because it would have cost a device session to discover.
+
+**The flip target and the scored field are not the same field.** `4bd6a78` deliberately split the
+measurement in two: `app_diff_bytes` counts differing bytes inside `__TEXT,__text` only, and
+`app_segment_diff_bytes` counts them across the whole `__TEXT` segment. `mach_header_64.reserved`
+lives in the segment but **ahead of** `__text`, which is exactly why the pre-`4bd6a78` probe could
+not see it. So flipping it increments `app_segment_diff_bytes` and leaves `app_diff_bytes` at 0.
+
+`ios_app_code_modified` reads `app_diff_bytes >= 4` and nothing else, and **no rule anywhere reads
+`app_segment_diff_bytes`** — it is telemetry by construction, as `4bd6a78` intended while it had no
+hardware baseline. Item 16's criterion is `app_diff_bytes > 0` → `ios_app_code_modified` +90 →
+`block`, so a reserved-field flip satisfies none of it. Two things are therefore outstanding, and
+they are independent:
+
+**1. A scoring decision.** The segment measurement now has the clean hardware baseline it was
+waiting for, so the question `4bd6a78` deferred is live: should the header range be scored, and if
+so as its own reason or by folding it into `app_diff_bytes`? Keeping them separate is probably
+right — a `__text` difference is an inline hook, while a header difference is not executable code
+and deserves its own weight — but that is a design call, not a measurement.
+
+**2. A way to modify the app's memory on this device, which we do not currently have.** §37 removed
+`get-task-allow` from the pre-signed build on purpose, and without it no debugger or Frida can
+attach on a device that is **not jailbroken** — the iPhone 7 runs stock iOS 15.8.5 with TrollStore,
+which is not a jailbreak (§31). Android closed item 16 with a Frida `Memory.write`; that route does
+not exist here as things stand. The options, none of them free:
+
+- **A one-off test build carrying `get-task-allow`.** Cheapest, and reversible by reinstalling the
+  normal pre-signed build. Costs isolation: `ios_get_task_allow` +35 fires alongside, so the run is
+  partly over-determined — the §25.11 warning about items 14 and 16 applies. The reason is named
+  separately in the report, so `ios_app_code_modified` is still distinguishable.
+- **checkm8 jailbreak.** The A10 bootrom is unpatchable and the jailbreak is semi-tethered, so a
+  reboot restores the clean state and the same handset gives both baselines on demand — the property
+  the device was bought for. It gives real Frida with no entitlement change, and so is the only
+  option that tests item 16 the way item 14 was tested on Android. It changes the state of a
+  physical test phone and therefore needs an explicit decision.
+- **An in-app debug fixture that modifies its own `__text`.** Rejected by default: `bf30934` left
+  iOS fixtures unimplemented deliberately, and §28 is explicit that a fixture validates the pipeline
+  and never proves that real tooling is detected. It would close the item on paper only.
+
+Until one of these is chosen, item 16 stays **blocked on iOS**, and §43.1's clean segment baseline is
+a prerequisite that has been met rather than the item itself.
+
+## 45. Battery item 16 on iOS — embedded gadget blocked by codesigning (2026-09-17) — INCONCLUSIVE
+
+First on-device attempt at item 16 (modify the app's own `__text` so `ios_app_code_modified` fires).
+Approach chosen with the user: embed a **real Frida Gadget**, renamed so `dyld_images` does not flag
+it, and have its script hook a function in an app-bucket module so the code_integrity probe sees a
+runtime `__text` divergence. No jailbreak, no Codemagic build — assembled locally.
+
+### 45.1 What was built
+
+From the existing Codemagic-unsigned build (`9bac726`), entirely on the Linux client:
+- **LIEF** added `LC_LOAD_DYLIB @executable_path/Frameworks/CoreSupport.dylib` to `Runner`.
+- Frida Gadget **17.18.0**, arm64 slice byte-extracted from the ios-universal dylib for the A10,
+  embedded as `CoreSupport.dylib` (renamed to dodge the suspicious-token scan: `frida`, `gadget`,
+  … ; install-id patched in place to match). `CoreSupport.config` + `CoreSupport.js` alongside it.
+- `CoreSupport.js` attaches an interceptor to a function export in Runner/App/Flutter and
+  `Interceptor.flush()`es — an inline branch into `__text`, behaviour preserved.
+- Signed with `ldid`: the four shipping entitlements **plus `dynamic-codesigning`**, no
+  `get-task-allow`. Chosen because no scoring rule reads `entitlement_count` or
+  `code_directory_flags` (only `get_task_allow`), so adding it preserves score isolation while — in
+  theory — granting the JIT right needed to write code. Verified: 5 keys, `get_task_allow` false.
+
+### 45.2 What happened — a CODESIGNING kill in the gadget's initializer
+
+The app **launches** (`runningboardd` tracks it `running-active`), then dies immediately. All three
+crash reports (one per launch attempt) are identical:
+
+```
+EXC_BAD_ACCESS (SIGKILL - CODESIGNING)      termination namespace CODESIGNING, code 2
+  0  libsystem_platform.dylib  sys_icache_invalidate
+  1..N  CoreSupport.dylib        (Frida Gum internals)
+  N+1  dyld  dyld4::Loader::findAndRunAllInitializers(...)
+faulting address in a PRV r-x/rwx page (Frida's own code buffer) next to CoreSupport.dylib __LINKEDIT
+```
+
+Two facts follow directly, and they point in opposite directions:
+
+1. **The embedded, renamed, `ldid`-signed gadget LOADED.** No `dyld`, `amfi`, "Library not loaded"
+   or "code signature invalid" line appears in the syslog around the launch; dyld ran the gadget's
+   initializers. So the signing-and-loading half of the approach works on non-jailbroken TrollStore
+   iOS — a renamed gadget can be shipped inside the app and dyld will map it.
+2. **It cannot create executable memory.** The kill is in Frida Gum's **own bootstrap** (inside the
+   gadget's initializer, before `CoreSupport.js` ever runs), the instant it flushed the icache on a
+   page it had made executable. The kernel's W^X/codesigning enforcement terminated the process.
+
+### 45.3 The conclusion: `dynamic-codesigning` self-applied is not honored
+
+`dynamic-codesigning` added with `ldid` to a CoreTrust-bypassed TrollStore app on stock iOS 15.8.5
+**does not actually grant JIT.** The entitlement is present in the signature but the kernel does not
+honour a self-asserted JIT right on a non-platform binary; genuine JIT requires the process to be in
+the `CS_DEBUGGED` state, which is set by a debugger attaching (`get-task-allow` + TrollStore's
+"Enable JIT", which runs debugserver), or by a jailbreak that disables codesign enforcement. This
+resolves the assumption recorded in §43.4 as **disproved**, on device.
+
+### 45.4 The deeper asymmetry — item 16 may have no clean-isolation form on iOS
+
+Android closed item 14/16 with a gadget on an **unrooted** OPPO/Huawei, because Android permits an
+app to modify its own code in-process. iOS does not: runtime `__text` modification is a **privileged
+operation**, and every route to it trips an *independent* sensor this server already scores:
+
+| route to modify app `__text` at runtime | independent signal it trips |
+|---|---|
+| `get-task-allow` + TrollStore "Enable JIT" (debugserver) | `ios_get_task_allow` +35, and `ios_process_traced` +50 while attached |
+| checkm8 jailbreak | `ios_jailbreak_artifact` +75 |
+| `dynamic-codesigning` alone | **none — but it does not work** (this section) |
+
+Static patching is not item 16: if the on-disk binary is patched, memory matches disk, the probe
+reads `app_diff_bytes 0`, and the tamper is instead caught by `ios_executable_hash_mismatch` /
+signing checks. So the runtime-divergence signal item 16 exists to test can only be produced under a
+condition iOS makes independently visible. The pristine "only `ios_app_code_modified` fires" result
+that item 14 achieved on Android **may be structurally unavailable on iOS** — itself a security
+finding (the OS forces the attacker to also do something detectable), not merely a test-rig
+limitation. In each contaminated route the `+90` would still dominate and drive `block`, so item 16's
+detection+enforcement can still be shown; its *isolation* cannot.
+
+### 45.5 Decision pending (the user paused here)
+
+Not decided unilaterally — narrowing or re-routing an agreed test is the user's call. The options are
+§45.4's two working routes (get-task-allow+JIT, or checkm8), each with its named contamination, or
+accepting that item 16-on-iOS is demonstrated in a non-isolated form, or recording it as
+"iOS-structurally-privileged" and moving on. Resume at §45.6.
+
+### 45.6 Resume-here state (2026-09-17)
+
+- **Server:** EC2 `i-0559685f02c4013b1` **stopped** on pause (was running at the time of test);
+  PostgreSQL 16.15 local, `observe` mode, `INTEGRITY_SCORE_IOS_CODE_INTEGRITY` **off**. The item-16
+  build never produced a report (it crashes before scanning), so nothing new is stored.
+- **Staged, left in place:** `devicetrust-item16.ipa` at `/srv/artifacts/e2a890/item16.ipa` and the
+  clean `dt.ipa` beside it, behind the temporary Caddy `/artifacts/*` block. Local copies and the
+  three crash reports are in the session scratchpad (ephemeral).
+- **Phone:** the crashing item-16 build is the currently-installed app on the iPhone 7. Identity is
+  unaffected (Secure Enclave key untouched). To restore a working app, reinstall the clean
+  `dt.ipa` (needs the server started to serve it) — deletion keeps the key.
+- **Local tooling proven this session:** LIEF in a venv adds the load command; the arm64 gadget
+  slice extracts and signs; `libimobiledevice` (`idevicecrashreport`, `idevicesyslog`) pulls crash
+  reports and streams the log over USB — the diagnostic path that produced §45.2.
+
+## 46. Battery item 16 on iOS — get-task-allow + JIT route: PASS (non-isolated) (2026-09-19)
+
+Resolves §45.5. The owner chose §45.4 route 1 (recorded in `owner_decisions.md`: "item 16:
+get-task-allow + JIT"). This section records the build, the run, and the on-device result — a **PASS
+in the non-isolated form** §45.4 anticipated.
+
+### 46.1 The build — one entitlement changed
+
+The §45.1 gadget build (`item16.ipa`) already embeds a renamed Frida Gadget (`CoreSupport.dylib`)
+whose script inline-hooks a Flutter app-bucket export and `Interceptor.flush()`es. It crashed (§45.2)
+because self-applied `dynamic-codesigning` does not grant JIT (§45.3). The only change for this route
+is the entitlement: the main `Runner` executable was re-signed locally with `ldid`, swapping
+`dynamic-codesigning` for **`get-task-allow`** and keeping the four shipping entitlements — crucially
+`keychain-access-groups = [TROLLTROLL.*, com.apple.token]` — byte for byte, so the Secure Enclave key
+and the installation identity survive (§37.3). No LIEF, no Codemagic rebuild.
+
+Result: `item16-jit.ipa`, five entitlements, `get-task-allow` present, `dynamic-codesigning` gone,
+`sha256 0ba88f43…`, staged at `/srv/artifacts/e2a890/item16-jit.ipa`.
+
+### 46.2 The run and the result
+
+Installed over the crashing build via TrollStore (in-place, same bundle id → key retained), launched
+via **TrollStore "Enable JIT"** (debugserver attaches, sets `CS_DEBUGGED`), then "Run native
+integrity scan". Server: local PostgreSQL 16.15 on the EC2 instance, `observe` mode,
+`INTEGRITY_SCORE_IOS_CODE_INTEGRITY=1` (enabled this session). The stored `integrity_reports` row:
+
+    score 100, verdict block, hard_block false
+    ios_app_code_modified                   +90   "the application's own code differs in memory from its packaged image"
+    ios_get_task_allow                      +35
+    ios_signing_identifier_bundle_mismatch  +0    (report_only; proposed 90)
+    ios_known_fake_team_identifier          +0    (report_only; proposed 25)
+
+    code_integrity: checked true, app_diff_bytes 16, app_segment_diff_bytes 16,
+                    diffed_libs "Flutter", app_libs_diff 1, ext_diff_bytes 0,
+                    app_compared_bytes 24,215,520, app_images_compared 4
+
+A 16-byte runtime divergence in the Flutter app-bucket `__text` — the gadget's inline hook — detected
+exactly as designed, driving `block`.
+
+### 46.3 What it settles
+
+- **§45.3's blocker is lifted on device.** The app produced a report instead of the CODESIGNING
+  SIGKILL of §45.2, so `get-task-allow` + TrollStore "Enable JIT" genuinely grants JIT where
+  self-applied `dynamic-codesigning` did not.
+- **Detection + block-weight are proven.** `ios_app_code_modified +90` alone reaches the block band
+  and is named as its own reason, so the item-16 signal is cleanly attributable.
+- **Isolation, honestly: not achieved — and that is the finding.** `ios_get_task_allow +35` rode
+  along; the enabling condition is itself independently visible, exactly §45.4's thesis that iOS
+  makes runtime `__text` modification a privileged, separately-detectable act. One nuance in our
+  favour: `ios_process_traced +50` did **not** fire, because TrollStore's debugserver detaches after
+  setting `CS_DEBUGGED`, so the process is JIT-capable but not traced at scan time. The only
+  contamination is +35, and the verdict does not depend on it.
+- Classification: **PASS** for item 16 detection in non-isolated form. Enforcement was then confirmed
+  on hardware in enforce mode — see §46.6.
+
+### 46.4 Should `ios_get_task_allow` be scored +0? — recommendation: no
+
+Raised by the owner: zero the +35 so item 16 reads in isolation. It removes the contamination but at a
+cost to the product that outweighs the cosmetic gain, and it does not change item 16's verdict (the
++90 blocks on its own):
+
+- A genuine App-Store build never carries `get-task-allow`; distribution signing strips it. In
+  production its presence means the running app is **not** the distributed app — a dev build, a
+  TrollStore/AltStore/enterprise-resigned copy, or an app a debugger can attach to. For a financial
+  client that is a signal worth keeping, and it fires **before** any code is modified, catching
+  attackers who only observe or resign rather than hook.
+- Its production false-positive cost is ~zero (legitimate users cannot have it), so +35 is almost
+  pure signal, already weighted "elevated/step-up", not a hard block.
+- The reason it contaminates *our* measurements is a **lab** artifact — every TrollStore build carries
+  it. §37 already solved that the right way: strip `get-task-allow` from the pre-signed baseline so
+  the clean phone reads trusted, rather than blinding the scorer. `INTEGRITY_ALLOW_DEBUG` was rejected
+  there for the same reason — it gates six rules including `ios_process_traced`.
+- If an isolated *measurement* is wanted for the record, the correct mechanism is a report-only toggle
+  (default scored +35), mirroring `INTEGRITY_SCORE_IOS_FAKE_SIGNATURE`, so a run can show
+  `ios_app_code_modified` alone without ever shipping +0 as policy. Not yet built; offered.
+
+Owner confirmed on 2026-09-19: **keep +35**. The stated concern was legitimate users being penalised,
+which does not arise — an App-Store build never carries `get-task-allow`, so only sideloaded / resigned
+/ debuggable copies trip it. A report-only switch for isolated demos remains available if wanted, not
+yet built.
+
+### 46.5 State after this run
+
+- **Server:** EC2 `i-0559685f02c4013b1` running, local PostgreSQL 16.15, **`enforce`** (flipped from
+  `observe` for §46.6; revert to `observe` for a production-representative resting state),
+  `INTEGRITY_SCORE_IOS_CODE_INTEGRITY=1`. SG port 22 now also allows the current dev IP
+  `39.58.208.8/32` (the three prior `/32`s left in place).
+- **Staged:** `item16-jit.ipa` beside `item16.ipa` and `dt.ipa` under `/srv/artifacts/e2a890/`.
+- **Phone:** iPhone 7 now runs the `get-task-allow` item-16 build (identity intact — a `+35` baseline
+  is expected on it). Restore with the clean `dt.ipa` when done; deletion keeps the key.
+- **Hygiene note:** the local Postgres password was printed to a session transcript this round (the
+  systemd drop-in ExecStart was catted); rotating `dtadmin` is advisable, though the DB is bound to
+  localhost and its SG admits 5432 only from the app SG.
+
+### 46.6 Enforcement confirmed on hardware (enforce mode)
+
+With `INTEGRITY_MODE=enforce`, the item-16 build (launched via TrollStore "Enable JIT" so the gadget
+hooks) attempted `POST /v1/accounts/register`. The server ran the full possession + integrity flow and
+refused it:
+
+    15:57:37  POST /v1/installations/challenge  200
+    15:57:38  POST /v1/installations/verify     200
+    15:57:38  POST /v1/integrity/challenge      200
+    15:57:39  POST /v1/integrity/report         200   (score 100, verdict block, ios_app_code_modified +90)
+    15:57:39  POST /v1/accounts/register        403   integrity_blocked
+
+The `403` code is `integrity_blocked` by construction, not inference: `_enforce_integrity_gate` maps
+`verdict == "block"` to `integrity_blocked`, and the report persisted in the same second is
+`verdict = block`. So a device that had just proven possession of its installation key was still
+refused a protected operation solely because its live scan detected the in-memory `__text`
+modification — detection and enforcement, on hardware. Item 16 is therefore **PASS** for both, in the
+non-isolated form of §45.4. (The werkzeug access log records only the HTTP status; the JSON error code
+is not logged, which is why the mapping was confirmed from source.)
+
+## 47. Operational state and the confirmed iOS JIT-arming recipe (2026-09-20)
+
+State save. Item 16 (§46) was reproduced by the .NET session on the same iPhone 7; this section records
+the reusable JIT recipe that emerged and the exact server/device/repo state at the save point.
+
+### 47.1 The iOS JIT-arming recipe that reproduces item 16 (confirmed twice)
+
+1. **The build must carry `get-task-allow`.** A pre-signed clean build (`tools/presign_trollstore_ipa.sh`)
+   has it stripped (§37), and TrollStore preserves that absence — so "Enable JIT" fails with
+   **`trollstorehelper returned 3`**. Verify with `ldid -e <Runner>` → `get-task-allow: true`.
+   `item16-jit.ipa` carries it; `dt.ipa` does not.
+2. Install via TrollStore; **launch via TrollStore "Enable JIT"**, not the home icon — this attaches
+   debugserver and sets `CS_DEBUGGED`, without which the embedded gadget's Frida-Gum bootstrap hits
+   W^X and is SIGKILLed (§45.2).
+3. **Wait ~10–15 s** after launch before scanning — the gadget defers its inline hook. Scanning too
+   early gives `score 35 / app_diff_bytes 0` (only `ios_get_task_allow`, no `ios_app_code_modified`),
+   with a non-scoring `app_segment_diff_bytes` (a `__TEXT`-segment, non-`__text` diff — telemetry
+   only, §43.4).
+4. Run the native integrity scan → `app_diff_bytes ≥ 4` (Flutter) → `ios_app_code_modified +90` → block.
+
+Failure-mode map: `returned 3` = missing get-task-allow; `+35 only / app_diff 0` = scanned before the
+deferred hook landed.
+
+### 47.2 Server / infrastructure state
+
+- EC2 `i-0559685f02c4013b1` **running** (t4g.micro, us-west-2). Endpoint
+  `https://devicefingerprinting.duckdns.org` (DuckDNS, auto-updated on start).
+- Local **PostgreSQL 16.15** + Redis on the instance; **no RDS**.
+- `INTEGRITY_MODE=enforce`, `DEVICE_POLICY_MODE=observe`, `INTEGRITY_SCORE_IOS_CODE_INTEGRITY=1`,
+  `INTEGRITY_SCORE_IOS_FAKE_SIGNATURE=0`, `INTEGRITY_ALLOW_DEBUG=0`. Left in **enforce** for the .NET
+  session's battery.
+- Android cert allow-list: **3 certs** — the two prior handset certs plus the .NET client's
+  `664e9c8e…de3` (added this session).
+- `dtadmin` DB password **rotated** this session (root-600 drop-in + Postgres role; never printed).
+  The previously-leaked password is dead.
+- SG `sg-0a7e35ab397d765e8`: port 22 now also allows dev IP `39.58.208.8/32` (the three prior `/32`s
+  remain).
+- Staged under `/srv/artifacts/e2a890/`: `dt.ipa` (clean), `item16.ipa` (crashing dynamic-codesigning
+  build, §45), `item16-jit.ipa` (get-task-allow build, §46 — the working item-16 build).
+
+### 47.3 Device state (iPhone 7)
+
+- Currently runs **`item16-jit.ipa`** (the get-task-allow item-16 build) — the .NET session reinstalled
+  it to reproduce item 16. **Not** the clean `dt.ipa`. Identity intact (Secure Enclave key preserved;
+  keychain group unchanged).
+- Latest verdict `100/block` (`ios_app_code_modified`). Block reports sit on the device's `device_id`
+  for 24 h — in enforce, the clean `dt.ipa` would be refused `integrity_device_blocked_recently` until
+  they age out or the server returns to observe. To restore a clean baseline: reinstall `dt.ipa`, then
+  wait out the window or run in observe.
+
+### 47.4 Repo / battery state
+
+- DESIGN.md §46 (item 16 PASS) and `NEXT_BATTERY_ITEM.md` are committed **and pushed** (origin/main was
+  current before this section; this §47 commit is a new local one to push).
+- Next battery item (`NEXT_BATTERY_ITEM.md`): item 17 (iOS clean baseline) already satisfied by the
+  2026-09-19 restore; item 18 (iOS fake-signature enforcement) is the next test, gated by §39.5.
+- Account/token battery (items 3–8, 12/13) + two-phone stolen-token: with the .NET session against this
+  endpoint.
+
+### 47.5 Teardown — completed 2026-09-20
+
+The .NET session finished. Executed: `INTEGRITY_MODE` reverted to **observe**; iPhone 7 reinstalled with
+the clean **`dt.ipa`** (verified `score 0 / trusted`, identity intact); EC2 `i-0559685f02c4013b1`
+**stopped** (not terminated; ~USD 0.64/mo EBS at rest), Elastic IPs 0, no NAT, no RDS. Resting config
+persists `INTEGRITY_MODE=observe` and `INTEGRITY_SCORE_IOS_CODE_INTEGRITY=1` for the next start; the
+DuckDNS endpoint repoints on start. To resume: start the instance, refresh the dev IP in SG 22 if it
+changed, and point clients at `https://devicefingerprinting.duckdns.org`.
+
+## 48. Battery item 17 — iOS clean baseline: PASS (2026-09-20)
+
+The proposed iOS-only item 17 (§40.3) — the iOS counterpart of item 1. Criterion: on a build put
+through `tools/presign_trollstore_ipa.sh`, with `INTEGRITY_ALLOW_DEBUG=0` and
+`INTEGRITY_SCORE_IOS_FAKE_SIGNATURE=0` → `get_task_allow: false`, `score 0`, `verdict trusted`.
+
+Satisfied and verified **twice** on the iPhone 7 with the clean `dt.ipa` (the pre-signed build):
+- **2026-09-19**, restoring the phone after item 16: `score 0, verdict trusted`, reasons only the two
+  report-only `+0` fake-sig codes — **no `ios_get_task_allow`** (so get-task-allow was false, the §37
+  pre-sign having stripped it) and no `ios_app_code_modified`.
+- **2026-09-20**, at teardown, re-confirmed identical: `score 0, verdict trusted`, same reasons.
+
+Every clause met. **PASS.** This closes item 17. The remaining iOS-side battery item is 18
+(fake-signature enforcement), gated by §39.5 — see `NEXT_BATTERY_ITEM.md`.
+
+## 49. Battery item 18 — iOS fake-signature enforcement: PASS (scoped demo, 2026-09-23)
+
+The proposed iOS-only item 18 (§40.3), run as the **scoped report-only demo** §39.5 called for:
+`INTEGRITY_SCORE_IOS_FAKE_SIGNATURE` was flipped to `1` for this single run and returned to `0`
+afterwards — never shipped as policy.
+
+No new build. The clean `dt.ipa` already on the iPhone 7 is TrollStore-signed, so it reports the
+CoreTrust-bypass donor identifier (`signing_identifier com.icraze.gtatracker` ≠ bundle id) and team
+`TROLLTROLL` (§35.4 / §39.1). With the flag off these are the two report-only `+0` reasons in every
+clean scan; with it on they score.
+
+Detection (observe, flag on):
+
+    score 100, verdict block
+    ios_signing_identifier_bundle_mismatch +90
+    ios_known_fake_team_identifier         +25
+
+Enforcement (enforce):
+
+    POST /v1/integrity/challenge 200 → /v1/integrity/report 200 (block) → POST /v1/accounts/register 403 integrity_blocked
+
+The `403` is `integrity_blocked` by the same `_enforce_integrity_gate` mapping proven in §46.6
+(`verdict == "block"` → `integrity_blocked`), with the fresh block report persisted at the same
+second. **PASS** for both detection and enforcement.
+
+**False-positive safety** (the standing owner concern): the rule cannot fire on a legitimately
+Apple-signed app — `signing_identifier` equals the bundle id (or the accepted `TEAMID.bundleid` .NET
+shape, §41) and the team id is the real developer team, never `TROLLTROLL`. §39.5's open point is
+unchanged: the guard has been validated against a conformance fixture and this TrollStore build, not
+against a real Apple-signed build, so the flag stays `0` as policy until such a build is observed.
+This run demonstrates the capability without shipping it.
+
+This closes the iOS-side battery (items 1 and 12/13 iOS variants, 15, 16, 17, 18; the account/token
+battery 3–8 / 12/13 was run by the .NET session).
+
+## 50. Hardware-backing policy — per-deployment, default off (2026-09-23)
+
+Resolves the open policy decision in §35.7 (and §39.5's second point). A software-backed installation
+key (Secure Enclave / StrongBox generation failed → software-keychain fallback) is now governed by a
+per-deployment operator knob, `INTEGRITY_HARDWARE_BACKING_POLICY`, exposed on `/health/ready` as
+`hardware_backing_policy`:
+
+- **`off`** (default) — no scoring; no verdict change for anyone. Chosen as default so no existing
+  deployment changes behaviour on upgrade and no legitimate user gains friction unasked. Flipping the
+  default is a one-line change.
+- **`advisory`** — adds `key_software_backed +30`, so a software-backed key trends to elevated /
+  step-up, never a standalone block. Recommended production setting.
+- **`required`** — `key_software_backed +100`, hard block; a software-backed key is refused. For
+  deployments with a known all-hardware fleet.
+
+Applied server-side in the integrity report path (`_apply_hardware_backing_policy`), reading the
+stored `app_installations.key_hardware_backed`. **NULL — the client did not report it (old clients,
+the Kotlin and .NET collectors) — is never read as software**; only an explicit `False` is acted on,
+preserving the §35.7 nullable principle so legitimate non-reporting clients are never penalised. The
+score is re-derived as the sum of reason points, consistent with `_score_integrity`. It is a client
+claim, never proof (§2): `required` is bypassable by a lying client and by a genuine hardware-key
+oracle, so it raises assurance for honest software/emulator environments, not against a sophisticated
+attacker. The downgrade-refusal (a thumbprint can't drop hardware→software) is unchanged and
+independent, and remains the false-positive-free part.
+
+**Before this ships:** a conformance-suite check (`null → no penalty`, `advisory → +30`,
+`required → block`) and a suite run; deferred here because the server is stopped. Deploy also needs
+the usual `diff -u` of `device_trust_server.py` against `/opt` in case of a hand-edit.
+
+## 51. Spec — step-up authentication and server-side behavioral signals (2026-09-23)
+
+Design blueprint agreed with the owner; **not yet implemented**. Two independent strands that both
+harden the §2 boundary — a fully compromised device holding a genuine hardware key and invoking it as
+a silent signing oracle. Neither makes the device trustworthy; both raise the attacker's cost and
+narrow the window. Key attestation was considered and **ruled out** (vendor root of trust, §50/§2).
+
+### 51.1 Step-up authentication — the problem
+
+The installation key currently signs unattended (§35.7: usable with no passcode set), so on a
+compromised OS it can be driven as a silent oracle. Step-up binds the *sensitive* operations to a
+fresh device authentication, so the key cannot sign those without the user present. Routine PoP and
+login stay unattended and frictionless.
+
+### 51.2 Auth factor — passcode default, biometric optional, configured both sides
+
+- **Default factor is the device passcode**, not biometric: a passcode always exists once device
+  security is set up, whereas biometric may be unenrolled or hardware-absent. Biometric is an opt-in
+  stronger-UX alternative.
+- The factor is **configurable on both sides and must map** (passcode↔passcode, biometric↔biometric):
+  a Flutter-plugin setting the integrating app sets, and a server-side policy value.
+- **Enforcement and its honest limit.** The factor is enforced *in the client secure hardware* — the
+  step-up key is generated so it cannot sign without the configured factor (Android
+  `setUserAuthenticationRequired(true)` + auth type; iOS `SecAccessControl` `.devicePasscode` /
+  `.biometryCurrentSet`). The server-side setting *declares and requires* the expected factor so the
+  client build and server policy stay consistent. **Without key attestation (deliberately excluded),
+  the server cannot cryptographically re-verify which factor fired** — the mapping is a
+  hardware-enforced-on-device + policy-declared-on-server contract, not a server proof, and on a fully
+  compromised device even the on-device enforcement can be bypassed.
+
+### 51.3 Mode — (a) per-use and (b) hardware-enforced window, both configurable
+
+- **(a) per-use** — every sensitive op requires a fresh authentication; no window. Strongest, more
+  prompts. **Default for crown-jewel operations.**
+- **(b) windowed** — one authentication unlocks the step-up key for N seconds; sensitive ops within
+  the window do not re-prompt. Fewer prompts; leaves an N-second oracle window. **Must be the
+  hardware-enforced flavor** (Android `setUserAuthenticationValidityDurationSeconds` /
+  `setUserAuthenticationParameters`; iOS `LAContext.touchIDAuthenticationAllowableReuseDuration`),
+  never an app-level "unlocked recently?" check, which a compromised OS forges.
+- Mode and window N are **configurable on both sides, matched** (plugin setting + server policy).
+  Guidance: (a) for crown jewels; (b) only as a friction-relief valve for a lower tier, and only if
+  prompt fatigue proves real.
+
+### 51.4 Which operations are gated
+
+The server defines the sensitive set (the client mirrors it for UX); a step-up-signed proof is
+required to execute them.
+- **Crown jewels — gate with (a):** money movement, adding/changing a payee, password / phone / email
+  change, adding a device.
+- **Reclassify as sensitive** (easy to leave ungated, but attack *enablers*): disabling transaction
+  alerts/notifications, changing an allow-listed payee, and **the step-up config itself**
+  (factor/mode/key) — which must be **self-gated**: changing the lock requires passing the lock.
+- **Cumulative/velocity trigger:** a running per-window sum so *many sub-threshold* transfers also
+  trip step-up, closing the structuring band a single amount threshold leaves open.
+
+**Guidance (the principle).** Don't gate everything — that is UX death. Gate the crown jewels with
+(a); reclassify the enablers above (alerts / security-settings / step-up-config) as sensitive since
+they are enablers; accept reads and session as ungated but cover them with the server-side anomaly
+signals (51.6) plus server-side alerting; and use the cumulative/velocity trigger so "many small
+transfers" also trips step-up, closing the sub-threshold band.
+
+### 51.5 Ungated paths and how they are covered
+
+Gating everything is UX death, so reads and session persistence stay ungated and remain exposed on a
+compromised device: **data reads / exfiltration** (balances, history, PII, payees, pay stubs),
+**session persistence** (the oracle re-signs PoP for a durable foothold), and volume abuse of any
+ungated op. These are covered not by more prompts but by the server-side signals in 51.6 plus
+server-side alerting. Honest limit: step-up closes the *silent* oracle for gated ops; a compromised
+device can still act on ungated paths and can strike the instant the user does authenticate.
+
+### 51.6 Server-side behavioral anomaly signals (device cannot falsify)
+
+The score lives server-side, so these survive full device compromise. Both feed the relationship-risk
+layer as **advisory / step-up, never a hard block** (the standing false-positive rule — legitimate
+bursts and outliers exist), and both are **consumer-tunable**:
+- **Per-key request-rate anomaly** — reuse the existing Redis counters; flag when a key's rate over a
+  window exceeds a DBA-set threshold. Caveat: legit bursts (refresh loops, catch-up after offline) →
+  use a window + burst allowance tuned to the app's real traffic.
+- **Population-baseline deviation** — implemented as a **DBA-set absolute threshold** (Option A,
+  chosen 2026-09-26) on a relationship metric (`accounts_per_device` or `installations_per_device`):
+  advisory `population_outlier` points when the metric exceeds the consumer-set base in
+  `risk_policy_settings` (reusing counts already computed in `_evaluate_risk_policy`). Portable
+  (plain `COUNT`, no dialect-specific percentile) and directly "the consumer sets the base". A
+  computed-percentile baseline (system computes p95, DBA sets the multiplier) was considered and
+  deferred: `percentile_cont` is dialect-specific and a real population is hard to seed and test.
+
+**Explicitly excluded: any geolocation signal.** Geo / impossible-travel and the IP-velocity proxy
+both false-positive on CGNAT, VPNs, dual-SIM↔WiFi handoff and real travel — indefensible against the
+lockout bar. Dropped by decision.
+
+### 51.7 Configuration surface — the DBA-tunable settings table
+
+The tunable values — factor, mode, window N, the sensitive-op thresholds, rate limits/windows,
+population deviation and minimum sample size — live in a **`risk_policy_settings` table** that the
+**versioned migration handoff scripts create and seed with safe defaults** (§24.2), which the
+consumer's DBA edits. The server reads it cached, re-reading on change. This is the "consumer sets
+their own base" mechanism: no code change per deployment, DBA-owned config rows, shipped *as* the
+database handoff deliverable.
+
+### 51.8 Status and sequencing
+
+Not implemented. It is client + server + schema, so it lands in pieces, each its own commit and each
+behind the conformance suite: (1) `risk_policy_settings` table + migration + server read path;
+(2) the two behavioral signals wired into relationship-risk; (3) the server step-up policy
+(sensitive-op set, step-up-proof verification, factor/mode declaration); (4) the Flutter-plugin
+step-up key + settings; (5) the other SDKs. Testing is deferred until the server is up.
+
+## 52. Implemented: settings, behavioural signals and step-up — validated on both engines (2026-09-26)
+
+DESIGN.md §51 built end to end server-side and validated on PostgreSQL 16.15 (EC2-local) and SQL
+Server 2019 (RDS `sqlserver-ex` 15.0.4480, created and deleted in-session). Item 4 — the Flutter
+step-up key on hardware — is the separate on-device track; its server contract is now fixed.
+
+### 52.1 What shipped (each its own commit)
+
+- **Item 1** (`ab6c28e`) — `risk_policy_settings`, a DBA-owned key/value table (migration 003, both
+  dialects), schema 3, read with a short-TTL cache and surfaced under
+  `/health/ready.scoring_flags.risk_policy_settings`. The app principal has SELECT only, so it cannot
+  rewrite its own policy.
+- **Item 2a** (`a7398fc`) — per-key request-rate anomaly: opt-in, advisory, a Redis counter in
+  `_evaluate_risk_policy`, DBA-tunable, fails open.
+- **Item 2b** (`bde3475`) — population-baseline as a DBA-set absolute threshold (Option A) on
+  `accounts_per_device` or `installations_per_device`; reuses already-computed counts, portable.
+- **Item 3a** (`f13a468`) — optional per-installation step-up key (migration 004, schema 4).
+- **Item 3b+3c** (`e6f6f7d`, fix `294eb85`) — a step-up proof signed by that key and **bound to the
+  request's access-proof nonce**, so no separate challenge or table is needed (replay protection is the
+  existing nonce store); DBA path-gated sensitive ops (`stepup_required_paths`); factor checked against
+  policy (a client claim, per 51.2); demo endpoint `/v1/account/sensitive-echo`. Per-use vs windowed is
+  the client's hardware auth cadence, not a server knob.
+
+Every signal and the step-up gate ship **off**, so a default deployment behaves exactly as before.
+
+### 52.2 Results — same suite, same HTTPS endpoint, backend swapped
+
+| | PostgreSQL 16.15 | SQL Server 2019 |
+|---|---|---|
+| Production defaults | **44 / 0 / 5** | **44 / 0 / 5** |
+| All signals + step-up enabled | **47 / 0 / 2** | **47 / 0 / 2** |
+
+(passed / failed / skipped.) At defaults the five skips are the three opt-in checks plus the two
+enforce-mode checks; enabled, only the enforce-mode checks skip (server in observe). Every `[db]`
+check — JSON round-trip, replay duplicate-key, timestamp `datetimeoffset`, refresh `UPDLOCK`, device
+memory — passed on SQL Server, so the dialect-critical paths hold for the new table and columns. The
+server reached SQL Server with validated TLS (`TrustServerCertificate=no`).
+
+### 52.3 Findings from testing
+
+- **Postgres new-table grant gap.** `GRANT ... ON ALL TABLES` is point-in-time; the app user could not
+  read `risk_policy_settings` (added by a later migration) until granted. Documented in
+  migrations/README with `ALTER DEFAULT PRIVILEGES`; SQL Server role membership already covers future
+  tables (`4ff9aeb`).
+- **Step-up signature decode.** The first cut passed the base64url signature to a verifier that needs
+  raw DER bytes; the suite caught it (`stepup_signature_invalid`) before it shipped (`294eb85`).
+- **SQL Server cold start.** A suite run started seconds after a restart reached the service before its
+  SQL Server connection pool and TLS handshakes had warmed, and a burst of early requests failed; an
+  immediate re-run was clean. Let a SQL Server-backed service warm before running the suite.
+- **Local DNS.** The DuckDNS name resolves intermittently through this dev box's systemd-resolved stub
+  (~12% of rapid lookups); the suite re-resolves on every request, so one miss aborts a run. Pinning the
+  name in `/etc/hosts` for the session removed it — per EC2 IP, so it needs updating on each start.
+
+### 52.4 State
+
+- EC2 running; server on PostgreSQL 16.15, schema 4, every signal off (production-representative).
+- SQL Server RDS deleted in-session; no manual or automated snapshot retained.
+- The conformance certificate is still in the Android allow-list for further suite runs. It is a
+  synthetic digest (no real signing cert can match it), but remove it before production use.
+- Item 4 (Flutter plugin step-up key + settings) not started.
+
+## 53. Item 4 — the step-up key in the Flutter client, and the server's view of it (2026-09-26)
+
+§51.8 item 4, built to the owner's **Option 1**: passcode on every use wherever the platform can bind
+it to a single signature (iPhone, Android 11+); on Android 9/10 a passcode with a short window
+enforced by the key hardware; the plugin reports what it actually got, so a downgrade is visible.
+
+### 53.1 What shipped (each its own commit)
+
+- **Server** (`931bb65`, migration 005, schema 5). Registration records the step-up key's
+  `stepup_key_auth` — `factor`, `mode` (`per_use` / `windowed`), `window_seconds` — and computes
+  `stepup_policy_downgrade` against `risk_policy_settings.stepup_mode`. A downgrade is **accepted,
+  recorded and logged, never refused**: refusing Android 9/10 keys would lock legitimate users out of
+  sensitive operations. The exact-key re-registration path **never attaches or replaces** a step-up
+  key: registration is unauthenticated, so doing so would let anyone holding the public installation
+  key — or a silent signing oracle on a compromised device — swap in a key it controls and pass
+  step-up (§51.4, "changing the lock requires passing the lock"). It reports
+  `stepup_key_registered` / `stepup_key_matches` / `stepup_key_auth` instead. Every step-up decision
+  is logged with its outcome code; `/v1/account/sensitive-echo` now says `step_up: verified` or
+  `not_required` truthfully and echoes the key's auth.
+- **Client** (`974d415`), channel `devicefingerprinting/stepup_key_v1`:
+  - Android `StepUpKeyManager.kt`. API 30+: `setUserAuthenticationParameters(0,
+    AUTH_DEVICE_CREDENTIAL)` and a `BiometricPrompt` with a `CryptoObject` per signature — per-use.
+    API 28–29, passcode: `setUserAuthenticationValidityDurationSeconds(30)` plus the system
+    confirm-credential screen before **every** signature. Factor, mode and window are **read back
+    from `KeyInfo`**, i.e. what the keystore enforces, not what was requested.
+  - iOS `StepUpKeyManager` (in `InstallationKeyManager.swift`). Secure Enclave, `.devicePasscode`
+    (or `.biometryCurrentSet`), `kSecAttrAccessibleWhenPasscodeSetThisDeviceOnly`, a fresh
+    `LAContext` per signature — always per-use. No windowed mode on iOS: there is no
+    hardware-enforced reuse window for a passcode-gated key, and an app-level one is what §51.3 rules
+    out.
+  - Dart: the step-up key and its auth go out with registration; the key rotates with the
+    installation key; **no passcode means no step-up key, never a failed enrolment**. The step-up proof
+    is signed before the access proof, so time spent at the prompt does not eat the access proof's
+    ±120 s window. Lab UI: "Sensitive op without step-up" / "Sensitive op with step-up".
+
+### 53.2 The Android 9/10 downgrade, stated plainly
+
+Before API 30, Keystore cannot bind a device credential to one operation, and a validity-window key
+accepts **any** lock-screen authentication inside the window — a fingerprint, or the device unlock
+itself. The plugin shows the passcode screen before every signature, but that prompt is enforced by
+the app; the hardware guarantees only "the user authenticated in the last 30 s". A compromised app
+process could therefore sign without a prompt within 30 s of any unlock. That is the downgrade the
+server records as `mode=windowed, window_seconds=30, stepup_policy_downgrade=true`.
+
+### 53.3 Conformance — schema 5, same suite, backend swapped
+
+| | PostgreSQL 16.15 | SQL Server 2019 (RDS, 15.0.4480) |
+|---|---|---|
+| Production defaults | **45 / 0 / 5** | **45 / 0 / 5** |
+| Enforce mode (defaults) | **47 / 0 / 3** | **47 / 0 / 3** |
+| Every signal + step-up enabled | **48 / 0 / 2** | **48 / 0 / 2** |
+
+New: `check_stepup_key_immutable` (re-registration can neither attach nor replace a step-up key), and
+the registration check now asserts the echoed auth, the downgrade flag and a refused malformed block.
+The SQL Server enforce-mode run closes the gap left in §52 (only observe had been run there).
+
+### 53.4 On hardware — OPPO CPH2083, Android 9 (API 28), PostgreSQL, observe
+
+- **No screen lock:** `STEPUP_NO_DEVICE_CREDENTIAL`, enrolment proceeds without a step-up key
+  (`stepup_key_registered=false`), integrity reads the usual baseline `score 18, trusted`. A user
+  without a passcode is not blocked. **PASS** (false-positive safety).
+- **PIN set, "Simulate fresh installation":** new installation `693b9c8a…`, correlated to the same
+  device by reinstall hint; the stored step-up key is `ES256, passcode, windowed, 30`, and the server
+  logged it as weaker than policy.
+- **Sensitive op without step-up:** `403 stepup_required`. **PASS.**
+- **Sensitive op with step-up:** confirm-credential PIN screen → `200`, `step_up: verified`; the
+  server logged `factor=passcode key_mode=windowed window_seconds=30 policy_downgrade=True`; the prompt
+  was answered in ~5 s. **PASS.**
+
+### 53.4a On hardware — iPhone 7, iOS 15.8.5, PostgreSQL, observe
+
+Build: Codemagic from `974d415` (the first compile of the Swift step-up code — clean), pre-signed with
+`tools/presign_trollstore_ipa.sh` (4 entitlements, no `get-task-allow`), installed through TrollStore
+as `dt-stepup.ipa` (`sha256 db7e9afa…`).
+
+- Passcode on, "Simulate fresh installation": new installation `582c166e…`, correlated to the same
+  device by reinstall hint; installation key `secure_enclave`; step-up key stored as
+  `ES256, passcode, per_use, 0`.
+- **Sensitive op without step-up:** `403 stepup_required`. **PASS.**
+- **Sensitive op with step-up:** the system passcode prompt → `200`; the server logged
+  `factor=passcode key_mode=per_use window_seconds=0 policy_downgrade=False`. **PASS.**
+- Integrity throughout: five reports, all `score 0, trusted` (only the two report-only `+0` fake-signature
+  reasons) — the pre-signed build keeps the §48 clean baseline.
+- Note: lockdown's `PasswordProtected` (read with `ideviceinfo`) still said `false` after the passcode was
+  set, although a `WhenPasscodeSetThisDeviceOnly` key cannot exist without one. That flag is not a
+  reliable live indicator; do not use it to check the passcode.
+
+### 53.4b On hardware — Vivo V2118, Android 12 (API 31), PostgreSQL, observe
+
+- **No screen lock** (fresh install): installation `ab7a1792…`, `new_device`, installation key
+  `trusted_execution_environment`, no step-up key; integrity `score 18, trusted` (developer options +8,
+  ADB +10). Enrolment unaffected. **PASS** (false-positive safety). This Vivo writes nothing to logcat
+  (the buffer is empty system-wide), so its evidence is read from the server.
+- **PIN set, "Simulate fresh installation":** installation `d88418bb…`, correlated by reinstall hint;
+  step-up key stored as `ES256, passcode, per_use, 0` — the API 30+ path, read back from `KeyInfo`.
+- **Sensitive op without step-up:** `403 stepup_required`. **PASS.**
+- **Sensitive op with step-up:** the system device-credential prompt (`BiometricPrompt` +
+  `CryptoObject`) → `200`; the server logged `factor=passcode key_mode=per_use window_seconds=0
+  policy_downgrade=False`. **PASS.** First on-hardware run of the Android 11+ per-use path.
+
+### 53.4c Device memory and the behavioural signals on real handset traffic
+
+- The app's device summary matched the server on all three: OPPO and Vivo **2 installations, 1
+  account** each (the no-PIN install plus the fresh one); iPhone **4 and 4** — three installations and
+  three accounts from the 2026-09-19 battery plus today's. The iPhone's IDFV hint has correlated every
+  TrollStore reinstall to one device for a week.
+- **Population baseline** (test setting: `installations_per_device`, threshold 2, strictly greater)
+  fired `population_outlier +30` on the iPhone (4) and correctly not on the OPPO or Vivo (2).
+- **Request-rate anomaly** (test setting: more than 3 in 60 s) did not fire in normal use on any
+  handset. It counts **risk evaluations** per installation, not HTTP requests, and no installation
+  reached four evaluations inside a minute — correct behaviour, not a miss. Driven deliberately on the
+  iPhone ("Test bound refresh", then "Evaluate current account risk" six times): the refresh and
+  `account_me` evaluations plus the first policy check stayed at 105; the **fourth evaluation inside
+  the window** added `request_rate_anomaly +30` (105 → **135**), and every later one in the window kept
+  it. Recommended `block`, effective `allow` (observe). **PASS** on hardware. (A first attempt with an
+  expired 10-minute access token was refused `401` at the JWT layer, before any evaluation, so it
+  correctly counted nothing.)
+- Observe mode hid one thing worth knowing: the iPhone's relationship risk is `105 → recommended
+  block` (`device_has_many_accounts +60`, `population_outlier +30`, `known_device_new_installation +15`),
+  effective `allow`. With `DEVICE_POLICY_MODE=enforce` this test-worn device would be refused on
+  accumulated test accounts.
+- **Owner's calibration (2026-09-26):** four accounts on one phone is illegitimate for a professional
+  financial app — families have their own phones, or at most two people share one. So
+  `device_has_many_accounts` (three or more, +60 → review) stands and is not a false-positive concern.
+  By the same bar a **two-person shared phone is legitimate**, and today
+  `device_has_multiple_accounts` (+35) alone puts it in the elevated band, whose enforced action
+  (`_enforce_risk_policy`) is a flat `403 risk_step_up_required` with **no way to satisfy it** — the
+  relationship-risk "step-up" is not yet wired to the §53 step-up proof. Open decision before
+  `DEVICE_POLICY_MODE=enforce`.
+
+### 53.5 Limits and open items
+
+- **Existing installations must re-enrol to get a step-up key** — a direct consequence of the
+  immutability rule. Rolling step-up out to a fleet that is already enrolled needs an authenticated
+  enrolment path that an oracle attacker cannot satisfy (password re-entry or an out-of-band
+  confirmation). Not built.
+- Factor and mode remain **client claims** (§51.2): without key attestation the server cannot
+  re-verify them.
+- Still to run on hardware: the whole handset battery again on SQL Server (§53.6), and the deferred
+  OPPO check of what removing the screen lock does to the step-up key.
+
+### 53.6 Agreed plan for the handset battery (owner, 2026-09-26)
+
+The step-up handset battery runs on **both engine families**: first on the EC2-local PostgreSQL on all
+three handsets — OPPO (Android 9), Vivo (Android 12, the per-use path) and iPhone 7 — then the SQL
+Server RDS is re-created (`--backup-retention-period 0`) and the same battery is repeated on all
+three. The first SQL Server RDS of the day was deleted after its conformance runs (§53.3) with
+`--skip-final-snapshot --delete-automated-backups`, at the owner's instruction, while the PostgreSQL
+handset runs proceed.
+
+## 54. Accounts per device — owner policy, DBA-tunable (2026-09-26)
+
+**Owner decision.** For a professional financial app, two people sharing one phone is legitimate;
+more is not ("each would have their own phone or at most 2 people using it"). Required behaviour:
+two accounts on a device get **some score, an elevation, but no blockage for either user**; three a
+higher score; four a block. And, restated as a standing rule: **every such value is a default the
+consumer's DBA can change** — not a constant.
+
+**What changed** (`2e7d2dd`, migration 006, schema 6). `risk_policy_settings` is seeded with the owner
+defaults, read through the cached settings helpers:
+
+| setting | default | effect |
+|---|---|---|
+| `device_accounts_elevated_count` / `_points` | 2 / 35 | `device_has_multiple_accounts`, elevated band |
+| `device_accounts_review_count` / `_points` | 3 / 60 | `device_has_many_accounts`, review band |
+| `device_accounts_block_count` | 4 | `device_account_count_block_threshold`, hard block |
+| `elevated_risk_refuses` | 0 | whether an elevated (`step_up`) decision refuses in enforce mode |
+
+Before this, the elevated band's enforced action was a flat `403 risk_step_up_required` that nothing
+could satisfy — so a second person on a shared phone was, in effect, blocked — and the block count was
+an env var defaulting to 5. Now an elevated decision is recorded and returned but does not refuse;
+its points still count, so combined with other risk it escalates to review or block. Step-up itself
+stays where it has meaning, on the DBA-designated sensitive paths (§53). A DBA can restore the old
+refusal with `elevated_risk_refuses = 1`. `POLICY_DEVICE_ACCOUNT_BLOCK_COUNT` remains only as the
+fallback when the row is missing.
+
+**Conformance.** New `check_device_account_bands` reads the live settings: the second account must be
+scored `device_has_multiple_accounts` and never refused, and both accounts must keep working; the third
+is scored for review, and under `DEVICE_POLICY_MODE=enforce` held with `403 risk_review_required`; in
+observe the fourth is scored `block`. This is also the **first run of the whole suite with
+relationship-risk enforcement on**:
+
+| schema 6 | PostgreSQL 16.15 | SQL Server 2019 (fresh RDS) |
+|---|---|---|
+| Production defaults (observe) | — | **46 / 0 / 5** |
+| Integrity enforce | — | **48 / 0 / 3** |
+| `DEVICE_POLICY_MODE=enforce` (defaults) | **46 / 0 / 5** | **46 / 0 / 5** |
+| Every signal + step-up enabled | **49 / 0 / 2** | **49 / 0 / 2** |
+
+(PostgreSQL's plain-defaults and integrity-enforce runs at schema 6 are to be repeated when the server
+returns to PostgreSQL after the SQL Server handset round.)
+
+## 55. SQL Server under concurrent requests — a crash the sequential suite never saw (2026-09-26)
+
+**Symptom.** The first time two handsets hit a SQL Server-backed server within seconds (OPPO and
+iPhone, 14:30 UTC), both requests to `/v1/device/me` stalled 16–23 s and completed together; the
+handsets' 15 s timeout fired. Every earlier SQL Server run had been sequential — the conformance
+suite sends one request at a time.
+
+**Reproduction** (four to eight parallel phone-like flows: enrol → prove → integrity → `device/me`):
+
+- Default configuration: the process aborted within seconds, twice — glibc
+  `corrupted size vs. prev_size while consolidating` and `double free or corruption (!prev)`.
+- pyodbc driver-manager pooling off (`2e7b853`): rarer, but still a `SIGSEGV` inside
+  `cursor.execute`, and one full hang. A `faulthandler` dump of the hung process showed 24 request
+  threads blocked in `pyodbc.connect()` and one in `connection.close()` — a deadlock inside the ODBC
+  stack.
+- Stack: pyodbc 5.3.0, unixODBC 2.3.12, msodbcsql18 18.6.2.1, OpenSSL 3.0.13, Python 3.12.3, arm64
+  (t4g.micro), Werkzeug's threaded server. Each thread used its own connection; nothing was shared.
+
+**Fix.** Pooling off; one process-wide **re-entrant lock per unit of work** (connect … close) for
+SQL Server, taken in `_cursor()`, with the three module locks that open a unit inside them now taking
+it first so the lock order is uniform (`b9c3967`); a **15 s statement timeout** (`DB_QUERY_TIMEOUT`)
+so one stuck statement cannot stall the serialized process (`d208be4`). PostgreSQL is unchanged (a
+`nullcontext`). After the lock: 3 × 32 parallel flows, 0 failures, no crash. The trade-off is real: a
+SQL Server deployment serializes database work per process, so it **scales with worker processes, not
+threads**.
+
+**Guard.** New `[db]` check `check_parallel_clients` (`db72c1c`): four concurrent flows, three rounds,
+must neither fail nor take 10 s a step. It failed once on the pooling-off build (the SIGSEGV) and
+passed on the locked build.
+
+**Load side effect, and a correction.** The repeated load tests, crashes and restarts drove the
+db.t3.micro instance hard (CPU credit balance 0 for the whole hour, ~60 MB freeable memory, SQL Server
+committing ~121 MB with a 2.8 MB query-memory target, RDS's own `DBCC CHECKDB` queued for a 23 MB
+grant). At the peak a bare login took 25 s; with the load stopped it took 0.1 s and two parallel
+clients ran clean. An instance upgrade was suggested at the peak and withdrawn — the slowness was
+mostly self-inflicted. A few intermittent 15 s timeouts in `_verify_challenge` after the load were not
+pinned down.
+
+**Handset round on SQL Server 2019** (RDS `sqlserver-ex` 15.00.4480.2 — the RDS default version; both
+of today's SQL Server instances were 2019, not 2025): iPhone **PASS** (`403 stepup_required`, then
+verified, `per_use`, no downgrade); OPPO **PASS** (`403`, then verified, `windowed 30`, downgrade
+flagged). The +10 `new_device` on both is correct: to the fresh database each phone was first seen
+minutes earlier. **Vivo: owner decision** — not available; its EC2-PostgreSQL result (§53.4b) stands
+for the Android 11+ path.
+
+## 56. State at end of session and where to resume (2026-09-26)
+
+### 56.1 Infrastructure
+
+- **EC2** `i-0559685f02c4013b1` **stopped** (never terminated). Server `/opt/device_trust_server.py` =
+  commit `d208be4` (md5 `caef50c0fd58…`); earlier copies kept as `/opt/device_trust_server.py.bak-*`.
+  Backend **PostgreSQL 16.15** (EC2-local), **schema 6**, `INTEGRITY_MODE=observe`,
+  `DEVICE_POLICY_MODE=observe`. `risk_policy_settings` at **production defaults**: both behavioural
+  signals off, `stepup_required_paths` empty, accounts-per-device at the owner defaults (§54).
+  `PYTHONFAULTHANDLER` is not set (it was only on the SQL Server drop-in, now gone).
+- **SQL Server RDS**: both of today's instances (2019, `sqlserver-ex`) **deleted** — deletion confirmed
+  complete (no RDS instances), no final snapshot, 0 automated backups, 0 manual snapshots; Elastic IPs
+  0, NAT gateways 0.
+- **Lesson recorded:** the second SQL Server instance ran about four hours for a round that should
+  have taken minutes, because concurrency on SQL Server was discovered on hardware (§55). Run
+  `check_parallel_clients` against any new backend before handset or paid-database time.
+- The public IP changes on the next start; DuckDNS updates itself, but the dev box's `/etc/hosts` pin
+  (`44.251.13.79 devicefingerprinting.duckdns.org`, §52.3) goes stale — update or remove it
+  (needs sudo — the owner removed it after the session). Port 22 is IP-allow-listed in `sg-0a7e35ab397d765e8`; add the current IP if it changed.
+- The synthetic conformance certificate is still in the Android allow-list (§52.4) — needed for suite
+  runs, remove before production.
+
+### 56.2 Code and results
+
+Unpushed commits on `main` (the owner pushes): `a69ee66` … `07e2879` (14). Today delivered §51.8
+items 1–4: settings table, both behavioural signals, server step-up, and the Flutter plugin step-up
+key on Android and iOS — validated by the conformance suite on PostgreSQL and SQL Server 2019 and on
+three handsets (OPPO Android 9, Vivo Android 12, iPhone 7 iOS 15.8.5; §53.4, §55). Final code on
+PostgreSQL at production defaults: **47 / 0 / 5**, including the new parallel-clients check.
+
+### 56.3 Handsets as left
+
+- **OPPO CPH2083** (Android 9): screen-lock PIN now set; release build with step-up installed.
+- **Vivo V2118** (Android 12, new test device): PIN set; release build installed. Its logcat is empty
+  system-wide — read results from the server. adb only listed it after `adb kill-server`.
+- **iPhone 7**: passcode now on; `dt-stepup.ipa` (`sha256 db7e9afa…`, from `974d415`) installed through
+  TrollStore and staged at `/srv/artifacts/e2a890/dt-stepup.ipa`. lockdown's `PasswordProtected`
+  reads `false` regardless — do not trust it.
+- **After the session the owner removed the PIN/passcode on all three phones.** Removing it should
+  affect only the step-up key and leave the installation identity alone (outcome: §57) —
+  documented platform behaviour, **not yet observed** here. That is now a test (open item 5).
+
+### 56.4 Open items, in suggested order
+
+1. **§51.8 item 5 — the other SDKs' step-up key** (.NET and others). The server contract is fixed
+   (§53.1). The .NET repository belongs to another session: hand over by document only, and only with
+   the owner's explicit permission.
+2. **SQL Server beyond 2019.** The step-up handset round ran on 2019 only; 2017/2022/2025 were covered
+   earlier by the conformance matrix, not by this feature. Owner declined a 2025 round today.
+3. **PostgreSQL integrity-enforce run at schema 6** — not yet run (SQL Server's was, 48/0/3).
+4. **SQL Server in production:** the per-process lock (§55) means scaling with worker processes; the
+   exact faulty library in the ODBC stack was not isolated (x86_64 or a newer msodbcsql18 would be the
+   comparison), and a few post-load 15 s timeouts in `_verify_challenge` were not explained.
+5. **Screen lock removed — was only the step-up key affected? (owner, first thing next session.)** The
+   PIN/passcode is already off on all three phones. Check on each: the installation key and identity
+   are unchanged (re-registration takes the exact-key path, same installation id, clean integrity scan),
+   step-up is unavailable (`STEPUP_NO_DEVICE_CREDENTIAL`), a sensitive op without step-up is still
+   `403 stepup_required`, and nothing else broke. Then set a PIN again and see whether the old step-up
+   key was deleted (`created=true`, server `stepup_key_matches=false`) or survived invalidated
+   (`STEPUP_KEY_INVALIDATED` on signing). The current Android build checks for a lock screen before it
+   looks at the key, so it cannot tell those apart while the lock is off; the offered Kotlin change that
+   logs the key's state and replaces an invalidated key eagerly would make it direct.
+8. **The intermittent 15 s statement timeouts on SQL Server (owner: check next time).** After the load
+   tests, some `_verify_challenge` SELECTs hit the new 15 s timeout (`HYT00`) even at one client, while
+   other runs were clean at 1–3 s per step. The cause was not captured: poll `sys.dm_exec_requests` /
+   `sys.dm_exec_query_memory_grants` **during a failing request**, compare with the RDS maintenance
+   queue (`RdsAdminService` `DBCC CHECKDB` waiting on `RESOURCE_SEMAPHORE`), and run
+   `check_parallel_clients` first on any new SQL Server instance.
+6. **Step-up for already-enrolled installations** (§53.5): needs an enrolment path an oracle attacker
+   cannot satisfy (password re-entry or out-of-band confirmation). Not built.
+7. **Advisory signals can still escalate.** `request_rate_anomaly` and `population_outlier` add
+   points to the same score, so in combination they can push a device into review or block (the
+   iPhone reached 135 with both). §51.6 calls them "advisory, never a hard block"; decide whether
+   their contribution should be capped below the review band.
+
+## 57. Screen lock removed — what happens to the step-up key (2026-09-29)
+
+§56 open item 5, run on PostgreSQL. A server log line (`11c9b8d`) now records, on every exact-key
+re-registration, whether a step-up key was offered, whether one is bound, and whether they match.
+
+**OPPO, Android 9.** With the lock off: same installation re-registered on the exact-key path,
+integrity `18, trusted`, sensitive op without step-up `403 stepup_required`. The step-up key's alias
+survived but its entry could no longer be loaded (`UnrecoverableKeyException`); the app reported a
+generic `KEY_LOOKUP_FAILED` on every launch and never recovered. **Fix** (`6ded9ae`, `5aae413`): a key
+that is unrecoverable, has no private key, or throws `KeyPermanentlyInvalidatedException` at `initSign`
+is dead — delete it and report `STEPUP_KEY_INVALIDATED`, saying truthfully whether removal worked; an
+existing key is checked before the screen-lock requirement. Observed with the fix: lock off → detected,
+but Android 9 would **not** remove the alias (`deleteEntry` raised nothing, alias still present); PIN
+restored → "has been removed"; next launch → fresh key, server `matches=False`. Re-enrolment ("Simulate
+fresh installation") restored step-up: new installation `da95b434…`, `200 verified`. A healthy key is
+left alone (checked before the test: `created=false`, `matches=True`).
+
+**iPhone 7, iOS 15.8.5.** Same installation re-registered on the exact-key path, integrity `0, trusted`
+in all eight reports, sensitive op without step-up `403 stepup_required`. But iOS did **not** delete the
+step-up key: its public key stayed readable (server `matches=True`) while every signature failed
+(`STEPUP_SIGNING_FAILED`), both with the passcode off and after it was set again. So the app keeps
+offering a dead key, and the "with step-up" button stays enabled. **Correction:** earlier statements
+that iOS deletes the key on passcode removal came from documentation, not observation, and are wrong
+for this device. The failure text was `CryptoTokenKit error -3` (corrupted data: the Secure Enclave can
+no longer unwrap the key).
+
+**iOS fix** (`9bf705e`, Codemagic build `dt-stepup2.ipa`, `sha256 0209adf3…`): a key found while iOS
+reports no passcode set is dead (checked at launch); a signature failing with CryptoTokenKit -3 marks the
+key dead (checked at use); either way it is deleted and `STEPUP_KEY_INVALIDATED` reported, and Dart stops
+offering it. Verified on the iPhone with the passcode on: the launch still offered the old key (server
+`matches=True`, as designed — with a passcode set a dead key is only caught at use); "Sensitive op with
+step-up" sent nothing to the server; the next "Prove installation again" offered a **different** key
+(server `matches=False`) — the dead key was removed and a fresh, unbound one created. Re-enrolment is
+required to bind it. The launch-time path (passcode off) was observed later the same day (§58).
+
+**Vivo, Android 12**: not run (not available).
+
+Conclusion on all three runs: removing the screen lock affects **only** the step-up key; the
+installation identity, integrity and the server's refusal of unsigned sensitive operations are
+unchanged, and a lost step-up key can only be replaced by re-enrolling.
+
+
+## 58. Step-up recovery: re-enrolment for an existing installation (2026-09-29)
+
+§56 open item 6. Before this, a lost step-up key (§57) could only be replaced by a new installation.
+
+**Server** (`78686e1`, scoping `8661612`, migration 007, schema 7). `POST /v1/installations/stepup-key`
+binds a new step-up key to an existing installation only with all three of: the installation key (the
+access proof, behind the usual trusted-request gates), the **account password** re-entered now, and a
+**signature by the new step-up key** over `{purpose: stepup_reenrol, installation_id, key thumbprint,
+access-proof nonce, timestamp}` — which the device grants only after the user passes the new screen
+lock. A signing oracle has the first but not the password; an attacker who also has the password could
+already enrol a fresh installation, so nothing new is granted. As in login, the gates run before the
+password check (no credential oracle); attempts are rate-limited and every refusal is logged.
+
+**Hole found and closed during the build.** The step-up key is per installation, but opening a second
+account on a device needs only the installation key — so a signing oracle could open its own account,
+re-enrol with *that* password, and pass step-up for the victim's account. A re-enrolled key is now
+**scoped to the re-enrolling account** (`stepup_key_account_id`); a key bound at registration (NULL) still
+serves every account on the installation, and any other account gets `403 stepup_key_other_account`
+until it re-enrols with its own password. `check_stepup_reenrol` covers the wrong password (`401`), a
+proof signed by another key (`403 stepup_reenrol_proof_invalid`), a valid re-enrolment, and the
+second-account attack. PostgreSQL schema 7: **49 / 0 / 4** (step-up gate on, signals off).
+
+**Client** (`80a9152`). "Sensitive op with step-up" is enabled only for a key the server will accept
+(bound and not reported as different). When it is missing or unbound, the step-up section offers the
+password field and **Re-enrol step-up key**; the app then re-registers to show the server's view.
+
+**On the OPPO** (installation `da95b434…`, fresh unbound local key after §57): button greyed; a wrong
+password was refused (`invalid_credentials`); the right one re-enrolled the key (PIN prompt, `200`);
+"Sensitive op with step-up" then passed (`200 verified`). This re-enrolment ran six seconds before the
+scoping deployment, so that key is installation-wide (NULL) — correct for a key re-enrolled by the only
+account on the device, and the scoping itself is covered by the suite.
+
+**On the iPhone** (Codemagic build of `a0d4e4a`, `dt-stepup3.ipa`, installation `3702678e…`): passcode
+off → the app offered **no** step-up key (the launch-time dead-key check of §57, now observed; before the
+fix iOS kept offering the dead one); passcode on + "Prove installation again" → fresh key, server
+`matches=False`, button greyed; a wrong password refused (`invalid_credentials`), the right one
+re-enrolled the key — **scoped to the account** (`1519b153…`), `per_use`, no downgrade — and the app's
+re-registration then matched; "Sensitive op with step-up" → `200 verified`. **PASS** on both platforms.
+
+## 59. SQL Server: the timeout hunt, two phones at once, and what this stack sustains (2026-09-29)
+
+§56 open item 8, on a fresh SQL Server 2019 RDS (`sqlserver-ex` 15.00.4480, db.t3.micro — 1 GiB,
+2 burstable vCPUs, Express edition), schema 7, server `8661612`.
+
+- **Fresh instance, idle:** nothing queued for query memory, login + query 0.37 s; SQL Server commits
+  only ~112 MB of the 1 GiB, query-memory target ~3.6 MB. No `DBCC CHECKDB` was waiting this time.
+- **Parallel-clients check** first (the §55 rule): PASS.
+- **Timeout hunt — not reproduced.** Eight clients looping phone-like flows for 150 s while every
+  request waiting over 1 s inside SQL Server was logged each second: 0 failures, 0 `HYT00` query
+  timeouts, 0 restarts, and **no application request ever waited over 1 s in SQL Server** (only RDS's
+  own maintenance queries appeared). The earlier timeouts coincided with an instance overloaded by load
+  tests while RDS's maintenance sat in the memory-grant queue; they remain unexplained, not
+  reproducible at this load.
+- **Two phones at once — the case that failed in §55 — now works.** OPPO and iPhone registered within
+  0.26 s of each other and both finished (`device/me`) in 5–6 s, under the handsets' 15 s timeout.
+
+**What this stack sustains, measured** (8 concurrent clients): **2.5 requests/s** (0.41 six-request
+flows/s), p50 latency 1.6–5.9 s per endpoint, max 8.6 s. The limit is the **application on SQL
+Server**, not the database: the §55 lock serializes database work per process, and every unit of work
+opens a fresh TLS login (pooling off), so latency grows with clients while SQL Server barely waits.
+Rough extrapolation, not a measurement: ~1,500 sign-in flows an hour per server process. Serving
+thousands to millions of users needs many worker processes (which also sidesteps the driver's thread
+unsafety), pooled connections per process, horizontal app servers, and a production SQL Server edition
+and instance class — Express's documented 10 GB database cap alone rules it out.
+
+## 60. Production-style serving: worker processes + pooled connections, measured on four backends (2026-09-29)
+
+**What changed.** (1) A per-process, fork-safe connection pool (`3cea32f`, `DB_POOL_SIZE` default 4,
+`0` disables): `_cursor()` reuses an idle connection instead of paying TCP + TLS + login per unit of
+work; read units roll back before check-in; a connection idle over 30 s is pinged before reuse; a
+forked worker starts with an empty pool. (2) **gunicorn with 4 sync worker processes** instead of
+Werkzeug's threaded development server. gunicorn is a deployment choice, not an import: it is installed
+in the EC2 venv and started from the systemd drop-in (`ExecStart=… gunicorn --workers 4 --bind
+127.0.0.1:5000 --chdir /opt --access-logfile - --timeout 60 device_trust_server:app`). Single-threaded
+workers also sidestep the SQL Server driver's thread unsafety (§55) — its per-process lock is now
+uncontended.
+
+**Method.** Same EC2 t4g.micro application host; each backend on RDS/EC2 as noted; a load generator on
+the dev box (keep-alive HTTPS per client, DuckDNS address pinned in-process so the local resolver does
+not add noise), 64 clients each looping phone-like flows (enrol → prove → integrity challenge + report
+→ `device/me`, six requests) for 60 s. The network round trip from the dev box is ~0.3 s, the floor of
+every latency below.
+
+| 64 clients | old: threaded dev server, no pool | new: gunicorn ×4 + pool |
+|---|---|---|
+| PostgreSQL 16.15 (EC2-local) | 40.5 req/s, p50 1.48 s, p95 2.49 s, EC2 load 11.4 | **199.6 req/s**, p50 **0.30 s**, p95 0.38 s, 0 failures |
+| SQL Server 2019 (db.t3.micro Express) | **2.6 req/s, 61 failures**, p50 11.1 s, p95 19.5 s | **53.4 req/s**, p50 1.07 s, p95 2.14 s, 0 failures |
+| SQL Server 2022 (db.t3.micro Express) | — | **63.5 req/s**, p50 0.95 s, p95 1.73 s, 0 failures |
+| SQL Server 2025 (db.t3.micro Express) | — | 33.0 req/s, **32 failures** (15 s query timeouts, see below) |
+
+PostgreSQL: ~5× the throughput at a fifth of the latency, and the new numbers sit on the network floor
+(64 clients ÷ 0.31 s ≈ 206 req/s offered), so the server's ceiling on this 2-vCPU host is above what
+64 remote clients can generate. SQL Server 2019: ~20× — the old setup collapsed at 64 clients. The
+conformance suite passed on the new setup on PostgreSQL (49/0/4), SQL Server 2019 (48/0/5) and 2022
+(48/0/5), and the parallel-clients check passed on 2019, 2022 and 2025.
+
+**The intermittent 15 s timeouts, explained (§56 item 8 closed).** They reproduced on the 2025 instance
+under load (48 `HYT00` query timeouts → 24 × `500`; the suite could not finish there), and this time
+the cause was caught live. RDS's own maintenance session (`RdsAdminService`) was running
+`DBCC CHECKDB`, waiting on `RESOURCE_SEMAPHORE` for a **22–25 MB** memory grant that this instance can
+never give (SQL Server commits only ~130 MB of the 1 GiB; its query-memory target is ~3 MB). The grant
+queue is FIFO, so RDS's own 1 MB queries — **and ours** (`python3.12`, 1 MB grants, polled in the same
+queue behind it) — waited too, until our 15 s statement timeout fired. A small follow-up load on 2025
+ran at 1.6 req/s with p95 20.6 s while the DBCC sat at the head of the queue. It is not our code: the
+same statements run in ~1 s when the queue is clear (2019, 2022 today). It is the instance class — on
+db.t3.micro, RDS's routine consistency check can starve every query that needs memory, whenever RDS
+schedules it. Production needs an instance with real memory (this one gives SQL Server ~130 MB).
+
+**Answer to "how far can this be stretched".** On this test stack the application side now scales with
+worker processes, and the database becomes the limit: ~55–65 req/s on SQL Server db.t3.micro Express
+when RDS maintenance is quiet, and far less when it is not; PostgreSQL on the same app host is beyond
+~200 req/s at 64 clients. Thousands-to-millions of users needs, in order: more app hosts behind a load
+balancer (the app tier is now horizontally scalable), a production database class with memory to spare
+(and for SQL Server a non-Express edition — Express caps the database at 10 GB), and a load test from
+inside the region to find the real ceiling, which 64 clients across a 0.3 s link cannot reach.
+
+## 61. State at end of session (2026-09-29)
+
+- **EC2** `i-0559685f02c4013b1` **stopped**. Server `/opt/device_trust_server.py` = `3cea32f` (pool),
+  served by **gunicorn with 4 workers** from the systemd drop-in (dev-server copies of the drop-in kept as
+  `test.conf.bak-devserver-*`). PostgreSQL 16.15, **schema 7**, `INTEGRITY_MODE=observe`,
+  `DEVICE_POLICY_MODE=observe`, `risk_policy_settings` at production defaults (step-up gate empty,
+  signals off, account policy at the owner defaults). Public IP changes on start (DuckDNS follows).
+- **SQL Server RDS**: 2019, 2022 and 2025 instances deleted with no final snapshot and no automated
+  backups; local master passwords shredded. No Elastic IP was ever allocated.
+- **Handsets**: OPPO — PIN set, build with the dead-key fix and recovery flow, installation `da95b434…`
+  re-enrolled; iPhone — passcode on, `dt-stepup3.ipa` (`a0d4e4a`), installation `3702678e…` re-enrolled
+  (scoped to its account). The OPPO device now has four linked accounts on PostgreSQL, so its
+  account-risk decisions read `block` (observe hides it) — an artefact of repeated test resets.
+- **Done later the same day (§62):** ~~Owed to the .NET client~~ — baseline-relative W^X scoring — the owner approved
+  it on 2026-09-23 and the .NET session already prints `sha256:bytes:granularity` entries for an
+  `INTEGRITY_ANDROID_WX_BASELINES` map (their commit `9d3a992`), but this server does not implement
+  the map yet, so the .NET Android client still reads 78/review on the OPPO. Read
+  `DESIGN_UPDATE_FROM_DOTNET.md` first: implemented naively it switches W^X scoring off for Flutter.
+- **Open next**: other SDKs' step-up (§51.8 item 5, .NET by handoff document only, with permission); a
+  load test from inside AWS to find the real ceiling; a larger SQL Server instance class if SQL Server
+  stays in scope (db.t3.micro Express starves under RDS's own `DBCC CHECKDB`, §60); Vivo (Android 12)
+  screen-lock and recovery runs when the phone is available.
+
+## 62. Baseline-relative W^X scoring per APK — implemented (2026-09-29)
+
+The owner approved the rule in `DESIGN_UPDATE_FROM_DOTNET.md` on 2026-09-23; the .NET session asked for it
+as a per-APK map. Implemented in `2427e11`.
+
+**Configuration.** `INTEGRITY_ANDROID_WX_BASELINES=<apk_sha256>:<bytes>:<granularity>[,…]` — one entry
+per build, keyed on the APK hash the operator pins (never on a runtime name the client reports, which
+a compromised process could claim). The .NET SDK's `baseline` command measures and prints the entry;
+on a shared server, append rather than replace. A malformed entry stops the server at start-up.
+`/health/ready.scoring_flags.android_wx_baselines` reports how many builds are pinned.
+
+**Rule** (`_score_wx_memory`):
+
+| report | points |
+|---|---|
+| no W^X at all | 0 |
+| no baseline for this APK, or a baseline of 0 | `android_wx_memory` **+60**, unchanged |
+| `wx_bytes` absent or malformed, or no usable size classes | `android_wx_memory` **+60** — absence is never read as zero |
+| baselined, ≤ baseline, every size a multiple of the granularity | **0** |
+| a size (from `wx_size_classes`, `wx_smallest_bytes`, `wx_largest_bytes`) not a multiple of the granularity | `android_wx_foreign_allocator` **+45** |
+| above the baseline / beyond twice it | `android_wx_above_baseline` **+15** / `android_wx_far_above_baseline` **+40** |
+
+The foreign-allocator and excess reasons add up: the gadget shape the .NET session measured (1,175,552
+bytes against 1,048,576, with 4,096 and 28,672-byte regions) scores 45 + 15 = 60.
+
+**The trap is closed.** The Flutter/Kotlin collector sends no `wx_bytes`, so every Flutter report takes
+the unchanged +60 path whenever W^X is present — a naive `wx_bytes or 0` would have switched W^X scoring
+off for a Flutter device with an injected gadget. Covered by the existing
+"w^x still scores when the client sends no wx_bytes" check, which still passes.
+
+**Validation.** Offline unit test of the rule (nine cases, including the trap, a zero baseline, missing
+size classes and a foreign size visible only in `wx_smallest_bytes`); new `check_wx_baseline` (clean at
+baseline, foreign allocator, above, far above, and a baselined report without `wx_bytes` still +60);
+full suite on PostgreSQL **49 / 0 / 5** (54 checks); on hardware, the OPPO's Flutter scan still reads
+`18, trusted`.
+
+**Server state.** `/etc/devicetrust.env` pins one entry, for the synthetic conformance APK
+(`1b536aea46be…:1048576:65536`, `sha256("conformance-apk")`, which no real build can match — like the
+conformance certificate, remove before production). The .NET build's own entry is **not** configured yet:
+the .NET session must append `<their apk sha256>:1048576:65536` (from their `baseline` command) to that
+line; until then the .NET Android client still scores +60.

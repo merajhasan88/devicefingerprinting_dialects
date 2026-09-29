@@ -6,11 +6,13 @@ namespace DeviceTrust.Client.Keys
     /// What a key store reports about the key it is holding.
     /// </summary>
     /// <remarks>
-    /// These fields exist so an operator can tell, from the client, whether the
-    /// key really is held by hardware. They are local self-description and are
-    /// deliberately not sent to the server as a security claim: the server does
-    /// not trust a client's assertion about its own security level, and there is
-    /// no remote key attestation in this design.
+    /// These fields let an operator tell whether the key really is held by
+    /// hardware. The level, backing and provider are sent at registration as
+    /// <c>key_security</c> (DESIGN.md 50). That is a client claim, not proof —
+    /// there is no key attestation in this design — and its value to the server
+    /// is comparative: the thumbprint is the identity, and a non-exportable
+    /// hardware key cannot move into software, so the same key later claiming
+    /// a weaker level is a contradiction the server records.
     /// </remarks>
     public sealed class InstallationKeyMetadata
     {

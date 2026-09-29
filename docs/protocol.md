@@ -16,6 +16,8 @@ protocol without reading the server.
 | 6 | `POST /v1/accounts/register` \| `/login` | **device** token + access proof | Issue account access and refresh tokens bound to `did` and `iid`. |
 | 7 | `GET /v1/account/me`, `POST /v1/account/protected-echo`, `GET /v1/policy/me`, `GET /v1/device/me` | account token + access proof | Ordinary protected calls. |
 | 8 | `POST /v1/auth/refresh/challenge` → `POST /v1/auth/refresh` | refresh token | Rotate the session. Reusing a rotated token revokes the family. |
+| 9 | `POST /v1/account/sensitive-echo` | account token + access proof (+ step-up proof on a gated path) | The demo crown-jewel operation. Gated only when a DBA lists it in `risk_policy_settings.stepup_required_paths`. |
+| 10 | `POST /v1/installations/stepup-key` | account token + access proof + password + new-key proof | Re-enrol a lost or replaced step-up key (DESIGN.md 58). |
 
 Lifetimes: access 10 minutes, device 10 minutes, refresh 30 days, challenge 2 minutes, access-proof
 skew ±120 seconds, integrity report skew ±90 seconds, integrity freshness 600 seconds.
@@ -23,6 +25,73 @@ skew ±120 seconds, integrity report skew ±90 seconds, integrity freshness 600 
 Only `android` and `ios` are accepted platforms. The client registers under the platform its
 integrity collector can actually measure, which is why `DeviceTrustClient.Platform` defaults to
 `IIntegrityProbeCollector.Platform` rather than to a constant.
+
+## Registration: `key_security` and the step-up key
+
+Since DESIGN.md 50 and 53 the registration body carries two optional blocks.
+
+```json
+"key_security":    {"security_level": "strongbox", "hardware_backed": true, "provider": "AndroidKeyStore"},
+"stepup_public_key": {"kty": "EC", "crv": "P-256", "alg": "ES256", "x": "…", "y": "…"},
+"stepup_key_auth": {"factor": "passcode", "mode": "per_use", "window_seconds": 0}
+```
+
+- `key_security` is always sent, from `InstallationKeyMetadata`. A level the store could not read is
+  sent as `security_level: null, hardware_backed: null`, never as `"unknown", false`: `false` is a
+  claim of software backing, which `INTEGRITY_HARDWARE_BACKING_POLICY=advisory` scores +30.
+- The step-up key is sent only when an `IStepUpKeyStore` produced one. No screen lock means no key and
+  no block, never a failed enrolment. `stepup_key_auth` is what the keystore **enforces**, read back
+  from the key: Android 9/10 turns a per-use passcode request into `windowed`/30, and the server
+  records that as `stepup_policy_downgrade: true`. iOS is always `per_use`.
+- A step-up key binds **only when the installation key is new**. On re-registration the server never
+  attaches or replaces one; it answers `stepup_key_registered`, `stepup_key_matches` (null when none
+  was offered), `stepup_key_auth` and `stepup_policy_downgrade`. The client offers step-up only when
+  the key is registered and `stepup_key_matches != false` (`DeviceTrustClient.StepUpUsable`).
+- A new installation key deletes the local step-up key, so the new installation enrols its own.
+
+## Step-up proof
+
+On a gated path the request carries two extra headers:
+
+| Header | Value |
+|---|---|
+| `X-Step-Up-Proof` | base64url of `{"version":1,"installation_id":…,"factor":…,"nonce":…,"timestamp":<unix s>}` |
+| `X-Step-Up-Signature` | base64url DER signature by the **step-up** key over those exact bytes |
+
+The `nonce` is this request's access-proof nonce, so the access proof's replay store protects the
+step-up proof too and there is no step-up challenge. The client generates the nonce, **signs the
+step-up proof first** (the user may take a while at the prompt), then builds the access proof with
+that nonce, so the access proof's ±120 s window starts after the prompt. `factor` must equal the
+deployment's `stepup_factor`. Codes: `stepup_required`, `stepup_key_not_registered`,
+`stepup_signature_invalid`, `stepup_installation_mismatch`, `stepup_binding_mismatch`,
+`stepup_factor_mismatch`, `stepup_timestamp_invalid`, `stepup_timestamp_outside_window`,
+`stepup_key_other_account`.
+
+## Step-up re-enrolment
+
+`POST /v1/installations/stepup-key`, account token plus access proof, body:
+
+```json
+{"password": "…", "stepup_public_key": {…}, "stepup_key_auth": {…},
+ "stepup_key_proof": "<base64url>", "stepup_key_signature": "<base64url DER>"}
+```
+
+`stepup_key_proof` is `{"version":1,"purpose":"stepup_reenrol","installation_id":…,
+"stepup_key_thumbprint":<RFC 7638 of the new key>,"nonce":<access-proof nonce>,"timestamp":…}`,
+signed by the **new** step-up key — the screen-lock prompt is the point. Wrong password:
+`401 invalid_credentials`; a proof not by the named key or not bound to the request:
+`403 stepup_reenrol_proof_invalid`. The re-enrolled key is scoped to the re-enrolling account;
+another account on the same installation gets `403 stepup_key_other_account`. The client
+re-registers afterwards so `Registration` shows the server's view.
+
+## Dead step-up keys (DESIGN.md 57)
+
+A step-up key that can never sign again is deleted by its store and reported as
+`STEPUP_KEY_INVALIDATED`, saying whether removal worked; the client clears `StepUpKey` and the
+installation must re-enrol. Android: `UnrecoverableKeyException` at `getEntry` (Android 9), no
+private key under the alias, or `KeyPermanentlyInvalidatedException` at `initSign`; an existing key
+is checked before the screen-lock requirement. iOS: a key present while `LAContext` reports
+`passcodeNotSet`, or a signature failing with CryptoTokenKit -3.
 
 ## Cryptography
 

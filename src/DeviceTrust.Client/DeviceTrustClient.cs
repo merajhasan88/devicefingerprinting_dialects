@@ -39,6 +39,7 @@ namespace DeviceTrust.Client
         private readonly IInstallationKeyStore _keyStore;
         private readonly IInstallationStateStore _stateStore;
         private readonly IIntegrityProbeCollector? _integrityCollector;
+        private readonly IStepUpKeyStore? _stepUpKeyStore;
         private readonly DeviceTrustApi _api;
         private readonly SemaphoreSlim _identityGate = new SemaphoreSlim(1, 1);
 
@@ -55,17 +56,24 @@ namespace DeviceTrust.Client
         /// fresh signed report exists.
         /// </param>
         /// <param name="httpClient">An externally owned <see cref="HttpClient"/>, if the host has one.</param>
+        /// <param name="stepUpKeyStore">
+        /// The optional step-up key store (DESIGN.md 53). Without one the client
+        /// registers no step-up key and the server refuses sensitive operations
+        /// with <c>stepup_key_not_registered</c>.
+        /// </param>
         public DeviceTrustClient(
             DeviceTrustOptions options,
             IInstallationKeyStore keyStore,
             IInstallationStateStore? stateStore = null,
             IIntegrityProbeCollector? integrityCollector = null,
-            HttpClient? httpClient = null)
+            HttpClient? httpClient = null,
+            IStepUpKeyStore? stepUpKeyStore = null)
         {
             _options = options ?? throw new ArgumentNullException(nameof(options));
             _keyStore = keyStore ?? throw new ArgumentNullException(nameof(keyStore));
             _stateStore = stateStore ?? new InMemoryInstallationStateStore();
             _integrityCollector = integrityCollector;
+            _stepUpKeyStore = stepUpKeyStore;
             _api = new DeviceTrustApi(options, httpClient);
 
             Platform = options.Platform
@@ -121,6 +129,26 @@ namespace DeviceTrust.Client
         /// </remarks>
         public IntegrityCollection? LastIntegrityCollection { get; private set; }
 
+        /// <summary>The local step-up key, once prepared; null when there is none.</summary>
+        public StepUpKeyMetadata? StepUpKey { get; private set; }
+
+        /// <summary>
+        /// Why there is no local step-up key — no screen lock, a key that died,
+        /// no store configured — or null when there is one.
+        /// </summary>
+        public InstallationKeyException? StepUpUnavailable { get; private set; }
+
+        /// <summary>
+        /// Whether a step-up signature from this device will be accepted: a
+        /// local key exists, the server has one bound, and it has not reported
+        /// the local key as a different one. Offer the step-up action only when
+        /// this is true; otherwise offer re-enrolment.
+        /// </summary>
+        public bool StepUpUsable => StepUpKey is not null
+                                    && Registration is not null
+                                    && Registration.StepUpKeyRegistered
+                                    && Registration.StepUpKeyMatches != false;
+
         /// <summary>
         /// Loads the installation identity, creating the key and the UUID if this
         /// is a first run.
@@ -145,6 +173,15 @@ namespace DeviceTrust.Client
 
                 var state = await _stateStore.LoadAsync(cancellationToken).ConfigureAwait(false);
                 var metadata = await _keyStore.GetOrCreateKeyAsync(cancellationToken).ConfigureAwait(false);
+
+                if (metadata.Created)
+                {
+                    // A new installation key is a new server installation, and a
+                    // step-up key binds only at first registration: rotate it so
+                    // the new installation enrols its own rather than offering a
+                    // key the server will report as not matching.
+                    await DeleteStepUpKeyQuietlyAsync(cancellationToken).ConfigureAwait(false);
+                }
 
                 var hadInstallationId = !string.IsNullOrEmpty(state.InstallationId);
                 if (!hadInstallationId)
@@ -178,6 +215,7 @@ namespace DeviceTrust.Client
             CancellationToken cancellationToken = default)
         {
             var identity = await LoadIdentityAsync(cancellationToken).ConfigureAwait(false);
+            await PrepareStepUpKeyAsync(cancellationToken).ConfigureAwait(false);
 
             RegistrationState registration;
             try
@@ -187,6 +225,8 @@ namespace DeviceTrust.Client
                     Platform,
                     identity.Key.PublicKey,
                     reinstallHint,
+                    identity.Key,
+                    StepUpKey,
                     cancellationToken).ConfigureAwait(false);
             }
             catch (DeviceTrustApiException error) when (error.Code == "registration_race_retry")
@@ -198,6 +238,8 @@ namespace DeviceTrust.Client
                     Platform,
                     identity.Key.PublicKey,
                     reinstallHint,
+                    identity.Key,
+                    StepUpKey,
                     cancellationToken).ConfigureAwait(false);
             }
 
@@ -405,6 +447,209 @@ namespace DeviceTrust.Client
                 cancellationToken: cancellationToken);
         }
 
+        /// <summary>
+        /// Calls the demo crown-jewel endpoint <c>POST /v1/account/sensitive-echo</c>,
+        /// with or without a step-up proof.
+        /// </summary>
+        /// <remarks>
+        /// The endpoint requires step-up only when the deployment lists it in
+        /// <c>risk_policy_settings.stepup_required_paths</c>; otherwise it answers
+        /// <c>step_up: not_required</c>. Without step-up on a gated path the
+        /// server answers <c>403 stepup_required</c>.
+        /// </remarks>
+        public Task<JsonElement> SensitiveEchoAsync(
+            IReadOnlyDictionary<string, object?> body,
+            bool withStepUp,
+            string reason = "Approve a sensitive operation",
+            CancellationToken cancellationToken = default)
+        {
+            if (body is null)
+            {
+                throw new ArgumentNullException(nameof(body));
+            }
+
+            var encoded = Json.SerializeToUtf8Bytes(body);
+            var accessToken = RequireSession().AccessToken;
+            return withStepUp
+                ? SendStepUpProtectedAsync("POST", "/v1/account/sensitive-echo", encoded, accessToken, reason,
+                    cancellationToken)
+                : SendProtectedAsync("POST", "/v1/account/sensitive-echo", encoded, accessToken,
+                    cancellationToken: cancellationToken);
+        }
+
+        /// <summary>
+        /// Sends a protected request that also carries a step-up proof: the user
+        /// authenticates, the step-up key signs a proof bound to this request's
+        /// access-proof nonce, and only then is the access proof signed.
+        /// </summary>
+        /// <remarks>
+        /// The order is deliberate. The prompt can take a while, and the access
+        /// proof's ±120-second timestamp window should start after the user has
+        /// answered, not before. The nonce is generated first so both proofs can
+        /// name it; the access proof's nonce is what the server's replay store
+        /// already protects, so the step-up proof needs no challenge of its own.
+        /// A key found dead at signing is discarded by the store and
+        /// <see cref="StepUpKey"/> is cleared, so the caller stops offering it.
+        /// </remarks>
+        public async Task<JsonElement> SendStepUpProtectedAsync(
+            string method,
+            string path,
+            byte[]? body,
+            string bearerToken,
+            string reason,
+            CancellationToken cancellationToken = default)
+        {
+            var key = StepUpKey ?? throw StepUpKeyMissing();
+            var identity = await LoadIdentityAsync(cancellationToken).ConfigureAwait(false);
+            var nonce = AccessProof.CreateNonce();
+
+            var proof = BuildStepUpProof(identity.InstallationId, key.Auth.Factor, nonce, AccessProof.CurrentTimestamp());
+            var signature = await SignWithStepUpKeyAsync(proof, reason, cancellationToken).ConfigureAwait(false);
+
+            var fixture = await BuildAccessProofFixtureAsync(
+                method,
+                path,
+                body,
+                bearerToken,
+                nonce: nonce,
+                cancellationToken: cancellationToken).ConfigureAwait(false);
+
+            return await SendAccessProofFixtureAsync(
+                fixture,
+                additionalHeaders: new Dictionary<string, string>(StringComparer.Ordinal)
+                {
+                    [StepUpProofHeader] = Base64Url.Encode(proof),
+                    [StepUpSignatureHeader] = Base64Url.Encode(signature),
+                },
+                cancellationToken: cancellationToken).ConfigureAwait(false);
+        }
+
+        /// <summary>
+        /// Binds this device's current step-up key to the installation for the
+        /// signed-in account (<c>POST /v1/installations/stepup-key</c>, DESIGN.md 58).
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// The recovery path when the step-up key was lost — the screen lock was
+        /// removed, or the installation enrolled before it had one. The server
+        /// accepts a new key only with all three of: the access proof, the
+        /// account password entered now, and a signature by the new key over a
+        /// proof naming its own thumbprint and this request's nonce, which the
+        /// device grants only after the user passes the screen lock.
+        /// </para>
+        /// <para>
+        /// The re-enrolled key is scoped to this account. Another account on the
+        /// same installation gets <c>403 stepup_key_other_account</c> until it
+        /// re-enrols with its own password. Afterwards the installation is
+        /// re-registered so <see cref="Registration"/> shows the server's view.
+        /// </para>
+        /// </remarks>
+        /// <returns>The server's answer: the key is registered, its auth, and any downgrade.</returns>
+        public async Task<JsonElement> ReenrolStepUpKeyAsync(
+            string password,
+            ReinstallHint? reinstallHint = null,
+            string reason = "Confirm your new step-up key",
+            CancellationToken cancellationToken = default)
+        {
+            if (string.IsNullOrEmpty(password))
+            {
+                throw new ArgumentException("The account password is required.", nameof(password));
+            }
+
+            var session = RequireSession();
+            if (StepUpKey is null)
+            {
+                await PrepareStepUpKeyAsync(cancellationToken).ConfigureAwait(false);
+            }
+
+            var key = StepUpKey ?? throw StepUpKeyMissing();
+            var identity = await LoadIdentityAsync(cancellationToken).ConfigureAwait(false);
+            var nonce = AccessProof.CreateNonce();
+
+            byte[] keyProof;
+            using (var buffer = new MemoryStream())
+            {
+                using (var writer = new Utf8JsonWriter(buffer))
+                {
+                    writer.WriteStartObject();
+                    writer.WriteNumber("version", 1);
+                    writer.WriteString("purpose", "stepup_reenrol");
+                    writer.WriteString("installation_id", identity.InstallationId);
+                    writer.WriteString("stepup_key_thumbprint", key.Thumbprint);
+                    writer.WriteString("nonce", nonce);
+                    writer.WriteNumber("timestamp", AccessProof.CurrentTimestamp());
+                    writer.WriteEndObject();
+                }
+
+                keyProof = buffer.ToArray();
+            }
+
+            var keySignature = await SignWithStepUpKeyAsync(keyProof, reason, cancellationToken).ConfigureAwait(false);
+
+            byte[] body;
+            using (var buffer = new MemoryStream())
+            {
+                using (var writer = new Utf8JsonWriter(buffer))
+                {
+                    writer.WriteStartObject();
+                    writer.WriteString("password", password);
+                    writer.WritePropertyName("stepup_public_key");
+                    key.PublicKey.Write(writer);
+                    writer.WritePropertyName("stepup_key_auth");
+                    key.Auth.Write(writer);
+                    writer.WriteString("stepup_key_proof", Base64Url.Encode(keyProof));
+                    writer.WriteString("stepup_key_signature", Base64Url.Encode(keySignature));
+                    writer.WriteEndObject();
+                }
+
+                body = buffer.ToArray();
+            }
+
+            var fixture = await BuildAccessProofFixtureAsync(
+                "POST",
+                "/v1/installations/stepup-key",
+                body,
+                session.AccessToken,
+                nonce: nonce,
+                cancellationToken: cancellationToken).ConfigureAwait(false);
+            var response = await SendAccessProofFixtureAsync(fixture, cancellationToken: cancellationToken)
+                .ConfigureAwait(false);
+
+            await RegisterInstallationAsync(reinstallHint, cancellationToken).ConfigureAwait(false);
+            return response;
+        }
+
+        /// <summary>
+        /// Loads or creates the local step-up key. Never throws for an
+        /// unavailable key: no screen lock, no store or a dead key is recorded in
+        /// <see cref="StepUpUnavailable"/>, because a device without step-up must
+        /// still enrol.
+        /// </summary>
+        public async Task<StepUpKeyMetadata?> PrepareStepUpKeyAsync(CancellationToken cancellationToken = default)
+        {
+            StepUpKey = null;
+            StepUpUnavailable = null;
+            if (_stepUpKeyStore is null)
+            {
+                StepUpUnavailable = new InstallationKeyException(
+                    StepUpErrorCodes.NotConfigured,
+                    "No step-up key store was configured for this client.");
+                return null;
+            }
+
+            try
+            {
+                StepUpKey = await _stepUpKeyStore.GetOrCreateKeyAsync(_options.StepUp, cancellationToken)
+                    .ConfigureAwait(false);
+            }
+            catch (InstallationKeyException error)
+            {
+                StepUpUnavailable = error;
+            }
+
+            return StepUpKey;
+        }
+
         /// <summary>Reads the current relationship-risk decision.</summary>
         public async Task<RiskPolicyDecision> GetPolicyAsync(CancellationToken cancellationToken = default)
         {
@@ -521,6 +766,7 @@ namespace DeviceTrust.Client
             string? actualMethod = null,
             string? actualPath = null,
             byte[]? actualBody = null,
+            IReadOnlyDictionary<string, string>? additionalHeaders = null,
             CancellationToken cancellationToken = default)
         {
             if (fixture is null)
@@ -532,17 +778,47 @@ namespace DeviceTrust.Client
             var path = actualPath ?? fixture.SignedPath;
             var body = method == "GET" ? null : actualBody ?? fixture.EncodedBody;
 
-            return _api.SendAsync(
-                method,
-                path,
-                body,
-                fixture.BearerToken,
-                new Dictionary<string, string>(StringComparer.Ordinal)
+            var headers = new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                [DeviceTrustApi.AccessProofHeader] = fixture.ProofPayload,
+                [DeviceTrustApi.AccessSignatureHeader] = fixture.Signature,
+            };
+            if (additionalHeaders is not null)
+            {
+                foreach (var header in additionalHeaders)
                 {
-                    [DeviceTrustApi.AccessProofHeader] = fixture.ProofPayload,
-                    [DeviceTrustApi.AccessSignatureHeader] = fixture.Signature,
-                },
-                cancellationToken);
+                    headers[header.Key] = header.Value;
+                }
+            }
+
+            return _api.SendAsync(method, path, body, fixture.BearerToken, headers, cancellationToken);
+        }
+
+        /// <summary>The header carrying the base64url step-up proof JSON.</summary>
+        public const string StepUpProofHeader = "X-Step-Up-Proof";
+
+        /// <summary>The header carrying the base64url DER step-up signature.</summary>
+        public const string StepUpSignatureHeader = "X-Step-Up-Signature";
+
+        /// <summary>
+        /// Serialises a step-up proof: <c>{version, installation_id, factor,
+        /// nonce, timestamp}</c>, where the nonce is the access proof's.
+        /// </summary>
+        public static byte[] BuildStepUpProof(string installationId, string factor, string nonce, long timestamp)
+        {
+            using var buffer = new MemoryStream();
+            using (var writer = new Utf8JsonWriter(buffer))
+            {
+                writer.WriteStartObject();
+                writer.WriteNumber("version", 1);
+                writer.WriteString("installation_id", installationId);
+                writer.WriteString("factor", factor);
+                writer.WriteString("nonce", nonce);
+                writer.WriteNumber("timestamp", timestamp);
+                writer.WriteEndObject();
+            }
+
+            return buffer.ToArray();
         }
 
         /// <summary>Builds a fresh proof and sends the request it describes.</summary>
@@ -613,9 +889,12 @@ namespace DeviceTrust.Client
         public async Task ResetInstallationAsync(CancellationToken cancellationToken = default)
         {
             await _keyStore.DeleteKeyAsync(cancellationToken).ConfigureAwait(false);
+            await DeleteStepUpKeyQuietlyAsync(cancellationToken).ConfigureAwait(false);
             await _stateStore.ClearAsync(cancellationToken).ConfigureAwait(false);
             _identity = null;
             Registration = null;
+            StepUpKey = null;
+            StepUpUnavailable = null;
             Session = null;
             DeviceToken = null;
             DeviceRecord = null;
@@ -698,6 +977,54 @@ namespace DeviceTrust.Client
             state.AccessToken = session.AccessToken;
             state.RefreshToken = session.RefreshToken;
             await _stateStore.SaveAsync(state, cancellationToken).ConfigureAwait(false);
+        }
+
+        private async Task<byte[]> SignWithStepUpKeyAsync(byte[] data, string reason, CancellationToken cancellationToken)
+        {
+            if (_stepUpKeyStore is null)
+            {
+                throw StepUpKeyMissing();
+            }
+
+            try
+            {
+                return await _stepUpKeyStore.SignAsync(data, reason, cancellationToken).ConfigureAwait(false);
+            }
+            catch (InstallationKeyException error) when (error.Code == StepUpErrorCodes.KeyInvalidated)
+            {
+                // The store has already discarded the dead key; stop offering it.
+                StepUpKey = null;
+                StepUpUnavailable = error;
+                throw;
+            }
+        }
+
+        private InstallationKeyException StepUpKeyMissing()
+        {
+            return StepUpUnavailable ?? new InstallationKeyException(
+                StepUpErrorCodes.KeyNotFound,
+                "No step-up key is available on this device. Register the installation first.");
+        }
+
+        private async Task DeleteStepUpKeyQuietlyAsync(CancellationToken cancellationToken)
+        {
+            if (_stepUpKeyStore is null)
+            {
+                return;
+            }
+
+            try
+            {
+                await _stepUpKeyStore.DeleteKeyAsync(cancellationToken).ConfigureAwait(false);
+            }
+            catch (InstallationKeyException)
+            {
+                // A step-up key that cannot be deleted must not stop the
+                // installation identity from rotating. The next registration
+                // reports it as not matching, and re-enrolment replaces it.
+            }
+
+            StepUpKey = null;
         }
 
         private AccountSession RequireSession()

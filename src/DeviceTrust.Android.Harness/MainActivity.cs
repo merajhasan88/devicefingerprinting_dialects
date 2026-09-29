@@ -92,12 +92,15 @@ namespace DeviceTrust.Android.Harness
         private TextView? _status;
         private TextView? _identityView;
         private TextView? _result;
+        private TextView? _stepUpView;
+        private AndroidStepUpKeyStore? _stepUpStore;
         private bool _busy;
 
         /// <inheritdoc />
         protected override void OnCreate(Bundle? savedInstanceState)
         {
             base.OnCreate(savedInstanceState);
+            _stepUpStore = new AndroidStepUpKeyStore(ApplicationContext!, () => this);
             BuildUserInterface();
             RunIntent(Intent);
         }
@@ -107,6 +110,18 @@ namespace DeviceTrust.Android.Harness
         {
             base.OnNewIntent(intent);
             RunIntent(intent);
+        }
+
+        /// <inheritdoc />
+        protected override void OnActivityResult(int requestCode, Result resultCode, Intent? data)
+        {
+            // Android 9/10 step-up: the confirm-credential screen answers here.
+            if (_stepUpStore?.OnActivityResult(requestCode, resultCode) == true)
+            {
+                return;
+            }
+
+            base.OnActivityResult(requestCode, resultCode, data);
         }
 
         // ---------------------------------------------------------------- UI
@@ -140,6 +155,18 @@ namespace DeviceTrust.Android.Harness
             root.AddView(Button("Create account", () => RunAsync("account-register", client => AccountAsync(client, "register"))));
             root.AddView(Button("Log in", () => RunAsync("account-login", client => AccountAsync(client, "login"))));
             root.AddView(Button("Evaluate current account risk", () => RunAsync("policy", PolicyAsync)));
+
+            root.AddView(SectionLabel("Step-up (sensitive operations)"));
+            root.AddView(Body(
+                "A second hardware key that signs only after the screen lock is passed. The server "
+                + "demands it on paths a DBA lists in stepup_required_paths. No screen lock means no "
+                + "step-up key, never a failed enrolment."));
+            _stepUpView = Body("Step-up key: not prepared yet.");
+            root.AddView(_stepUpView);
+            root.AddView(Button("Sensitive op without step-up", () => RunAsync("sensitive-plain", SensitiveWithoutStepUpAsync)));
+            root.AddView(Button("Sensitive op with step-up", () => RunAsync("sensitive-stepup", SensitiveWithStepUpAsync)));
+            root.AddView(Body("Re-enrolment uses the account password above and the new screen lock."));
+            root.AddView(Button("Re-enrol step-up key", () => RunAsync("stepup-reenrol", ReenrolStepUpAsync)));
 
             root.AddView(SectionLabel("Proof of possession"));
             root.AddView(Button("Test protected access", () => RunAsync("bound-access", BoundAccessAsync)));
@@ -266,6 +293,9 @@ namespace DeviceTrust.Android.Harness
                 case "reset": RunLocalAsync("reset", ResetLocalAsync); break;
                 case "mapsdump": RunLocalAsync("mapsdump", MapsDumpAsync); break;
                 case "wxreport": RunLocalAsync("wxreport", WxReportAsync); break;
+                case "sensitive-plain": RunAsync("sensitive-plain", SensitiveWithoutStepUpAsync); break;
+                case "sensitive-stepup": RunAsync("sensitive-stepup", SensitiveWithStepUpAsync); break;
+                case "stepup-reenrol": RunAsync("stepup-reenrol", ReenrolStepUpAsync); break;
                 default: Line("Unknown action '" + action + "'."); break;
             }
         }
@@ -404,6 +434,13 @@ namespace DeviceTrust.Android.Harness
         private async Task ResetLocalAsync(AndroidKeyStoreInstallationKeyStore keyStore, string stateDirectory)
         {
             await keyStore.DeleteKeyAsync().ConfigureAwait(false);
+            if (_stepUpStore is not null)
+            {
+                // A step-up key binds only with a new installation key, so it
+                // rotates with it.
+                await _stepUpStore.DeleteKeyAsync().ConfigureAwait(false);
+            }
+
             foreach (var file in Directory.GetFiles(stateDirectory))
             {
                 File.Delete(file);
@@ -431,7 +468,8 @@ namespace DeviceTrust.Android.Harness
                 options,
                 keyStore,
                 new FileInstallationStateStore(System.IO.Path.Combine(stateDirectory, "state.json")),
-                collector);
+                collector,
+                stepUpKeyStore: _stepUpStore);
 
             await client.RestoreSessionAsync().ConfigureAwait(false);
             await body(client).ConfigureAwait(false);
@@ -470,6 +508,14 @@ namespace DeviceTrust.Android.Harness
             Line("key_created_this_run   " + identity.Key.Created);
             Line("security_level         " + identity.Key.SecurityLevel
                  + "  hardware_backed=" + identity.Key.HardwareBacked);
+            if (registration.KeySecurity is not null)
+            {
+                Line("server key_security    " + (registration.KeySecurity.SecurityLevel ?? "null")
+                     + " hardware_backed=" + (registration.KeySecurity.HardwareBacked?.ToString() ?? "null")
+                     + " downgrade_reported=" + registration.KeySecurity.DowngradeReported);
+            }
+
+            ReportStepUp(client);
 
             var deviceToken = await client.AcquireDeviceTokenAsync().ConfigureAwait(false);
             var decision = await client.SubmitIntegrityReportAsync(deviceToken).ConfigureAwait(false);
@@ -522,6 +568,136 @@ namespace DeviceTrust.Android.Harness
                      + "\nRecognition " + registration.Method + " / " + registration.Confidence
                      + "\nIntegrity " + decision.Score + "/100 " + decision.Verdict
                      + "\nInstallations on device " + summary.InstallationCount);
+        }
+
+        private void ReportStepUp(DeviceTrustClient client)
+        {
+            var key = client.StepUpKey;
+            var registration = client.Registration;
+            string text;
+            if (key is null)
+            {
+                text = "Step-up key: unavailable - "
+                       + (client.StepUpUnavailable is null
+                           ? "not prepared yet"
+                           : client.StepUpUnavailable.Message + " [" + client.StepUpUnavailable.Code + "]");
+            }
+            else
+            {
+                var server = registration is null ? "not registered yet"
+                    : !registration.StepUpKeyRegistered ? "not bound on the server: re-enrol it with your password"
+                    : registration.StepUpKeyMatches == false ? "the server holds a different step-up key: re-enrol it"
+                    : "bound on the server";
+                text = "Step-up key: " + key.Auth.Description + ", " + key.SecurityLevel + "; " + server
+                       + (registration?.StepUpPolicyDowngrade == true ? "; weaker than server policy (downgrade recorded)" : string.Empty);
+            }
+
+            Line("STEPUP " + text.Substring("Step-up key: ".Length));
+            Line("STEPUP server registered=" + (registration?.StepUpKeyRegistered.ToString() ?? "?")
+                 + " matches=" + (registration?.StepUpKeyMatches?.ToString() ?? "null")
+                 + " auth=" + (registration?.StepUpKeyAuth?.Description ?? "null")
+                 + " policy_downgrade=" + (registration?.StepUpPolicyDowngrade?.ToString() ?? "null")
+                 + " usable=" + client.StepUpUsable);
+            RunOnUiThread(() =>
+            {
+                if (_stepUpView is not null)
+                {
+                    _stepUpView.Text = text;
+                }
+            });
+        }
+
+        private async Task PrepareSensitiveAsync(DeviceTrustClient client)
+        {
+            RequireSession(client);
+            await client.RegisterInstallationAsync(ReadReinstallHint()).ConfigureAwait(false);
+            ReportStepUp(client);
+            var deviceToken = await client.AcquireDeviceTokenAsync().ConfigureAwait(false);
+            await client.SubmitIntegrityReportAsync(deviceToken).ConfigureAwait(false);
+        }
+
+        private async Task SensitiveWithoutStepUpAsync(DeviceTrustClient client)
+        {
+            await PrepareSensitiveAsync(client).ConfigureAwait(false);
+            try
+            {
+                var response = await client.SensitiveEchoAsync(
+                    new Dictionary<string, object?>(StringComparer.Ordinal)
+                    {
+                        ["operation"] = "transfer",
+                        ["probe_id"] = Guid.NewGuid().ToString(),
+                    },
+                    withStepUp: false).ConfigureAwait(false);
+                Line("INFO  200 but the path is not gated (step_up=" + Json.GetString(response, "step_up") + ")");
+            }
+            catch (DeviceTrustApiException error) when (error.StatusCode == 403
+                                                       && error.Code is "stepup_required" or "stepup_key_not_registered")
+            {
+                Line("ITEM PASS  sensitive operation refused without step-up: 403 " + error.Code);
+            }
+        }
+
+        private async Task SensitiveWithStepUpAsync(DeviceTrustClient client)
+        {
+            await PrepareSensitiveAsync(client).ConfigureAwait(false);
+            if (client.StepUpKey is null)
+            {
+                Line("ITEM FAIL  no step-up key on this device: " + client.StepUpUnavailable?.Message);
+                return;
+            }
+
+            var clock = System.Diagnostics.Stopwatch.StartNew();
+            try
+            {
+                var response = await client.SensitiveEchoAsync(
+                    new Dictionary<string, object?>(StringComparer.Ordinal)
+                    {
+                        ["operation"] = "transfer",
+                        ["probe_id"] = Guid.NewGuid().ToString(),
+                    },
+                    withStepUp: true,
+                    reason: "Approve a sensitive operation (step-up test)").ConfigureAwait(false);
+                var seen = Json.GetObject(response, "step_up_key");
+                Line(Json.GetString(response, "step_up") == "verified"
+                    ? "ITEM PASS  step-up verified, sensitive operation allowed"
+                    : "INFO  200 but the path is not gated (step_up=" + Json.GetString(response, "step_up") + ")");
+                Line("prompt+call took " + clock.ElapsedMilliseconds.ToString(CultureInfo.InvariantCulture) + " ms");
+                Line("key " + client.StepUpKey?.Auth.Description + " (" + client.StepUpKey?.SecurityLevel + ")");
+                if (seen is not null)
+                {
+                    Line("server saw key_auth=" + (StepUpKeyAuth.TryParse(Json.GetObject(seen.Value, "key_auth"))?.Description ?? "null")
+                         + " policy_downgrade=" + (Json.GetNullableBoolean(seen.Value, "policy_downgrade")?.ToString() ?? "null"));
+                }
+            }
+            catch (InstallationKeyException error)
+            {
+                Line("ITEM FAIL  the step-up key could not sign: " + error.Message + " [" + error.Code + "]");
+                ReportStepUp(client);
+            }
+        }
+
+        private async Task ReenrolStepUpAsync(DeviceTrustClient client)
+        {
+            var password = (_password?.Text ?? string.Empty).Trim();
+            if (password.Length == 0)
+            {
+                Line("The account password is required to re-enrol the step-up key.");
+                return;
+            }
+
+            await PrepareSensitiveAsync(client).ConfigureAwait(false);
+            try
+            {
+                var response = await client.ReenrolStepUpKeyAsync(password, ReadReinstallHint()).ConfigureAwait(false);
+                Line("ITEM PASS  step-up key re-enrolled: POST /v1/installations/stepup-key 200");
+                Line("policy_downgrade=" + (Json.GetNullableBoolean(response, "stepup_policy_downgrade")?.ToString() ?? "null"));
+            }
+            catch (InstallationKeyException error)
+            {
+                Line("ITEM FAIL  the new step-up key could not sign: " + error.Message + " [" + error.Code + "]");
+            }
+
+            ReportStepUp(client);
         }
 
         private async Task AccountAsync(DeviceTrustClient client, string mode)

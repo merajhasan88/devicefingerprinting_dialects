@@ -61,12 +61,12 @@ way; do not describe an untested path as working.
 
 ```bash
 dotnet build DeviceTrust.sln            # everything that builds without a workload
-dotnet test                             # 54 offline tests, net6.0 and net8.0
+dotnet test                             # 106 offline tests, net6.0 and net8.0
 dotnet build src/DeviceTrust.Client.Maui   # needs: dotnet workload install android
 
 export API_BASE_URL=https://<endpoint>
 dotnet run --project src/DeviceTrust.Cli -- health
-dotnet run --project src/DeviceTrust.Cli -- conformance   # 24 checks against a live server
+dotnet run --project src/DeviceTrust.Cli -- conformance   # 31 checks against a live server
 dotnet run --project src/DeviceTrust.Cli -- battery       # the DESIGN.md 25.11 battery
 ```
 

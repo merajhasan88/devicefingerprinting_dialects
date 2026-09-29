@@ -535,6 +535,8 @@ namespace DeviceTrust.Cli.Harness
                 ExpectRejection(failure, 403, "integrity_device_blocked_recently");
             });
 
+            new StepUpConformanceChecks(_context).AddTo(runner);
+
             return runner.RunAsync(cancellationToken);
         }
 

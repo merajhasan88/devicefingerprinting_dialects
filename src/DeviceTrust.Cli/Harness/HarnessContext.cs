@@ -51,7 +51,8 @@ namespace DeviceTrust.Cli.Harness
         /// </summary>
         public DeviceTrustClient CreateEphemeralDevice(
             string label,
-            ConformanceProbeCollector? collector = null)
+            ConformanceProbeCollector? collector = null,
+            IStepUpKeyStore? stepUpKeyStore = null)
         {
             var directory = Path.Combine(
                 Path.GetTempPath(),
@@ -60,14 +61,14 @@ namespace DeviceTrust.Cli.Harness
                 + Guid.NewGuid().ToString("N").Substring(0, 8));
             Directory.CreateDirectory(directory);
             _temporaryDirectories.Add(directory);
-            return CreateClient(directory, collector ?? new ConformanceProbeCollector());
+            return CreateClient(directory, collector ?? new ConformanceProbeCollector(), stepUpKeyStore);
         }
 
         /// <summary>Creates the client that uses the configured, persistent state directory.</summary>
         public DeviceTrustClient CreatePersistentDevice(IIntegrityProbeCollector? collector)
         {
             Directory.CreateDirectory(_configuration.StateDirectory);
-            return CreateClient(_configuration.StateDirectory, collector);
+            return CreateClient(_configuration.StateDirectory, collector, null);
         }
 
         /// <summary>Runs an operation expected to fail, and returns the failure for assertions.</summary>
@@ -113,12 +114,19 @@ namespace DeviceTrust.Cli.Harness
             }
         }
 
-        private DeviceTrustClient CreateClient(string directory, IIntegrityProbeCollector? collector)
+        private DeviceTrustClient CreateClient(
+            string directory,
+            IIntegrityProbeCollector? collector,
+            IStepUpKeyStore? stepUpKeyStore)
         {
             var keyStore = new SoftwareInstallationKeyStore(
                 Path.Combine(directory, "installation-key.p8"),
                 acknowledgeNotHardwareBacked: true);
             _disposables.Add(keyStore);
+            if (stepUpKeyStore is IDisposable disposableStepUp)
+            {
+                _disposables.Add(disposableStepUp);
+            }
 
             var options = _configuration.ToClientOptions();
             if (collector is null)
@@ -133,7 +141,8 @@ namespace DeviceTrust.Cli.Harness
                 keyStore,
                 new FileInstallationStateStore(Path.Combine(directory, "state.json")),
                 collector,
-                _httpClient);
+                _httpClient,
+                stepUpKeyStore);
             _disposables.Add(client);
             return client;
         }
