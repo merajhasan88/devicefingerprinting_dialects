@@ -847,22 +847,96 @@ def _connect_db():
     return DIALECT.connect()
 
 
+# Per-process pool of idle connections (DESIGN.md 60). Opening a connection
+# costs a TCP + TLS handshake and a login on every unit of work; reusing one
+# removes that from the request path. The pool belongs to one process: after a
+# fork (a multi-process server) the child starts empty and never touches the
+# parent's sockets. A connection idle longer than DB_POOL_RECHECK_SECONDS is
+# pinged before reuse; DB_POOL_SIZE=0 turns pooling off.
+DB_POOL_SIZE = int(os.environ.get("DB_POOL_SIZE", "4"))
+DB_POOL_RECHECK_SECONDS = int(os.environ.get("DB_POOL_RECHECK_SECONDS", "30"))
+_pool_lock = threading.Lock()
+_pool_state = {"pid": None, "idle": []}
+
+
+def _close_quietly(connection):
+    try:
+        connection.close()
+    except Exception:
+        pass
+
+
+def _connection_alive(connection):
+    try:
+        cursor = connection.cursor()
+        cursor.execute("SELECT 1")
+        cursor.fetchone()
+        cursor.close()
+        connection.rollback()
+        return True
+    except Exception:
+        return False
+
+
+def _checkout_connection():
+    with _pool_lock:
+        if _pool_state["pid"] != os.getpid():
+            _pool_state["pid"] = os.getpid()
+            _pool_state["idle"] = []
+        idle = _pool_state["idle"].pop() if _pool_state["idle"] else None
+    if idle is not None:
+        connection, last_used = idle
+        if time.monotonic() - last_used < DB_POOL_RECHECK_SECONDS or _connection_alive(
+            connection
+        ):
+            return connection
+        _close_quietly(connection)
+    return _connect_db()
+
+
+def _checkin_connection(connection, reusable):
+    if reusable and DB_POOL_SIZE > 0:
+        with _pool_lock:
+            if (
+                _pool_state["pid"] == os.getpid()
+                and len(_pool_state["idle"]) < DB_POOL_SIZE
+            ):
+                _pool_state["idle"].append((connection, time.monotonic()))
+                return
+    _close_quietly(connection)
+
+
 @contextmanager
 def _cursor(commit=False):
     # A no-op for PostgreSQL; serializes units of work for SQL Server (55).
     with DIALECT.unit_lock():
-        connection = _connect_db()
-        cursor = _DialectCursor(connection.cursor())
+        connection = _checkout_connection()
+        reusable = False
+        cursor = None
         try:
+            cursor = _DialectCursor(connection.cursor())
             yield cursor
             if commit:
                 connection.commit()
+            else:
+                # End the read transaction so a pooled connection holds no
+                # snapshot or locks while idle.
+                connection.rollback()
+            reusable = True
         except Exception:
-            connection.rollback()
+            try:
+                connection.rollback()
+                reusable = True
+            except Exception:
+                reusable = False
             raise
         finally:
-            cursor.close()
-            connection.close()
+            if cursor is not None:
+                try:
+                    cursor.close()
+                except Exception:
+                    reusable = False
+            _checkin_connection(connection, reusable)
 
 
 # ---------------------------------------------------------------------------
