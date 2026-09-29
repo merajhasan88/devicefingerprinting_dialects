@@ -81,39 +81,48 @@ Teardown discipline matters more than provisioning: RDS final snapshots and manu
 the instance and keep billing, unattached Elastic IPs bill hourly, and a Route 53 hosted zone deleted
 within 12 hours of creation is not charged.
 
+The test server is EC2 `i-0559685f02c4013b1` (stopped between sessions; public IP changes on every
+start, DuckDNS `devicefingerprinting.duckdns.org` follows it). It runs **gunicorn with 4 worker
+processes** from the systemd drop-in, with a per-process connection pool (`DB_POOL_SIZE`,
+`DB_POOL_RECHECK_SECONDS`) and, on SQL Server, a 15 s statement timeout (`DB_QUERY_TIMEOUT`) —
+DESIGN.md 55 and 60. Serve SQL Server with processes, never threads.
+
+**Schema is migrations, DBA-applied.** `migrations/<dialect>/001…007`, applied in order; the server
+refuses to serve unless `schema_migrations` holds the version it requires (currently **7**). A new
+table needs its grant (`GRANT`/`ALTER DEFAULT PRIVILEGES` on PostgreSQL). Risk and step-up policy
+values live in `risk_policy_settings`, seeded by the migrations with the owner's defaults, which a DBA
+may change — never hard-code a policy value.
+
 ## Commands
 
 ```bash
-# Conformance suite — the gate. 26 checks; needs `cryptography` (harness only).
+# Conformance suite — the gate. 53 checks; needs `cryptography` (harness only).
 python3 conformance_suite.py --base-url https://<endpoint>
 #   Scoring checks need the server started with INTEGRITY_ANDROID_CERT_SHA256 set to the
 #   certificate the suite prints, or empty to disable the allow-list.
-#   The two enforcement checks SKIP unless INTEGRITY_MODE=enforce.
+#   Enforcement checks SKIP unless INTEGRITY_MODE=enforce; opt-in checks (rate anomaly,
+#   population baseline, step-up) SKIP until their risk_policy_settings rows are enabled.
+#   check_parallel_clients (4 concurrent flows) must pass on any new backend BEFORE handset
+#   or paid-database time is spent on it.
 
 # Server syntax gate
 python3 -c "import ast,io; ast.parse(io.open('device_trust_server.py',encoding='utf-8').read(), feature_version=(3,9)); print('3.9 OK')"
 
-# Client — endpoint is mandatory
+# Client — endpoint is mandatory; Android builds are release builds
 flutter analyze
-flutter run -d <device> --dart-define=API_BASE_URL=https://<endpoint>
+flutter build apk --release --dart-define=API_BASE_URL=https://<endpoint>
+# iOS: Codemagic (manual trigger), then tools/presign_trollstore_ipa.sh, then TrollStore
 ```
 
 ## Test devices
 
-OPPO CPH2083 and Huawei AQM-LX1, both clean production `user` builds, neither rooted, both used to
-validate real Frida detection and enforcement. The emulator AVD `integrity_root_lab` is the
-disposable root laboratory; it has `hw.keyboard=no`, so drive text with `adb shell input text`.
+OPPO CPH2083 (Android 9) and Huawei AQM-LX1 (Android 10), clean `user` builds, never rooted; Vivo
+V2118 (Android 12, logcat empty — read results from the server); iPhone 7 (iOS 15.8.5, TrollStore,
+not jailbroken). The emulator AVD `integrity_root_lab` is the disposable root laboratory; it has
+`hw.keyboard=no`, so drive text with `adb shell input text`.
 
 ## Current point of work
 
-DESIGN.md section 24 phase plan. Phases 0 and 0b are done: 26 conformance checks green against
-PostgreSQL 13.23.
-
-Next: deploy to AWS behind HTTPS and re-run the suite against **PostgreSQL RDS**, then **SQL Server
-RDS**, then **Supabase**, pointing the client at each with `--dart-define`. The one code change the
-RDS round needs is TLS support in the database connection for `rds.force_ssl`.
-
-Agreed and not yet built: the runtime DDL in the schema guard becomes **versioned migration scripts
-per dialect**, DBA-run, with the app verifying schema version at boot and refusing to start on
-mismatch. Those migration files are the "database setup scripts" deliverable. This matters more on
-Lambda, where a cold start would otherwise attempt DDL and concurrent cold starts could race.
+See the end of DESIGN.md: section 61 holds the state at the last session's end and the open items;
+sections 51–60 cover the step-up key, dead-key recovery, the account policy, SQL Server concurrency
+and the serving model.

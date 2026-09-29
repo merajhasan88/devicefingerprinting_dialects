@@ -4888,6 +4888,11 @@ inside the region to find the real ceiling, which 64 clients across a 0.3 s link
   re-enrolled; iPhone — passcode on, `dt-stepup3.ipa` (`a0d4e4a`), installation `3702678e…` re-enrolled
   (scoped to its account). The OPPO device now has four linked accounts on PostgreSQL, so its
   account-risk decisions read `block` (observe hides it) — an artefact of repeated test resets.
+- **Owed to the .NET client (server side, ours):** baseline-relative W^X scoring — the owner approved
+  it on 2026-09-23 and the .NET session already prints `sha256:bytes:granularity` entries for an
+  `INTEGRITY_ANDROID_WX_BASELINES` map (their commit `9d3a992`), but this server does not implement
+  the map yet, so the .NET Android client still reads 78/review on the OPPO. Read
+  `DESIGN_UPDATE_FROM_DOTNET.md` first: implemented naively it switches W^X scoring off for Flutter.
 - **Open next**: other SDKs' step-up (§51.8 item 5, .NET by handoff document only, with permission); a
   load test from inside AWS to find the real ceiling; a larger SQL Server instance class if SQL Server
   stays in scope (db.t3.micro Express starves under RDS's own `DBCC CHECKDB`, §60); Vivo (Android 12)

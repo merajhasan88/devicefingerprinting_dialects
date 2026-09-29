@@ -17,6 +17,14 @@ Per backend, imported lazily so only what is used must be installed:
 Optional:
     REDIS_URL set          redis
 
+Serving (DESIGN.md 60): run it under a multi-process WSGI server, e.g.
+    gunicorn --workers 4 --bind 127.0.0.1:5000 device_trust_server:app
+Worker processes, not threads: the SQL Server ODBC stack is not thread-safe
+(DESIGN.md 55). app.run() below is the development server only.
+    DB_POOL_SIZE             idle connections kept per process (default 4, 0 = off)
+    DB_POOL_RECHECK_SECONDS  ping an idle connection older than this (default 30)
+    DB_QUERY_TIMEOUT         SQL Server statement timeout, seconds (default 15)
+
 This replaces the old shared-passphrase/RSA-AES transport. Run it behind HTTPS.
 The private installation key stays inside Android Keystore or the iOS Secure
 Enclave/Keychain. The server stores only public JWKs, opaque IDs, password
