@@ -417,15 +417,20 @@ class StepUpKeyManager(private val context: Context) {
      * step-up key for an existing installation (DESIGN.md 53.1).
      */
     private fun discardDeadKey(cause: Throwable): InstallationKeyFailure {
-        try {
-            loadKeyStore().deleteEntry(keyAlias)
-        } catch (_: Exception) {
-            // Reported either way; the next getOrCreateKey finds it again.
+        // Say whether the removal actually happened: on the OPPO (Android 9) a
+        // dead key's alias survived deleteEntry while the screen lock was off.
+        val removal = try {
+            val keyStore = loadKeyStore()
+            keyStore.deleteEntry(keyAlias)
+            if (keyStore.containsAlias(keyAlias)) "could not be removed (alias still present)" else "has been removed"
+        } catch (error: Exception) {
+            "could not be removed (${error.javaClass.simpleName}: ${error.message})"
         }
         return InstallationKeyFailure(
             "STEPUP_KEY_INVALIDATED",
             "The step-up key was invalidated (the screen lock or enrolled biometrics changed) " +
-                "and has been removed. Re-enrol the installation to get a new one.",
+                "and $removal. Re-enrol the installation to get a new one. " +
+                "[cause ${cause.javaClass.simpleName}]",
             cause,
         )
     }
