@@ -1775,22 +1775,24 @@ def check_stepup_reenrol(api, ctx):
     new_priv, new_jwk = stepup_jwk_pair()
     other_priv, _ = stepup_jwk_pair()
 
-    def reenrol(pw, signer):
+    def reenrol(pw, signer, jwk=None, bearer=None):
+        jwk = jwk or new_jwk
+        bearer = bearer or access
         nonce_bytes = secrets.token_bytes(32)
         key_proof = b64u(json.dumps({
             "version": 1, "purpose": "stepup_reenrol",
             "installation_id": inst.installation_id,
-            "stepup_key_thumbprint": jwk_thumbprint(new_jwk),
+            "stepup_key_thumbprint": jwk_thumbprint(jwk),
             "nonce": b64u(nonce_bytes), "timestamp": int(time.time()),
         }).encode("utf-8"))
-        body = {"password": pw, "stepup_public_key": new_jwk, "stepup_key_auth": auth,
+        body = {"password": pw, "stepup_public_key": jwk, "stepup_key_auth": auth,
                 "stepup_key_proof": key_proof,
                 "stepup_key_signature": b64u(signer.sign(b64u_decode(key_proof),
                                                          ec.ECDSA(hashes.SHA256())))}
         headers, body_text = build_proof(inst, "POST", "/v1/installations/stepup-key",
-                                         access, body, nonce_bytes=nonce_bytes)
+                                         bearer, body, nonce_bytes=nonce_bytes)
         return api.call("POST", "/v1/installations/stepup-key", body_text=body_text,
-                        bearer=access, headers=headers)
+                        bearer=bearer, headers=headers)
 
     def matches(jwk):
         st, pl = enrol(api, inst, fresh_hint(), stepup_public_key=jwk, stepup_key_auth=auth)
@@ -1810,6 +1812,31 @@ def check_stepup_reenrol(api, ctx):
            "valid re-enrolment expected 200, got %s %s" % (st, pl))
     expect(matches(new_jwk) is True and matches(old_jwk) is False,
            "after re-enrolment the new key must be bound and the old one not")
+
+    # A second account opened on the same device (needs only the installation
+    # key) may re-enrol with its own password, but that key must not pass
+    # step-up for the first account. Needs the sensitive path gated.
+    _, health = api.call("GET", "/health/ready")
+    settings = ((health if isinstance(health, dict) else {}).get("scoring_flags") or {}).get(
+        "risk_policy_settings") or {}
+    if "/v1/account/sensitive-echo" not in (settings.get("stepup_required_paths") or ""):
+        return
+    factor = settings.get("stepup_factor", "passcode")
+    st, pl = open_account(api, inst, tok, "re2-%s" % secrets.token_hex(4), "Second0ne123")
+    expect(st in (200, 201), "second account open failed: %s %s" % (st, pl))
+    second_access = pl["access_token"]
+    second_priv, second_jwk = stepup_jwk_pair()
+    st, pl = reenrol("Second0ne123", second_priv, second_jwk, second_access)
+    expect(st == 200, "the second account's re-enrolment expected 200, got %s %s" % (st, pl))
+    body = {"move": "money"}
+    st, pl = stepup_call(api, inst, second_priv, "POST", "/v1/account/sensitive-echo",
+                         access, body, factor)
+    expect(st == 403 and error_code(pl) == "stepup_key_other_account",
+           "the first account must not pass step-up with the second account's key, got %s %s"
+           % (st, error_code(pl)))
+    st, pl = stepup_call(api, inst, second_priv, "POST", "/v1/account/sensitive-echo",
+                         second_access, body, factor)
+    expect(st == 200, "the second account's own key expected 200, got %s %s" % (st, pl))
 
 @check("concurrency: parallel clients neither crash nor stall the server", db_sensitive=True)
 def check_parallel_clients(api, ctx):

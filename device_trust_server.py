@@ -939,7 +939,7 @@ def _get_backend_identity():
 # against a schema it does not understand. /health/* still answers so operators
 # can see why.
 
-REQUIRED_SCHEMA_VERSION = 6
+REQUIRED_SCHEMA_VERSION = 7
 
 _schema_state = None
 _schema_lock = threading.Lock()
@@ -2645,7 +2645,7 @@ def _stepup_required_paths():
     return {p.strip() for p in raw.replace(";", ",").split(",") if p.strip()}
 
 
-def _enforce_step_up(installation_id):
+def _enforce_step_up(installation_id, account_id):
     """Gate DBA-designated sensitive paths on a valid step-up proof.
 
     Every decision is logged with its outcome code, so an operator can see
@@ -2655,7 +2655,7 @@ def _enforce_step_up(installation_id):
     if request.path not in _stepup_required_paths():
         return
     try:
-        key_auth = _verify_step_up(installation_id)
+        key_auth = _verify_step_up(installation_id, account_id)
     except ApiProblem as problem:
         logger.info(
             "Step-up refused: installation=%s path=%s code=%s",
@@ -2678,7 +2678,7 @@ def _enforce_step_up(installation_id):
     )
 
 
-def _verify_step_up(installation_id):
+def _verify_step_up(installation_id, account_id):
     """Verify the step-up proof on a sensitive path; return the key's auth.
 
     The proof is a step-up-key signature over {installation_id, factor, nonce,
@@ -2691,7 +2691,8 @@ def _verify_step_up(installation_id):
     with _cursor() as cursor:
         cursor.execute(
             "SELECT stepup_public_key_jwk, stepup_key_algorithm, "
-            "stepup_key_factor, stepup_key_mode, stepup_key_window_seconds "
+            "stepup_key_factor, stepup_key_mode, stepup_key_window_seconds, "
+            "stepup_key_account_id "
             "FROM app_installations WHERE installation_id = %s",
             (installation_id,),
         )
@@ -2704,6 +2705,15 @@ def _verify_step_up(installation_id):
             "registered for this installation.",
             403,
             "stepup_key_not_registered",
+        )
+    # A key re-enrolled later belongs to the account that re-enrolled it
+    # (DESIGN.md 58); only a key bound at registration (NULL) serves them all.
+    if row[5] is not None and str(row[5]) != str(account_id):
+        raise ApiProblem(
+            "This installation's step-up key was re-enrolled by another account; "
+            "re-enrol it with your own password.",
+            403,
+            "stepup_key_other_account",
         )
     proof_b64 = request.headers.get("X-Step-Up-Proof")
     signature_b64 = request.headers.get("X-Step-Up-Signature")
@@ -2770,7 +2780,7 @@ def _require_trusted_account_request(event_type="protected_request"):
     server-side device/account policy and enforce its effective action.
     """
     claims = _require_access_proof("account")
-    _enforce_step_up(claims.get("iid"))
+    _enforce_step_up(claims.get("iid"), get_jwt_identity())
     integrity = _enforce_integrity_gate(claims.get("did"), claims.get("iid"))
     policy = _evaluate_risk_policy(
         event_type,
@@ -4358,7 +4368,10 @@ def reenrol_stepup_key():
 
     A step-up key binds only at first registration, so an installation whose
     key died (screen lock removed, 57) had no way back short of a new
-    installation. This path accepts a new key only with all three of:
+    installation. The re-enrolled key is scoped to the re-enrolling account:
+    opening a second account on a device needs only the installation key, so an
+    installation-wide key would let that account's password unlock step-up for
+    the first account. This path accepts a new key only with all three of:
     possession of the installation key (the access proof), the account password
     re-entered now, and a signature by the new step-up key itself -- which the
     device grants only after the user passes the new screen lock. A signing
@@ -4439,7 +4452,8 @@ def reenrol_stepup_key():
                 stepup_key_algorithm = %s,
                 stepup_key_factor = %s,
                 stepup_key_mode = %s,
-                stepup_key_window_seconds = %s
+                stepup_key_window_seconds = %s,
+                stepup_key_account_id = %s
             WHERE installation_id = %s
             """,
             (
@@ -4448,14 +4462,16 @@ def reenrol_stepup_key():
                 stepup_auth["factor"],
                 stepup_auth["mode"],
                 stepup_auth["window_seconds"],
+                account_id,
                 installation_id,
             ),
         )
     downgrade = _stepup_policy_downgrade(stepup_auth)
     logger.info(
-        "Step-up key re-enrolled: installation=%s factor=%s mode=%s "
+        "Step-up key re-enrolled: installation=%s account=%s factor=%s mode=%s "
         "window_seconds=%s policy_downgrade=%s",
         installation_id,
+        account_id,
         stepup_auth["factor"],
         stepup_auth["mode"],
         stepup_auth["window_seconds"],
