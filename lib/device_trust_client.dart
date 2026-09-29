@@ -243,6 +243,16 @@ class StepUpKeyMetadata {
       ? '$factor, per-use'
       : '$factor, ${windowSeconds}s hardware window';
 
+  /// RFC 7638 thumbprint, the same form the server derives from the JWK.
+  String get thumbprint => crypto.sha256
+      .convert(utf8.encode(jsonEncode(<String, dynamic>{
+        'crv': publicKey['crv'],
+        'kty': 'EC',
+        'x': publicKey['x'],
+        'y': publicKey['y'],
+      })))
+      .toString();
+
   factory StepUpKeyMetadata.fromPlatform(Map<String, dynamic> value) {
     final Object? rawPublicKey = value['public_key'];
     final Object? rawAuth = value['auth'];
@@ -1485,6 +1495,37 @@ class DeviceApi {
     );
   }
 
+  /// Re-enrols this installation's step-up key (DESIGN.md 58): the account
+  /// password plus a proof signed by the new step-up key over this request's
+  /// access-proof nonce. [signKeyProof] receives the nonce and returns the
+  /// proof fields; like the sensitive-op step-up, it runs before the access
+  /// proof is signed so time at the prompt does not eat its timestamp window.
+  Future<Map<String, dynamic>> reenrolStepUpKey({
+    required String accessToken,
+    required InstallationIdentity signingIdentity,
+    required String password,
+    required StepUpKeyMetadata stepUpKey,
+    required Future<Map<String, String>> Function(String nonce) signKeyProof,
+  }) async {
+    final List<int> nonceBytes = _freshNonce();
+    final Map<String, String> keyProof =
+        await signKeyProof(_b64UrlNoPadding(nonceBytes));
+    final AccessProofFixture fixture = await buildAccessProofFixture(
+      'POST',
+      '/v1/installations/stepup-key',
+      body: <String, dynamic>{
+        'password': password,
+        'stepup_public_key': stepUpKey.publicKey,
+        'stepup_key_auth': stepUpKey.authJson,
+        ...keyProof,
+      },
+      bearerToken: accessToken,
+      signingIdentity: signingIdentity,
+      nonceBytes: nonceBytes,
+    );
+    return sendAccessProofFixture(fixture);
+  }
+
   Future<RiskPolicyDecision> currentPolicy({
     required String accessToken,
     required InstallationIdentity signingIdentity,
@@ -1673,6 +1714,92 @@ class DeviceRecognitionController extends ChangeNotifier {
     }
   }
 
+  /// A local step-up key the server will actually accept: present here, bound
+  /// to this installation, and not reported as a different key.
+  bool get stepUpUsable {
+    final RegistrationState? current = registration;
+    return stepUpKey != null &&
+        current != null &&
+        current.stepupKeyRegistered &&
+        current.stepupKeyMatches != false;
+  }
+
+  /// Recovery when this installation's step-up key is lost or replaced
+  /// (DESIGN.md 58): the user re-enters the account password and passes the
+  /// new screen lock, which signs a proof with a fresh step-up key.
+  Future<void> reenrolStepUpKey(String password) {
+    stepUpTestResult = null;
+    return _run('Re-enrolling the step-up key…', () async {
+      final AccountSession? session = accountSession;
+      final InstallationIdentity? currentIdentity = identity;
+      if (session == null || currentIdentity == null) {
+        throw ApiException('Log in first: re-enrolment needs the account.');
+      }
+      if (stepUpKey == null) {
+        await _prepareStepUpKey();
+      }
+      final StepUpKeyMetadata? key = stepUpKey;
+      if (key == null) {
+        throw ApiException(
+          'No step-up key can be created: ${stepUpUnavailable ?? 'unknown'}',
+        );
+      }
+      try {
+        final Map<String, dynamic> value = await _api.reenrolStepUpKey(
+          accessToken: session.accessToken,
+          signingIdentity: currentIdentity,
+          password: password,
+          stepUpKey: key,
+          signKeyProof: (String nonce) async {
+            final String payload = _base64UrlNoPadding(
+              utf8.encode(jsonEncode(<String, dynamic>{
+                'version': 1,
+                'purpose': 'stepup_reenrol',
+                'installation_id': currentIdentity.installationId,
+                'stepup_key_thumbprint': key.thumbprint,
+                'nonce': nonce,
+                'timestamp':
+                    DateTime.now().toUtc().millisecondsSinceEpoch ~/ 1000,
+              })),
+            );
+            final String signature = await _stepUpKeyProvider.sign(
+              payload,
+              reason: 'Confirm your new step-up key',
+            );
+            return <String, String>{
+              'stepup_key_proof': payload,
+              'stepup_key_signature': signature,
+            };
+          },
+        );
+        // Re-register so the server's view (bound, matching) is what shows.
+        await _registerAndProve();
+        _recordStepUp(<String>[
+          'PASS: step-up key re-enrolled',
+          'POST /v1/installations/stepup-key: 200',
+          'Key: ${key.description} (${key.securityLevel})',
+          'Server now: registered=${registration?.stepupKeyRegistered} '
+              'matches=${registration?.stepupKeyMatches}',
+          'Policy downgrade: ${value['stepup_policy_downgrade']}',
+        ]);
+      } on NativeKeyException catch (error) {
+        if (error.code == 'STEPUP_KEY_INVALIDATED') {
+          stepUpKey = null;
+          stepUpUnavailable = '${error.message} [${error.code}]';
+        }
+        _recordStepUp(<String>[
+          'FAIL: the new step-up key could not sign',
+          '${error.message} [${error.code}]',
+        ]);
+      } on ApiException catch (error) {
+        _recordStepUp(<String>[
+          'FAIL: re-enrolment refused',
+          'POST /v1/installations/stepup-key: ${error.statusCode} ${error.code}',
+        ]);
+      }
+    });
+  }
+
   String get stepUpStatusLine {
     final StepUpKeyMetadata? key = stepUpKey;
     if (key == null) {
@@ -1683,11 +1810,10 @@ class DeviceRecognitionController extends ChangeNotifier {
     if (current == null) {
       server = 'not registered yet';
     } else if (!current.stepupKeyRegistered) {
-      server = 'not bound on the server (a step-up key binds only to a new '
-          'installation: use "Simulate fresh installation")';
+      server = 'not bound on the server: re-enrol it with your password below';
     } else if (current.stepupKeyMatches == false) {
-      server = 'the server holds a different step-up key (re-enrol with '
-          '"Simulate fresh installation")';
+      server = 'the server holds a different step-up key: re-enrol it with '
+          'your password below';
     } else {
       server = 'bound on the server';
     }
@@ -2975,6 +3101,8 @@ class _DeviceRecognitionPageState extends State<DeviceRecognitionPage> {
   final TextEditingController _passwordController = TextEditingController();
   final TextEditingController _stolenRefreshController =
       TextEditingController(text: injectedStolenRefreshToken);
+  final TextEditingController _stepUpPasswordController =
+      TextEditingController();
   final TextEditingController _stolenAccessController =
       TextEditingController(text: injectedStolenAccessToken);
 
@@ -3012,6 +3140,7 @@ class _DeviceRecognitionPageState extends State<DeviceRecognitionPage> {
     _passwordController.dispose();
     _stolenRefreshController.dispose();
     _stolenAccessController.dispose();
+    _stepUpPasswordController.dispose();
     super.dispose();
   }
 
@@ -3617,13 +3746,37 @@ class _DeviceRecognitionPageState extends State<DeviceRecognitionPage> {
                 FilledButton.tonal(
                   onPressed: _controller.busy ||
                           _controller.accountSession == null ||
-                          _controller.stepUpKey == null
+                          !_controller.stepUpUsable
                       ? null
                       : _controller.testSensitiveWithStepUp,
                   child: const Text('Sensitive op with step-up'),
                 ),
               ],
             ),
+            if (_controller.accountSession != null &&
+                !_controller.stepUpUsable) ...<Widget>[
+              const SizedBox(height: 12),
+              TextField(
+                controller: _stepUpPasswordController,
+                enabled: !_controller.busy,
+                obscureText: true,
+                onChanged: (_) => setState(() {}),
+                decoration: const InputDecoration(
+                  labelText: 'Account password (to re-enrol step-up)',
+                  border: OutlineInputBorder(),
+                ),
+              ),
+              const SizedBox(height: 8),
+              FilledButton(
+                onPressed: _controller.busy ||
+                        _stepUpPasswordController.text.isEmpty
+                    ? null
+                    : () => _controller.reenrolStepUpKey(
+                          _stepUpPasswordController.text,
+                        ),
+                child: const Text('Re-enrol step-up key'),
+              ),
+            ],
             if (_controller.stepUpTestResult != null) ...<Widget>[
               const SizedBox(height: 12),
               _testResultPanel(
