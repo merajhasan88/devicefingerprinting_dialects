@@ -4750,7 +4750,7 @@ offering it. Verified on the iPhone with the passcode on: the launch still offer
 `matches=True`, as designed — with a passcode set a dead key is only caught at use); "Sensitive op with
 step-up" sent nothing to the server; the next "Prove installation again" offered a **different** key
 (server `matches=False`) — the dead key was removed and a fresh, unbound one created. Re-enrolment is
-required to bind it. The launch-time path (passcode off) is written but not yet observed.
+required to bind it. The launch-time path (passcode off) was observed later the same day (§58).
 
 **Vivo, Android 12**: not run (not available).
 
@@ -4789,5 +4789,11 @@ password field and **Re-enrol step-up key**; the app then re-registers to show t
 password was refused (`invalid_credentials`); the right one re-enrolled the key (PIN prompt, `200`);
 "Sensitive op with step-up" then passed (`200 verified`). This re-enrolment ran six seconds before the
 scoping deployment, so that key is installation-wide (NULL) — correct for a key re-enrolled by the only
-account on the device, and the scoping itself is covered by the suite. iPhone: pending a Codemagic
-build of `80a9152`.
+account on the device, and the scoping itself is covered by the suite.
+
+**On the iPhone** (Codemagic build of `a0d4e4a`, `dt-stepup3.ipa`, installation `3702678e…`): passcode
+off → the app offered **no** step-up key (the launch-time dead-key check of §57, now observed; before the
+fix iOS kept offering the dead one); passcode on + "Prove installation again" → fresh key, server
+`matches=False`, button greyed; a wrong password refused (`invalid_credentials`), the right one
+re-enrolled the key — **scoped to the account** (`1519b153…`), `per_use`, no downgrade — and the app's
+re-registration then matched; "Sensitive op with step-up" → `200 verified`. **PASS** on both platforms.
