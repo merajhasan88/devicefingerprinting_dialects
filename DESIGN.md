@@ -4758,3 +4758,36 @@ Conclusion on all three runs: removing the screen lock affects **only** the step
 installation identity, integrity and the server's refusal of unsigned sensitive operations are
 unchanged, and a lost step-up key can only be replaced by re-enrolling.
 
+
+## 58. Step-up recovery: re-enrolment for an existing installation (2026-09-29)
+
+§56 open item 6. Before this, a lost step-up key (§57) could only be replaced by a new installation.
+
+**Server** (`78686e1`, scoping `8661612`, migration 007, schema 7). `POST /v1/installations/stepup-key`
+binds a new step-up key to an existing installation only with all three of: the installation key (the
+access proof, behind the usual trusted-request gates), the **account password** re-entered now, and a
+**signature by the new step-up key** over `{purpose: stepup_reenrol, installation_id, key thumbprint,
+access-proof nonce, timestamp}` — which the device grants only after the user passes the new screen
+lock. A signing oracle has the first but not the password; an attacker who also has the password could
+already enrol a fresh installation, so nothing new is granted. As in login, the gates run before the
+password check (no credential oracle); attempts are rate-limited and every refusal is logged.
+
+**Hole found and closed during the build.** The step-up key is per installation, but opening a second
+account on a device needs only the installation key — so a signing oracle could open its own account,
+re-enrol with *that* password, and pass step-up for the victim's account. A re-enrolled key is now
+**scoped to the re-enrolling account** (`stepup_key_account_id`); a key bound at registration (NULL) still
+serves every account on the installation, and any other account gets `403 stepup_key_other_account`
+until it re-enrols with its own password. `check_stepup_reenrol` covers the wrong password (`401`), a
+proof signed by another key (`403 stepup_reenrol_proof_invalid`), a valid re-enrolment, and the
+second-account attack. PostgreSQL schema 7: **49 / 0 / 4** (step-up gate on, signals off).
+
+**Client** (`80a9152`). "Sensitive op with step-up" is enabled only for a key the server will accept
+(bound and not reported as different). When it is missing or unbound, the step-up section offers the
+password field and **Re-enrol step-up key**; the app then re-registers to show the server's view.
+
+**On the OPPO** (installation `da95b434…`, fresh unbound local key after §57): button greyed; a wrong
+password was refused (`invalid_credentials`); the right one re-enrolled the key (PIN prompt, `200`);
+"Sensitive op with step-up" then passed (`200 verified`). This re-enrolment ran six seconds before the
+scoping deployment, so that key is installation-wide (NULL) — correct for a key re-enrolled by the only
+account on the device, and the scoping itself is covered by the suite. iPhone: pending a Codemagic
+build of `80a9152`.
