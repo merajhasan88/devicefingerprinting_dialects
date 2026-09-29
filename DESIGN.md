@@ -4874,3 +4874,21 @@ when RDS maintenance is quiet, and far less when it is not; PostgreSQL on the sa
 balancer (the app tier is now horizontally scalable), a production database class with memory to spare
 (and for SQL Server a non-Express edition — Express caps the database at 10 GB), and a load test from
 inside the region to find the real ceiling, which 64 clients across a 0.3 s link cannot reach.
+
+## 61. State at end of session (2026-09-29)
+
+- **EC2** `i-0559685f02c4013b1` **stopped**. Server `/opt/device_trust_server.py` = `3cea32f` (pool),
+  served by **gunicorn with 4 workers** from the systemd drop-in (dev-server copies of the drop-in kept as
+  `test.conf.bak-devserver-*`). PostgreSQL 16.15, **schema 7**, `INTEGRITY_MODE=observe`,
+  `DEVICE_POLICY_MODE=observe`, `risk_policy_settings` at production defaults (step-up gate empty,
+  signals off, account policy at the owner defaults). Public IP changes on start (DuckDNS follows).
+- **SQL Server RDS**: 2019, 2022 and 2025 instances deleted with no final snapshot and no automated
+  backups; local master passwords shredded. No Elastic IP was ever allocated.
+- **Handsets**: OPPO — PIN set, build with the dead-key fix and recovery flow, installation `da95b434…`
+  re-enrolled; iPhone — passcode on, `dt-stepup3.ipa` (`a0d4e4a`), installation `3702678e…` re-enrolled
+  (scoped to its account). The OPPO device now has four linked accounts on PostgreSQL, so its
+  account-risk decisions read `block` (observe hides it) — an artefact of repeated test resets.
+- **Open next**: other SDKs' step-up (§51.8 item 5, .NET by handoff document only, with permission); a
+  load test from inside AWS to find the real ceiling; a larger SQL Server instance class if SQL Server
+  stays in scope (db.t3.micro Express starves under RDS's own `DBCC CHECKDB`, §60); Vivo (Android 12)
+  screen-lock and recovery runs when the phone is available.
