@@ -21,6 +21,7 @@ import java.security.KeyFactory
 import java.security.KeyPairGenerator
 import java.security.KeyStore
 import java.security.Signature
+import java.security.UnrecoverableKeyException
 import java.security.interfaces.ECPublicKey
 import java.security.spec.ECGenParameterSpec
 
@@ -94,6 +95,12 @@ class StepUpKeyManager(private val context: Context) {
                 "A windowed step-up key needs window_seconds between 1 and $MAX_WINDOW_SECONDS.",
             )
         }
+        // An existing key is checked before the screen lock: removing the lock
+        // is what kills it, so this is where the app can say so precisely.
+        val keyStore = loadKeyStore()
+        if (keyStore.containsAlias(keyAlias)) {
+            liveEntry(keyStore)
+        }
         requireDeviceCredential()
         if (factor == FACTOR_BIOMETRIC && Build.VERSION.SDK_INT < Build.VERSION_CODES.P) {
             throw InstallationKeyFailure(
@@ -102,13 +109,12 @@ class StepUpKeyManager(private val context: Context) {
             )
         }
 
-        val keyStore = loadKeyStore()
         var created = false
         if (!keyStore.containsAlias(keyAlias)) {
             generateKeyPair(keyStore, factor, mode, windowSeconds)
             created = true
         }
-        val entry = privateKeyEntry(keyStore)
+        val entry = liveEntry(keyStore)
         val publicKey = entry.certificate.publicKey as? ECPublicKey
             ?: throw InstallationKeyFailure(
                 "INVALID_PUBLIC_KEY",
@@ -179,7 +185,7 @@ class StepUpKeyManager(private val context: Context) {
                     "No step-up key exists on this installation.",
                 )
             }
-            val entry = privateKeyEntry(keyStore)
+            val entry = liveEntry(keyStore)
             val auth = describeAuth(keyInfo(entry))
 
             if (auth.mode == MODE_PER_USE) {
@@ -199,7 +205,7 @@ class StepUpKeyManager(private val context: Context) {
             }
             authenticateThenSign(activity, entry, auth.factor, reason, payload, done)
         } catch (error: KeyPermanentlyInvalidatedException) {
-            done(Result.failure(invalidated(error)))
+            done(Result.failure(discardDeadKey(error)))
         } catch (error: InstallationKeyFailure) {
             done(Result.failure(error))
         } catch (error: GeneralSecurityException) {
@@ -389,7 +395,7 @@ class StepUpKeyManager(private val context: Context) {
         try {
             done(Result.success(signNow(entry, payload)))
         } catch (error: KeyPermanentlyInvalidatedException) {
-            done(Result.failure(invalidated(error)))
+            done(Result.failure(discardDeadKey(error)))
         } catch (error: UserNotAuthenticatedException) {
             done(
                 Result.failure(
@@ -405,12 +411,24 @@ class StepUpKeyManager(private val context: Context) {
         }
     }
 
-    private fun invalidated(error: Throwable) = InstallationKeyFailure(
-        "STEPUP_KEY_INVALIDATED",
-        "The step-up key was invalidated (the screen lock or enrolled biometrics changed). " +
-            "Re-enrol the installation to get a new one.",
-        error,
-    )
+    /**
+     * Deletes a step-up key that can never sign again and reports it. The
+     * installation must then re-enrol: the server never accepts a replacement
+     * step-up key for an existing installation (DESIGN.md 53.1).
+     */
+    private fun discardDeadKey(cause: Throwable): InstallationKeyFailure {
+        try {
+            loadKeyStore().deleteEntry(keyAlias)
+        } catch (_: Exception) {
+            // Reported either way; the next getOrCreateKey finds it again.
+        }
+        return InstallationKeyFailure(
+            "STEPUP_KEY_INVALIDATED",
+            "The step-up key was invalidated (the screen lock or enrolled biometrics changed) " +
+                "and has been removed. Re-enrol the installation to get a new one.",
+            cause,
+        )
+    }
 
     private fun signingFailed(error: Throwable) = InstallationKeyFailure(
         "STEPUP_SIGNING_FAILED",
@@ -530,20 +548,42 @@ class StepUpKeyManager(private val context: Context) {
         }
     }
 
-    private fun privateKeyEntry(keyStore: KeyStore): KeyStore.PrivateKeyEntry {
-        try {
-            return keyStore.getEntry(keyAlias, null) as? KeyStore.PrivateKeyEntry
-                ?: throw InstallationKeyFailure(
-                    "STEPUP_KEY_NOT_FOUND",
-                    "The step-up key entry is missing or has the wrong type.",
-                )
+    /**
+     * Loads the stored step-up key, removing it if it has died in place.
+     *
+     * Removing the screen lock (or, for a biometric key, changing the enrolled
+     * biometrics) invalidates an auth-bound key. On the OPPO (Android 9) the
+     * alias survived while the entry could no longer be loaded, which the app
+     * used to report only as a generic KEY_LOOKUP_FAILED and never recovered
+     * from (DESIGN.md 57); newer keystores keep the entry and refuse initSign.
+     * Either way the key is dead: delete it and report STEPUP_KEY_INVALIDATED.
+     * Any other lookup failure is reported with its cause and the key is kept.
+     */
+    private fun liveEntry(keyStore: KeyStore): KeyStore.PrivateKeyEntry {
+        val loaded = try {
+            keyStore.getEntry(keyAlias, null)
+        } catch (error: UnrecoverableKeyException) {
+            throw discardDeadKey(error)
         } catch (error: GeneralSecurityException) {
             throw InstallationKeyFailure(
                 "KEY_LOOKUP_FAILED",
-                "AndroidKeyStore could not load the step-up key.",
+                "AndroidKeyStore could not load the step-up key: " +
+                    "${error.javaClass.simpleName}: ${error.message}",
                 error,
             )
         }
+        val entry = loaded as? KeyStore.PrivateKeyEntry
+            ?: throw discardDeadKey(
+                IllegalStateException("The step-up alias no longer holds a private key."),
+            )
+        try {
+            Signature.getInstance("SHA256withECDSA").initSign(entry.privateKey)
+        } catch (error: KeyPermanentlyInvalidatedException) {
+            throw discardDeadKey(error)
+        } catch (_: UserNotAuthenticatedException) {
+            // Alive: a windowed key outside its window only needs authentication.
+        }
+        return entry
     }
 
     private fun keyInfo(entry: KeyStore.PrivateKeyEntry): KeyInfo {
