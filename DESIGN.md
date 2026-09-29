@@ -4797,3 +4797,29 @@ fix iOS kept offering the dead one); passcode on + "Prove installation again" �
 `matches=False`, button greyed; a wrong password refused (`invalid_credentials`), the right one
 re-enrolled the key — **scoped to the account** (`1519b153…`), `per_use`, no downgrade — and the app's
 re-registration then matched; "Sensitive op with step-up" → `200 verified`. **PASS** on both platforms.
+
+## 59. SQL Server: the timeout hunt, two phones at once, and what this stack sustains (2026-09-29)
+
+§56 open item 8, on a fresh SQL Server 2019 RDS (`sqlserver-ex` 15.00.4480, db.t3.micro — 1 GiB,
+2 burstable vCPUs, Express edition), schema 7, server `8661612`.
+
+- **Fresh instance, idle:** nothing queued for query memory, login + query 0.37 s; SQL Server commits
+  only ~112 MB of the 1 GiB, query-memory target ~3.6 MB. No `DBCC CHECKDB` was waiting this time.
+- **Parallel-clients check** first (the §55 rule): PASS.
+- **Timeout hunt — not reproduced.** Eight clients looping phone-like flows for 150 s while every
+  request waiting over 1 s inside SQL Server was logged each second: 0 failures, 0 `HYT00` query
+  timeouts, 0 restarts, and **no application request ever waited over 1 s in SQL Server** (only RDS's
+  own maintenance queries appeared). The earlier timeouts coincided with an instance overloaded by load
+  tests while RDS's maintenance sat in the memory-grant queue; they remain unexplained, not
+  reproducible at this load.
+- **Two phones at once — the case that failed in §55 — now works.** OPPO and iPhone registered within
+  0.26 s of each other and both finished (`device/me`) in 5–6 s, under the handsets' 15 s timeout.
+
+**What this stack sustains, measured** (8 concurrent clients): **2.5 requests/s** (0.41 six-request
+flows/s), p50 latency 1.6–5.9 s per endpoint, max 8.6 s. The limit is the **application on SQL
+Server**, not the database: the §55 lock serializes database work per process, and every unit of work
+opens a fresh TLS login (pooling off), so latency grows with clients while SQL Server barely waits.
+Rough extrapolation, not a measurement: ~1,500 sign-in flows an hour per server process. Serving
+thousands to millions of users needs many worker processes (which also sidesteps the driver's thread
+unsafety), pooled connections per process, horizontal app servers, and a production SQL Server edition
+and instance class — Express's documented 10 GB database cap alone rules it out.
