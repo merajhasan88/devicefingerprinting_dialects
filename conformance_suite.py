@@ -194,7 +194,7 @@ def build_proof(
     return headers, (None if method == "GET" else body_text)
 
 
-def stepup_proof(installation, method, path, bearer, body_text, nonce, factor, **overrides):
+def stepup_proof(installation, method, path, bearer, body_text, nonce, factor, overrides=None):
     """Step-up proof v2 (DESIGN.md 63): the step-up key approves one complete
     request -- token, method, path, query, body and the access proof's nonce --
     so the approval cannot be attached to any other request."""
@@ -211,12 +211,12 @@ def stepup_proof(installation, method, path, bearer, body_text, nonce, factor, *
         "nonce": nonce,
         "timestamp": int(time.time()),
     }
-    proof.update(overrides)
+    proof.update(overrides or {})
     return b64u(json.dumps(proof).encode("utf-8"))
 
 
 def stepup_call(api, installation, stepup_priv, method, path, bearer, body_obj, factor,
-                approve_body=None, **overrides):
+                approve_body=None, overrides=None):
     """A protected call that also carries a step-up proof over this exact
     request, signed by the separate step-up key. approve_body signs an approval
     for a DIFFERENT body than the one sent, which is the retargeting attack."""
@@ -224,7 +224,7 @@ def stepup_call(api, installation, stepup_priv, method, path, bearer, body_obj, 
     access_proof = json.loads(b64u_decode(headers["X-Access-Proof"]).decode("utf-8"))
     approved = body_text if approve_body is None else json.dumps(approve_body)
     proof_b64 = stepup_proof(installation, method, path, bearer, approved,
-                             access_proof["nonce"], factor, **overrides)
+                             access_proof["nonce"], factor, overrides)
     sig = stepup_priv.sign(b64u_decode(proof_b64), ec.ECDSA(hashes.SHA256()))
     headers["X-Step-Up-Proof"] = proof_b64
     headers["X-Step-Up-Signature"] = b64u(sig)
@@ -1798,7 +1798,7 @@ def check_step_up(api, ctx):
            "a retargeted approval expected 403 stepup_binding_mismatch, got %s %s"
            % (st, error_code(pl)))
     st, pl = stepup_call(api, inst, stepup_priv, "POST", "/v1/account/sensitive-echo", access,
-                         body, factor, path="/v1/account/protected-echo")
+                         body, factor, overrides={"path": "/v1/account/protected-echo"})
     expect(st == 403 and error_code(pl) == "stepup_binding_mismatch",
            "an approval for another path expected 403 stepup_binding_mismatch, got %s %s"
            % (st, error_code(pl)))
