@@ -281,6 +281,17 @@ EXPECTED_IOS_SIGNING_ID = os.environ.get("INTEGRITY_IOS_SIGNING_ID", "").strip()
 EXPECTED_IOS_TEAM_ID = os.environ.get("INTEGRITY_IOS_TEAM_ID", "").strip()
 EXPECTED_IOS_EXECUTABLE_SHA256 = _env_values("INTEGRITY_IOS_EXECUTABLE_SHA256")
 
+# Collector versions accepted in integrity reports (DESIGN.md 63). The Kotlin,
+# Swift and .NET collectors report 2 and the conformance suite 1; raise the
+# floor to retire an old collector. A version outside the range is refused with
+# 400 rather than scored: an unknown collector is not evidence.
+INTEGRITY_MIN_COLLECTOR_VERSION = int(
+    os.environ.get("INTEGRITY_MIN_COLLECTOR_VERSION", "1")
+)
+INTEGRITY_MAX_COLLECTOR_VERSION = 1000
+if INTEGRITY_MIN_COLLECTOR_VERSION < 1:
+    raise RuntimeError("INTEGRITY_MIN_COLLECTOR_VERSION must be at least 1.")
+
 REQUIRE_HTTPS = os.environ.get("REQUIRE_HTTPS", "0") == "1"
 MAX_OPEN_CHALLENGES_PER_INSTALLATION = 5
 
@@ -1721,6 +1732,112 @@ def _as_list(value):
     return value if isinstance(value, list) else []
 
 
+def _as_int(value):
+    return value if isinstance(value, int) and not isinstance(value, bool) else 0
+
+
+# The measurements each probe must carry when it answers status "ok"
+# (DESIGN.md 63). The scorers read an absent field as its clean value -- an
+# empty list, False, 0 -- so an "ok" probe without its fields used to score as a
+# pristine device: fifteen bare {"status": "ok"} probes came out trusted
+# (review F2). Such a probe delivered no evidence, and is now scored exactly
+# like one that failed to run. A field present with the wrong JSON type makes
+# the report malformed: 400, never a 500 and never a silent zero.
+#
+# Checked against every report the Kotlin, Swift and .NET collectors and the
+# conformance suite sent in September 2026: none lacks one of these fields.
+_PROBE_REQUIRED_FIELDS = {
+    "android": {
+        "app_identity": {"package_name": str, "apk_sha256": str, "cert_sha256": list,
+                         "debuggable": bool, "allow_backup": bool},
+        "debug_state": {"debugger_connected": bool, "waiting_for_debugger": bool},
+        "tracer": {"tracer_pid": int},
+        "root_files": {"found_paths": list, "test_keys": bool},
+        "root_shell": {"su_found": bool},
+        "system_properties": {"properties": dict},
+        "selinux": {"mode": str, "getenforce": str, "enforce_value": str},
+        "mounts": {"protected_rw_mounts": list},
+        "runtime_maps": {"suspicious_tokens": list},
+        "frida_ports": {"open_ports": list},
+        "instrumentation_threads": {"frida_threads": list, "token_threads": list,
+                                    "glib_threads": list},
+        "exec_mappings": {"wx_mappings": int, "deleted_exec_mappings": int},
+        "code_integrity": {"checked": bool, "diff_bytes": int, "core_compared_bytes": int,
+                           "ext_diff_bytes": int, "ext_compared_bytes": int,
+                           "app_diff_bytes": int, "app_compared_bytes": int},
+        "emulator": {"suspected": bool},
+        "developer_settings": {"developer_options_enabled": bool, "adb_enabled": bool},
+    },
+    "ios": {
+        "app_identity": {"bundle_id": str, "executable_sha256": str},
+        "code_signing": {"signing_identifier": str, "team_identifier": str,
+                         "get_task_allow": bool},
+        "debugger": {"traced": bool},
+        "jailbreak_files": {"found_paths": list},
+        "sandbox": {"write_outside_sandbox_succeeded": bool},
+        "dyld_images": {"suspicious_tokens": list},
+        "environment": {"dyld_insert_libraries": str},
+        "simulator": {"is_simulator": bool},
+        "code_integrity": {"checked": bool, "app_diff_bytes": int, "app_compared_bytes": int},
+    },
+}
+# Fields a scorer reads when present but that not every collector sends; only
+# their type is checked.
+_PROBE_OPTIONAL_FIELDS = {
+    "android": {
+        "exec_mappings": {"wx_bytes": int, "wx_size_classes": str,
+                          "wx_smallest_bytes": int, "wx_largest_bytes": int},
+    },
+}
+_MAX_PROBE_INT = 1 << 53
+
+
+def _probe_field_ok(value, kind):
+    if kind is int:
+        return (isinstance(value, int) and not isinstance(value, bool)
+                and 0 <= value <= _MAX_PROBE_INT)
+    if kind is bool:
+        return isinstance(value, bool)
+    return isinstance(value, kind)
+
+
+def _check_probe_evidence(platform, probes, required_probes):
+    """Reject wrongly typed fields; return the required probes lacking evidence.
+
+    Returns [(probe, [missing field, ...])] for every server-requested probe
+    that answered "ok" without its measurements. A code_integrity probe
+    reporting checked=false measured nothing and is listed too, whatever else
+    it carries -- "the native component did not run" is not a clean result.
+    """
+    required_fields = _PROBE_REQUIRED_FIELDS.get(platform, {})
+    optional_fields = _PROBE_OPTIONAL_FIELDS.get(platform, {})
+    for name, value in probes.items():
+        if not isinstance(value, dict):
+            continue
+        for fields in (required_fields.get(name, {}), optional_fields.get(name, {})):
+            for field, kind in fields.items():
+                present = value.get(field)
+                if present is not None and not _probe_field_ok(present, kind):
+                    raise ApiProblem(
+                        "Integrity probe field %s.%s is not a valid %s."
+                        % (name, field, kind.__name__),
+                        400,
+                        "invalid_integrity_probe",
+                        details={"probe": name, "field": field},
+                    )
+    incomplete = []
+    for name in required_probes:
+        value = probes.get(name)
+        if not isinstance(value, dict) or value.get("status") != "ok":
+            continue  # scored as integrity_probe_failed
+        missing = [f for f in required_fields.get(name, {}) if value.get(f) is None]
+        if name == "code_integrity" and value.get("checked") is False and not missing:
+            missing = ["checked=false"]
+        if missing:
+            incomplete.append((name, missing))
+    return incomplete
+
+
 def _integrity_verdict(score, hard_block=False):
     if hard_block or score >= 90:
         return "block"
@@ -1810,7 +1927,7 @@ def _score_wx_memory(reasons, exec_maps, apk_hash):
     and treating that as "0 bytes over baseline" would switch W^X scoring off
     for a device with a live injected gadget (DESIGN_UPDATE_FROM_DOTNET.md).
     """
-    wx_count = int(exec_maps.get("wx_mappings") or 0)
+    wx_count = _as_int(exec_maps.get("wx_mappings"))
     wx_bytes = exec_maps.get("wx_bytes")
     if isinstance(wx_bytes, bool) or not isinstance(wx_bytes, int) or wx_bytes < 0:
         wx_bytes = None
@@ -2021,9 +2138,9 @@ def _score_android_integrity(probes):
     # measured exactly zero, so the threshold is margin, not tuning.
     code = _probe(probes, "code_integrity")
     code_checked = _as_bool(code.get("checked"))
-    core_diff = int(code.get("diff_bytes") or 0)
-    ext_diff = int(code.get("ext_diff_bytes") or 0)
-    app_diff = int(code.get("app_diff_bytes") or 0)
+    core_diff = _as_int(code.get("diff_bytes"))
+    ext_diff = _as_int(code.get("ext_diff_bytes"))
+    app_diff = _as_int(code.get("app_diff_bytes"))
     # Core libc/libart is always scored. The extended system libraries are
     # folded in only once their on-device baseline is confirmed (the flag).
     system_diff = core_diff + (ext_diff if INTEGRITY_SCORE_EXTENDED_LIBS else 0)
@@ -2041,7 +2158,7 @@ def _score_android_integrity(probes):
 
     exec_maps = _probe(probes, "exec_mappings")
     score += _score_wx_memory(reasons, exec_maps, apk_hash)
-    if int(exec_maps.get("deleted_exec_mappings") or 0) > 0:
+    if _as_int(exec_maps.get("deleted_exec_mappings")) > 0:
         # The ART JIT cache is excluded client-side; what remains is an
         # executable region backed by a deleted file, a classic injection shape.
         _integrity_reason(reasons, "android_deleted_code_mapping", 55,
@@ -2207,7 +2324,7 @@ def _score_ios_integrity(probes):
     # app_compared_bytes 0 is inert, not clean, and must not be scored as
     # either. The 4-byte floor is one arm64 branch, the smallest inline hook.
     code = _probe(probes, "code_integrity")
-    if _as_bool(code.get("checked")) and int(code.get("app_diff_bytes") or 0) >= 4:
+    if _as_bool(code.get("checked")) and _as_int(code.get("app_diff_bytes")) >= 4:
         _integrity_reason(
             reasons,
             "ios_app_code_modified",
@@ -4331,8 +4448,17 @@ def integrity_report():
     if abs(now_seconds - collected_at) > INTEGRITY_REPORT_MAX_SKEW_SECONDS:
         raise ApiProblem("Integrity report timestamp is outside the allowed window.", 401, "integrity_report_stale")
     collector_version = report.get("collector_version")
-    if isinstance(collector_version, bool) or not isinstance(collector_version, int):
-        raise ApiProblem("Integrity collector version is invalid.", 400, "invalid_integrity_collector")
+    if (
+        isinstance(collector_version, bool)
+        or not isinstance(collector_version, int)
+        or not INTEGRITY_MIN_COLLECTOR_VERSION <= collector_version <= INTEGRITY_MAX_COLLECTOR_VERSION
+    ):
+        raise ApiProblem(
+            "Integrity collector version is invalid or no longer supported.",
+            400,
+            "invalid_integrity_collector",
+            details={"minimum": INTEGRITY_MIN_COLLECTOR_VERSION},
+        )
     probes = report.get("probe_results")
     if not isinstance(probes, dict):
         raise ApiProblem("probe_results must be an object.", 400, "invalid_integrity_report")
@@ -4406,6 +4532,7 @@ def integrity_report():
             )
         if report.get("challenge_nonce") != challenge_nonce_text:
             raise ApiProblem("Integrity nonce encoding mismatch.", 400, "integrity_nonce_mismatch")
+        incomplete = _check_probe_evidence(platform, probes, required_probes)
 
         _verify_installation_signature(
             key_algorithm,
@@ -4420,15 +4547,27 @@ def integrity_report():
             probe_value = probes.get(probe_name)
             if not isinstance(probe_value, dict) or probe_value.get("status") != "ok":
                 failed_required.append(probe_name)
-        if failed_required:
-            for probe_name in failed_required:
-                _integrity_reason(
-                    scored["reasons"],
-                    "integrity_probe_failed:%s" % probe_name,
-                    30,
-                    "A server-requested native integrity probe did not complete successfully.",
-                )
-                scored["score"] = min(100, int(scored["score"]) + 30)
+        for probe_name in failed_required:
+            _integrity_reason(
+                scored["reasons"],
+                "integrity_probe_failed:%s" % probe_name,
+                30,
+                "A server-requested native integrity probe did not complete successfully.",
+            )
+        # Missing evidence weighs exactly what a failed probe does: a probe
+        # that answered "ok" without its measurements measured nothing.
+        for probe_name, missing in incomplete:
+            _integrity_reason(
+                scored["reasons"],
+                "integrity_probe_incomplete:%s" % probe_name,
+                30,
+                "A server-requested probe answered ok without the measurements it "
+                "must carry (%s)." % ", ".join(missing[:6]),
+            )
+        if failed_required or incomplete:
+            scored["score"] = min(
+                100, sum(max(0, int(r.get("points", 0))) for r in scored["reasons"])
+            )
             scored["verdict"] = _integrity_verdict(
                 scored["score"],
                 hard_block=scored["hard_block"],
