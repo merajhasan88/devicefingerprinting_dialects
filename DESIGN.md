@@ -5067,3 +5067,17 @@ Codemagic build of this code, since the installed build still sends v1 (its step
 with `stepup_proof_version_unsupported`, by design). SQL Server: the suite and `race_first_link.py`
 once the owner wants an RDS round. Test stack: `stepup_required_paths` is set to
 `/v1/account/sensitive-echo` for these runs; reset it to `''` afterwards.
+
+### 63.7 State at end of session (2026-09-30)
+
+- **EC2** `i-0559685f02c4013b1` **stopped**; no Elastic IP, no RDS instance, no manual RDS snapshot.
+  `/opt/device_trust_server.py` = this round's server (md5 `eb2003c6…`, identical to the repo file);
+  previous copy `.bak-20260930-144242`. The drop-in now carries `TRUSTED_PROXY_COUNT=1` (previous drop-in in
+  `/root/test.conf.bak-20260930-144242`). PostgreSQL 16.15, schema 7, observe/observe.
+- **Left on for tomorrow's handset run:** `risk_policy_settings.stepup_required_paths` =
+  `/v1/account/sensitive-echo` (set 2026-09-30 for the suite and the OPPO step-up test). Reset it to `''`
+  when the round ends.
+- A root-owned `/tmp/racecheck/__pycache__` from the race run may survive on the host; delete it with sudo
+  on next start if the boot-time `/tmp` clean did not.
+- **Resume with 63.6:** connect the OPPO, install the release APK built from this code, run a native scan
+  and the step-up v2 test; then the iPhone after a Codemagic build. The owner decisions are in 63.3.
