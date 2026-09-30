@@ -1898,29 +1898,58 @@ def _apply_hardware_backing_policy(cursor, installation_id, scored):
     )
 
 
-def _wx_size_classes(exec_maps):
-    """Sizes of the writable-executable mappings, or None if not described.
+_WX_MAX_SIZE_CLASSES = 12
 
-    From wx_size_classes ("<bytes>:<count>,..." largest first, at most twelve
-    classes) plus wx_smallest_bytes and wx_largest_bytes, so a small foreign
-    size cut off the list is still seen. Anything malformed is None.
+
+def _wx_size_classes(exec_maps):
+    """[(size, count), ...] from wx_size_classes, or None if absent or malformed.
+
+    The collector lists "<bytes>:<count>" pairs largest first, at most twelve
+    classes, so smaller classes may be cut off; wx_smallest_bytes and
+    wx_largest_bytes still name the extremes.
     """
     raw = exec_maps.get("wx_size_classes")
     if not isinstance(raw, str):
         return None
-    sizes = set()
+    classes = []
     for part in raw.split(","):
-        size = part.strip().partition(":")[0].strip()
-        if not size:
+        if not part.strip():
             continue
-        if not size.isdigit():
+        size, _, count = (piece.strip() for piece in part.partition(":"))
+        if not size.isdigit() or not count.isdigit():
             return None
-        sizes.add(int(size))
-    for key in ("wx_smallest_bytes", "wx_largest_bytes"):
-        value = exec_maps.get(key)
-        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
-            sizes.add(value)
-    return sizes or None
+        classes.append((int(size), int(count)))
+    return classes or None
+
+
+def _wx_shape_consistent(exec_maps, wx_count, wx_bytes, classes):
+    """Whether the reported W^X figures agree with each other (DESIGN.md 63).
+
+    The baseline allowance trusts sizes the client reports, so figures that
+    contradict one another are not a measurement and earn no allowance (review
+    F2). A class list shorter than the cap must account for every mapping and
+    byte exactly; a full one may be truncated but must fit inside the totals.
+    """
+    if wx_count <= 0 or wx_bytes <= 0:
+        return False
+    if any(size <= 0 or count <= 0 for size, count in classes):
+        return False
+    listed = sum(count for _, count in classes)
+    listed_bytes = sum(size * count for size, count in classes)
+    if listed > wx_count or listed_bytes > wx_bytes:
+        return False
+    if len(classes) < _WX_MAX_SIZE_CLASSES and listed != wx_count:
+        return False
+    if listed == wx_count and listed_bytes != wx_bytes:
+        return False
+    sizes = [size for size, _ in classes]
+    smallest = _as_int(exec_maps.get("wx_smallest_bytes"))
+    largest = _as_int(exec_maps.get("wx_largest_bytes"))
+    if largest and (largest < max(sizes) or largest > wx_bytes):
+        return False
+    if smallest and (smallest > min(sizes) or smallest * wx_count > wx_bytes):
+        return False
+    return True
 
 
 def _score_wx_memory(reasons, exec_maps, apk_hash):
@@ -1932,6 +1961,7 @@ def _score_wx_memory(reasons, exec_maps, apk_hash):
     never read as zero: the Flutter/Kotlin collector does not send wx_bytes,
     and treating that as "0 bytes over baseline" would switch W^X scoring off
     for a device with a live injected gadget (DESIGN_UPDATE_FROM_DOTNET.md).
+    Figures that contradict one another fall back to the same +60 (63).
     """
     wx_count = _as_int(exec_maps.get("wx_mappings"))
     wx_bytes = exec_maps.get("wx_bytes")
@@ -1940,11 +1970,21 @@ def _score_wx_memory(reasons, exec_maps, apk_hash):
     if wx_count <= 0 and not wx_bytes:
         return 0
     baseline = ANDROID_WX_BASELINES.get(apk_hash)
-    sizes = _wx_size_classes(exec_maps)
-    if baseline is None or baseline[0] <= 0 or wx_bytes is None or sizes is None:
+    classes = _wx_size_classes(exec_maps)
+    if (
+        baseline is None
+        or baseline[0] <= 0
+        or wx_bytes is None
+        or classes is None
+        or not _wx_shape_consistent(exec_maps, wx_count, wx_bytes, classes)
+    ):
         _integrity_reason(reasons, "android_wx_memory", 60,
                           "Writable-and-executable memory is mapped into the process.")
         return 60
+    sizes = {size for size, _ in classes}
+    for key in ("wx_smallest_bytes", "wx_largest_bytes"):
+        if _as_int(exec_maps.get(key)) > 0:
+            sizes.add(_as_int(exec_maps.get(key)))
     baseline_bytes, granularity = baseline
     points = 0
     if any(size % granularity for size in sizes):
