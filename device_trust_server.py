@@ -559,6 +559,12 @@ class Dialect(object):
         """Table hint that takes an exclusive row lock."""
         return ""
 
+    def savepoint(self, name):
+        """(set, rollback, release) statements that let one failed statement be
+        undone without losing the enclosing transaction, or None where the
+        engine already rolls back only the failed statement."""
+        return None
+
 
 class PostgresDialect(Dialect):
     name = "postgresql"
@@ -596,6 +602,16 @@ class PostgresDialect(Dialect):
 
     def row_lock_suffix(self):
         return " FOR UPDATE"
+
+    def savepoint(self, name):
+        # Any failed statement aborts the whole PostgreSQL transaction; every
+        # later statement fails with "current transaction is aborted" until a
+        # rollback. A savepoint confines the rollback to the failed statement.
+        return (
+            "SAVEPOINT %s" % name,
+            "ROLLBACK TO SAVEPOINT %s" % name,
+            "RELEASE SAVEPOINT %s" % name,
+        )
 
 
 class SqlServerDialect(Dialect):
@@ -728,6 +744,10 @@ class SqlServerDialect(Dialect):
         # PostgreSQL is MVCC; SQL Server READ COMMITTED takes shared locks and
         # would let refresh-reuse detection be raced without this.
         return " WITH (UPDLOCK, ROWLOCK)"
+
+    # savepoint() stays None: a duplicate-key error (2627/2601) terminates only
+    # its own statement, and the transaction continues, because this server
+    # never sets XACT_ABORT ON.
 
 
 def _make_dialect():
@@ -3843,9 +3863,12 @@ def _issue_device_token(installation_id, device_id, key_thumbprint):
 
 
 def _link_device_account(cursor, device_id, account_id, installation_id):
-    # Portable upsert: update first, insert only if nothing was updated. A
-    # concurrent insert losing the race raises a duplicate key, which means the
-    # link already exists - the desired end state either way.
+    # Portable upsert: update first, insert only if nothing was updated. Two
+    # first logins racing both see no row, and the loser's INSERT hits the
+    # primary key -- the link exists, the desired end state either way. On
+    # PostgreSQL that failed INSERT used to abort the caller's whole
+    # transaction, so the refresh-session INSERT after it failed too (review
+    # F10); the savepoint confines the rollback to the INSERT.
     cursor.execute(
         """
         UPDATE device_account_links
@@ -3855,6 +3878,9 @@ def _link_device_account(cursor, device_id, account_id, installation_id):
         (device_id, account_id),
     )
     if cursor.rowcount == 0:
+        savepoint = DIALECT.savepoint("link_insert")
+        if savepoint:
+            cursor.execute(savepoint[0])
         try:
             cursor.execute(
                 """
@@ -3867,6 +3893,11 @@ def _link_device_account(cursor, device_id, account_id, installation_id):
         except Exception as error:
             if not DIALECT.is_unique_violation(error):
                 raise
+            if savepoint:
+                cursor.execute(savepoint[1])
+        else:
+            if savepoint:
+                cursor.execute(savepoint[2])
 
 
 def _issue_account_tokens(
