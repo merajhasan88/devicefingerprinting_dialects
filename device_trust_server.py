@@ -154,7 +154,8 @@ if INTEGRITY_MODE not in ("observe", "enforce"):
 # operator opts in. "off" (default) scores nothing and changes no verdict;
 # "advisory" adds a moderate weight so a software-backed key trends to step-up;
 # "required" hard-blocks it. A NULL measurement (client did not report it) is
-# never treated as software.
+# never treated as software; under "required" it is still unsatisfied and
+# blocks as key_hardware_backing_unreported (DESIGN.md 63).
 INTEGRITY_HARDWARE_BACKING_POLICY = os.environ.get(
     "INTEGRITY_HARDWARE_BACKING_POLICY", "off"
 ).strip().lower()
@@ -1860,9 +1861,12 @@ def _apply_hardware_backing_policy(cursor, installation_id, scored):
     A software-backed installation key is only ever a client claim, never proof,
     so it is applied per INTEGRITY_HARDWARE_BACKING_POLICY. key_hardware_backed is
     NULL when the client did not report it (old clients, the Kotlin and .NET
-    collectors); an absent measurement must never be read as software, so only an
-    explicit False is acted on. The score is re-derived from the reasons so it
-    stays the sum of advertised points, as _score_integrity does.
+    collectors); an absent measurement must never be read as software, so
+    "advisory" acts only on an explicit False. "required" demands a claim, and no
+    claim cannot satisfy it (review F2): NULL blocks there under its own reason.
+    Even then it is only a claim -- "required" means "claimed at enrolment", never
+    "proven". The score is re-derived from the reasons so it stays the sum of
+    advertised points, as _score_integrity does.
     """
     if INTEGRITY_HARDWARE_BACKING_POLICY == "off":
         return
@@ -1871,9 +1875,22 @@ def _apply_hardware_backing_policy(cursor, installation_id, scored):
         (installation_id,),
     )
     row = cursor.fetchone()
-    if not row or row[0] is None or bool(row[0]):
+    stored = row[0] if row else None
+    if stored is not None and bool(stored):
         return
-    if INTEGRITY_HARDWARE_BACKING_POLICY == "required":
+    if stored is None and INTEGRITY_HARDWARE_BACKING_POLICY != "required":
+        return
+    if stored is None:
+        _integrity_reason(
+            scored["reasons"],
+            "key_hardware_backing_unreported",
+            100,
+            "This deployment requires a hardware-backed installation key, and this "
+            "installation never reported how its key is stored.",
+            hard=True,
+        )
+        scored["hard_block"] = True
+    elif INTEGRITY_HARDWARE_BACKING_POLICY == "required":
         _integrity_reason(
             scored["reasons"],
             "key_software_backed",
