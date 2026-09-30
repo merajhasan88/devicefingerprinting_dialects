@@ -392,6 +392,42 @@ def one_changed_byte_is_detected():
         s.INTEGRITY_SCORE_IOS_CODE_INTEGRITY = saved
 
 
+def coverage(probes, core=(614400, 0, 0), ext=(2097152, 0, 0), app=(4194304, 0, 0)):
+    """Add native coverage: (compared, skipped, unreadable) per bucket."""
+    ci = probes["code_integrity"]
+    for bucket, (compared, skipped, unreadable) in (("core", core), ("ext", ext), ("app", app)):
+        expected = compared + skipped + unreadable
+        ci.update({"%s_compared_bytes" % bucket: compared,
+                   "%s_expected_bytes" % bucket: expected,
+                   "%s_skipped_bytes" % bucket: skipped,
+                   "%s_unreadable_bytes" % bucket: unreadable,
+                   "%s_complete" % bucket: expected > 0 and compared == expected})
+    ci["protect_restore_failures"] = 0
+    return probes
+
+
+@check
+def code_coverage_is_reported_and_checked():
+    status, payload = send_report("android", coverage(clean("android")))
+    expect(status == 200 and payload["integrity"]["score"] == 0 and not codes(payload),
+           "complete coverage must score 0 with no reason, got %s" % payload)
+    status, payload = send_report("android", coverage(clean("android"), core=(614400, 0, 65536)))
+    partial = [r for r in payload["integrity"]["reasons"] if r["code"] == "android_code_integrity_partial"]
+    expect(status == 200 and partial and partial[0].get("report_only")
+           and payload["integrity"]["score"] == 0,
+           "partial coverage must be visible and report-only, got %s" % payload)
+    probes = coverage(clean("android"))
+    probes["code_integrity"]["app_expected_bytes"] = 8388608   # does not add up
+    status, payload = send_report("android", probes)
+    expect(status == 200 and "integrity_probe_incomplete:code_integrity" in codes(payload),
+           "coverage that does not add up must be incomplete evidence, got %s" % payload)
+    probes = coverage(clean("android"))
+    probes["code_integrity"]["protect_restore_failures"] = 1
+    status, payload = send_report("android", probes)
+    expect("android_code_integrity_restore_failed" in codes(payload),
+           "a failed protection restore must be reported, got %s" % codes(payload))
+
+
 # ---------------------------------------------------------------------------
 # F1 -- a step-up approval authorises exactly one request
 # ---------------------------------------------------------------------------

@@ -1833,8 +1833,41 @@ _PROBE_OPTIONAL_FIELDS = {
     "android": {
         "exec_mappings": {"wx_bytes": int, "wx_size_classes": str,
                           "wx_smallest_bytes": int, "wx_largest_bytes": int},
+        # Coverage, reported by the native scanner since DESIGN.md 63.
+        "code_integrity": dict(
+            [("%s_%s" % (bucket, field), int)
+             for bucket in ("core", "ext", "app")
+             for field in ("expected_bytes", "skipped_bytes", "unreadable_bytes")]
+            + [("%s_complete" % bucket, bool) for bucket in ("core", "ext", "app")]
+            + [("protect_restore_failures", int), ("xom_regions_unlocked", int),
+               ("xom_regions_unreadable", int), ("elapsed_ms", int)]
+        ),
     },
 }
+_CODE_BUCKETS = ("core", "ext", "app")
+
+
+def _code_coverage_consistent(code):
+    """Whether reported code-integrity coverage adds up (DESIGN.md 63).
+
+    expected = compared + skipped + unreadable in every bucket that reports
+    coverage, and complete is true exactly when all expected bytes were
+    compared. A collector that does not report coverage is not judged here.
+    """
+    for bucket in _CODE_BUCKETS:
+        expected = code.get("%s_expected_bytes" % bucket)
+        if expected is None:
+            continue
+        parts = [code.get("%s_%s" % (bucket, f)) for f in
+                 ("compared_bytes", "skipped_bytes", "unreadable_bytes")]
+        if any(not isinstance(v, int) or isinstance(v, bool) for v in parts):
+            return False
+        if sum(parts) != expected:
+            return False
+        complete = code.get("%s_complete" % bucket)
+        if complete is not None and complete != (expected > 0 and parts[0] == expected):
+            return False
+    return True
 _MAX_PROBE_INT = 1 << 53
 
 
@@ -1879,6 +1912,9 @@ def _check_probe_evidence(platform, probes, required_probes):
         missing = [f for f in required_fields.get(name, {}) if value.get(f) is None]
         if name == "code_integrity" and value.get("checked") is False and not missing:
             missing = ["checked=false"]
+        if (name == "code_integrity" and platform == "android" and not missing
+                and not _code_coverage_consistent(value)):
+            missing = ["coverage figures that add up"]
         if missing:
             incomplete.append((name, missing))
     return incomplete
@@ -2258,6 +2294,28 @@ def _score_android_integrity(probes):
         _integrity_reason(reasons, "android_app_code_modified", 90,
                           "The application's own native code differs from its packaged image.")
         score += 90
+    # Coverage (DESIGN.md 63). The scanner now measures every target mapping in
+    # full and says when it could not; a bucket that compared only part of its
+    # code is not clean evidence for the rest. Visible but not yet scored: what
+    # partial evidence should cost is an owner decision awaiting fleet data, and
+    # the collector that reports it is the honest one (a platform refusing to
+    # make execute-only code readable), not the lying one.
+    if code_checked:
+        partial = []
+        for bucket in _CODE_BUCKETS[: 3 if INTEGRITY_SCORE_EXTENDED_LIBS else 1]:
+            expected = code.get("%s_expected_bytes" % bucket)
+            if isinstance(expected, int) and not isinstance(expected, bool):
+                compared = _as_int(code.get("%s_compared_bytes" % bucket))
+                if expected == 0 or compared < expected:
+                    partial.append("%s %d of %d bytes" % (bucket, compared, expected))
+        if partial:
+            _integrity_reason(reasons, "android_code_integrity_partial", 30,
+                              "Code integrity compared only part of its targets (%s)."
+                              % "; ".join(partial), report_only=True)
+        if _as_int(code.get("protect_restore_failures")) > 0:
+            _integrity_reason(reasons, "android_code_integrity_restore_failed", 30,
+                              "The scanner could not restore a mapping's original "
+                              "protection after reading it.", report_only=True)
 
     exec_maps = _probe(probes, "exec_mappings")
     score += _score_wx_memory(reasons, exec_maps, apk_hash)
