@@ -1131,14 +1131,79 @@ def schema_guard():
 # ---------------------------------------------------------------------------
 # risk_policy_settings is owned by the consumer's DBA and read -- never written
 # -- by the server. Values are cached with a short TTL so a DBA UPDATE takes
-# effect without a restart. The read fails closed to an empty dict, so a
-# database still on schema < 3 (table absent) simply yields defaults everywhere.
+# effect without a restart.
+#
+# The read fails CLOSED (DESIGN.md 63). It used to fall back to an empty dict,
+# and an empty dict means "no path needs step-up": a cold worker that could not
+# read the table -- a missing SELECT grant is enough -- served sensitive
+# operations without step-up. Now only a successfully loaded and validated
+# snapshot is used. A worker that loaded one keeps serving it for at most
+# RISK_SETTINGS_MAX_STALE_SECONDS while reads fail (visible on /health/ready as
+# "stale"); a worker with none, or past that bound, refuses policy-dependent
+# requests with 503 risk_policy_unavailable.
 
 RISK_SETTINGS_CACHE_TTL_SECONDS = int(
     os.environ.get("RISK_SETTINGS_CACHE_TTL_SECONDS", "30")
 )
-_risk_settings_cache = {"at": 0.0, "values": None}
+RISK_SETTINGS_MAX_STALE_SECONDS = int(
+    os.environ.get("RISK_SETTINGS_MAX_STALE_SECONDS", "300")
+)
+_RISK_SETTINGS_RETRY_SECONDS = 5
+_risk_settings_cache = {"at": 0.0, "values": None, "failed_at": None, "error": None}
 _risk_settings_lock = threading.Lock()
+
+# What each known setting must parse as. A value that does not is a DBA typo;
+# substituting the default would hide it, so the snapshot is refused instead.
+# Keys not listed here pass through unchecked.
+_RISK_SETTING_KINDS = {
+    "stepup_required_paths": "paths",
+    "stepup_factor": ("passcode", "biometric"),
+    "stepup_mode": ("per_use", "windowed"),
+    "stepup_window_seconds": "int",
+    "rate_anomaly_enabled": "bool",
+    "rate_anomaly_max_requests": "int",
+    "rate_anomaly_window_seconds": "int",
+    "rate_anomaly_points": "int",
+    "population_baseline_enabled": "bool",
+    "population_baseline_metric": ("accounts_per_device", "installations_per_device"),
+    "population_baseline_threshold": "int",
+    "population_points": "int",
+    "device_accounts_elevated_count": "int",
+    "device_accounts_elevated_points": "int",
+    "device_accounts_review_count": "int",
+    "device_accounts_review_points": "int",
+    "device_accounts_block_count": "int",
+    "elevated_risk_refuses": "bool",
+}
+_RISK_SETTING_BOOL_WORDS = ("0", "1", "true", "false", "yes", "no", "on", "off")
+# Rows whose absence would silently weaken a gate instead of restoring the
+# owner's default. An EMPTY stepup_required_paths is a valid choice (step-up
+# nowhere); a MISSING row is not that statement, so the snapshot is refused.
+_RISK_SETTINGS_REQUIRED = ("stepup_required_paths", "stepup_factor", "stepup_mode")
+
+
+def _validate_risk_settings(values):
+    for key in _RISK_SETTINGS_REQUIRED:
+        if key not in values:
+            raise ValueError("risk_policy_settings has no %s row" % key)
+    for key, kind in _RISK_SETTING_KINDS.items():
+        if key not in values:
+            continue
+        value = values[key].strip()
+        if kind == "int":
+            valid = re.fullmatch(r"[0-9]{1,9}", value) is not None
+        elif kind == "bool":
+            valid = value.lower() in _RISK_SETTING_BOOL_WORDS
+        elif kind == "paths":
+            valid = all(
+                path.strip().startswith("/")
+                for path in value.replace(";", ",").split(",")
+                if path.strip()
+            )
+        else:
+            valid = value in kind
+        if not valid:
+            raise ValueError("risk_policy_settings.%s has an invalid value" % key)
 
 
 def _risk_policy_settings():
@@ -1148,26 +1213,52 @@ def _risk_policy_settings():
     ) < RISK_SETTINGS_CACHE_TTL_SECONDS:
         return cache["values"]
     with DIALECT.unit_lock(), _risk_settings_lock:  # lock order: unit first
-        if cache["values"] is not None and (
-            time.monotonic() - cache["at"]
-        ) < RISK_SETTINGS_CACHE_TTL_SECONDS:
+        now = time.monotonic()
+        if cache["values"] is not None and now - cache["at"] < RISK_SETTINGS_CACHE_TTL_SECONDS:
             return cache["values"]
-        values = {}
-        try:
-            with _cursor() as cursor:
-                cursor.execute(
-                    "SELECT setting_key, setting_value FROM risk_policy_settings"
-                )
-                for row in cursor.fetchall():
-                    values[str(row[0])] = str(row[1])
-        except Exception:
-            logger.exception(
-                "Could not read risk_policy_settings; using defaults this cycle"
-            )
-            values = cache["values"] if cache["values"] is not None else {}
-        cache["values"] = values
-        cache["at"] = time.monotonic()
-        return values
+        failed_at = cache.get("failed_at")
+        if failed_at is None or now - failed_at >= _RISK_SETTINGS_RETRY_SECONDS:
+            try:
+                values = {}
+                with _cursor() as cursor:
+                    cursor.execute(
+                        "SELECT setting_key, setting_value FROM risk_policy_settings"
+                    )
+                    for row in cursor.fetchall():
+                        values[str(row[0])] = str(row[1])
+                _validate_risk_settings(values)
+            except Exception as error:
+                logger.exception("Could not load a valid risk_policy_settings snapshot")
+                cache["failed_at"] = now
+                cache["error"] = ("%s: %s" % (type(error).__name__, error))[:200]
+            else:
+                cache.update(values=values, at=now, failed_at=None, error=None)
+                return values
+        if cache["values"] is not None and now - cache["at"] < RISK_SETTINGS_MAX_STALE_SECONDS:
+            return cache["values"]
+        raise ApiProblem(
+            "The risk policy could not be loaded, so the request was refused "
+            "rather than evaluated without it.",
+            503,
+            "risk_policy_unavailable",
+        )
+
+
+def _risk_policy_status():
+    """Health view of the policy snapshot: (status, values or None). Never raises."""
+    try:
+        values = _risk_policy_settings()
+    except ApiProblem:
+        return {"state": "unavailable", "error": _risk_settings_cache.get("error")}, None
+    age = time.monotonic() - _risk_settings_cache["at"]
+    if age < RISK_SETTINGS_CACHE_TTL_SECONDS:
+        return {"state": "fresh", "age_seconds": int(age)}, values
+    return {
+        "state": "stale",
+        "age_seconds": int(age),
+        "max_stale_seconds": RISK_SETTINGS_MAX_STALE_SECONDS,
+        "error": _risk_settings_cache.get("error"),
+    }, values
 
 
 def _risk_setting_str(key, default):
@@ -3647,14 +3738,42 @@ def health_live():
 
 @app.get("/health/ready")
 def health_ready():
-    with _cursor() as cursor:
-        cursor.execute("SELECT 1")
-        cursor.fetchone()
+    """Readiness: 200 only when this worker can serve protected requests.
+
+    503 "not_ready", naming each problem, when the database cannot be reached,
+    the schema does not match this build, no valid policy snapshot is loaded,
+    or NONCE_BACKEND=redis and Redis is unreachable (the replay store fails
+    closed, so nothing protected could be served). It used to answer 200
+    "ready" beside schema.ok=false (DESIGN.md 63). /health/live stays a bare
+    liveness probe.
+    """
+    problems = []
+    database = schema = None
+    try:
+        with _cursor() as cursor:
+            cursor.execute("SELECT 1")
+            cursor.fetchone()
+        database = _get_backend_identity()
+        schema = _get_schema_state()
+    except Exception as error:
+        logger.exception("Readiness: the database is unreachable")
+        database = {"reachable": False, "error": type(error).__name__}
+        problems.append("database_unreachable")
+    if schema is not None and not schema.get("ok"):
+        problems.append("schema_version_mismatch")
+    policy_state, policy_values = _risk_policy_status()
+    if policy_state["state"] == "unavailable":
+        problems.append("risk_policy_unavailable")
+    redis_state = _redis_status()
+    if NONCE_BACKEND == "redis" and not redis_state.get("reachable"):
+        problems.append("nonce_store_unavailable")
     return jsonify(
         {
-            "status": "ready",
-            "database": _get_backend_identity(),
-            "schema": _get_schema_state(),
+            "status": "not_ready" if problems else "ready",
+            "problems": problems,
+            "database": database,
+            "schema": schema,
+            "risk_policy": policy_state,
             "installation_key_algorithms": ["ES256", "RS256"],
             "device_policy_mode": DEVICE_POLICY_MODE,
             "integrity_mode": INTEGRITY_MODE,
@@ -3668,12 +3787,12 @@ def health_ready():
                 "ios_code_integrity": INTEGRITY_SCORE_IOS_CODE_INTEGRITY,
                 "hardware_backing_policy": INTEGRITY_HARDWARE_BACKING_POLICY,
                 "android_wx_baselines": len(ANDROID_WX_BASELINES),
-                "risk_policy_settings": _risk_policy_settings(),
+                "risk_policy_settings": policy_values or {},
             },
             "remote_attestation": "not_used",
-            "redis": _redis_status(),
+            "redis": redis_state,
         }
-    )
+    ), (503 if problems else 200)
 
 
 @app.post("/v1/installations/register")
