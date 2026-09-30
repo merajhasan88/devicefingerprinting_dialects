@@ -4116,56 +4116,46 @@ def register_installation():
                     stepup_matches,
                 )
 
-            # A non-exportable hardware key cannot migrate into software. The
-            # thumbprint is the authoritative identity, so the same key later
-            # claiming weaker protection is a contradiction, not an update --
-            # record it and keep the stronger stored value rather than letting
-            # a client talk its own installation down.
+            # Key-security metadata is recorded once, when the installation key
+            # is first registered, and never changed here. This path is public:
+            # it proves nothing about the caller, since the public key is not a
+            # credential, so letting it rewrite the stored claim let anyone
+            # holding the JWK "upgrade" a software key to StrongBox, or fill in
+            # an unreported one (review F7) -- which the "required" hardware
+            # policy would then honour. A different claim is logged, and a
+            # weaker one is still reported, because the same non-exportable key
+            # cannot have become weaker (the contradiction is the signal).
             downgraded = _key_security_downgraded(
                 stored_level, stored_backed, key_security
             )
-            if downgraded:
+            claimed = (
+                key_security["security_level"],
+                key_security["hardware_backed"],
+                key_security["provider"],
+            )
+            if any(value is not None for value in claimed) and claimed != (
+                stored_level, stored_backed, stored_provider
+            ):
                 logger.warning(
-                    "Installation %s reported weaker key security than stored "
-                    "(stored level=%s hardware_backed=%s; reported level=%s "
-                    "hardware_backed=%s). Keeping the stored value.",
+                    "Installation %s re-registered with a key-security claim that "
+                    "differs from the stored one (stored level=%s hardware_backed=%s; "
+                    "claimed level=%s hardware_backed=%s; downgrade=%s). Stored "
+                    "value kept: re-registration is unauthenticated.",
                     canonical_installation_id,
                     stored_level,
                     stored_backed,
                     key_security["security_level"],
                     key_security["hardware_backed"],
+                    downgraded,
                 )
-                cursor.execute(
-                    """
-                    UPDATE app_installations
-                    SET last_seen_at = NOW()
-                    WHERE installation_id = %s
-                    """,
-                    (canonical_installation_id,),
-                )
-            else:
-                # COALESCE keeps a previously recorded value when this client
-                # did not report one, so a mixed fleet cannot erase it.
-                cursor.execute(
-                    """
-                    UPDATE app_installations
-                    SET last_seen_at = NOW(),
-                        key_security_level = COALESCE(%s, key_security_level),
-                        key_hardware_backed = COALESCE(%s, key_hardware_backed),
-                        key_provider = COALESCE(%s, key_provider)
-                    WHERE installation_id = %s
-                    """,
-                    (
-                        key_security["security_level"],
-                        key_security["hardware_backed"],
-                        key_security["provider"],
-                        canonical_installation_id,
-                    ),
-                )
-                stored_level = key_security["security_level"] or stored_level
-                if key_security["hardware_backed"] is not None:
-                    stored_backed = key_security["hardware_backed"]
-                stored_provider = key_security["provider"] or stored_provider
+            cursor.execute(
+                """
+                UPDATE app_installations
+                SET last_seen_at = NOW()
+                WHERE installation_id = %s
+                """,
+                (canonical_installation_id,),
+            )
             cursor.execute(
                 "UPDATE recognized_devices SET last_seen_at = NOW() WHERE device_id = %s",
                 (device_id,),

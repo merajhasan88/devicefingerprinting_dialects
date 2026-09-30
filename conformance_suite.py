@@ -1548,6 +1548,35 @@ def check_key_security_recorded(api, ctx):
            "hardware_backed round-tripped as %r" % block.get("hardware_backed"))
 
 
+@check("identity: unauthenticated re-registration cannot rewrite key security")
+def check_key_security_not_rewritten(api, ctx):
+    """Review F7. Registration is public and the public key is not a
+    credential, so re-registering a known key must not change its stored
+    key_security: not upgrade software to StrongBox, and not fill in a claim
+    the installation never made (which INTEGRITY_HARDWARE_BACKING_POLICY=
+    required would honour)."""
+    installation = Installation()
+    st, pl = enrol(api, installation, key_security={
+        "security_level": "software", "hardware_backed": False, "provider": "AndroidKeyStore"})
+    expect(st in (200, 201), "enrol failed: %s %s" % (st, pl))
+    if pl.get("key_security") is None:
+        raise Skip("this server predates the key_security block (schema < 2)")
+    st, pl = enrol(api, installation, key_security={
+        "security_level": "strongbox", "hardware_backed": True, "provider": "claim-without-proof"})
+    block = pl.get("key_security") or {}
+    expect(st == 200 and block.get("hardware_backed") is False
+           and block.get("security_level") == "software",
+           "re-registration rewrote stored key security: %s %s" % (st, block))
+    unreported = Installation()
+    st, pl = enrol(api, unreported)
+    expect(st in (200, 201), "enrol failed: %s %s" % (st, pl))
+    st, pl = enrol(api, unreported, key_security={
+        "security_level": "strongbox", "hardware_backed": True, "provider": "late-claim"})
+    block = pl.get("key_security") or {}
+    expect(st == 200 and block.get("hardware_backed") is None,
+           "re-registration filled in an unreported claim: %s %s" % (st, block))
+
+
 @check("risk: a per-key request-rate anomaly is scored when enabled")
 def check_request_rate_anomaly(api, ctx):
     """Opt-in server-side signal. The DBA enables it in risk_policy_settings and
