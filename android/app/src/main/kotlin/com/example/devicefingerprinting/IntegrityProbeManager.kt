@@ -14,6 +14,7 @@ import java.net.InetSocketAddress
 import java.net.Socket
 import java.security.MessageDigest
 import java.util.Locale
+import java.util.concurrent.TimeUnit
 import org.json.JSONObject
 
 /**
@@ -33,6 +34,9 @@ class IntegrityProbeManager(private val context: Context) {
         //     produced it - see DESIGN.md 29.
         private const val COLLECTOR_VERSION = 2
         private const val MAX_TEXT = 8192
+        // Every shell command is bounded (review, DESIGN.md 63): one hung
+        // child used to block its probe, and the whole scan, indefinitely.
+        private const val COMMAND_TIMEOUT_MS = 3000L
         private val suspiciousRuntimeTokens = listOf(
             "frida", "gadget", "objection", "xposed", "lsposed",
             "substrate", "cydia", "zygisk", "riru", "magisk",
@@ -288,7 +292,10 @@ class IntegrityProbeManager(private val context: Context) {
     }
 
     private fun probeRootShell(): Map<String, Any> {
+        // A lookup that never finishes is not "no su": fail the probe, which the
+        // server scores as integrity_probe_failed rather than as clean.
         val whichSu = runCommand(listOf("/system/bin/sh", "-c", "command -v su || which su || true"))
+            ?: throw IllegalStateException("su lookup timed out")
         return ok(
             "su_path" to whichSu.trim().take(512),
             "su_found" to whichSu.trim().isNotEmpty()
@@ -308,7 +315,8 @@ class IntegrityProbeManager(private val context: Context) {
         )
         val values = linkedMapOf<String, String>()
         for (name in names) {
-            values[name] = runCommand(listOf("/system/bin/getprop", name)).trim().take(256)
+            values[name] = (runCommand(listOf("/system/bin/getprop", name))
+                ?: throw IllegalStateException("getprop $name timed out")).trim().take(256)
         }
         return ok("properties" to values)
     }
@@ -320,9 +328,11 @@ class IntegrityProbeManager(private val context: Context) {
         // is the authoritative kernel boolean when readable: 1=enforcing,
         // 0=permissive. Never turn command errors into a security verdict here;
         // the server normalizes and scores the evidence.
-        val mode = runCommand(
+        // A timed-out getenforce is unknown, like an unreadable one: unknown
+        // SELinux state is telemetry, never evidence (server scores it +0).
+        val mode = (runCommand(
             listOf("/system/bin/sh", "-c", "getenforce 2>/dev/null || true")
-        ).trim().lineSequence().firstOrNull().orEmpty().take(64)
+        ) ?: "").trim().lineSequence().firstOrNull().orEmpty().take(64)
 
         val enforceValue = try {
             val file = File("/sys/fs/selinux/enforce")
@@ -626,23 +636,47 @@ class IntegrityProbeManager(private val context: Context) {
         }
     }
 
-    private fun runCommand(command: List<String>): String {
-        return try {
-            val process = ProcessBuilder(command)
-                .redirectErrorStream(true)
-                .start()
-            val result = BufferedReader(InputStreamReader(process.inputStream)).use { reader ->
-                val builder = StringBuilder()
-                var line: String?
-                while (reader.readLine().also { line = it } != null && builder.length < MAX_TEXT) {
-                    builder.append(line).append('\n')
-                }
-                builder.toString()
-            }
-            process.waitFor()
-            result.take(MAX_TEXT)
+    /**
+     * Runs one command with a deadline. Returns its output (at most MAX_TEXT),
+     * "" if it could not be run, or null if it did not finish within
+     * COMMAND_TIMEOUT_MS -- the child is then killed, and the caller decides
+     * what an unfinished measurement means for its probe. The output is read on
+     * a separate thread because a blocking read is exactly what used to hang.
+     */
+    private fun runCommand(command: List<String>): String? {
+        val process = try {
+            ProcessBuilder(command).redirectErrorStream(true).start()
         } catch (_: Throwable) {
-            ""
+            return ""
+        }
+        val output = StringBuilder()
+        val reader = Thread {
+            try {
+                BufferedReader(InputStreamReader(process.inputStream)).use { input ->
+                    var line: String?
+                    while (input.readLine().also { line = it } != null) {
+                        synchronized(output) {
+                            if (output.length < MAX_TEXT) output.append(line).append('\n')
+                        }
+                    }
+                }
+            } catch (_: Throwable) {
+            }
+        }
+        reader.isDaemon = true
+        reader.start()
+        return try {
+            if (!process.waitFor(COMMAND_TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
+                process.destroyForcibly()
+                null
+            } else {
+                reader.join(500)
+                synchronized(output) { output.toString().take(MAX_TEXT) }
+            }
+        } catch (_: InterruptedException) {
+            process.destroyForcibly()
+            Thread.currentThread().interrupt()
+            null
         }
     }
 
