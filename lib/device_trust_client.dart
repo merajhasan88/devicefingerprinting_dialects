@@ -1095,6 +1095,15 @@ class DeviceApi {
         code: 'api_base_url_missing',
       );
     }
+    // A release build talks HTTPS only (review F8, DESIGN.md 63). The Android
+    // manifest refuses cleartext in release too; this makes a mistyped
+    // endpoint fail loudly instead of sending tokens in the clear.
+    if (kReleaseMode && !apiBaseUrl.toLowerCase().startsWith('https://')) {
+      throw ApiException(
+        'API_BASE_URL must be an https:// URL in a release build.',
+        code: 'api_base_url_insecure',
+      );
+    }
     return apiBaseUrl.endsWith('/')
         ? apiBaseUrl.substring(0, apiBaseUrl.length - 1)
         : apiBaseUrl;

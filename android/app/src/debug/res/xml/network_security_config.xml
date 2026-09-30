@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Debug builds only: allows a local HTTP lab server (e.g. the emulator's
+     http://10.0.2.2:5000). Release builds use the HTTPS-only config in main. -->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true" />
+</network-security-config>

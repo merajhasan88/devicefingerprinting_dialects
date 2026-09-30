@@ -1,4 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!-- HTTPS only (review F8, DESIGN.md 63). The debug build overrides this with
+     src/debug/res/xml/network_security_config.xml for a local HTTP lab server. -->
 <network-security-config>
-    <base-config cleartextTrafficPermitted="true" />
+    <base-config cleartextTrafficPermitted="false" />
 </network-security-config>
