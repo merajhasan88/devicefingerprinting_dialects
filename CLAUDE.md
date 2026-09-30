@@ -96,7 +96,7 @@ may change — never hard-code a policy value.
 ## Commands
 
 ```bash
-# Conformance suite — the gate. 54 checks; needs `cryptography` (harness only).
+# Conformance suite — the gate. 55 checks; needs `cryptography` (harness only).
 python3 conformance_suite.py --base-url https://<endpoint>
 #   Scoring checks need the server started with INTEGRITY_ANDROID_CERT_SHA256 set to the
 #   certificate the suite prints, or empty to disable the allow-list.
@@ -104,6 +104,14 @@ python3 conformance_suite.py --base-url https://<endpoint>
 #   population baseline, step-up) SKIP until their risk_policy_settings rows are enabled.
 #   check_parallel_clients (4 concurrent flows) must pass on any new backend BEFORE handset
 #   or paid-database time is spent on it.
+
+# Offline security regression gate (review F1-F10, DESIGN.md 63): no database needed
+python3 tools/check_security_regressions.py
+# Native scanner on the host (from a scratch dir; clang++ or g++)
+clang++ -std=c++17 -O1 -Wall -Wextra -Itools/native -Iandroid/app/src/main/cpp \
+    tools/native/check_code_integrity.cpp -o check_code_integrity && ./check_code_integrity
+# Live first-link race on a real engine (server env; --compare an older server file)
+python3 tools/race_first_link.py
 
 # Server syntax gate
 python3 -c "import ast,io; ast.parse(io.open('device_trust_server.py',encoding='utf-8').read(), feature_version=(3,9)); print('3.9 OK')"
@@ -123,6 +131,8 @@ not jailbroken). The emulator AVD `integrity_root_lab` is the disposable root la
 
 ## Current point of work
 
-See the end of DESIGN.md: section 61 holds the state at the last session's end and the open items;
-sections 51–60 cover the step-up key, dead-key recovery, the account policy, SQL Server concurrency
-and the serving model.
+See the end of DESIGN.md: section 63 records the 2026-09-29 external review, what was repaired, the
+owner decisions it leaves open and what is still to run on handsets; sections 51–62 cover the step-up
+key, dead-key recovery, the account policy, SQL Server concurrency, the serving model and W^X
+baselines. Step-up proofs are **v2** (they sign the whole request); behind a TLS-terminating proxy set
+`TRUSTED_PROXY_COUNT`, or `REQUIRE_HTTPS=1` answers 426 to everything.
