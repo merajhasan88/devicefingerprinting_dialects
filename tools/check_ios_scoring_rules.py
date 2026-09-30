@@ -225,11 +225,14 @@ def main():
     check("a client that sends no code_integrity at all raises nothing",
           reason(reasons, "ios_app_code_modified") is None, sorted(r["code"] for r in reasons))
 
-    # A sub-instruction diff is below the one-arm64-branch floor.
-    tiny_ci = dict(clean_ci, app_diff_bytes=3)
+    # Any differing byte in immutable code counts; there is no 4-byte floor
+    # any more (review F4, DESIGN.md 63). Report-only here, so it scores 0.
+    tiny_ci = dict(clean_ci, app_diff_bytes=1)
     score, _, reasons = server._score_ios_integrity(probes(code_integrity=tiny_ci))
-    check("a 3-byte diff is below the 4-byte inline-hook floor",
-          reason(reasons, "ios_app_code_modified") is None, sorted(r["code"] for r in reasons))
+    tiny = reason(reasons, "ios_app_code_modified")
+    check("a 1-byte diff is reported (report-only, 0 points)",
+          tiny is not None and tiny["points"] == 0 and tiny.get("proposed_points") == 90,
+          sorted(r["code"] for r in reasons))
 
     # --- the same input with scoring enabled ------------------------------
     os.environ["INTEGRITY_SCORE_IOS_FAKE_SIGNATURE"] = "1"

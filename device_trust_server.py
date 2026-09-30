@@ -2196,9 +2196,11 @@ def _score_android_integrity(probes):
         score += 40
 
     # Code integrity: native compares libc/libart .text in memory against disk.
-    # An inline hook overwrites a function prologue (at least one 4-byte branch
-    # on arm64), so any diff at or above that is a modification. Clean devices
-    # measured exactly zero, so the threshold is margin, not tuning.
+    # Clean devices measure exactly zero, and code expected to be immutable has
+    # no benign one-byte change, so ANY differing byte counts. The old 4-byte
+    # floor (one arm64 branch) missed edits that alter a constant or part of an
+    # encoding with fewer changed bytes (review F4; DESIGN.md 63). No report
+    # stored in September 2026 had 1-3 differing bytes, so none changes verdict.
     code = _probe(probes, "code_integrity")
     code_checked = _as_bool(code.get("checked"))
     core_diff = _as_int(code.get("diff_bytes"))
@@ -2207,14 +2209,13 @@ def _score_android_integrity(probes):
     # Core libc/libart is always scored. The extended system libraries are
     # folded in only once their on-device baseline is confirmed (the flag).
     system_diff = core_diff + (ext_diff if INTEGRITY_SCORE_EXTENDED_LIBS else 0)
-    if code_checked and system_diff >= 4:
+    if code_checked and system_diff > 0:
         # Modified system-library code in memory is unambiguous tampering, as
-        # definitive as a mapped Frida artifact, so it blocks on its own. The
-        # 4-byte floor is one arm64 branch, the smallest inline hook.
+        # definitive as a mapped Frida artifact, so it blocks on its own.
         _integrity_reason(reasons, "android_code_integrity_violation", 90,
                           "A system library's executable code differs from its on-disk image (inline hook).")
         score += 90
-    if code_checked and INTEGRITY_SCORE_EXTENDED_LIBS and app_diff >= 4:
+    if code_checked and INTEGRITY_SCORE_EXTENDED_LIBS and app_diff > 0:
         _integrity_reason(reasons, "android_app_code_modified", 90,
                           "The application's own native code differs from its packaged image.")
         score += 90
@@ -2385,9 +2386,9 @@ def _score_ios_integrity(probes):
     #
     # checked gates the rule, exactly as on Android: an app bucket reporting
     # app_compared_bytes 0 is inert, not clean, and must not be scored as
-    # either. The 4-byte floor is one arm64 branch, the smallest inline hook.
+    # either. Any differing byte counts, as on Android (DESIGN.md 63).
     code = _probe(probes, "code_integrity")
-    if _as_bool(code.get("checked")) and _as_int(code.get("app_diff_bytes")) >= 4:
+    if _as_bool(code.get("checked")) and _as_int(code.get("app_diff_bytes")) > 0:
         _integrity_reason(
             reasons,
             "ios_app_code_modified",
