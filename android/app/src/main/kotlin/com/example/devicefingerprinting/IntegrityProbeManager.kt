@@ -604,17 +604,20 @@ class IntegrityProbeManager(private val context: Context) {
         if (!nativeAvailable) {
             return ok("checked" to false, "reason" to "native_unavailable")
         }
+        val started = System.nanoTime()
         val json = try {
             nativeCodeIntegrity()
         } catch (error: Throwable) {
             return ok("checked" to false, "reason" to ("native_error:" + error.javaClass.simpleName))
         }
+        val elapsedMs = (System.nanoTime() - started) / 1_000_000
         if (json.isNullOrEmpty()) {
             return ok("checked" to false, "reason" to "native_no_result")
         }
         return try {
             val o = JSONObject(json)
-            ok(
+            val result = linkedMapOf<String, Any>(
+                "status" to "ok",
                 "checked" to o.optBoolean("checked", false),
                 "diff_bytes" to o.optLong("diff_bytes", 0),
                 "core_compared_bytes" to o.optLong("core_compared_bytes", 0),
@@ -629,8 +632,26 @@ class IntegrityProbeManager(private val context: Context) {
                 // everything reads as clean unless these are reported.
                 "xom_regions_unlocked" to o.optInt("xom_regions_unlocked", 0),
                 "xom_regions_unreadable" to o.optInt("xom_regions_unreadable", 0),
-                "diffed_libs" to o.optString("diffed_libs", "")
+                "diffed_libs" to o.optString("diffed_libs", ""),
+                // Wall time of the native comparison, for the scan-cost figures
+                // the review asked for.
+                "elapsed_ms" to elapsedMs
             )
+            // Coverage per bucket (DESIGN.md 63): expected = compared + skipped +
+            // unreadable, so partial measurement is visible, never read as
+            // clean. Copied only when the native side reported them.
+            for (bucket in listOf("core", "ext", "app")) {
+                for (field in listOf("expected_bytes", "skipped_bytes", "unreadable_bytes")) {
+                    val key = "${bucket}_$field"
+                    if (o.has(key)) result[key] = o.optLong(key, 0)
+                }
+                val complete = "${bucket}_complete"
+                if (o.has(complete)) result[complete] = o.optBoolean(complete, false)
+            }
+            if (o.has("protect_restore_failures")) {
+                result["protect_restore_failures"] = o.optInt("protect_restore_failures", 0)
+            }
+            result
         } catch (error: Throwable) {
             ok("checked" to false, "reason" to ("parse_error:" + error.javaClass.simpleName))
         }
