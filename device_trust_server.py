@@ -294,9 +294,26 @@ if INTEGRITY_MIN_COLLECTOR_VERSION < 1:
     raise RuntimeError("INTEGRITY_MIN_COLLECTOR_VERSION must be at least 1.")
 
 REQUIRE_HTTPS = os.environ.get("REQUIRE_HTTPS", "0") == "1"
+# Reverse proxies in front of this process that set X-Forwarded-For/-Proto
+# (DESIGN.md 63). 0, the default, trusts no forwarded header at all: the HTTPS
+# guard used to believe a client-supplied X-Forwarded-Proto, so a direct HTTP
+# request could claim to be HTTPS (review F8). Set it to the number of proxies
+# that REPLACE these headers -- 1 for a single nginx/Caddy terminating TLS in
+# front of a backend that listens only on 127.0.0.1.
+TRUSTED_PROXY_COUNT = int(os.environ.get("TRUSTED_PROXY_COUNT", "0"))
+# Whole-request body limit, enforced before JSON parsing (413). The largest
+# legitimate body, a signed integrity report, is well under 140 KiB.
+MAX_REQUEST_BYTES = int(os.environ.get("MAX_REQUEST_BYTES", str(256 * 1024)))
 MAX_OPEN_CHALLENGES_PER_INSTALLATION = 5
 
 app = Flask(__name__)
+if TRUSTED_PROXY_COUNT > 0:
+    from werkzeug.middleware.proxy_fix import ProxyFix
+
+    app.wsgi_app = ProxyFix(
+        app.wsgi_app, x_for=TRUSTED_PROXY_COUNT, x_proto=TRUSTED_PROXY_COUNT
+    )
+app.config["MAX_CONTENT_LENGTH"] = MAX_REQUEST_BYTES
 app.config["JWT_SECRET_KEY"] = _JWT_SECRET
 app.config["JWT_ACCESS_TOKEN_EXPIRES"] = ACCESS_TOKEN_LIFETIME
 app.config["JWT_REFRESH_TOKEN_EXPIRES"] = REFRESH_TOKEN_LIFETIME
@@ -451,8 +468,10 @@ def _iso_z(value):
 def transport_guard():
     if not REQUIRE_HTTPS or request.path in ("/health/live", "/health/ready"):
         return None
-    forwarded_proto = request.headers.get("X-Forwarded-Proto", request.scheme)
-    if forwarded_proto.lower() != "https":
+    # request.scheme is the connection's own scheme, or -- only when
+    # TRUSTED_PROXY_COUNT is set -- the one the trusted proxy recorded. A raw
+    # X-Forwarded-Proto from the client is never consulted.
+    if request.scheme.lower() != "https":
         raise ApiProblem(
             "HTTPS is required for this endpoint.", 426, "https_required"
         )
