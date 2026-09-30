@@ -3015,21 +3015,21 @@ STEPUP_AUTH_NOT_REPORTED = {"factor": None, "mode": None, "window_seconds": None
 
 
 def _parse_stepup_key_auth(body):
-    """Read the optional stepup_key_auth block sent alongside a step-up key.
+    """Read the stepup_key_auth block that must accompany a step-up key.
 
     It states how the key was created: the device factor that unlocks it, and
     whether every signature needs a fresh authentication (per_use) or one
     authentication covers a hardware-enforced window (windowed). Like
     key_security it is a client claim the server cannot re-verify without key
     attestation (51.2), so it is recorded and compared with policy, never
-    treated as proof. Absent means "not reported", never "per_use".
+    treated as proof. It is required with the key (DESIGN.md 63): a key whose
+    factor was never stated can never be shown to satisfy the policy's factor,
+    and step-up now checks the stored factor as well as the proof's.
     """
     block = body.get("stepup_key_auth")
-    if block is None:
-        return dict(STEPUP_AUTH_NOT_REPORTED)
     if not isinstance(block, dict):
         raise ApiProblem(
-            "stepup_key_auth must be an object when present.",
+            "stepup_key_auth is required with a step-up key and must be an object.",
             400,
             "invalid_stepup_key_auth",
         )
@@ -3132,18 +3132,30 @@ def _enforce_step_up(installation_id, account_id):
 def _verify_step_up(installation_id, account_id):
     """Verify the step-up proof on a sensitive path; return the key's auth.
 
-    The proof is a step-up-key signature over {installation_id, factor, nonce,
-    timestamp}; the nonce binds it to THIS request's access proof (already
-    replay-protected), so no separate step-up challenge or table is needed. The
-    factor is a client claim checked against policy -- the honest limit of 51.2 --
-    and per-use vs windowed is the client's hardware auth cadence, reported at
-    enrolment (stepup_key_auth) rather than proven here.
+    Proof v2 (DESIGN.md 63) is a step-up-key signature over the complete
+    request it approves:
+
+        {"version": 2, "purpose": "stepup", "installation_id", "factor",
+         "access_token_sha256", "method", "path", "query", "body_sha256",
+         "nonce", "timestamp"}
+
+    and every request field is compared with THIS request. Proof v1 signed only
+    the installation, factor, nonce and timestamp, so whoever held the
+    installation signer could attach a fresh approval to a different body under
+    a re-signed access proof carrying the same nonce (review F1). The nonce is
+    the access proof's, which is claimed once, so one approval authorises one
+    request; the token hash ties it to this session and therefore this account.
+
+    The factor must equal the deployment policy AND the factor the key was
+    registered with. Per-use vs windowed is the client's hardware auth cadence,
+    reported at enrolment and not proven here (51.2); a windowed key under a
+    per_use policy is accepted and reported as a downgrade (owner decision, 53).
     """
     with _cursor() as cursor:
         cursor.execute(
             "SELECT stepup_public_key_jwk, stepup_key_algorithm, "
             "stepup_key_factor, stepup_key_mode, stepup_key_window_seconds, "
-            "stepup_key_account_id "
+            "stepup_key_account_id, key_thumbprint "
             "FROM app_installations WHERE installation_id = %s",
             (installation_id,),
         )
@@ -3166,6 +3178,15 @@ def _verify_step_up(installation_id, account_id):
             403,
             "stepup_key_other_account",
         )
+    # A step-up key that is the installation key adds nothing: whatever can
+    # sign access proofs could sign approvals. Registration and re-enrolment
+    # refuse it; this covers rows written before they did.
+    if _parse_public_key(stepup_jwk)["thumbprint"] == row[6]:
+        raise ApiProblem(
+            "The step-up key is the installation key; re-enrol a separate key.",
+            403,
+            "stepup_key_not_independent",
+        )
     proof_b64 = request.headers.get("X-Step-Up-Proof")
     signature_b64 = request.headers.get("X-Step-Up-Signature")
     if not proof_b64 or not signature_b64:
@@ -3184,28 +3205,55 @@ def _verify_step_up(installation_id, account_id):
         proof = json.loads(proof_bytes.decode("utf-8"))
     except Exception:
         raise ApiProblem("The step-up proof is not valid JSON.", 400, "stepup_proof_invalid")
-    if not isinstance(proof, dict) or proof.get("installation_id") != installation_id:
+    if (
+        not isinstance(proof, dict)
+        or proof.get("version") != 2
+        or proof.get("purpose") != "stepup"
+    ):
+        raise ApiProblem(
+            "Only step-up proof version 2 with purpose \"stepup\" is accepted.",
+            403,
+            "stepup_proof_version_unsupported",
+        )
+    if proof.get("installation_id") != installation_id:
         raise ApiProblem(
             "The step-up proof installation does not match.",
             403,
             "stepup_installation_mismatch",
         )
     try:
-        access_proof = json.loads(
+        access_nonce = json.loads(
             _b64url_decode(request.headers.get("X-Access-Proof"), "access_proof", 8192).decode("utf-8")
-        )
+        ).get("nonce")
     except Exception:
-        access_proof = {}
-    if not proof.get("nonce") or proof.get("nonce") != access_proof.get("nonce"):
-        raise ApiProblem(
-            "The step-up proof is not bound to this request.",
-            403,
-            "stepup_binding_mismatch",
-        )
+        access_nonce = None
+    this_request = (
+        ("nonce", access_nonce),
+        ("access_token_sha256", hashlib.sha256(
+            _bearer_token_from_request().encode("utf-8")).hexdigest()),
+        ("method", request.method.upper()),
+        ("path", request.path),
+        ("query", request.query_string.decode("latin-1")),
+        ("body_sha256", hashlib.sha256(request.get_data(cache=True) or b"").hexdigest()),
+    )
+    for field, expected in this_request:
+        claimed = proof.get(field)
+        if (
+            not isinstance(expected, str)
+            or not isinstance(claimed, str)
+            or not hmac.compare_digest(claimed.encode("utf-8"), expected.encode("utf-8"))
+        ):
+            raise ApiProblem(
+                "The step-up proof does not approve this request (%s differs)." % field,
+                403,
+                "stepup_binding_mismatch",
+                details={"field": field},
+            )
     required_factor = _risk_setting_str("stepup_factor", "passcode")
-    if proof.get("factor") != required_factor:
+    if proof.get("factor") != required_factor or row[2] != required_factor:
         raise ApiProblem(
-            "The step-up proof factor does not match the deployment policy.",
+            "The step-up factor (claimed in the proof, or registered with the key) "
+            "does not match the deployment policy.",
             403,
             "stepup_factor_mismatch",
         )
@@ -4000,6 +4048,12 @@ def register_installation():
         if parsed_stepup["algorithm"] != "ES256":
             raise ApiProblem(
                 "The step-up key must be an ES256 P-256 key.",
+                400,
+                "invalid_stepup_key",
+            )
+        if parsed_stepup["thumbprint"] == key_thumbprint:
+            raise ApiProblem(
+                "The step-up key must be a separate key from the installation key.",
                 400,
                 "invalid_stepup_key",
             )
@@ -4895,6 +4949,18 @@ def reenrol_stepup_key():
             "The step-up key must be an ES256 P-256 key.", 400, "invalid_stepup_key"
         )
     stepup_auth = _parse_stepup_key_auth(body)
+    with _cursor() as cursor:
+        cursor.execute(
+            "SELECT key_thumbprint FROM app_installations WHERE installation_id = %s",
+            (installation_id,),
+        )
+        row = cursor.fetchone()
+    if row is None or parsed["thumbprint"] == row[0]:
+        raise ApiProblem(
+            "The step-up key must be a separate key from the installation key.",
+            400,
+            "invalid_stepup_key",
+        )
 
     def refuse(message, code, status=403):
         logger.info(

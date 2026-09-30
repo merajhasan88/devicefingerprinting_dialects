@@ -1460,28 +1460,60 @@ class DeviceApi {
     );
   }
 
-  /// The demo crown-jewel endpoint. [stepUpHeaders] receives this request's
-  /// access-proof nonce and returns the step-up headers. It runs BEFORE the
-  /// access proof is signed: the user may take a while at the prompt, and the
-  /// access proof's timestamp window should start after that.
+  /// The demo crown-jewel endpoint. With [signStepUp], the request is frozen
+  /// first -- token, method, path, query, body digest and nonce -- and the
+  /// step-up key signs exactly that request (proof v2, DESIGN.md 63), so an
+  /// approval cannot be attached to any other request. [signStepUp] runs BEFORE
+  /// the access proof is signed: the user may take a while at the prompt, and
+  /// the access proof's timestamp window should start after that.
   Future<Map<String, dynamic>> sensitiveEcho({
     required String accessToken,
     required InstallationIdentity signingIdentity,
     required Map<String, dynamic> body,
-    Future<Map<String, String>> Function(String nonce)? stepUpHeaders,
+    String? stepUpFactor,
+    Future<String> Function(String payload)? signStepUp,
   }) async {
+    const String path = '/v1/account/sensitive-echo';
     final List<int> nonceBytes = _freshNonce();
-    final Map<String, String> stepUp = stepUpHeaders == null
-        ? const <String, String>{}
-        : await stepUpHeaders(_b64UrlNoPadding(nonceBytes));
+    final String encodedBody = jsonEncode(body);
+    final Map<String, String> stepUp = <String, String>{};
+    if (signStepUp != null) {
+      final String payload = _b64UrlNoPadding(utf8.encode(jsonEncode(
+        <String, dynamic>{
+          'version': 2,
+          'purpose': 'stepup',
+          'installation_id': signingIdentity.installationId,
+          'access_token_sha256':
+              crypto.sha256.convert(utf8.encode(accessToken)).toString(),
+          'method': 'POST',
+          'path': path,
+          'query': '',
+          'body_sha256':
+              crypto.sha256.convert(utf8.encode(encodedBody)).toString(),
+          'factor': stepUpFactor,
+          'nonce': _b64UrlNoPadding(nonceBytes),
+          'timestamp': DateTime.now().toUtc().millisecondsSinceEpoch ~/ 1000,
+        },
+      )));
+      stepUp['X-Step-Up-Proof'] = payload;
+      stepUp['X-Step-Up-Signature'] = await signStepUp(payload);
+    }
     final AccessProofFixture fixture = await buildAccessProofFixture(
       'POST',
-      '/v1/account/sensitive-echo',
+      path,
       body: body,
       bearerToken: accessToken,
       signingIdentity: signingIdentity,
       nonceBytes: nonceBytes,
     );
+    if (fixture.encodedBody != encodedBody) {
+      // The step-up approval covers these exact bytes; sending others would
+      // be refused as stepup_binding_mismatch, so fail here instead.
+      throw ApiException(
+        'The request body changed after it was approved.',
+        code: 'stepup_body_changed',
+      );
+    }
     return _request(
       'POST',
       fixture.signedPath,
@@ -2968,8 +3000,9 @@ class DeviceRecognitionController extends ChangeNotifier {
     });
   }
 
-  /// The legitimate path: the user authenticates, the step-up key signs a
-  /// proof bound to this request's access-proof nonce, and the server allows it.
+  /// The legitimate path: the user authenticates, the step-up key signs this
+  /// exact request (proof v2: token, method, path, body digest and the access
+  /// proof's nonce), and the server allows it.
   Future<void> testSensitiveWithStepUp() {
     stepUpTestResult = null;
     return _run('Waiting for step-up authentication…', () async {
@@ -2996,27 +3029,15 @@ class DeviceRecognitionController extends ChangeNotifier {
             'operation': 'transfer',
             'probe_id': Uuid().v4(),
           },
-          stepUpHeaders: (String nonce) async {
-            final String payload = _base64UrlNoPadding(
-              utf8.encode(jsonEncode(<String, dynamic>{
-                'version': 1,
-                'installation_id': currentIdentity.installationId,
-                'factor': key.factor,
-                'nonce': nonce,
-                'timestamp':
-                    DateTime.now().toUtc().millisecondsSinceEpoch ~/ 1000,
-              })),
-            );
+          stepUpFactor: key.factor,
+          signStepUp: (String payload) async {
             prompt.start();
             final String signature = await _stepUpKeyProvider.sign(
               payload,
               reason: 'Approve a sensitive operation (step-up test)',
             );
             prompt.stop();
-            return <String, String>{
-              'X-Step-Up-Proof': payload,
-              'X-Step-Up-Signature': signature,
-            };
+            return signature;
           },
         );
         final Map<String, dynamic>? seen = value['step_up_key'] is Map

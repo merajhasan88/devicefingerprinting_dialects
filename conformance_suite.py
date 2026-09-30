@@ -194,19 +194,37 @@ def build_proof(
     return headers, (None if method == "GET" else body_text)
 
 
-def stepup_call(api, installation, stepup_priv, method, path, bearer, body_obj, factor):
-    """A protected call that also carries a step-up proof bound to this request's
-    access-proof nonce, signed by the separate step-up key."""
-    headers, body_text = build_proof(installation, method, path, bearer, body_obj)
-    access_proof = json.loads(b64u_decode(headers["X-Access-Proof"]).decode("utf-8"))
+def stepup_proof(installation, method, path, bearer, body_text, nonce, factor, **overrides):
+    """Step-up proof v2 (DESIGN.md 63): the step-up key approves one complete
+    request -- token, method, path, query, body and the access proof's nonce --
+    so the approval cannot be attached to any other request."""
     proof = {
-        "version": 1,
+        "version": 2,
+        "purpose": "stepup",
         "installation_id": installation.installation_id,
+        "access_token_sha256": sha256_hex(bearer.encode("utf-8")),
+        "method": method.upper(),
+        "path": path,
+        "query": "",
+        "body_sha256": sha256_hex((body_text or "").encode("utf-8")),
         "factor": factor,
-        "nonce": access_proof["nonce"],
+        "nonce": nonce,
         "timestamp": int(time.time()),
     }
-    proof_b64 = b64u(json.dumps(proof).encode("utf-8"))
+    proof.update(overrides)
+    return b64u(json.dumps(proof).encode("utf-8"))
+
+
+def stepup_call(api, installation, stepup_priv, method, path, bearer, body_obj, factor,
+                approve_body=None, **overrides):
+    """A protected call that also carries a step-up proof over this exact
+    request, signed by the separate step-up key. approve_body signs an approval
+    for a DIFFERENT body than the one sent, which is the retargeting attack."""
+    headers, body_text = build_proof(installation, method, path, bearer, body_obj)
+    access_proof = json.loads(b64u_decode(headers["X-Access-Proof"]).decode("utf-8"))
+    approved = body_text if approve_body is None else json.dumps(approve_body)
+    proof_b64 = stepup_proof(installation, method, path, bearer, approved,
+                             access_proof["nonce"], factor, **overrides)
     sig = stepup_priv.sign(b64u_decode(proof_b64), ec.ECDSA(hashes.SHA256()))
     headers["X-Step-Up-Proof"] = proof_b64
     headers["X-Step-Up-Signature"] = b64u(sig)
@@ -1647,6 +1665,18 @@ def check_stepup_key_registration(api, ctx):
            "per_use with a window expected 400 invalid_stepup_key_auth, got %s %s"
            % (st, error_code(pl)))
 
+    same = Installation()
+    st, pl = enrol(api, same, fresh_hint(), stepup_public_key=same.jwk,
+                   stepup_key_auth={"factor": "passcode", "mode": "per_use", "window_seconds": 0})
+    expect(st == 400 and error_code(pl) == "invalid_stepup_key",
+           "the installation key offered as its own step-up key expected 400 "
+           "invalid_stepup_key, got %s %s" % (st, error_code(pl)))
+    _, jwk_no_auth = stepup_jwk_pair()
+    st, pl = enrol(api, Installation(), fresh_hint(), stepup_public_key=jwk_no_auth)
+    expect(st == 400 and error_code(pl) == "invalid_stepup_key_auth",
+           "a step-up key without stepup_key_auth expected 400 invalid_stepup_key_auth, got %s %s"
+           % (st, error_code(pl)))
+
     st2, pl2 = enrol(api, Installation(), fresh_hint())
     expect(st2 in (200, 201), "plain enrol failed: %s %s" % (st2, pl2))
     expect(not pl2.get("stepup_key_registered"),
@@ -1690,11 +1720,14 @@ def check_stepup_key_immutable(api, ctx):
            % (pl.get("stepup_key_registered"), pl.get("stepup_key_matches")))
 
 
-@check("step-up: a sensitive path requires a valid step-up proof")
+@check("step-up: a sensitive path requires a valid step-up proof for that exact request")
 def check_step_up(api, ctx):
     """Opt-in: skips unless the demo sensitive path is in stepup_required_paths.
     No proof -> 403 stepup_required; a valid step-up proof -> 200; wrong factor
-    -> 403 stepup_factor_mismatch."""
+    -> 403 stepup_factor_mismatch; an approval moved to another body (review
+    F1) -> 403 stepup_binding_mismatch; a v1 proof -> 403
+    stepup_proof_version_unsupported; a key registered with another factor ->
+    403 stepup_factor_mismatch."""
     _, health = api.call("GET", "/health/ready")
     scoring = health.get("scoring_flags", {}) if isinstance(health, dict) else {}
     settings = scoring.get("risk_policy_settings", {})
@@ -1727,6 +1760,48 @@ def check_step_up(api, ctx):
     st, pl = stepup_call(api, inst, stepup_priv, "POST", "/v1/account/sensitive-echo", access, body, wrong)
     expect(st == 403 and error_code(pl) == "stepup_factor_mismatch",
            "wrong-factor expected 403 stepup_factor_mismatch, got %s %s" % (st, error_code(pl)))
+
+    # The review's reproduction: an approval signed for one body, attached to a
+    # different body under a freshly signed access proof with the same nonce.
+    st, pl = stepup_call(api, inst, stepup_priv, "POST", "/v1/account/sensitive-echo", access,
+                         {"move": "all the money"}, factor, approve_body=body)
+    expect(st == 403 and error_code(pl) == "stepup_binding_mismatch",
+           "a retargeted approval expected 403 stepup_binding_mismatch, got %s %s"
+           % (st, error_code(pl)))
+    st, pl = stepup_call(api, inst, stepup_priv, "POST", "/v1/account/sensitive-echo", access,
+                         body, factor, path="/v1/account/protected-echo")
+    expect(st == 403 and error_code(pl) == "stepup_binding_mismatch",
+           "an approval for another path expected 403 stepup_binding_mismatch, got %s %s"
+           % (st, error_code(pl)))
+    headers, body_text = build_proof(inst, "POST", "/v1/account/sensitive-echo", access, body)
+    nonce = json.loads(b64u_decode(headers["X-Access-Proof"]).decode("utf-8"))["nonce"]
+    v1 = b64u(json.dumps({"version": 1, "installation_id": inst.installation_id,
+                          "factor": factor, "nonce": nonce,
+                          "timestamp": int(time.time())}).encode("utf-8"))
+    headers["X-Step-Up-Proof"] = v1
+    headers["X-Step-Up-Signature"] = b64u(stepup_priv.sign(b64u_decode(v1),
+                                                           ec.ECDSA(hashes.SHA256())))
+    st, pl = api.call("POST", "/v1/account/sensitive-echo", body_text=body_text,
+                      bearer=access, headers=headers)
+    expect(st == 403 and error_code(pl) == "stepup_proof_version_unsupported",
+           "a v1 step-up proof expected 403 stepup_proof_version_unsupported, got %s %s"
+           % (st, error_code(pl)))
+
+    # The key's registered factor counts too, not only the proof's claim.
+    other = Installation()
+    other_priv, other_jwk = stepup_jwk_pair()
+    st, pl = enrol(api, other, fresh_hint(), stepup_public_key=other_jwk,
+                   stepup_key_auth={"factor": wrong, "mode": "per_use", "window_seconds": 0})
+    expect(st in (200, 201), "enrol failed: %s %s" % (st, pl))
+    other_tok = device_token(api, other)
+    submit_report(api, other, other_tok)
+    st, pl = open_account(api, other, other_tok, "sf-%s" % secrets.token_hex(4))
+    expect(st in (200, 201), "account open failed: %s %s" % (st, pl))
+    st, pl = stepup_call(api, other, other_priv, "POST", "/v1/account/sensitive-echo",
+                         pl["access_token"], body, factor)
+    expect(st == 403 and error_code(pl) == "stepup_factor_mismatch",
+           "a key registered as %s under a %s policy expected 403 stepup_factor_mismatch, "
+           "got %s %s" % (wrong, factor, st, error_code(pl)))
 
 
 
