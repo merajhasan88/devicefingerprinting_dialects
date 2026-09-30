@@ -1680,6 +1680,12 @@ def _integrity_probe_plan(platform):
             "sandbox",
             "dyld_images",
         ]
+        # Once its scoring is on, the app-bucket comparison must be requested
+        # rather than volunteered: a client that simply omitted it would
+        # otherwise never be scored on it (review F2). Report-only, it stays
+        # out of the plan and the Swift collector keeps sending it unasked.
+        if INTEGRITY_SCORE_IOS_CODE_INTEGRITY:
+            mandatory.append("code_integrity")
         optional = ["environment", "simulator"]
     else:
         raise ApiProblem("Unsupported integrity platform.", 400, "unsupported_platform")

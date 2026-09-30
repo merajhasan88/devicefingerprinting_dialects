@@ -611,6 +611,26 @@ IOS_CLEAN = {
     },
     "environment": {"status": "ok", "dyld_insert_libraries": ""},
     "simulator": {"status": "ok", "is_simulator": False, "model": "iPhone10,4"},
+    # Requested only once INTEGRITY_SCORE_IOS_CODE_INTEGRITY is on; the shape
+    # the Swift collector reports on a clean iPhone (app bucket measured,
+    # system images unreadable by construction).
+    "code_integrity": {
+        "status": "ok",
+        "checked": True,
+        "app_compared_bytes": 1310720,
+        "app_diff_bytes": 0,
+        "app_libs_diff": 0,
+        "app_images_compared": 2,
+        "core_compared_bytes": 0,
+        "core_diff_bytes": 0,
+        "diff_bytes": 0,
+        "ext_compared_bytes": 0,
+        "ext_diff_bytes": 0,
+        "ext_libs_diff": 0,
+        "diffed_libs": "",
+        "system_images_unreadable": 380,
+        "system_bucket_reason": "dyld_shared_cache_has_no_backing_files",
+    },
 }
 
 
