@@ -74,6 +74,8 @@ class Rows(object):
         self.hardware_backed = None
         self.fail_settings = False
         self.settings = dict(SETTINGS)
+        self.open_challenges = 0
+        self.oldest_challenge = None
 
     def execute(self, sql, params=None):
         q = " ".join(sql.split())
@@ -93,6 +95,14 @@ class Rows(object):
                            s._parse_public_key(inst.jwk)["thumbprint"])
         elif q.startswith("SELECT installation_id, device_id, registration_method"):
             self.result = self.reenrol_row
+        elif q.startswith("SELECT i.status, d.status FROM app_installations i"):
+            self.result = ("active", "active")
+        elif q.startswith("SELECT COUNT(*) FROM installation_challenges"):
+            self.result = (self.open_challenges,)
+        elif q.startswith("SELECT challenge_id FROM installation_challenges"):
+            self.result = (self.oldest_challenge,)
+        elif q.startswith(("INSERT INTO installation_challenges", "DELETE FROM installation_challenges")):
+            self.writes.append((q, params))
         elif q.startswith("SELECT setting_key, setting_value"):
             if self.fail_settings:
                 raise RuntimeError("simulated policy-table permission/read failure")
@@ -832,6 +842,75 @@ def readiness_reports_not_ready():
            "a healthy worker must answer 200 ready, got %s %s" % (reply.status_code, reply.get_json()))
     live = client.get("/health/live")
     expect(live.status_code == 200, "liveness must stay independent of readiness")
+
+
+# ---------------------------------------------------------------------------
+# F9 -- admission: budgets, a challenge flood cannot lock a client out
+# ---------------------------------------------------------------------------
+
+
+class FakeRedis(object):
+    def __init__(self):
+        self.counts = {}
+
+    def incr(self, key):
+        self.counts[key] = self.counts.get(key, 0) + 1
+        return self.counts[key]
+
+    def expire(self, key, seconds):
+        return True
+
+
+@check
+def challenge_flood_drops_the_oldest_instead_of_refusing():
+    db.writes = []
+    db.open_challenges = s.MAX_OPEN_CHALLENGES_PER_INSTALLATION
+    db.oldest_challenge = str(uuid.uuid4())
+    try:
+        reply = client.post("/v1/installations/challenge",
+                            json={"installation_id": inst.installation_id})
+        expect(reply.status_code == 200,
+               "a full challenge allowance must not lock the client out, got %s %s"
+               % (reply.status_code, reply.get_json()))
+        dropped = [p for q, p in db.writes if q.startswith("DELETE FROM installation_challenges WHERE challenge_id")]
+        expect(dropped and dropped[0][0] == db.oldest_challenge,
+               "the oldest unused challenge must be dropped, writes were %s" % db.writes)
+    finally:
+        db.open_challenges = 0
+        db.oldest_challenge = None
+
+
+@check
+def login_attempts_are_budgeted_per_handle_and_source():
+    saved = (s.RATE_LIMIT_ENABLED, s.REDIS_URL, s._REDIS_CLIENT, s._enforce_integrity_gate)
+    fake = FakeRedis()
+    s.RATE_LIMIT_ENABLED, s.REDIS_URL, s._REDIS_CLIENT = True, "redis://fixture", fake
+
+    def stop(*a, **k):
+        raise s.ApiProblem("stop", 418, "fixture_stop")
+    s._enforce_integrity_gate = stop
+    login = encode({"handle": "victim-handle", "password": "Passw0rd123"})
+    path = "/v1/accounts/login"
+    try:
+        reply = client.post(path, data=login, headers=access_headers("POST", path, login, device_token))
+        expect(reply.status_code == 418, "setup: expected the fixture stop, got %s" % reply.status_code)
+        handle_key = "dt:rate:accounts_login_handle:%s" % s._handle_lookup("victim-handle")
+        expect(handle_key in fake.counts and any(k.startswith("dt:rate:accounts_login_source:")
+                                                 for k in fake.counts),
+               "login must consult per-handle and per-source budgets, keys were %s" % sorted(fake.counts))
+        fake.counts[handle_key] = s.RATE_LIMIT_MAX_ATTEMPTS
+        reply = client.post(path, data=login, headers=access_headers("POST", path, login, device_token))
+        expect(reply.status_code == 429 and error_code(reply) == "rate_limited",
+               "an exhausted handle budget must refuse, got %s %s" % (reply.status_code, error_code(reply)))
+    finally:
+        s.RATE_LIMIT_ENABLED, s.REDIS_URL, s._REDIS_CLIENT, s._enforce_integrity_gate = saved
+
+
+@check
+def housekeeping_runs_at_most_once_per_interval():
+    name = "fixture-%s" % uuid.uuid4()
+    expect(s._maintenance_due(name) is True and s._maintenance_due(name) is False,
+           "a cleanup must not run on every request")
 
 
 # ---------------------------------------------------------------------------

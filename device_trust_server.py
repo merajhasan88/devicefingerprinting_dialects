@@ -826,6 +826,14 @@ NONCE_BACKEND = os.environ.get("NONCE_BACKEND", "database").strip().lower()
 RATE_LIMIT_ENABLED = os.environ.get("RATE_LIMIT_ENABLED", "0").strip() == "1"
 RATE_LIMIT_MAX_ATTEMPTS = int(os.environ.get("RATE_LIMIT_MAX_ATTEMPTS", "20"))
 RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("RATE_LIMIT_WINDOW_SECONDS", "60"))
+# Per-source budgets (DESIGN.md 63, review F9) are looser than the per-identity
+# ones above because one address can front many legitimate phones (carrier
+# NAT). They key on request.remote_addr, which is the client's own address only
+# when TRUSTED_PROXY_COUNT names the proxies in front; otherwise every client
+# shares the proxy's address and one budget.
+RATE_LIMIT_SOURCE_MAX_ATTEMPTS = int(
+    os.environ.get("RATE_LIMIT_SOURCE_MAX_ATTEMPTS", "120")
+)
 
 if NONCE_BACKEND not in ("database", "redis"):
     raise RuntimeError(
@@ -903,7 +911,7 @@ def _claim_nonce_redis(nonce_hash, installation_id):
         )
 
 
-def _enforce_rate_limit(bucket, identity):
+def _enforce_rate_limit(bucket, identity, limit=None):
     """Throttle repeated attempts. Fails open by design."""
     if not RATE_LIMIT_ENABLED or not REDIS_URL:
         return
@@ -916,12 +924,38 @@ def _enforce_rate_limit(bucket, identity):
     except Exception:
         logger.exception("The Redis rate limiter is unreachable; allowing.")
         return
-    if attempts > RATE_LIMIT_MAX_ATTEMPTS:
+    if attempts > (limit or RATE_LIMIT_MAX_ATTEMPTS):
         raise ApiProblem(
             "Too many attempts. Try again shortly.",
             429,
             "rate_limited",
         )
+
+
+def _limit_source(bucket):
+    """The per-source budget for one public or credential-bearing endpoint."""
+    _enforce_rate_limit(
+        bucket + "_source", request.remote_addr or "unknown", RATE_LIMIT_SOURCE_MAX_ATTEMPTS
+    )
+
+
+# Housekeeping deletes of expired, ephemeral rows (nonces, unused challenges)
+# used to run inside every request that touched those tables (review F9). Each
+# worker now runs each one at most once per MAINTENANCE_INTERVAL_SECONDS. These
+# are the only rows the server ever deletes: nothing that records a
+# relationship or a verdict is removed (DESIGN.md 63.3a).
+MAINTENANCE_INTERVAL_SECONDS = int(os.environ.get("MAINTENANCE_INTERVAL_SECONDS", "60"))
+_maintenance_last = {}
+_maintenance_lock = threading.Lock()
+
+
+def _maintenance_due(name):
+    now = time.monotonic()
+    with _maintenance_lock:
+        if _maintenance_last.get(name, -1e9) + MAINTENANCE_INTERVAL_SECONDS > now:
+            return False
+        _maintenance_last[name] = now
+        return True
 
 
 def _key_request_rate(installation_id, window_seconds):
@@ -3475,12 +3509,13 @@ def _create_challenge(installation_id, purpose):
                 "The recognized device is not active.", 403, "device_inactive"
             )
 
-        cursor.execute(
-            """
-            DELETE FROM installation_challenges
-            WHERE expires_at < NOW() - INTERVAL '1 day'
-            """
-        )
+        if _maintenance_due("installation_challenges"):
+            cursor.execute(
+                """
+                DELETE FROM installation_challenges
+                WHERE expires_at < NOW() - INTERVAL '1 day'
+                """
+            )
         cursor.execute(
             """
             SELECT COUNT(*)
@@ -3492,11 +3527,33 @@ def _create_challenge(installation_id, purpose):
             (installation_id,),
         )
         if cursor.fetchone()[0] >= MAX_OPEN_CHALLENGES_PER_INSTALLATION:
-            raise ApiProblem(
-                "Too many open challenges. Complete or wait for an existing challenge.",
-                429,
-                "too_many_challenges",
+            # The public challenge endpoint needs only the installation ID, so
+            # refusing at the cap let anyone who knew it lock the real client
+            # out until the open challenges expired (review F9). Drop the
+            # oldest unused one instead: a flood then only churns, and the
+            # client always gets a fresh challenge. Unused challenges are
+            # ephemeral -- never evidence.
+            cursor.execute(
+                """
+                SELECT challenge_id
+                FROM installation_challenges
+                WHERE installation_id = %s
+                  AND used_at IS NULL
+                  AND expires_at > NOW()
+                ORDER BY expires_at ASC
+                LIMIT 1
+                """,
+                (installation_id,),
             )
+            oldest = cursor.fetchone()
+            if oldest is not None:
+                cursor.execute(
+                    """
+                    DELETE FROM installation_challenges
+                    WHERE challenge_id = %s AND used_at IS NULL
+                    """,
+                    (str(oldest[0]),),
+                )
 
         cursor.execute(
             """
@@ -3914,12 +3971,13 @@ def _require_access_proof(required_role="account"):
 
     with _cursor(commit=True) as cursor:
         if NONCE_BACKEND == "database":
-            cursor.execute(
-                """
-                DELETE FROM access_proof_nonces
-                WHERE expires_at < NOW() - INTERVAL '1 day'
-                """
-            )
+            if _maintenance_due("access_proof_nonces"):
+                cursor.execute(
+                    """
+                    DELETE FROM access_proof_nonces
+                    WHERE expires_at < NOW() - INTERVAL '1 day'
+                    """
+                )
             # A plain INSERT is the whole replay defence, and it is portable:
             # a duplicate primary key IS the replay. This deliberately avoids
             # ON CONFLICT (PostgreSQL-only) and its SQL Server translations,
@@ -4199,6 +4257,7 @@ def health_ready():
 
 @app.post("/v1/installations/register")
 def register_installation():
+    _limit_source("installations_register")
     body = _json_body()
     submitted_installation_id = _uuid_text(
         body.get("installation_id"), "installation_id"
@@ -4498,13 +4557,16 @@ def register_installation():
 
 @app.post("/v1/installations/challenge")
 def installation_challenge():
+    _limit_source("installations_challenge")
     body = _json_body()
     installation_id = _uuid_text(body.get("installation_id"), "installation_id")
+    _enforce_rate_limit("installations_challenge", installation_id)
     return jsonify(_create_challenge(installation_id, "device_auth"))
 
 
 @app.post("/v1/installations/verify")
 def installation_verify():
+    _limit_source("installations_verify")
     body = _json_body()
     installation_id = _uuid_text(body.get("installation_id"), "installation_id")
     challenge_id = _uuid_text(body.get("challenge_id"), "challenge_id")
@@ -4649,17 +4711,18 @@ def integrity_challenge():
     probes = _integrity_probe_plan(platform)
 
     with _cursor(commit=True) as cursor:
-        cursor.execute(
-            """
-            DELETE FROM integrity_challenges
-            WHERE expires_at < NOW() - INTERVAL '1 day'
-              AND NOT EXISTS (
-                  SELECT 1
-                  FROM integrity_reports AS r
-                  WHERE r.challenge_id = integrity_challenges.challenge_id
-              )
-            """
-        )
+        if _maintenance_due("integrity_challenges"):
+            cursor.execute(
+                """
+                DELETE FROM integrity_challenges
+                WHERE expires_at < NOW() - INTERVAL '1 day'
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM integrity_reports AS r
+                      WHERE r.challenge_id = integrity_challenges.challenge_id
+                  )
+                """
+            )
         cursor.execute(
             """
             INSERT INTO integrity_challenges
@@ -4917,6 +4980,7 @@ def integrity_me():
 @jwt_required()
 def account_register():
     _enforce_rate_limit("accounts_register", get_jwt().get("iid") or request.remote_addr)
+    _limit_source("accounts_register")
     claims = _require_access_proof("device")
     body = _json_body()
     lookup = _handle_lookup(body.get("handle"))
@@ -4971,9 +5035,13 @@ def account_register():
 @jwt_required()
 def account_login():
     _enforce_rate_limit("accounts_login", get_jwt().get("iid") or request.remote_addr)
+    _limit_source("accounts_login")
     claims = _require_access_proof("device")
     body = _json_body()
     lookup = _handle_lookup(body.get("handle"))
+    # Per account handle as well: the installation bucket alone is spread by a
+    # client that keeps registering new installations (review F9).
+    _enforce_rate_limit("accounts_login_handle", lookup)
     password = _password_bytes(body.get("password"))
     device_id = claims.get("did")
     installation_id = claims.get("iid")
@@ -5101,6 +5169,7 @@ def reenrol_stepup_key():
     serve as a credential oracle.
     """
     _enforce_rate_limit("stepup_reenrol", get_jwt().get("iid") or request.remote_addr)
+    _enforce_rate_limit("stepup_reenrol_account", str(get_jwt_identity()))
     claims, policy, integrity = _require_trusted_account_request("stepup_reenrol")
     installation_id = claims.get("iid")
     account_id = str(get_jwt_identity())
