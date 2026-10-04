@@ -230,25 +230,29 @@ Target: `https://devicefingerprinting.duckdns.org`, PostgreSQL 16.15, **schema 8
 |---|---|
 | Offline tests | **112 passed** on net6.0 and net8.0 — new: both proofs sign the query the request carries (a space signs as `%20`), the step-up proof's request fields equal the access proof's, a refused re-enrolment leaves the fresh key unusable (the iPhone sequence), a key reported different is unusable, `http://` refused |
 | .NET conformance | **31 passed, 0 failed, 3 skipped** (the three enforce-mode checks). Passing with the gate on: the client signs v2 and an appended query is refused `401 access_proof_query_mismatch`; a v1 proof accepted where allowed and refused with a query; step-up v2 verified; wrong factor, an approval moved to another body (`stepup_binding_mismatch`, field `body_sha256`), to another path (field `path`), a v1 step-up proof (`stepup_proof_version_unsupported`) and a key registered with another factor (`stepup_factor_mismatch`) all refused; re-enrolment including the second-account attack (`stepup_key_other_account`) |
-| Android harness, release APK (`58396d51…`, harness key `664e9c8e…e3`) | builds clean; **not yet installed** |
-| iOS sources (`tools/ioscheck`, `tools/obsscan`) | compile clean, no new obsoleted call sites; **no Codemagic build yet** |
+| .NET conformance, server refusing v1 (`ACCESS_PROOF_MIN_VERSION=2`, `access_proof_versions: [2]`) | **31 passed, 0 failed, 3 skipped**; the v1 check now takes its other branch — a v1 access proof is refused `400 unsupported_access_proof_version` — and everything else passes on v2 alone |
+| **OPPO CPH2083** (Android 9), release APK `58396d51…` (harness key `664e9c8e…e3`), installed in place over `834a5a23…`, server v2 only, observe | same installation (`exact_key`); W^X baseline `3735552:65536` from four agreeing cold starts, pinned by the reference session; scan **18 / trusted** (developer options +8, adb +10); step-up key created as passcode with a **30 s hardware window** (the Android 9 shape), not bound until re-enrolled; re-enrolment 200 with `policy_downgrade=true`, then bound and matching; **sensitive op without step-up 403 `stepup_required`; with step-up (confirm-credential PIN screen) verified, 200**, the server echoing `windowed`/30 and the downgrade |
+| .NET conformance, server in `INTEGRITY_MODE=enforce`, v2 only | **34 passed, 0 failed, 0 skipped** — the three enforce-mode checks included: a blocked device is refused, reinstalling does not clear it, and a step-up proof satisfies an `elevated` verdict (`integrity.satisfied_by_step_up`) |
+| **iPhone 7** (iOS 15.8.5, TrollStore), Codemagic build of `15418ad`, pre-signed (4 entitlements, no `get-task-allow`), server v2 only, observe | every call 200 on v2 alone (register, challenge/verify, integrity challenge/report, `device/me`, login); five integrity reports **0 / trusted** (the two fake-signature reasons report-only, +0); step-up key re-enrolled — passcode, **per-use**, no downgrade — and re-registration then matched; **sensitive op without step-up 403 `stepup_required`; with step-up (passcode prompt) verified, 200**. Read from the server's log and `integrity_reports` |
 
 ## Not covered
 
 These are gaps, not oversights.
 
-**Step-up on hardware.** `AndroidStepUpKeyStore` and `SecureEnclaveStepUpKeyStore` have been
-compiled, not run (as of section 8). Neither the BiometricPrompt path (API 30+), the confirm-credential path
-(Android 9/10), the Secure Enclave passcode prompt, nor the dead-key handling has been exercised on a
-phone. The conformance run proves the wire contract with software step-up keys only, which sign
-with nobody present.
+**Step-up on hardware, partly.** Run on the OPPO (Android 9 confirm-credential path, windowed 30 s)
+and the iPhone 7 (Secure Enclave, passcode per use), section 8. Not run on hardware: the API 30+
+`BiometricPrompt` per-use path (no Android 11+ handset was available), either platform's dead-key
+handling (the screen lock was not removed this round — the Android `IsKeyEntry` case and the iOS
+CryptoTokenKit -3 case are covered by code review against the reference fixes only), and the
+"refused re-enrolment leaves an unbound key" sequence, which is covered by an offline test.
+
+**W^X run-to-run variance.** Of eight cold-start measurements of build `58396d51…`, two read one
+64 KiB block above the pinned `3735552`: the first launch after install, which created the step-up
+key, and one unexplained run. A real scan that lands there scores `android_wx_above_baseline` +15
+(33, `elevated`). Watch for it; the allowance itself is the server owner's decision.
 
 **The biometric factor.** Not exercised anywhere; the iOS harness also lacks the
 `NSFaceIDUsageDescription` a Face ID device would need.
-
-**Access proof v2 only.** The shared server accepted v1 and v2 during the section 8 run, so the
-client's v2 proofs passed, but no .NET run has yet been made with the server refusing v1
-(`ACCESS_PROOF_MIN_VERSION=2`).
 
 **A new APK needs a new W^X baseline.** Any rebuild of the Android harness changes its APK hash, so
 the pinned `834a5a23…` entry no longer applies and the device reads 78/review until the new build's
