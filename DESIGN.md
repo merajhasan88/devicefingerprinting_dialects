@@ -5191,3 +5191,59 @@ Their new OPPO build's W^X entry, `58396d51…:3735552:65536`, was appended to
 build's (env backed up to `/root/devicetrust.env.bak-20261004-180233`); `/health/ready` reports
 `android_wx_baselines: 3`. Their iPhone build is served from `/srv/artifacts/e2a890/dt-dotnet-15418ad.ipa`.
 
+## 64. Design (not implemented): a per-app W^X allowance, so .NET apps are not re-pinned every release (2026-10-04)
+
+**The problem.** The .NET runtime on Android (Mono) maps writable-and-executable memory by design, which
+the server cannot tell apart from injected code by the memory map alone, so it scores +60 (§62). The
+allowance that removes that for a clean .NET device is keyed on the **APK hash** (§62). Every release
+has a new hash, so every release needs a new `INTEGRITY_ANDROID_WX_BASELINES` entry; until someone adds
+it, every clean device on that release reads 78 / review. For a customer that is a per-release
+operational step whose failure mode is a false refusal for all their users — not acceptable in
+production. A separate server for .NET would not change this (each customer already runs their own
+deployment, and a second scoring implementation is the divergence risk §0 rules out).
+
+**What the evidence says** (every stored .NET report carrying `wx_bytes`, 2026-09-19 … 10-04): every
+clean region is a whole multiple of **64 KiB** (classes 64, 128 and 192 KiB). The total varies by app
+build — about 1.0–1.2 MB for the September harness, 3.67–3.74 MB for the later builds — and is
+identical across the two phones measured. The three runs with an injected gadget each added regions of
+**4,096 and 28,672 bytes**: the granularity test caught them; the total alone would have caught
+only one of them. The granularity is a property of the runtime; the total is a property of the app.
+
+**Proposal.** Allow per **app** rather than per build, keep the granularity rule exactly, and bound the
+total with an operator-set ceiling that has headroom.
+
+- **Configuration**, next to the certificate pin it depends on:
+  `INTEGRITY_ANDROID_WX_APP_ALLOWANCES=<package>@<cert_sha256>:<ceiling_bytes>:<granularity>[,…]`.
+  Operator-declared, never client-claimed (a client able to say "I am .NET" could grant itself the
+  allowance from inside a compromised app — the trap §62 recorded).
+- **Matching.** An entry applies only when the report's package name equals `<package>`, its
+  certificate list contains `<cert_sha256>`, **and** the deployment pins that certificate in
+  `INTEGRITY_ANDROID_CERT_SHA256` (otherwise the entry is ignored and a startup warning names it).
+  A repackaged app is already a hard block on the certificate pin; this keeps the allowance from ever
+  being the weaker key.
+- **Precedence.** An exact per-APK entry (§62) wins; then the app entry; with neither, today's +60.
+- **Rule** — the §62/§63 rule with the ceiling in place of one build's measurement: no W^X → 0;
+  `wx_bytes` absent, size classes missing or figures inconsistent → +60; any region not a multiple of
+  the granularity → `android_wx_foreign_allocator` +45; total above the ceiling → +15, above twice it
+  → +40. The reason names the entry that matched, so an operator can see which allowance was used.
+- **Choosing the ceiling.** In observe mode, collect the app's clean reports across its supported
+  devices, OS versions and at least two releases; ceiling = the largest clean total × 1.5, rounded up to
+  the granularity. With today's data that would be about 5.6 MB. A release whose footprint outgrows it
+  shows `android_wx_above_baseline` in observe mode before any enforcement — the signal to raise it.
+- **Optional:** a CI step that pins each release exactly (option 2 of the discussion) stays available
+  for customers who want the tighter per-build bound; the two co-exist through the precedence above.
+
+**The trade-off, stated plainly.** Within the ceiling, injected code that allocates in whole 64 KiB
+blocks is not caught by this rule — as today within a per-build baseline, but with more room (the 1.5×
+headroom). The granularity test, which caught every injected gadget observed, is unchanged, and the
+structural probes (instrumentation threads, code integrity) are independent of it.
+
+**Before enabling it under enforcement:** clean measurements of the customer's own app on its own
+device range in observe mode, as above; and a conformance check — an app entry for the conformance
+package and certificate: within the ceiling 0, a foreign size +45, above the ceiling +15, and the same
+entry with no certificate pin still +60.
+
+**Owner decisions:** the headroom factor (1.5 proposed); whether the configuration lives in the
+environment (proposed: beside the certificate pin) or in a DBA-managed table like
+`risk_policy_settings`.
+
