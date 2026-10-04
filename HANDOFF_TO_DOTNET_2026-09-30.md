@@ -76,6 +76,31 @@ factor → `stepup_factor_mismatch`.
 
 ## 5. The shared test stack
 
-EC2 `i-0559685f02c4013b1`, PostgreSQL 16.15, schema 7, observe/observe. Ask the owner before starting
-it. The reference suite now has 55 checks; `tools/check_security_regressions.py` is the offline gate for
-server changes.
+EC2 `i-0559685f02c4013b1`, PostgreSQL 16.15, **schema 8**, observe/observe, `ACCESS_PROOF_MIN_VERSION=1`
+(see 6). Ask the owner before starting it. The reference suite now has 59 checks;
+`tools/check_security_regressions.py` is the offline gate for server changes. `INTEGRATION_GUIDE.md`
+in the reference repository is the customer-facing configuration guide.
+
+## 6. Added 2026-10-04 (owner-approved, DESIGN.md 63.9)
+
+**Must change: access proof v2.** Every protected request's access proof gains `"query"` — the raw
+query string exactly as sent, without `?` (`""` when there is none) — and `"version": 2`. Everything
+else in the proof is unchanged. A server with the default `ACCESS_PROOF_MIN_VERSION=2` answers a v1
+proof with **400 `unsupported_access_proof_version`** (`details.minimum`). The shared stack is set to 1
+for the transition, so your v1 proofs still work there — except on a request that carries a query
+string, which a v1 proof can never cover (401 `access_proof_query_mismatch`). The same code answers a
+v2 proof whose `query` differs from the request's. `/health/ready` lists `access_proof_versions`.
+
+Also new, no client change required:
+
+- **Elevated integrity** (enforce mode): on an authenticated account request, attaching a valid step-up
+  proof v2 for that request now satisfies an `elevated` verdict (`integrity.satisfied_by_step_up`).
+  Login, account registration and refresh accept none; there an elevated verdict now answers
+  **403 `integrity_elevated`** (a clean scan is needed) instead of `integrity_step_up_required`.
+- **Admission budgets** (only with `RATE_LIMIT_ENABLED=1`, as on the shared stack): per source address on
+  registration, challenge, verify, account registration and login (120 per minute by default), and per
+  account handle on login (20 per minute). Expect **429 `rate_limited`** from a tight loop.
+- At five open challenges for one installation the oldest unused one is now dropped instead of
+  answering 429, so verifying a dropped challenge answers 404 `challenge_not_found`; request a new one.
+- Registrations that never proved their key no longer count toward a device's installation and
+  reinstall totals (migration 008, `verified_at`).
