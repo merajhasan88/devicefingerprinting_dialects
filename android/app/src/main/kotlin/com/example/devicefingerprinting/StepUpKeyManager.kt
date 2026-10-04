@@ -565,9 +565,21 @@ class StepUpKeyManager(private val context: Context) {
      * Any other lookup failure is reported with its cause and the key is kept.
      */
     private fun liveEntry(keyStore: KeyStore): KeyStore.PrivateKeyEntry {
+        // An alias can outlive its private key. Seen on the OPPO (Android 9) on
+        // 2026-10-04: containsAlias was true, isKeyEntry false, and getEntry
+        // threw a bare UnsupportedOperationException, which surfaced as an
+        // unexplained native error instead of a dead key. A certificate without
+        // its private key can never sign, so it is a dead key like the others.
+        if (!keyStore.isKeyEntry(keyAlias)) {
+            throw discardDeadKey(
+                IllegalStateException("The step-up alias holds no private key."),
+            )
+        }
         val loaded = try {
             keyStore.getEntry(keyAlias, null)
         } catch (error: UnrecoverableKeyException) {
+            throw discardDeadKey(error)
+        } catch (error: UnsupportedOperationException) {
             throw discardDeadKey(error)
         } catch (error: GeneralSecurityException) {
             throw InstallationKeyFailure(
