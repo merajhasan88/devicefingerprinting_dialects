@@ -73,7 +73,8 @@ Read back from the server's own `integrity_reports` table; the pinned baseline i
 one run that has not been explained.
 
 **One process, one session, growing.** The owner's step-up session on the same handset, each row a
-report the app made before the operation named (the app was not restarted between them):
+report the app made before the operation named. The first row is a cold start driven over adb; the
+owner then pressed the buttons in that running app, without restarting it:
 
 | UTC | Operation | `wx_bytes` | Mappings | Size classes | Score |
 |---|---|---|---|---|---|
@@ -85,10 +86,11 @@ report the app made before the operation named (the app was not restarted betwee
 
 The same pattern recurred during the dead-key test that evening: the first scan read 3,735,552,
 and the scans made after the owner had logged in and run the step-up flows read 4,128,768 (33,
-`elevated`). Every size remained a multiple of
-65,536, so `android_wx_foreign_allocator` never fired, and every total stayed far below twice the
-baseline, so `android_wx_far_above_baseline` never fired either. Growth after the scan: at most 458,752 bytes (+12 %) so far,
-exactly seven 64 KiB units.
+`elevated`).
+
+Every size remained a multiple of 65,536, so `android_wx_foreign_allocator` never fired, and every
+total stayed far below twice the baseline, so `android_wx_far_above_baseline` never fired either.
+Growth after the scan: at most 458,752 bytes (+12 %) so far, exactly seven 64 KiB units.
 
 **iOS is not affected.** .NET on iOS is fully AOT-compiled (Apple forbids a JIT), and the W^X probe is
 an Android probe.
