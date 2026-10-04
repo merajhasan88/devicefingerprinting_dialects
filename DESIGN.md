@@ -5183,4 +5183,7 @@ is back to `ACCESS_PROOF_MIN_VERSION=2`, v2 only, and stays there. Step-up stays
 `/v1/account/sensitive-echo` until the .NET phone runs are done; reset `stepup_required_paths` to `''`
 afterwards. Their new harness APK needs its W^X baseline entry appended before its OPPO run (until then
 78/review).
+The .NET session's conformance suite against this stack, v2 only: 31 passed, 0 failed, 3 skipped in
+observe, then **34 / 34** with `INTEGRITY_MODE=enforce` briefly on (17:40–17:47 UTC); back to observe.
+(Reported by the .NET session; not re-run here.)
 
