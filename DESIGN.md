@@ -5040,6 +5040,23 @@ Deployed to the test stack: `/opt/device_trust_server.py` = this build (backup
 8. **Release signing.** The Android release build is still debug-signed. Moving to a production key
    changes ANDROID_ID (so the reinstall hint) and the certificate pin — an owner step.
 
+### 63.3a Owner decisions on 63.3 (2026-10-04)
+
+- **Device-account links are permanent.** Nothing in this project retires, expires or deletes a link —
+  "this is the core of our project". Where a legitimate account is held back by the count, a DBA marks
+  it as reviewed/safe; rows are never removed. (Item 5's "unlink/retire state" is withdrawn.) Checked:
+  the server only INSERTs links and UPDATEs `last_seen_at`; the one DELETE anywhere was in
+  `tools/race_first_link.py`, which on 2026-09-30 removed the two throwaway links it had created. It
+  now uses its own synthetic device and deletes nothing.
+- **1 (partial coverage)**: stays report-only until pilot data. **F6** and **F9**: approved as
+  recommended. **F11**: a valid step-up proof may satisfy an `elevated` integrity verdict — approved.
+- **Access-proof query binding (6)**: approved, as access proof v2.
+- **Root secret and release signing (7, 8)** belong to the customer's deployment and app; the test
+  harness keeps its own secret and its debug-signed release build. For the integration guide: pin the
+  customer's production signing certificate (Google's app-signing certificate under Play App
+  Signing), never a debug one; and changing `DEVICE_ID_MASTER_SECRET` today makes stored reinstall
+  hints and account lookups unmatchable, so the guide must say so until the server supports rotation.
+
 ### 63.4 What the review says about claims, adopted
 
 A registered key proves possession or use of that key, nothing more. A custom client can generate an
