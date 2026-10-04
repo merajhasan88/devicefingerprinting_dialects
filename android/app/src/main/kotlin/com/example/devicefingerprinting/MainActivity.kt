@@ -153,12 +153,25 @@ class MainActivity : FlutterActivity() {
                     result.error(error.errorCode, error.message, null)
                 }
             } catch (error: Throwable) {
+                // Name the exception and its cause: a release build's log output
+                // is suppressed on the test OPPO, so the message shown in the app
+                // is the only diagnostic there is.
+                val detail = buildString {
+                    append("The Android native operation failed: ")
+                    append(error.javaClass.name)
+                    error.message?.let { append(": ").append(it) }
+                    error.cause?.let { cause ->
+                        append(" (cause ").append(cause.javaClass.name)
+                        cause.message?.let { append(": ").append(it) }
+                        append(")")
+                    }
+                    append(" at ")
+                    append(error.stackTrace.take(6).joinToString(" < ") {
+                        "${it.className.substringAfterLast('.')}.${it.methodName}:${it.lineNumber}"
+                    })
+                }
                 mainHandler.post {
-                    result.error(
-                        "NATIVE_INTEGRITY_ERROR",
-                        error.message ?: "The Android native operation failed.",
-                        null,
-                    )
+                    result.error("NATIVE_INTEGRITY_ERROR", detail, null)
                 }
             }
         }
