@@ -5120,3 +5120,37 @@ top frames; the OPPO suppresses a release build's logcat output, so the in-app m
 diagnostic) and fixed in `b74ff1e` (such an alias is a dead key: removed, `STEPUP_KEY_INVALIDATED`,
 re-enrolment offered). Re-enrolment needed the account password; the owner created a new account for it.
 
+### 63.9 The owner's decisions, implemented (2026-10-04)
+
+| Decision | Commit | What changed |
+|---|---|---|
+| Access-proof query binding | `5f02cac` | **Access proof v2** adds `query` (the raw query string as sent). `ACCESS_PROOF_MIN_VERSION` defaults to 2; the test stack runs **1** for the transition (the installed iPhone build and the .NET harness still send v1). A v1 proof is refused on any request carrying a query string. |
+| F11 | `16a2a7a` | On authenticated account requests a step-up proof v2 for that request satisfies an `elevated` integrity verdict (`satisfied_by_step_up`); an invalid offered proof refuses. Login, account registration and refresh accept none and now answer `integrity_elevated` instead of a step-up they cannot use. |
+| F9 | `3ee520d` | Per-source budgets (`RATE_LIMIT_SOURCE_MAX_ATTEMPTS`, 120) on registration, challenge, verify, account registration and login; per-handle budget on login; at the open-challenge cap the oldest unused challenge is dropped instead of refusing; expired-row housekeeping at most once per `MAINTENANCE_INTERVAL_SECONDS` per worker. No nonce-expiry index added: the review asks for indexes from measured plans. |
+| F6 | `940b37e` | **Schema 8**: `app_installations.verified_at`, set at the first consumed challenge; installation and reinstall counts include only proven installations (plus the caller). Backfill on the test stack: 3,933 of 4,076 installations proven; 143 never were. |
+| Integration guide | `8a837d0` | `INTEGRATION_GUIDE.md`: root secret (what it derives; changing it orphans hints and handle lookups; customer-owned), production signing pins (Google's app-signing certificate under Play App Signing), transport, least-privilege grants (DELETE only on the three ephemeral tables), modes, the DBA-owned policy, permanent links and customer-side "mark safe". |
+| Dead-key gap | `e3c2b56`, `b74ff1e` | Found on the OPPO, see 63.8. |
+
+**F6, the part not implemented.** The 63.3 recommendation also said a hint-correlated installation should
+affect a device only once "account-bound". Worked through, that is worse than nothing: a device farm that
+reinstalls and opens a new account each time would leave the accounts-per-device count; a compromised
+installation that never logged in could launder its block by reinstalling; and an attacker holding the
+hint can open an account anyway. Only the unauthenticated half of the poisoning (keys registered without
+being proven) is closed. The remaining case needs the victim's reinstall hint — on Android 8+ a hash of an
+ANDROID_ID scoped to the app's signing key, user and device — and a proven key; recorded as a limit.
+
+**Results.**
+
+| Check | Result |
+|---|---|
+| `tools/check_security_regressions.py` | **31 / 31** |
+| Conformance suite, PostgreSQL 16.15, observe, schema 8, **59 checks** | **54 passed, 0 failed, 5 skipped** (three enforce-mode checks, two opt-in signals); this time `check_parallel_clients` passed from the dev machine too |
+| The three enforce-mode checks, with the stack briefly in `INTEGRITY_MODE=enforce` | **3 / 3** — blocked device refused, device memory survives reinstall, **step-up satisfies an elevated verdict** |
+| OPPO, release build, with the server refusing v1 (`ACCESS_PROOF_MIN_VERSION=2`) | start-up register/verify/scan/`device/me`, refresh, `account/me` all 200; **step-up v2 verified** — the client speaks v2 |
+
+**State.** Test stack on this round's server (backup `.bak-20261004-155703`), schema 8, observe/observe,
+`TRUSTED_PROXY_COUNT=1`, `ACCESS_PROOF_MIN_VERSION=1`, `stepup_required_paths` gated for the handset
+runs. Next: an iPhone build from Codemagic (its installed build still sends step-up v1, now refused);
+the .NET session's move to access proof v2 and step-up v2, after which the stack goes back to v2 only;
+a SQL Server round (suite, enforce checks, `race_first_link.py`) when the owner wants one.
+
