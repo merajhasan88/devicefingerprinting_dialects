@@ -5154,3 +5154,26 @@ runs. Next: an iPhone build from Codemagic (its installed build still sends step
 the .NET session's move to access proof v2 and step-up v2, after which the stack goes back to v2 only;
 a SQL Server round (suite, enforce checks, `race_first_link.py`) when the owner wants one.
 
+### 63.10 On hardware — iPhone 7, iOS 15.8.5, TrollStore, PostgreSQL, observe (2026-10-04)
+
+Codemagic build of this round's client, pre-signed for TrollStore, server refusing v1 access proofs for
+the run (`ACCESS_PROOF_MIN_VERSION=2`, set back to 1 afterwards).
+
+| Check | Result |
+|---|---|
+| Start-up register / verify / scan / `device/me`, refresh, `account/me` | all 200 with v1 refused — the iOS client speaks access proof v2 |
+| Native scan | **0 / trusted**; the two fake-signature reasons present and report-only (0 points), as designed for a TrollStore install; `code_integrity` requested (iOS code-integrity scoring is on here) and present: app bucket 10,540,264 bytes compared, 0 differing |
+| Step-up | re-enrolled for the signed-in account (passcode, **per-use**, no downgrade), then **step-up v2 verified, 200** |
+
+**Found on the way: the app offered an unbound step-up key.** The passcode had been off at launch, so the
+old key was dead and none was offered at registration; with the passcode back on, a re-enrolment attempt
+created a fresh key and was refused (wrong password, 401), yet the step-up button enabled, because the app
+excluded only a key the server had *reported* as different. The server refused the fresh key's signature
+(`stepup_signature_invalid`) — correct. Fixed client-side in `215768b`: step-up is offered only for the key
+the server last confirmed as bound. A relaunch put the installed build into the right state for this run.
+
+**Which account a re-enrolled key belongs to.** Re-enrolment checks the password of the account the app is
+signed in as (the access token's subject) and scopes the key to that account (`stepup_key_account_id`):
+here `1519b153…`, one of six accounts linked to this iPhone's device record. The other five would be
+refused with `stepup_key_other_account` until they re-enrol with their own password while signed in.
+
