@@ -5177,3 +5177,10 @@ signed in as (the access token's subject) and scopes the key to that account (`s
 here `1519b153…`, one of six accounts linked to this iPhone's device record. The other five would be
 refused with `stepup_key_other_account` until they re-enrol with their own password while signed in.
 
+**v1 transition over (2026-10-04).** The .NET SDK now sends access proof v2 and step-up proof v2 (their
+`15418ad`, read here: `AccessProof.Version = 2` with `query`, `StepUpProofVersion = 2`), so the test stack
+is back to `ACCESS_PROOF_MIN_VERSION=2`, v2 only, and stays there. Step-up stays gated on
+`/v1/account/sensitive-echo` until the .NET phone runs are done; reset `stepup_required_paths` to `''`
+afterwards. Their new harness APK needs its W^X baseline entry appended before its OPPO run (until then
+78/review).
+
