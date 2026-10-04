@@ -146,12 +146,14 @@ def fresh_nonce():
     return c.b64u(os.urandom(32))
 
 
-def access_headers(method, path, body=b"", bearer=None, nonce=None):
+def access_headers(method, path, body=b"", bearer=None, nonce=None, version=2, query=""):
     bearer = bearer or token
-    proof = {"version": 1, "installation_id": inst.installation_id,
+    proof = {"version": version, "installation_id": inst.installation_id,
              "method": method, "path": path, "body_sha256": c.sha256_hex(body),
              "access_token_sha256": c.sha256_hex(bearer.encode()),
              "timestamp": int(time.time()), "nonce": nonce or fresh_nonce()}
+    if version >= 2:
+        proof["query"] = query
     raw = c.b64u(encode(proof))
     return {"Authorization": "Bearer " + bearer, "X-Access-Proof": raw,
             "X-Access-Signature": inst.sign_b64(raw), "Content-Type": "application/json"}
@@ -564,6 +566,55 @@ def stepup_key_must_differ_from_installation_key():
     expect(reply.status_code == 400 and error_code(reply) == "invalid_stepup_key_auth",
            "a step-up key without its auth block must be a 400, got %s %s"
            % (reply.status_code, error_code(reply)))
+
+
+# ---------------------------------------------------------------------------
+# Backlog -- the access proof binds the query string (v2)
+# ---------------------------------------------------------------------------
+
+ECHO = "/v1/account/protected-echo"
+
+
+@check
+def access_proof_binds_the_query_string():
+    body = encode({"x": 1})
+    with isolated_stepup():
+        reply = client.post(ECHO, data=body, headers=access_headers("POST", ECHO, body))
+        expect(reply.status_code == 200, "control: a v2 proof must pass, got %s %s"
+               % (reply.status_code, reply.get_json()))
+        reply = client.post(ECHO + "?to=someone-else", data=body,
+                            headers=access_headers("POST", ECHO, body))
+        expect(reply.status_code == 401 and error_code(reply) == "access_proof_query_mismatch",
+               "a query string added after signing passed: %s %s"
+               % (reply.status_code, error_code(reply)))
+        reply = client.post(ECHO + "?to=me", data=body,
+                            headers=access_headers("POST", ECHO, body, query="to=me"))
+        expect(reply.status_code == 200, "a signed query must pass, got %s %s"
+               % (reply.status_code, reply.get_json()))
+
+
+@check
+def access_proof_v1_only_by_setting_and_never_with_a_query():
+    body = encode({"x": 1})
+    saved = s.ACCESS_PROOF_MIN_VERSION
+    try:
+        with isolated_stepup():
+            reply = client.post(ECHO, data=body, headers=access_headers("POST", ECHO, body, version=1))
+            expect(reply.status_code == 400 and error_code(reply) == "unsupported_access_proof_version",
+                   "by default a v1 proof must be refused, got %s %s"
+                   % (reply.status_code, error_code(reply)))
+            s.ACCESS_PROOF_MIN_VERSION = 1
+            reply = client.post(ECHO, data=body, headers=access_headers("POST", ECHO, body, version=1))
+            expect(reply.status_code == 200,
+                   "with the transition setting a v1 proof without a query must pass, got %s"
+                   % reply.status_code)
+            reply = client.post(ECHO + "?to=x", data=body,
+                                headers=access_headers("POST", ECHO, body, version=1))
+            expect(reply.status_code == 401 and error_code(reply) == "access_proof_query_mismatch",
+                   "a v1 proof must never cover a query string, got %s %s"
+                   % (reply.status_code, error_code(reply)))
+    finally:
+        s.ACCESS_PROOF_MIN_VERSION = saved
 
 
 # ---------------------------------------------------------------------------

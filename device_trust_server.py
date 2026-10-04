@@ -107,6 +107,14 @@ REFRESH_TOKEN_LIFETIME = timedelta(days=30)
 CHALLENGE_LIFETIME = timedelta(minutes=2)
 ACCESS_PROOF_MAX_SKEW_SECONDS = 120
 ACCESS_PROOF_NONCE_RETENTION = timedelta(minutes=10)
+# Lowest access-proof version accepted (DESIGN.md 63). v2 adds the raw query
+# string to the signed request fields, which v1 never covered (review backlog).
+# The default, 2, refuses v1. Setting 1 is a transition aid for a fleet whose
+# clients still send v1 -- and even then a v1 proof is refused for any request
+# that carries a query string, since nothing it signed covers one.
+ACCESS_PROOF_MIN_VERSION = int(os.environ.get("ACCESS_PROOF_MIN_VERSION", "2"))
+if ACCESS_PROOF_MIN_VERSION not in (1, 2):
+    raise RuntimeError("ACCESS_PROOF_MIN_VERSION must be 1 or 2.")
 
 # ---------------------------------------------------------------------------
 # Device/account risk policy
@@ -3662,7 +3670,8 @@ def _require_access_proof(required_role="account"):
 
     The client signs the exact base64url-decoded proof JSON bytes. The server
     then verifies that those signed fields describe this exact HTTP request:
-    token hash, installation id, method, path, body hash, timestamp and nonce.
+    token hash, installation id, method, path, query (v2), body hash, timestamp
+    and nonce.
     The nonce is committed only after the signature verifies, making a captured
     proof unusable a second time.
     """
@@ -3705,11 +3714,17 @@ def _require_access_proof(required_role="account"):
             "invalid_access_proof",
         )
 
-    if proof.get("version") != 1:
+    version = proof.get("version")
+    if (
+        isinstance(version, bool)
+        or version not in (1, 2)
+        or version < ACCESS_PROOF_MIN_VERSION
+    ):
         raise ApiProblem(
             "The access proof version is unsupported.",
             400,
             "unsupported_access_proof_version",
+            details={"minimum": ACCESS_PROOF_MIN_VERSION, "current": 2},
         )
 
     if proof.get("installation_id") != installation_id:
@@ -3732,6 +3747,24 @@ def _require_access_proof(required_role="account"):
             "The access proof path does not match the request.",
             401,
             "access_proof_path_mismatch",
+        )
+
+    # The query string, exactly as sent (v2). request.path excludes it, so v1
+    # left every query parameter outside the signature (review backlog).
+    raw_query = request.query_string.decode("latin-1")
+    if version >= 2:
+        signed_query = proof.get("query")
+        if not isinstance(signed_query, str) or signed_query != raw_query:
+            raise ApiProblem(
+                "The access proof query string does not match the request.",
+                401,
+                "access_proof_query_mismatch",
+            )
+    elif raw_query:
+        raise ApiProblem(
+            "A version 1 access proof cannot cover a query string.",
+            401,
+            "access_proof_query_mismatch",
         )
 
     raw_body = request.get_data(cache=True) or b""
@@ -4112,6 +4145,7 @@ def health_ready():
             "schema": schema,
             "risk_policy": policy_state,
             "installation_key_algorithms": ["ES256", "RS256"],
+            "access_proof_versions": list(range(ACCESS_PROOF_MIN_VERSION, 3)),
             "device_policy_mode": DEVICE_POLICY_MODE,
             "integrity_mode": INTEGRITY_MODE,
             "integrity_freshness_seconds": INTEGRITY_FRESHNESS_SECONDS,

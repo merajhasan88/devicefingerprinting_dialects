@@ -1213,15 +1213,19 @@ class DeviceApi {
     final int timestamp = timestampSeconds ??
         DateTime.now().toUtc().millisecondsSinceEpoch ~/ 1000;
 
+    // Access proof v2 (DESIGN.md 63): the query string is signed too, exactly
+    // as sent; v1 left it outside the signature.
+    final Uri target = Uri.parse(path);
     final Map<String, dynamic> proof = <String, dynamic>{
       'access_token_sha256': tokenHash,
       'body_sha256': bodyHash,
       'installation_id': proofInstallationId ?? signingIdentity.installationId,
       'method': normalizedMethod,
       'nonce': nonce,
-      'path': path,
+      'path': target.path,
+      'query': target.query,
       'timestamp': timestamp,
-      'version': 1,
+      'version': 2,
     };
 
     // The native private key signs the exact JSON bytes represented by this

@@ -168,6 +168,7 @@ def build_proof(
     timestamp=None,
     nonce_bytes=None,
     signer=None,
+    version=2,
 ):
     """Return (headers, body_text_to_send).
 
@@ -178,16 +179,21 @@ def build_proof(
     body_text = "" if method == "GET" else json.dumps(body_obj or {})
     signed_body = signed_body_text if signed_body_text is not None else body_text
     nonce = b64u(nonce_bytes or secrets.token_bytes(32))
+    # Access proof v2 (DESIGN.md 63): the signed target splits into the path and
+    # the raw query string, both compared with the request.
+    route, _, query = (signed_path or path).partition("?")
     proof = {
         "access_token_sha256": sha256_hex(bearer.encode("utf-8")),
         "body_sha256": sha256_hex(signed_body.encode("utf-8")),
         "installation_id": installation.installation_id,
         "method": (signed_method or method).upper(),
         "nonce": nonce,
-        "path": signed_path or path,
+        "path": route,
         "timestamp": int(timestamp if timestamp is not None else time.time()),
-        "version": 1,
+        "version": version,
     }
+    if version >= 2:
+        proof["query"] = query
     payload_b64 = b64u(json.dumps(proof, separators=(",", ":")).encode("utf-8"))
     signature = (signer or installation).sign_b64(payload_b64)
     headers = {"X-Access-Proof": payload_b64, "X-Access-Signature": signature}
@@ -473,6 +479,53 @@ def check_path_tamper(api, ctx):
         error_code(payload) == "access_proof_path_mismatch",
         "expected access_proof_path_mismatch, got %s" % error_code(payload),
     )
+
+
+@check("access proof: a query string added after signing is rejected")
+def check_query_tamper(api, ctx):
+    """Access proof v2 signs the raw query string; v1 never covered it, so a
+    parameter appended after signing went through (review backlog)."""
+    status, payload = protected(
+        api,
+        ctx["installation"],
+        "POST",
+        "/v1/account/protected-echo?to=someone-else",
+        ctx["access_token"],
+        {"x": 1},
+        signed_path="/v1/account/protected-echo",
+    )
+    expect(status == 401 and error_code(payload) == "access_proof_query_mismatch",
+           "expected 401 access_proof_query_mismatch, got %s %s" % (status, error_code(payload)))
+    status, payload = protected(
+        api, ctx["installation"], "POST", "/v1/account/protected-echo?to=me",
+        ctx["access_token"], {"x": 1},
+    )
+    expect(status == 200, "a signed query string must pass, got %s %s" % (status, payload))
+
+
+@check("access proof: v1 only where the server allows it, and never with a query")
+def check_access_proof_v1(api, ctx):
+    """ACCESS_PROOF_MIN_VERSION (default 2) refuses v1; a fleet in transition may
+    set 1, and then a v1 proof still cannot cover a query string."""
+    _, health = api.call("GET", "/health/ready")
+    versions = (health if isinstance(health, dict) else {}).get("access_proof_versions") or [1]
+    status, payload = protected(
+        api, ctx["installation"], "POST", "/v1/account/protected-echo",
+        ctx["access_token"], {"x": 1}, version=1,
+    )
+    if 1 not in versions:
+        expect(status == 400 and error_code(payload) == "unsupported_access_proof_version",
+               "v1 refused by this server, expected 400 unsupported_access_proof_version, got %s %s"
+               % (status, error_code(payload)))
+        return
+    expect(status == 200, "v1 is allowed here, expected 200, got %s %s" % (status, payload))
+    status, payload = protected(
+        api, ctx["installation"], "POST", "/v1/account/protected-echo?to=x",
+        ctx["access_token"], {"x": 1}, version=1,
+    )
+    expect(status == 401 and error_code(payload) == "access_proof_query_mismatch",
+           "a v1 proof with a query string expected 401 access_proof_query_mismatch, got %s %s"
+           % (status, error_code(payload)))
 
 
 @check("access proof: a tampered method is rejected")
