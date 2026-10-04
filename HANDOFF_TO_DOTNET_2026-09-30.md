@@ -104,3 +104,31 @@ Also new, no client change required:
   answering 429, so verifying a dropped challenge answers 404 `challenge_not_found`; request a new one.
 - Registrations that never proved their key no longer count toward a device's installation and
   reinstall totals (migration 008, `verified_at`).
+
+## 7. Two client-side step-up gaps found on hardware on 2026-10-04 — your SDK has both
+
+Read from your repository at `1065b33` (nothing there was changed).
+
+**a. Step-up offered for a key the server never bound** (reference fix `215768b`, DESIGN.md 63.10).
+On the iPhone the passcode was off at launch, so the old step-up key was dead and none was offered at
+registration (`stepup_key_matches` came back null). With the passcode back on, a re-enrolment attempt
+created a fresh key and was refused (wrong password, 401); the app then enabled step-up anyway and the
+server refused the unbound key's signature (`stepup_signature_invalid`). Your
+`DeviceTrustClient.StepUpUsable` has the same condition (`StepUpKeyMatches != false`), so a null
+"never asked" passes. The fix: remember the thumbprint of the key you offered at registration when the
+server bound it (new installation) or reported it matching, and treat only that key as usable; any other
+local key gets the re-enrol path.
+
+**b. An Android step-up alias that has lost its private key** (reference fix `b74ff1e`, DESIGN.md 63.8).
+On the OPPO (Android 9), after the screen lock had been off and was set again, the alias still existed
+but held no private key: `containsAlias` true, `isKeyEntry` false, and `getEntry(alias, null)` threw a
+bare `UnsupportedOperationException` — not `UnrecoverableKeyException`, not
+`KeyPermanentlyInvalidatedException` — so the app showed an unexplained native error and never offered
+re-enrolment. Your `AndroidStepUpKeyStore` follows the same `ContainsAlias` → `LiveEntry` shape. Treat
+`!IsKeyEntry(alias)` (and that exception) as a dead key: delete the alias, report
+`STEPUP_KEY_INVALIDATED`.
+
+**Results on the shared stack today**, with the server refusing v1 access proofs for each run: the OPPO
+(18/trusted, every code-integrity bucket complete — core 7.1 MB, ext 5.7 MB, app 15.2 MB in ~440 ms —
+step-up v2 verified) and the iPhone (0/trusted, step-up v2 verified, per-use passcode). The stack is back
+to `ACCESS_PROOF_MIN_VERSION=1` until you move to v2.
