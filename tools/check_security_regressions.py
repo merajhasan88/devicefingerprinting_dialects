@@ -440,7 +440,7 @@ _real_risk_policy = s._evaluate_risk_policy
 
 @contextmanager
 def isolated_stepup():
-    s._enforce_integrity_gate = lambda *a: {"score": 0, "verdict": "trusted", "fresh": True}
+    s._enforce_integrity_gate = lambda *a, **k: {"score": 0, "verdict": "trusted", "fresh": True}
     s._evaluate_risk_policy = lambda *a, **k: {"effective_action": "allow"}
     try:
         yield
@@ -615,6 +615,54 @@ def access_proof_v1_only_by_setting_and_never_with_a_query():
                    % (reply.status_code, error_code(reply)))
     finally:
         s.ACCESS_PROOF_MIN_VERSION = saved
+
+
+# ---------------------------------------------------------------------------
+# F11 -- an elevated integrity verdict can be satisfied, where that is possible
+# ---------------------------------------------------------------------------
+
+
+@contextmanager
+def elevated_integrity():
+    saved = (s._latest_integrity_state, s._device_integrity_memory, s._evaluate_risk_policy)
+    s._latest_integrity_state = lambda iid: {"score": 30, "verdict": "elevated", "fresh": True}
+    s._device_integrity_memory = lambda did: None
+    s._evaluate_risk_policy = lambda *a, **k: {"effective_action": "allow"}
+    try:
+        yield
+    finally:
+        s._latest_integrity_state, s._device_integrity_memory, s._evaluate_risk_policy = saved
+
+
+@check
+def elevated_integrity_is_satisfied_by_a_step_up_proof():
+    body = encode({"x": 1})
+    with elevated_integrity():
+        reply = client.post(ECHO, data=body, headers=access_headers("POST", ECHO, body))
+        expect(reply.status_code == 403 and error_code(reply) == "integrity_step_up_required",
+               "elevated without step-up expected 403 integrity_step_up_required, got %s %s"
+               % (reply.status_code, error_code(reply)))
+        nonce = fresh_nonce()
+        head = access_headers("POST", ECHO, body, nonce=nonce)
+        head.update(stepup_headers("POST", ECHO, body, nonce))
+        reply = client.post(ECHO, data=body, headers=head)
+        integrity = (reply.get_json() or {}).get("integrity") or {}
+        expect(reply.status_code == 200 and integrity.get("satisfied_by_step_up") is True,
+               "a valid step-up proof must satisfy an elevated verdict, got %s %s"
+               % (reply.status_code, reply.get_json()))
+        nonce = fresh_nonce()
+        head = access_headers("POST", ECHO, body, nonce=nonce)
+        head.update(stepup_headers("POST", ECHO, body, nonce, signer=c.Installation()))
+        reply = client.post(ECHO, data=body, headers=head)
+        expect(reply.status_code == 403 and error_code(reply) == "stepup_signature_invalid",
+               "an invalid offered step-up proof must refuse, not be ignored: %s %s"
+               % (reply.status_code, error_code(reply)))
+        login = encode({"handle": "someone", "password": "Passw0rd123"})
+        reply = client.post("/v1/accounts/login", data=login,
+                            headers=access_headers("POST", "/v1/accounts/login", login, device_token))
+        expect(reply.status_code == 403 and error_code(reply) == "integrity_elevated",
+               "where no step-up is accepted the code must say so, got %s %s"
+               % (reply.status_code, error_code(reply)))
 
 
 # ---------------------------------------------------------------------------

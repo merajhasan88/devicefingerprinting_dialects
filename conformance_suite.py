@@ -1441,6 +1441,41 @@ def check_device_memory(api, ctx):
     )
 
 
+@check("enforcement: a step-up proof satisfies an elevated integrity verdict")
+def check_elevated_step_up(api, ctx):
+    """Review F11 (DESIGN.md 63). An elevated verdict used to answer
+    integrity_step_up_required although no step-up proof could satisfy it. On
+    an authenticated account request a valid proof for that request now does;
+    without one the refusal stands."""
+    if ctx["mode"] != "enforce":
+        raise Skip("server is in observe mode")
+    _, health = api.call("GET", "/health/ready")
+    settings = ((health if isinstance(health, dict) else {}).get("scoring_flags") or {}).get(
+        "risk_policy_settings") or {}
+    factor = settings.get("stepup_factor", "passcode")
+    inst = Installation()
+    stepup_priv, stepup_jwk = stepup_jwk_pair()
+    st, pl = enrol(api, inst, fresh_hint(), stepup_public_key=stepup_jwk,
+                   stepup_key_auth={"factor": factor, "mode": "per_use", "window_seconds": 0})
+    expect(st in (200, 201), "enrol failed: %s %s" % (st, pl))
+    tok = device_token(api, inst)
+    submit_report(api, inst, tok)
+    st, pl = open_account(api, inst, tok, "el-%s" % secrets.token_hex(4))
+    expect(st in (200, 201), "account open failed: %s %s" % (st, pl))
+    access = pl["access_token"]
+    decision = submit_report(api, inst, tok, lambda probes: probes.update(
+        {"mounts": {"status": "error", "error": "permission denied"}}))
+    expect(decision["verdict"] == "elevated", "setup: expected elevated, got %s" % decision)
+    body = {"x": 1}
+    st, pl = protected(api, inst, "POST", "/v1/account/protected-echo", access, body)
+    expect(st == 403 and error_code(pl) == "integrity_step_up_required",
+           "without step-up expected 403 integrity_step_up_required, got %s %s" % (st, error_code(pl)))
+    st, pl = stepup_call(api, inst, stepup_priv, "POST", "/v1/account/protected-echo",
+                         access, body, factor)
+    expect(st == 200 and (pl.get("integrity") or {}).get("satisfied_by_step_up") is True,
+           "a step-up proof must satisfy the elevated verdict, got %s %s" % (st, pl))
+
+
 # ---------------------------------------------------------------------------
 # runner
 # ---------------------------------------------------------------------------

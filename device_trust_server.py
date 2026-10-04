@@ -2597,7 +2597,16 @@ def _device_integrity_memory(device_id):
     }
 
 
-def _enforce_integrity_gate(device_id, installation_id):
+def _enforce_integrity_gate(device_id, installation_id, step_up=None, step_up_accepted=False):
+    """Refuse the request unless the latest integrity verdict allows it.
+
+    An elevated verdict is satisfied by a step-up proof verified for this very
+    request (step_up), on the endpoints that accept one (step_up_accepted) --
+    the authenticated account requests (DESIGN.md 63, review F11). It used to
+    answer integrity_step_up_required even where no step-up proof could ever
+    satisfy it; where none is accepted (login, registration, refresh) it now
+    says so: integrity_elevated, and the remedy is a clean scan.
+    """
     state = _latest_integrity_state(installation_id)
     if INTEGRITY_MODE != "enforce":
         return state
@@ -2623,11 +2632,22 @@ def _enforce_integrity_gate(device_id, installation_id):
             "integrity_review_required",
             details={"integrity": state},
         )
-    if verdict == "elevated":
+    if verdict == "elevated" and step_up:
+        state = dict(state, satisfied_by_step_up=True)
+    elif verdict == "elevated" and step_up_accepted:
         raise ApiProblem(
-            "The latest device-integrity verdict requires step-up verification.",
+            "The latest device-integrity verdict requires step-up verification: "
+            "repeat the request with a step-up proof.",
             403,
             "integrity_step_up_required",
+            details={"integrity": state},
+        )
+    elif verdict == "elevated":
+        raise ApiProblem(
+            "The latest device-integrity verdict is elevated and this operation "
+            "accepts no step-up proof; a clean integrity scan is required.",
+            403,
+            "integrity_elevated",
             details={"integrity": state},
         )
     # This installation's own scan is clean. Before allowing the request, check
@@ -3202,14 +3222,22 @@ def _stepup_required_paths():
 
 
 def _enforce_step_up(installation_id, account_id):
-    """Gate DBA-designated sensitive paths on a valid step-up proof.
+    """Verify a step-up proof where one is required, or offered; return it.
 
+    Required on the DBA-designated sensitive paths (none by default). On any
+    other authenticated account request a client may attach one anyway, to
+    satisfy an elevated integrity verdict (DESIGN.md 63): it is verified exactly
+    as on a sensitive path, and an invalid one refuses the request rather than
+    being ignored. Returns g.step_up when a proof was verified, else None.
     Every decision is logged with its outcome code, so an operator can see
     step-up activity, and a downgraded key in use, without a new table.
-    Sensitive paths default to none, so this is inert until a deployment opts in.
     """
-    if request.path not in _stepup_required_paths():
-        return
+    required = request.path in _stepup_required_paths()
+    offered = bool(
+        request.headers.get("X-Step-Up-Proof") or request.headers.get("X-Step-Up-Signature")
+    )
+    if not required and not offered:
+        return None
     try:
         key_auth = _verify_step_up(installation_id, account_id)
     except ApiProblem as problem:
@@ -3232,6 +3260,7 @@ def _enforce_step_up(installation_id, account_id):
         key_auth.get("window_seconds"),
         downgrade,
     )
+    return g.step_up
 
 
 def _verify_step_up(installation_id, account_id):
@@ -3384,8 +3413,10 @@ def _require_trusted_account_request(event_type="protected_request"):
     server-side device/account policy and enforce its effective action.
     """
     claims = _require_access_proof("account")
-    _enforce_step_up(claims.get("iid"), get_jwt_identity())
-    integrity = _enforce_integrity_gate(claims.get("did"), claims.get("iid"))
+    step_up = _enforce_step_up(claims.get("iid"), get_jwt_identity())
+    integrity = _enforce_integrity_gate(
+        claims.get("did"), claims.get("iid"), step_up=step_up, step_up_accepted=True
+    )
     policy = _evaluate_risk_policy(
         event_type,
         claims.get("did"),
