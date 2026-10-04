@@ -232,6 +232,10 @@ Target: `https://devicefingerprinting.duckdns.org`, PostgreSQL 16.15, **schema 8
 | .NET conformance | **31 passed, 0 failed, 3 skipped** (the three enforce-mode checks). Passing with the gate on: the client signs v2 and an appended query is refused `401 access_proof_query_mismatch`; a v1 proof accepted where allowed and refused with a query; step-up v2 verified; wrong factor, an approval moved to another body (`stepup_binding_mismatch`, field `body_sha256`), to another path (field `path`), a v1 step-up proof (`stepup_proof_version_unsupported`) and a key registered with another factor (`stepup_factor_mismatch`) all refused; re-enrolment including the second-account attack (`stepup_key_other_account`) |
 | .NET conformance, server refusing v1 (`ACCESS_PROOF_MIN_VERSION=2`, `access_proof_versions: [2]`) | **31 passed, 0 failed, 3 skipped**; the v1 check now takes its other branch — a v1 access proof is refused `400 unsupported_access_proof_version` — and everything else passes on v2 alone |
 | **OPPO CPH2083** (Android 9), release APK `58396d51…` (harness key `664e9c8e…e3`), installed in place over `834a5a23…`, server v2 only, observe | same installation (`exact_key`); W^X baseline `3735552:65536` from four agreeing cold starts, pinned by the reference session; scan **18 / trusted** (developer options +8, adb +10); step-up key created as passcode with a **30 s hardware window** (the Android 9 shape), not bound until re-enrolled; re-enrolment 200 with `policy_downgrade=true`, then bound and matching; **sensitive op without step-up 403 `stepup_required`; with step-up (confirm-credential PIN screen) verified, 200**, the server echoing `windowed`/30 and the downgrade |
+| **iPhone dead key, launch-time** (passcode off, app opened) | the key found while iOS reports no passcode: "invalidated (the device passcode was removed) and has been removed", `STEPUP_KEY_INVALIDATED`; same installation, 0 / trusted; the server still held the old key (`matches` null, nothing offered) and the client did **not** offer it (`usable=False` — the bound-thumbprint rule on hardware); sensitive op without step-up 403 `stepup_required`. Passcode back on: a fresh key, server `matches=false`, re-enrolled, step-up verified |
+| **iPhone dead key, use-time** (passcode off and on with the app closed) | the old key still offered and matching; at "Sensitive op with step-up" the signature failed with CryptoTokenKit -3: "invalidated (the Secure Enclave can no longer use it) and has been removed", and **no request reached the server** (none in its log for that window); next scan a fresh key, `matches=false`, re-enrolled, step-up verified |
+| **OPPO dead key** (screen lock off, then the PIN set again) | lock off: `UnrecoverableKeyException`, "could not be removed (alias still present)" — the reference's Android 9 observation exactly; same installation, 18 / trusted; sensitive op without step-up 403 `stepup_required`. PIN set again: the first scan removed the dead alias (cause still `UnrecoverableKeyException`), the next created a fresh key (`matches=false`), re-enrolled (30 s window, downgrade recorded), step-up verified |
+| **OPPO W^X across a session** | ten more cold-start scans all exactly `3735552` (18 / trusted). But a report made later **in the same app process** reads more: 4,063,232 after a login, 4,128,768 after re-enrolment, 4,194,304 after a step-up — every one `android_wx_above_baseline` +15, **33 / elevated** on this handset (developer options and adb add 18) |
 | .NET conformance, server in `INTEGRITY_MODE=enforce`, v2 only | **34 passed, 0 failed, 0 skipped** — the three enforce-mode checks included: a blocked device is refused, reinstalling does not clear it, and a step-up proof satisfies an `elevated` verdict (`integrity.satisfied_by_step_up`) |
 | **iPhone 7** (iOS 15.8.5, TrollStore), Codemagic build of `15418ad`, pre-signed (4 entitlements, no `get-task-allow`), server v2 only, observe | every call 200 on v2 alone (register, challenge/verify, integrity challenge/report, `device/me`, login); five integrity reports **0 / trusted** (the two fake-signature reasons report-only, +0); step-up key re-enrolled — passcode, **per-use**, no downgrade — and re-registration then matched; **sensitive op without step-up 403 `stepup_required`; with step-up (passcode prompt) verified, 200**. Read from the server's log and `integrity_reports` |
 
@@ -240,16 +244,26 @@ Target: `https://devicefingerprinting.duckdns.org`, PostgreSQL 16.15, **schema 8
 These are gaps, not oversights.
 
 **Step-up on hardware, partly.** Run on the OPPO (Android 9 confirm-credential path, windowed 30 s)
-and the iPhone 7 (Secure Enclave, passcode per use), section 8. Not run on hardware: the API 30+
-`BiometricPrompt` per-use path (no Android 11+ handset was available), either platform's dead-key
-handling (the screen lock was not removed this round — the Android `IsKeyEntry` case and the iOS
-CryptoTokenKit -3 case are covered by code review against the reference fixes only), and the
-"refused re-enrolment leaves an unbound key" sequence, which is covered by an offline test.
+and the iPhone 7 (Secure Enclave, passcode per use), including both iOS dead-key paths and the
+Android 9 dead key, section 8. Not run on hardware: the API 30+ `BiometricPrompt` per-use path (no
+Android 11+ handset was available); the Android alias that is no longer a key entry (`IsKeyEntry`
+false, the reference OPPO's 2026-10-04 state) — this round the OPPO's dead key was caught as
+`UnrecoverableKeyException` both with the lock off and once it was set again, so that branch is
+covered by code review against the reference fix only; and the "refused re-enrolment leaves an
+unbound key" sequence, covered by an offline test.
 
-**W^X run-to-run variance.** Of eight cold-start measurements of build `58396d51…`, two read one
-64 KiB block above the pinned `3735552`: the first launch after install, which created the step-up
-key, and one unexplained run. A real scan that lands there scores `android_wx_above_baseline` +15
-(33, `elevated`). Watch for it; the allowance itself is the server owner's decision.
+**The W^X baseline does not cover a session (open).** The pinned figure is measured at the first
+report after a cold start, and cold starts agree (18 of 20 measurements of build `58396d51…` read
+exactly `3735552`; the other two were the first launch, which created the step-up key, and one
+unexplained run). But Mono compiles code as each new flow runs, so any later report in the same
+process reads more — up to 4,194,304 (+12 %) after a login, a re-enrolment and a step-up — and scores
+`android_wx_above_baseline` +15. On this handset that is 33 / `elevated`, which enforce mode refuses
+for login and account registration (`integrity_elevated`); on a handset with developer options off it
+would be 15 / trusted. A baseline taken at one point of one flow cannot describe a JIT runtime that
+keeps compiling. Candidate fixes: a full-AOT build (most code precompiled, so the anonymous RWX is
+mostly trampolines — to be measured; the harness currently builds with `RunAOTCompilation=false`),
+measuring the baseline at the end of a full session, or a server-side tolerance — the last is the
+server owner's decision.
 
 **The biometric factor.** Not exercised anywhere; the iOS harness also lacks the
 `NSFaceIDUsageDescription` a Face ID device would need.
