@@ -5220,6 +5220,18 @@ divergence risk §24 rules out ("one server, many clients").
 So the granularity looks like a property of the runtime, and the total like a property of the app — on
 two phones, a handful of builds and one workload. That is thin evidence for either option.
 
+**And the total grows during a session** (reported by the .NET session after this section was first
+written, 2026-10-04): fresh-launch scans of their pinned OPPO build matched the pinned figure exactly
+(10 of 10), but the runtime compiles more code as each feature is used — 3.74 MB at launch, 4.19 MB
+after a login, a step-up re-enrolment and a step-up. Every report after the first in a session
+therefore scores `android_wx_above_baseline` +15: on a phone with developer options and ADB on, 33 /
+elevated (refused in enforce mode); on an ordinary phone, 15 / trusted. So **neither** option can use
+a launch-time figure as its bound: an exact per-build pin is too tight for a real session, and the
+"tightest bound" argued for option 2 below holds only if the pin is measured at the end of a
+representative session or given a margin. The granularity rule held: the reported 33 carries no
+`android_wx_foreign_allocator`, so every region in those reports was still a whole multiple of 64 KiB. The .NET session will next try an ahead-of-time-compiled build, which
+may shrink or remove the runtime's writable-executable memory altogether. No server change has been made.
+
 ### Option 1 — one allowance per app, with a ceiling
 
 - Configured once per app beside the certificate pin, e.g.
@@ -5255,5 +5267,26 @@ the pin is too tight; an emulator may not measure what a phone does.
 ### What we ask the reviewer
 
 Which option (or a better one); whether the 64 KiB granularity is a sound basis for detection across
-.NET runtime versions; and, for option 1, whether any headroom is acceptable, or the ceiling should
-be per release after all. Both options keep the operator, not the client, in charge of the allowance.
+.NET runtime versions; whether the size limit should tolerate growth within a session, and by how much,
+or be dropped in favour of the granularity test alone; and, for option 1, whether any headroom is
+acceptable, or the ceiling should be per release after all. Both options keep the operator, not the
+client, in charge of the allowance.
+
+## 65. State at end of session (2026-10-04)
+
+- **EC2** `i-0559685f02c4013b1` **stopped**; no Elastic IP, no RDS instance, no manual snapshot. Server
+  `/opt/device_trust_server.py` = this round's server (md5 `1c141794…`); PostgreSQL 16.15 at **schema 8**;
+  `INTEGRITY_MODE` and `DEVICE_POLICY_MODE` observe; access proofs **v2 only**
+  (`ACCESS_PROOF_MIN_VERSION=2`); `TRUSTED_PROXY_COUNT=1`; three W^X build pins (conformance APK and two
+  .NET builds); `stepup_required_paths` reset to `''` after the .NET phone runs.
+- **.NET session** (as reported): its SDK speaks access proof v2 and step-up proof v2 (`15418ad`),
+  its suite passed 34/34 against this server with enforce briefly on, and both dead-key paths pass on
+  both phones (iPhone: found-dead and fails-at-use with CryptoTokenKit -3; OPPO: undeletable while the
+  lock is off, removed once the PIN is back) with re-enrolment working afterwards.
+- **Handsets.** The lock removals in the .NET runs also killed **this** app's step-up keys on both phones:
+  re-enrol them at the next run. The client fix `215768b` (offer step-up only for the confirmed bound key)
+  is committed but in no installed build yet — the OPPO APK and the iPhone IPA predate it.
+- **Open:** §64 (the .NET W^X allowance, now with the session-growth finding) awaits the reviewer;
+  SQL Server has not been run on this round's code (suite, enforce checks, `race_first_link.py`); the
+  review's remaining items (file split and SDK boundaries; race tests beyond the first link) stand.
+

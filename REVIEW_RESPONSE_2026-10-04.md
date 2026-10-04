@@ -29,7 +29,7 @@ them gave 3 passed — the controls — and 21 failed). Your native harness, inv
 | Query binding | **Fixed.** Access proof v2 signs the query string; v1 configurable for a transition (now over: the test stack is v2-only). | `5f02cac` |
 | Subprocess hangs | **Fixed.** 3 s deadline per command. | `e24cae2` |
 | Revocation, root secret, release signing | **Owner decision:** customer-owned. The guide states what the root secret derives, that changing it today orphans stored hints and handle lookups, and which certificate to pin under Play App Signing. | `8a837d0` |
-| W^X baseline per build | **Open, for you:** §64 sets out a per-app allowance and automated per-build pins; the owner has adopted neither. | — |
+| W^X baseline per build | **Open, for you:** §64 sets out a per-app allowance and automated per-build pins; the owner has adopted neither. A late finding sharpens it: the .NET runtime's writable-executable memory grows within a session (3.74 → 4.19 MB after a login and a step-up), so any bound measured at launch scores later reports +15. | — |
 | File split / SDK boundaries | **Not done.** | — |
 
 **Found on hardware while validating** (both fixed): an Android 9 step-up alias that had lost its
@@ -43,6 +43,7 @@ refusing v1: register, scan, refresh and step-up v2 verified; OPPO 18/trusted wi
 bucket complete (28 MB compared in about 440 ms), iPhone 0/trusted. The .NET SDK reports its own suite
 at 34/34 against the same v2-only server. Not yet re-run: SQL Server.
 
-**Test stack state.** EC2 test server on this `main`, PostgreSQL 16.15 at schema 8, `INTEGRITY_MODE` and
-`DEVICE_POLICY_MODE` observe, v2-only access proofs, `TRUSTED_PROXY_COUNT=1`, three W^X build pins, step-up
-gated on `/v1/account/sensitive-echo` for the remaining phone runs.
+**Test stack state.** EC2 test server on this `main`, stopped between sessions: PostgreSQL 16.15 at
+schema 8, `INTEGRITY_MODE` and `DEVICE_POLICY_MODE` observe, v2-only access proofs, `TRUSTED_PROXY_COUNT=1`,
+three W^X build pins, no step-up paths gated. The .NET SDK's own phone runs (both dead-key paths on both
+phones) pass as reported by that session; `DESIGN.md` §65 holds the end-of-session state.

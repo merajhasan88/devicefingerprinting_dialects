@@ -131,8 +131,9 @@ not jailbroken). The emulator AVD `integrity_root_lab` is the disposable root la
 
 ## Current point of work
 
-See the end of DESIGN.md: section 63 records the 2026-09-29 external review, what was repaired, the
-owner decisions it leaves open and what is still to run on handsets; sections 51–62 cover the step-up
+See the end of DESIGN.md: section 65 is the latest end-of-session state; section 64 an open question
+for the reviewer (the .NET W^X allowance); section 63 records the 2026-09-29 external review, what was
+repaired and the owner's decisions; sections 51–62 cover the step-up
 key, dead-key recovery, the account policy, SQL Server concurrency, the serving model and W^X
 baselines. Access proofs and step-up proofs are **v2** (they sign the whole request, query string
 included; `ACCESS_PROOF_MIN_VERSION` lets a transition accept v1); behind a TLS-terminating proxy set
