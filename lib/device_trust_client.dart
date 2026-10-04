@@ -1759,14 +1759,19 @@ class DeviceRecognitionController extends ChangeNotifier {
     }
   }
 
-  /// A local step-up key the server will actually accept: present here, bound
-  /// to this installation, and not reported as a different key.
+  /// Thumbprint of the local step-up key the server last confirmed as bound:
+  /// offered at registration and either bound there (new installation) or
+  /// reported as matching. A key made afterwards -- found on the iPhone,
+  /// 2026-10-04: a re-enrolment refused for a wrong password left a fresh,
+  /// unbound key behind -- is not confirmed, so it is never offered for
+  /// step-up; the server would refuse it with stepup_signature_invalid.
+  String? _boundStepUpThumbprint;
+
+  /// A local step-up key the server will actually accept: the one it last
+  /// confirmed as bound to this installation.
   bool get stepUpUsable {
-    final RegistrationState? current = registration;
-    return stepUpKey != null &&
-        current != null &&
-        current.stepupKeyRegistered &&
-        current.stepupKeyMatches != false;
+    final StepUpKeyMetadata? key = stepUpKey;
+    return key != null && key.thumbprint == _boundStepUpThumbprint;
   }
 
   /// Recovery when this installation's step-up key is lost or replaced
@@ -1859,6 +1864,9 @@ class DeviceRecognitionController extends ChangeNotifier {
     } else if (current.stepupKeyMatches == false) {
       server = 'the server holds a different step-up key: re-enrol it with '
           'your password below';
+    } else if (key.thumbprint != _boundStepUpThumbprint) {
+      server = 'not confirmed as the bound key: re-enrol it with your '
+          'password below';
     } else {
       server = 'bound on the server';
     }
@@ -1905,6 +1913,12 @@ class DeviceRecognitionController extends ChangeNotifier {
     }
     registration = currentRegistration;
     await _store.saveRegistration(currentRegistration);
+    final StepUpKeyMetadata? offered = stepUpKey;
+    _boundStepUpThumbprint = offered != null &&
+            currentRegistration.stepupKeyRegistered &&
+            currentRegistration.stepupKeyMatches != false
+        ? offered.thumbprint
+        : null;
 
     deviceToken = await _proveInstallation(currentIdentity);
     await _collectIntegrityWithToken(deviceToken!, currentIdentity);
