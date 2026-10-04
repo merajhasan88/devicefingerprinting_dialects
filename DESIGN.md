@@ -5099,3 +5099,24 @@ once the owner wants an RDS round. Test stack: `stepup_required_paths` is set to
   on next start if the boot-time `/tmp` clean did not.
 - **Resume with 63.6:** connect the OPPO, install the release APK built from this code, run a native scan
   and the step-up v2 test; then the iPhone after a Codemagic build. The owner decisions are in 63.3.
+
+### 63.8 On hardware — OPPO CPH2083, Android 9, PostgreSQL, observe (2026-10-04)
+
+Release APK of this round's client (step-up v2, HTTPS-only, full-coverage scanner).
+
+| Check | Result |
+|---|---|
+| Native scan (two runs) | **18 / trusted** — `android_developer_options` +8, `android_adb_enabled` +10, as before |
+| Coverage, every bucket `complete:true`, all diffs 0 | core **7,106,560** bytes (was 5,058,560 under the old 4 MiB cap — libart was being cut off), ext 5,742,592 (unchanged), app **15,151,104** (was 4,194,304); `xom_regions_*` 0, `protect_restore_failures` 0 |
+| Scan cost | `elapsed_ms` **434 / 446** for ~28 MB compared |
+| Step-up | key re-enrolled (passcode, windowed 30 s — the Android 9 shape, `policy_downgrade=True` as designed), then **step-up v2 verified, 200** |
+
+**Found on the way: a dead-key state the app did not recognise.** The OPPO's screen lock had been off
+since the last session and was set again today. The step-up alias then still existed but held no private
+key (`containsAlias` true, `isKeyEntry` false), `getEntry` threw a bare `UnsupportedOperationException`,
+and the app showed only "The Android native operation failed" with the step-up button disabled and no
+re-enrol offer. Diagnosed with `e3c2b56` (unmapped native exceptions now carry their class, cause and
+top frames; the OPPO suppresses a release build's logcat output, so the in-app message is the only
+diagnostic) and fixed in `b74ff1e` (such an alias is a dead key: removed, `STEPUP_KEY_INVALIDATED`,
+re-enrolment offered). Re-enrolment needed the account password; the owner created a new account for it.
+
