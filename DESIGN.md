@@ -5186,4 +5186,8 @@ afterwards. Their new harness APK needs its W^X baseline entry appended before i
 The .NET session's conformance suite against this stack, v2 only: 31 passed, 0 failed, 3 skipped in
 observe, then **34 / 34** with `INTEGRITY_MODE=enforce` briefly on (17:40–17:47 UTC); back to observe.
 (Reported by the .NET session; not re-run here.)
+Their new OPPO build's W^X entry, `58396d51…:3735552:65536`, was appended to
+`INTEGRITY_ANDROID_WX_BASELINES` in `/etc/devicetrust.env` next to the conformance APK's and their previous
+build's (env backed up to `/root/devicetrust.env.bak-20261004-180233`); `/health/ready` reports
+`android_wx_baselines: 3`. Their iPhone build is served from `/srv/artifacts/e2a890/dt-dotnet-15418ad.ipa`.
 
