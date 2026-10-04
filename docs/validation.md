@@ -208,22 +208,47 @@ default (step-up gate empty).
 | iOS sources, `tools/ioscheck` + `tools/obsscan` | compile clean; no new obsoleted call sites |
 | W^X baseline for build `834a5a23…` | `3735552:65536`, four agreeing cold starts on the OPPO; pinned on the server by the owner; the OPPO's scan then read **18/100 trusted** (developer options +8, adb +10) with `android_wx_memory` gone |
 
+## 8. Access proof v2, step-up proof v2, and the two hardware-found step-up gaps (2026-10-04)
+
+From the reference session's `HANDOFF_TO_DOTNET_2026-09-30.md` (DESIGN.md 63):
+
+- **Access proof v2**: the proof gains `query` (the raw query string as sent) and `version: 2`.
+  The query is read from the `Uri` actually sent, so `Uri`'s escaping and the signature agree.
+- **Step-up proof v2**: the step-up key approves one complete request (token hash, method, path,
+  query, body hash, nonce), built from the same request description as the access proof.
+- **Step-up offered only for the key the server last confirmed as bound**
+  (`BoundStepUpThumbprint`), not for any local key the server has not called different.
+- **Android: an alias with no private key is a dead key** (`IsKeyEntry` false, or a bare
+  `UnsupportedOperationException` from `GetEntry`), deleted and reported `STEPUP_KEY_INVALIDATED`.
+- `http://` endpoints are refused (`api_base_url_insecure`) unless `AllowInsecureHttp` is set.
+
+Target: `https://devicefingerprinting.duckdns.org`, PostgreSQL 16.15, **schema 8**,
+`INTEGRITY_MODE=observe`, `DEVICE_POLICY_MODE=observe`, `ACCESS_PROOF_MIN_VERSION=1` (versions 1 and
+2 accepted), `stepup_required_paths=/v1/account/sensitive-echo`, factor `passcode`, mode `per_use`.
+
+| What | Result |
+|---|---|
+| Offline tests | **112 passed** on net6.0 and net8.0 — new: both proofs sign the query the request carries (a space signs as `%20`), the step-up proof's request fields equal the access proof's, a refused re-enrolment leaves the fresh key unusable (the iPhone sequence), a key reported different is unusable, `http://` refused |
+| .NET conformance | **31 passed, 0 failed, 3 skipped** (the three enforce-mode checks). Passing with the gate on: the client signs v2 and an appended query is refused `401 access_proof_query_mismatch`; a v1 proof accepted where allowed and refused with a query; step-up v2 verified; wrong factor, an approval moved to another body (`stepup_binding_mismatch`, field `body_sha256`), to another path (field `path`), a v1 step-up proof (`stepup_proof_version_unsupported`) and a key registered with another factor (`stepup_factor_mismatch`) all refused; re-enrolment including the second-account attack (`stepup_key_other_account`) |
+| Android harness, release APK (`58396d51…`, harness key `664e9c8e…e3`) | builds clean; **not yet installed** |
+| iOS sources (`tools/ioscheck`, `tools/obsscan`) | compile clean, no new obsoleted call sites; **no Codemagic build yet** |
+
 ## Not covered
 
 These are gaps, not oversights.
 
 **Step-up on hardware.** `AndroidStepUpKeyStore` and `SecureEnclaveStepUpKeyStore` have been
-compiled, not run. Neither the BiometricPrompt path (API 30+), the confirm-credential path
+compiled, not run (as of section 8). Neither the BiometricPrompt path (API 30+), the confirm-credential path
 (Android 9/10), the Secure Enclave passcode prompt, nor the dead-key handling has been exercised on a
 phone. The conformance run proves the wire contract with software step-up keys only, which sign
 with nobody present.
 
-**Step-up with the gate on.** `stepup_required_paths` was empty on the shared server, so
-`403 stepup_required`, a verified step-up, `stepup_factor_mismatch` and the second-account
-`stepup_key_other_account` attack have not been run against it from .NET.
-
 **The biometric factor.** Not exercised anywhere; the iOS harness also lacks the
 `NSFaceIDUsageDescription` a Face ID device would need.
+
+**Access proof v2 only.** The shared server accepted v1 and v2 during the section 8 run, so the
+client's v2 proofs passed, but no .NET run has yet been made with the server refusing v1
+(`ACCESS_PROOF_MIN_VERSION=2`).
 
 **A new APK needs a new W^X baseline.** Any rebuild of the Android harness changes its APK hash, so
 the pinned `834a5a23…` entry no longer applies and the device reads 78/review until the new build's

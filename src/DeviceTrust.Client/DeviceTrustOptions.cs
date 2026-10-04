@@ -43,6 +43,16 @@ namespace DeviceTrust.Client
         /// </summary>
         public string? Platform { get; set; }
 
+        /// <summary>
+        /// Whether a plain <c>http://</c> endpoint is accepted. False by default:
+        /// bearer tokens, access proofs and integrity reports must not cross the
+        /// network in clear, so <see cref="ResolveBaseUri"/> refuses one with
+        /// <c>api_base_url_insecure</c> — the .NET counterpart of the reference
+        /// client refusing a non-https endpoint in release builds (DESIGN.md 63,
+        /// review F8). Set it only for a local lab server.
+        /// </summary>
+        public bool AllowInsecureHttp { get; set; }
+
         /// <summary>How long any single HTTP call may take. Defaults to 15 seconds, as in the Flutter client.</summary>
         public TimeSpan NetworkTimeout { get; set; } = TimeSpan.FromSeconds(15);
 
@@ -103,6 +113,14 @@ namespace DeviceTrust.Client
                 throw new DeviceTrustConfigurationException(
                     "The API base URL '" + BaseUrl + "' is not an absolute http(s) URL.",
                     "api_base_url_invalid");
+            }
+
+            if (uri.Scheme == Uri.UriSchemeHttp && !AllowInsecureHttp)
+            {
+                throw new DeviceTrustConfigurationException(
+                    "The API base URL '" + BaseUrl + "' is not https. Tokens and proofs must not travel "
+                    + "in clear; set AllowInsecureHttp only for a local lab server.",
+                    "api_base_url_insecure");
             }
 
             return uri;

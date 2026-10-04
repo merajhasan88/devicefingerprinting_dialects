@@ -28,6 +28,16 @@ namespace DeviceTrust.Client.Protocol
     /// that does not serialise exactly like the reference one.
     /// </para>
     /// <para>
+    /// Version 2 (DESIGN.md 63.9) adds <c>query</c>, the raw query string exactly
+    /// as sent and without the <c>?</c> (<c>""</c> when there is none). The server
+    /// compares the path against its decoded <c>request.path</c>, which excludes
+    /// the query, so a version 1 proof left every query parameter outside the
+    /// signature; a server at the default <c>ACCESS_PROOF_MIN_VERSION=2</c>
+    /// refuses version 1 with <c>unsupported_access_proof_version</c>, and even a
+    /// transitional one refuses a version 1 proof on a request that carries a
+    /// query (<c>access_proof_query_mismatch</c>).
+    /// </para>
+    /// <para>
     /// The nonce is 32 random bytes and is single-use: the server commits it only
     /// after the signature verifies, so a rejected request cannot burn a nonce,
     /// and a captured proof replayed verbatim fails with
@@ -37,7 +47,7 @@ namespace DeviceTrust.Client.Protocol
     public static class AccessProof
     {
         /// <summary>The proof schema version this SDK emits and the server accepts.</summary>
-        public const int Version = 1;
+        public const int Version = 2;
 
         /// <summary>The number of random bytes in a nonce. The server rejects any other length.</summary>
         public const int NonceByteLength = 32;
@@ -45,6 +55,14 @@ namespace DeviceTrust.Client.Protocol
         /// <summary>
         /// Serialises the proof JSON for a request.
         /// </summary>
+        /// <param name="accessTokenSha256Hex">Lowercase hex SHA-256 of the bearer token string.</param>
+        /// <param name="bodySha256Hex">Lowercase hex SHA-256 of the exact body bytes sent.</param>
+        /// <param name="installationId">The installation the token is bound to.</param>
+        /// <param name="method">The HTTP method, upper-case.</param>
+        /// <param name="nonce">32 random bytes, base64url.</param>
+        /// <param name="path">The request path without the query, as the server sees it.</param>
+        /// <param name="query">The raw query string as sent, without <c>?</c>; empty when none.</param>
+        /// <param name="timestamp">Unix seconds.</param>
         /// <remarks>
         /// The fields are written in the same order the Dart reference client
         /// uses. Order carries no meaning — the server verifies the signature
@@ -58,6 +76,7 @@ namespace DeviceTrust.Client.Protocol
             string method,
             string nonce,
             string path,
+            string query,
             long timestamp)
         {
             using var buffer = new MemoryStream();
@@ -70,6 +89,7 @@ namespace DeviceTrust.Client.Protocol
                 writer.WriteString("method", method);
                 writer.WriteString("nonce", nonce);
                 writer.WriteString("path", path);
+                writer.WriteString("query", query ?? string.Empty);
                 writer.WriteNumber("timestamp", timestamp);
                 writer.WriteNumber("version", Version);
                 writer.WriteEndObject();

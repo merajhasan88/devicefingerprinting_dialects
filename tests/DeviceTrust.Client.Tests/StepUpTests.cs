@@ -149,11 +149,23 @@ namespace DeviceTrust.Client.Tests
 
             using var proofDocument = JsonDocument.Parse(proofBytes);
             var proof = proofDocument.RootElement;
-            Assert.Equal(1, proof.GetProperty("version").GetInt32());
+            Assert.Equal(2, proof.GetProperty("version").GetInt32());
+            Assert.Equal("stepup", proof.GetProperty("purpose").GetString());
             Assert.Equal(client.Identity!.InstallationId, proof.GetProperty("installation_id").GetString());
             Assert.Equal("passcode", proof.GetProperty("factor").GetString());
-            Assert.Equal(accessProof.GetProperty("nonce").GetString(), proof.GetProperty("nonce").GetString());
             Assert.Equal(JsonValueKind.Number, proof.GetProperty("timestamp").ValueKind);
+
+            // Version 2 approves this exact request: every field the server
+            // compares equals what the access proof signed and what was sent.
+            Assert.Equal(Hex.Sha256Hex("access-token"), proof.GetProperty("access_token_sha256").GetString());
+            Assert.Equal("POST", proof.GetProperty("method").GetString());
+            Assert.Equal("/v1/account/sensitive-echo", proof.GetProperty("path").GetString());
+            Assert.Equal(string.Empty, proof.GetProperty("query").GetString());
+            Assert.Equal(Hex.Sha256Hex(request.Body), proof.GetProperty("body_sha256").GetString());
+            foreach (var field in new[] { "nonce", "access_token_sha256", "method", "path", "query", "body_sha256" })
+            {
+                Assert.Equal(accessProof.GetProperty(field).GetString(), proof.GetProperty(field).GetString());
+            }
 
             Assert.True(EcdsaSignatureFormat.LooksLikeDerSequence(signature));
             using var stepUpPublic = PublicKey(client.StepUpKey!.PublicKey);
@@ -261,6 +273,111 @@ namespace DeviceTrust.Client.Tests
         }
 
         [Fact]
+        public async Task StepUp_BothProofsSignTheQueryTheRequestCarries()
+        {
+            var server = new ScriptedServer();
+            server.Respond(RegistrationResponse(stepUpRegistered: true));
+            server.Respond("{\"step_up\":\"verified\"}");
+            using var stepUp = new SoftwareStepUpKeyStore(true);
+            using var client = CreateClient(server, stepUp);
+            await client.RegisterInstallationAsync();
+            await SignInAsync(client);
+
+            await client.SendStepUpProtectedAsync(
+                "POST",
+                "/v1/account/sensitive-echo?to=me&note=a b",
+                Encoding.UTF8.GetBytes("{\"x\":1}"),
+                "access-token",
+                "test");
+
+            var request = server.Requests.Last();
+            var sentQuery = request.Query.TrimStart('?');
+            Assert.Equal("to=me&note=a%20b", sentQuery);
+            var accessProof = JsonDocument.Parse(Base64Url.Decode(request.Headers["X-Access-Proof"])).RootElement;
+            var stepUpProof = JsonDocument.Parse(Base64Url.Decode(request.Headers["X-Step-Up-Proof"])).RootElement;
+            Assert.Equal(2, accessProof.GetProperty("version").GetInt32());
+            Assert.Equal("/v1/account/sensitive-echo", accessProof.GetProperty("path").GetString());
+            Assert.Equal(sentQuery, accessProof.GetProperty("query").GetString());
+            Assert.Equal(sentQuery, stepUpProof.GetProperty("query").GetString());
+            Assert.Equal("/v1/account/sensitive-echo", stepUpProof.GetProperty("path").GetString());
+        }
+
+        [Fact]
+        public async Task StepUp_ARefusedReenrolmentLeavesTheFreshKeyUnusable()
+        {
+            // DESIGN.md 63.10, found on the reference iPhone. The passcode is off
+            // at launch, so no key is offered and the server answers with its
+            // (dead) bound key: registered=true, matches=null. With the passcode
+            // back, a re-enrolment with the wrong password creates a fresh key and
+            // is refused. A rule that excludes only matches=false would now offer
+            // that unbound key; the server would refuse its signature.
+            var server = new ScriptedServer();
+            server.Respond(RegistrationResponse(stepUpRegistered: true, matches: null));
+            server.Respond("{\"error\":{\"code\":\"invalid_credentials\",\"message\":\"no\"}}",
+                HttpStatusCode.Unauthorized);
+            var stepUp = new SwitchableStepUpKeyStore { Unavailable = true };
+            using var client = CreateClient(server, stepUp);
+
+            await client.RegisterInstallationAsync();
+            Assert.Null(client.StepUpKey);
+            Assert.Null(client.BoundStepUpThumbprint);
+
+            stepUp.Unavailable = false;
+            await SignInAsync(client);
+            var refused = await Assert.ThrowsAsync<DeviceTrustApiException>(
+                () => client.ReenrolStepUpKeyAsync("wrong-password"));
+
+            Assert.Equal("invalid_credentials", refused.Code);
+            Assert.NotNull(client.StepUpKey);
+            Assert.True(client.Registration!.StepUpKeyRegistered);
+            Assert.Null(client.Registration.StepUpKeyMatches);
+            Assert.False(client.StepUpUsable);
+        }
+
+        [Fact]
+        public async Task StepUp_AKeyReportedAsDifferentIsNotUsable()
+        {
+            var server = new ScriptedServer();
+            server.Respond(RegistrationResponse(stepUpRegistered: true, matches: false));
+            using var stepUp = new SoftwareStepUpKeyStore(true);
+            using var client = CreateClient(server, stepUp);
+
+            await client.RegisterInstallationAsync();
+
+            Assert.NotNull(client.StepUpKey);
+            Assert.Null(client.BoundStepUpThumbprint);
+            Assert.False(client.StepUpUsable);
+        }
+
+        [Fact]
+        public async Task StepUp_TheOfferedKeyIsBoundOnANewInstallationOrWhenItMatches()
+        {
+            foreach (var matches in new bool?[] { null, true })
+            {
+                var server = new ScriptedServer();
+                server.Respond(RegistrationResponse(stepUpRegistered: true, matches: matches));
+                using var stepUp = new SoftwareStepUpKeyStore(true);
+                using var client = CreateClient(server, stepUp);
+
+                await client.RegisterInstallationAsync();
+
+                Assert.Equal(client.StepUpKey!.Thumbprint, client.BoundStepUpThumbprint);
+                Assert.True(client.StepUpUsable);
+            }
+        }
+
+        [Fact]
+        public void Options_RefusePlainHttpUnlessAllowed()
+        {
+            var options = new DeviceTrustOptions { BaseUrl = "http://lab.test:5000" };
+            Assert.Equal("api_base_url_insecure",
+                Assert.Throws<DeviceTrustConfigurationException>(() => options.ResolveBaseUri()).Code);
+
+            options.AllowInsecureHttp = true;
+            Assert.Equal("http", options.ResolveBaseUri().Scheme);
+        }
+
+        [Fact]
         public void RegistrationState_KeepsNullMatchesDistinctFromFalse()
         {
             using var document = JsonDocument.Parse(RegistrationResponse(stepUpRegistered: true, matches: false));
@@ -353,13 +470,42 @@ namespace DeviceTrust.Client.Tests
             }
         }
 
+        /// <summary>A software step-up store whose screen lock can be switched off.</summary>
+        private sealed class SwitchableStepUpKeyStore : IStepUpKeyStore
+        {
+            private readonly SoftwareStepUpKeyStore _inner = new SoftwareStepUpKeyStore(true);
+
+            public bool Unavailable { get; set; }
+
+            public Task<StepUpKeyMetadata> GetOrCreateKeyAsync(
+                StepUpKeyAuth requested,
+                CancellationToken cancellationToken = default)
+            {
+                return Unavailable
+                    ? throw new InstallationKeyException(StepUpErrorCodes.NoDeviceCredential, "no passcode")
+                    : _inner.GetOrCreateKeyAsync(requested, cancellationToken);
+            }
+
+            public Task<byte[]> SignAsync(byte[] data, string reason, CancellationToken cancellationToken = default)
+            {
+                return _inner.SignAsync(data, reason, cancellationToken);
+            }
+
+            public Task<bool> DeleteKeyAsync(CancellationToken cancellationToken = default)
+            {
+                return _inner.DeleteKeyAsync(cancellationToken);
+            }
+        }
+
         private sealed class ScriptedServer : HttpMessageHandler
         {
-            private readonly Queue<string> _responses = new Queue<string>();
+            private readonly Queue<(string Json, HttpStatusCode Status)> _responses =
+                new Queue<(string Json, HttpStatusCode Status)>();
 
             public List<RecordedRequest> Requests { get; } = new List<RecordedRequest>();
 
-            public void Respond(string json) => _responses.Enqueue(json);
+            public void Respond(string json, HttpStatusCode status = HttpStatusCode.OK) =>
+                _responses.Enqueue((json, status));
 
             protected override async Task<HttpResponseMessage> SendAsync(
                 HttpRequestMessage request,
@@ -372,30 +518,34 @@ namespace DeviceTrust.Client.Tests
                     header => header.Key,
                     header => string.Join(",", header.Value),
                     StringComparer.OrdinalIgnoreCase);
-                Requests.Add(new RecordedRequest(request.RequestUri!.AbsolutePath, headers, body));
+                Requests.Add(new RecordedRequest(request.RequestUri!.AbsolutePath, request.RequestUri.Query, headers, body));
 
                 if (_responses.Count == 0)
                 {
                     throw new InvalidOperationException("Unexpected request to " + request.RequestUri);
                 }
 
-                return new HttpResponseMessage(HttpStatusCode.OK)
+                var (json, status) = _responses.Dequeue();
+                return new HttpResponseMessage(status)
                 {
-                    Content = new StringContent(_responses.Dequeue(), Encoding.UTF8, "application/json"),
+                    Content = new StringContent(json, Encoding.UTF8, "application/json"),
                 };
             }
         }
 
         private sealed class RecordedRequest
         {
-            public RecordedRequest(string path, Dictionary<string, string> headers, byte[] body)
+            public RecordedRequest(string path, string query, Dictionary<string, string> headers, byte[] body)
             {
                 Path = path;
+                Query = query;
                 Headers = headers;
                 Body = body;
             }
 
             public string Path { get; }
+
+            public string Query { get; }
 
             public Dictionary<string, string> Headers { get; }
 

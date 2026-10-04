@@ -22,6 +22,10 @@ protocol without reading the server.
 Lifetimes: access 10 minutes, device 10 minutes, refresh 30 days, challenge 2 minutes, access-proof
 skew ±120 seconds, integrity report skew ±90 seconds, integrity freshness 600 seconds.
 
+The endpoint must be `https://`: `DeviceTrustOptions.ResolveBaseUri` refuses `http://` with
+`api_base_url_insecure` unless `AllowInsecureHttp` is set for a local lab server (the counterpart of
+the reference client's release-build rule, DESIGN.md 63 F8).
+
 Only `android` and `ios` are accepted platforms. The client registers under the platform its
 integrity collector can actually measure, which is why `DeviceTrustClient.Platform` defaults to
 `IIntegrityProbeCollector.Platform` rather than to a constant.
@@ -45,27 +49,55 @@ Since DESIGN.md 50 and 53 the registration body carries two optional blocks.
   records that as `stepup_policy_downgrade: true`. iOS is always `per_use`.
 - A step-up key binds **only when the installation key is new**. On re-registration the server never
   attaches or replaces one; it answers `stepup_key_registered`, `stepup_key_matches` (null when none
-  was offered), `stepup_key_auth` and `stepup_policy_downgrade`. The client offers step-up only when
-  the key is registered and `stepup_key_matches != false` (`DeviceTrustClient.StepUpUsable`).
+  was offered), `stepup_key_auth` and `stepup_policy_downgrade`. `stepup_key_auth` is required with a
+  key, and the step-up key must differ from the installation key (`400 invalid_stepup_key_auth`,
+  `400 invalid_stepup_key`).
+- The client offers step-up only for **the key the server last confirmed as bound**: the key it
+  offered at registration, when that registration bound it (new installation) or reported it
+  matching (`DeviceTrustClient.BoundStepUpThumbprint`, `StepUpUsable`). "Not asked" (`matches` null
+  because no key was offered) is not "matches": the reference iPhone otherwise offered a fresh,
+  unbound key after a refused re-enrolment, and the server refused its signature (DESIGN.md 63.10).
+- `key_security` is written once, at first registration; re-registering never changes it.
 - A new installation key deletes the local step-up key, so the new installation enrols its own.
 
-## Step-up proof
+## Step-up proof (version 2)
 
 On a gated path the request carries two extra headers:
 
 | Header | Value |
 |---|---|
-| `X-Step-Up-Proof` | base64url of `{"version":1,"installation_id":…,"factor":…,"nonce":…,"timestamp":<unix s>}` |
+| `X-Step-Up-Proof` | base64url of the proof JSON below |
 | `X-Step-Up-Signature` | base64url DER signature by the **step-up** key over those exact bytes |
 
-The `nonce` is this request's access-proof nonce, so the access proof's replay store protects the
-step-up proof too and there is no step-up challenge. The client generates the nonce, **signs the
-step-up proof first** (the user may take a while at the prompt), then builds the access proof with
-that nonce, so the access proof's ±120 s window starts after the prompt. `factor` must equal the
-deployment's `stepup_factor`. Codes: `stepup_required`, `stepup_key_not_registered`,
-`stepup_signature_invalid`, `stepup_installation_mismatch`, `stepup_binding_mismatch`,
-`stepup_factor_mismatch`, `stepup_timestamp_invalid`, `stepup_timestamp_outside_window`,
-`stepup_key_other_account`.
+```json
+{"version": 2, "purpose": "stepup", "installation_id": "…",
+ "access_token_sha256": "<sha256 hex of the bearer token>", "method": "POST",
+ "path": "/v1/account/sensitive-echo", "query": "", "body_sha256": "<sha256 hex of the body sent>",
+ "factor": "passcode", "nonce": "<the access proof's nonce>", "timestamp": 1790000000}
+```
+
+Version 2 (DESIGN.md 63, review F1) approves **one complete request**. Version 1 signed only the
+installation, factor and nonce, so whoever held the installation signer could move a fresh approval
+onto a different body under a re-signed access proof with the same nonce; the server now refuses it
+with `403 stepup_proof_version_unsupported`. Every request field — nonce, token hash, method, path,
+query, body hash — is compared with the request received; a difference is
+`403 stepup_binding_mismatch` with `details.field` naming it. `path` and `query` are exactly what
+the access proof signs, and `body_sha256` is over the same bytes.
+
+The nonce is this request's access-proof nonce, so the access proof's replay store protects the
+step-up proof too and there is no step-up challenge. The client freezes the body and nonce, **signs
+the step-up proof first** (the user may take a while at the prompt), then builds the access proof with
+that nonce, so the access proof's ±120 s window starts after the prompt. Both proofs are built from
+one description of the request (`DeviceTrustClient.SendStepUpProtectedAsync`). `factor` must equal
+the deployment's `stepup_factor` **and** the factor the key was registered with. On any authenticated
+account request — not only gated ones — a valid step-up proof also satisfies an `elevated` integrity
+verdict (`integrity.satisfied_by_step_up`); login, account registration and refresh accept none and
+answer `403 integrity_elevated`.
+
+Codes: `stepup_required`, `stepup_key_not_registered`, `stepup_key_not_independent`,
+`stepup_signature_invalid`, `stepup_proof_version_unsupported`, `stepup_installation_mismatch`,
+`stepup_binding_mismatch`, `stepup_factor_mismatch`, `stepup_timestamp_invalid`,
+`stepup_timestamp_outside_window`, `stepup_key_other_account`.
 
 ## Step-up re-enrolment
 
@@ -88,9 +120,11 @@ re-registers afterwards so `Registration` shows the server's view.
 
 A step-up key that can never sign again is deleted by its store and reported as
 `STEPUP_KEY_INVALIDATED`, saying whether removal worked; the client clears `StepUpKey` and the
-installation must re-enrol. Android: `UnrecoverableKeyException` at `getEntry` (Android 9), no
-private key under the alias, or `KeyPermanentlyInvalidatedException` at `initSign`; an existing key
-is checked before the screen-lock requirement. iOS: a key present while `LAContext` reports
+installation must re-enrol. Android: `UnrecoverableKeyException` at `getEntry` (Android 9), an alias
+that is no longer a key entry (`isKeyEntry` false; `getEntry` then throws a bare
+`UnsupportedOperationException` — the OPPO after its lock was set again, DESIGN.md 63.8), no private
+key under the alias, or `KeyPermanentlyInvalidatedException` at `initSign`; an existing key is checked
+before the screen-lock requirement. iOS: a key present while `LAContext` reports
 `passcodeNotSet`, or a signature failing with CryptoTokenKit -3.
 
 ## Cryptography
@@ -119,7 +153,7 @@ X-Access-Proof:     base64url(utf8(proofJson))                     no padding
 X-Access-Signature: base64url(DER ECDSA-SHA256 over those bytes)   no padding
 ```
 
-The proof JSON has exactly these eight fields:
+The proof JSON (version 2, since 2026-10-04) has exactly these nine fields:
 
 ```json
 {
@@ -128,11 +162,21 @@ The proof JSON has exactly these eight fields:
   "installation_id":     "<this installation's id>",
   "method":              "<UPPERCASE HTTP method>",
   "nonce":               "<base64url of 32 random bytes, no padding>",
-  "path":                "<request path, e.g. /v1/account/me>",
+  "path":                "<request path without the query, e.g. /v1/account/me>",
+  "query":               "<raw query string as sent, without '?'; \"\" when none>",
   "timestamp":           1757090000,
-  "version":             1
+  "version":             2
 }
 ```
+
+`query` is new in version 2 (DESIGN.md 63.9). The server compares `path` with its decoded
+`request.path`, which excludes the query, so version 1 left every query parameter outside the
+signature. The query is taken from the `Uri` the request is actually sent to — after `Uri`'s own
+escaping — so a space signs as `%20`, as it travels (`DeviceTrustApi.ResolveSignedTarget`). A
+mismatch is `401 access_proof_query_mismatch`. A server at the default `ACCESS_PROOF_MIN_VERSION=2`
+answers a version 1 proof with `400 unsupported_access_proof_version` (`details.minimum`); one in
+transition (`=1`) still refuses a version 1 proof on any request carrying a query string.
+`/health/ready` lists `access_proof_versions`.
 
 `timestamp` and `version` are JSON **numbers**; a timestamp sent as a string is rejected with
 `invalid_access_proof_timestamp`. Field order carries no meaning, because the signature is verified

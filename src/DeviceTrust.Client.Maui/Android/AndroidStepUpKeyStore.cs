@@ -44,11 +44,13 @@ namespace DeviceTrust.Client.Maui.Android
     /// the keystore enforces — never echoed from the request.
     /// </para>
     /// <para>
-    /// Dead keys (DESIGN.md 57): after the screen lock is removed, Android 9
-    /// keeps the alias but <c>getEntry</c> throws <c>UnrecoverableKeyException</c>;
-    /// newer keystores keep the entry and throw
-    /// <c>KeyPermanentlyInvalidatedException</c> at <c>initSign</c>. Both, and an
-    /// alias holding no private key, are treated as dead: the key is deleted and
+    /// Dead keys (DESIGN.md 57, 63.8): after the screen lock is removed, Android 9
+    /// keeps the alias but <c>getEntry</c> throws <c>UnrecoverableKeyException</c>
+    /// — or, once the lock is set again, the alias is no longer a key entry and
+    /// <c>getEntry</c> throws <c>UnsupportedOperationException</c>; newer
+    /// keystores keep the entry and throw
+    /// <c>KeyPermanentlyInvalidatedException</c> at <c>initSign</c>. All of
+    /// these, and an alias holding no private key, are treated as dead: the key is deleted and
     /// <see cref="StepUpErrorCodes.KeyInvalidated"/> reported, saying truthfully
     /// whether removal worked — on the OPPO it did not while the lock was off.
     /// </para>
@@ -667,12 +669,28 @@ namespace DeviceTrust.Client.Maui.Android
         /// </summary>
         private KeyStore.PrivateKeyEntry LiveEntry(KeyStore keyStore)
         {
+            // An alias can outlive its private key. Seen on the reference OPPO
+            // (Android 9) on 2026-10-04, after the screen lock had been off and
+            // was set again: ContainsAlias true, IsKeyEntry false, and GetEntry
+            // threw a bare UnsupportedOperationException -- neither of the two
+            // exceptions above -- so the app showed an unexplained native error
+            // and never offered re-enrolment (DESIGN.md 63.8). A certificate
+            // without its private key can never sign: it is a dead key.
+            if (!keyStore.IsKeyEntry(_keyAlias))
+            {
+                throw DiscardDeadKey(new InvalidOperationException("The step-up alias holds no private key."));
+            }
+
             KeyStore.IEntry? loaded;
             try
             {
                 loaded = keyStore.GetEntry(_keyAlias, null);
             }
             catch (UnrecoverableKeyException error)
+            {
+                throw DiscardDeadKey(error);
+            }
+            catch (Java.Lang.UnsupportedOperationException error)
             {
                 throw DiscardDeadKey(error);
             }

@@ -4939,3 +4939,241 @@ full suite on PostgreSQL **49 / 0 / 5** (54 checks); on hardware, the OPPO's Flu
 conformance certificate, remove before production). The .NET build's own entry is **not** configured yet:
 the .NET session must append `<their apk sha256>:1048576:65536` (from their `baseline` command) to that
 line; until then the .NET Android client still scores +60.
+
+### 62.1 The .NET build pinned (2026-09-29, reported by the .NET session, spot-checked here)
+
+The owner added the .NET harness build's entry, `834a5a23…:3735552:65536`, next to the conformance APK's
+(`1b536aea…:1048576:65536`); `/health/ready` reports `android_wx_baselines: 2`. The .NET session reports
+the OPPO's clean .NET scan now reads **18 / trusted** instead of 78 / review, and its own conformance run
+against this server **28 / 0 / 3** (two enforce-mode checks and the gated step-up check skipped). The .NET
+client now sends `key_security` and implements the step-up key, step-up proofs, dead-key handling and
+re-enrolment. Checked here before stopping EC2: server code unchanged (`2427e11`), both modes `observe`,
+no `risk_policy_settings` row changed, `stepup_required_paths` empty.
+
+**Next .NET session needs:** `stepup_required_paths` set to `/v1/account/sensitive-echo` for the gated
+checks, and a baseline entry for their new harness APK before step-up is tested on the OPPO (each new
+build needs its own entry).
+
+## 63. External critical review (2026-09-29) — verified, repaired, and what it leaves open (2026-09-30)
+
+**Input.** `device_fingerprinting_critical_review_2026-09-29.md` and its check bundle, written against
+the `devicefingerprinting_dialects_2026-09-29.tar.gz` snapshot (main `3aafa6c`; server code identical
+to `4d045eb`). Eleven findings (F1–F11) plus a backlog. Its verdict: a sound pilot-grade risk input,
+not yet the sole gate for sensitive operations; fix the protocol and evidence-handling defects rather
+than rewrite.
+
+**Verification first.** Every one of the review's 17 recorded observations reproduced on `4d045eb` with
+its own harness (real Flask/JWT/ECDSA, scripted storage), and its native harness reproduced on this host
+(`non-target --xp → r-xp`, `late modification compared=4194304 diff=0`, `early … diff=4`). Before
+tightening any evidence rule, the 4,648 integrity reports stored on the test server in September (Kotlin,
+Swift and .NET collectors, conformance suite) were exported and every new rule was run over them
+offline: none would be refused, none gains an incomplete-evidence reason, none has 1–3 differing code
+bytes, and all 15 reports carrying `wx_bytes` (11 from the .NET client, 4 from the suite) are
+internally consistent.
+
+### 63.1 Repaired (each its own commit, in order)
+
+| Finding | Commit | Change |
+|---|---|---|
+| F3 | `54ba568` | Policy snapshot fails **closed**: an unreadable or invalid `risk_policy_settings` no longer means "no step-up anywhere". A warm worker may serve its last valid snapshot for `RISK_SETTINGS_MAX_STALE_SECONDS` (300); otherwise **503 `risk_policy_unavailable`**. Missing `stepup_required_paths`/`stepup_factor`/`stepup_mode` rows and invalid values are refused; an *empty* sensitive set stays valid. `/health/ready` answers **503 `not_ready`** naming each problem (database, schema, policy, Redis nonce store); `/health/live` unchanged. |
+| F2 | `d0414af` | Typed probe evidence. A requested probe answering `ok` without its required fields — or `code_integrity` with `checked:false` — earns `integrity_probe_incomplete:<probe>` at the same **+30** as a failed probe. A known field with the wrong JSON type is **400 `invalid_integrity_probe`** (was a 500). `collector_version` must be `INTEGRITY_MIN_COLLECTOR_VERSION` (1)…1000, else **400**. |
+| F2 | `ff44975` | iOS `code_integrity` is a *requested* probe whenever `INTEGRITY_SCORE_IOS_CODE_INTEGRITY=1`. |
+| F2 | `9cb690e` | The W^X baseline allowance requires an internally consistent shape (classes account for every mapping and byte, extremes inside the classes); otherwise today's `android_wx_memory` +60. |
+| F2 | `d2ec2f7` | `INTEGRITY_HARDWARE_BACKING_POLICY=required` is unsatisfied by an **unreported** claim (`key_hardware_backing_unreported`, hard). Still a claim, never proof. |
+| F4 | `1deffe7` | Code integrity fires on **any** differing byte (was ≥ 4) — Android core/ext/app and the report-only iOS app bucket. |
+| F1 | `d518cae` | **Step-up proof v2**: the step-up key signs `{version:2, purpose:"stepup", installation_id, access_token_sha256, method, path, query, body_sha256, factor, nonce, timestamp}` and the server compares every request field (**403 `stepup_binding_mismatch`**, naming the field). v1 → **403 `stepup_proof_version_unsupported`**. The key's *registered* factor must match policy too; the installation key can no longer be its own step-up key (**400 `invalid_stepup_key`**, **403 `stepup_key_not_independent`** for old rows); `stepup_key_auth` is required with a step-up key (**400 `invalid_stepup_key_auth`**). Flutter client and suite moved to v2. |
+| F7 | `1232166` | Public re-registration no longer rewrites `key_security`: metadata is written only at first registration; a differing claim is logged and ignored, a weaker one still reported as `downgrade_reported`. |
+| F8 | `1162afc` | The HTTPS guard reads `request.scheme` only; `TRUSTED_PROXY_COUNT` (default 0) applies Werkzeug `ProxyFix` for the proxies that replace forwarded headers. `MAX_CONTENT_LENGTH` = `MAX_REQUEST_BYTES` (256 KiB) → **413** before JSON parsing. |
+| F8 | `c1b0e8d` | Release clients are HTTPS-only: Android manifest and network-security config refuse cleartext (a debug-only config keeps a local HTTP lab server working); the Dart client refuses a non-https `API_BASE_URL` in release (`api_base_url_insecure`). |
+| F10 | `6e139f2` | `_link_device_account` runs its INSERT under a savepoint on PostgreSQL, so a lost first-link race no longer aborts the caller's transaction. SQL Server keeps statement-level rollback (`XACT_ABORT` stays off). |
+| gate | `2554a5c` | `tools/check_security_regressions.py` — the review's harness with its assertions inverted and controls kept. |
+| backlog | `e24cae2` | Android collector: every shell command has a 3 s deadline; a hung `su` lookup or `getprop` fails its probe, a hung `getenforce` is unknown SELinux (+0). |
+| F5, F4 | `6e846eb` | Native scanner: targets selected **before** any `mprotect`; a guard restores the **exact** original protection on every exit path and counts failures; every target mapping compared **in full** (256 KiB chunks, 256 MiB per-bucket ceiling); each bucket reports `expected/compared/skipped/unreadable` bytes and `complete`; the probe adds `elapsed_ms`. `tools/native/check_code_integrity.cpp` is the review's host harness inverted. |
+| F4 | `ae35dba` | Server: coverage fields are typed and must add up (else incomplete, +30); a scored bucket measured only in part raises `android_code_integrity_partial`, a failed restore `android_code_integrity_restore_failed` — both **report-only** (see 63.3). |
+| F10 | `55df912` | `tools/race_first_link.py` — live two-connection race on the first account link. |
+
+### 63.2 Results
+
+| Check | Result |
+|---|---|
+| `tools/check_security_regressions.py` (25 checks) | **25 / 25**. The same file against the reviewed code: 3 passed (the negative controls), 21 failed (it had 24 checks then) |
+| `tools/native/check_code_integrity.cpp` (host, x86-64, clang 21.1.8) | **12 / 12** — non-target `--x` untouched; a target `--x` read and restored; short read restored and counted unreadable; the 4 bytes at 5 MiB of a 6 MiB mapping found |
+| `tools/race_first_link.py` on PostgreSQL 16.15 (test stack) | reviewed code: `InFailedSqlTransaction: current transaction is aborted`; this build: loser continues and commits; one link row both times |
+| `tools/check_ios_scoring_rules.py`, `check_sqlserver_translation.py` (57 statements), `check_module_order.py`, 3.9 syntax | OK |
+| Conformance suite, PostgreSQL 16.15, observe, `stepup_required_paths` gated, **55 checks** | **50 passed, 1 failed, 4 skipped**. Skips: the two enforce-mode checks and the two opt-in signals. The failure is `check_parallel_clients` exceeding its 10 s step budget **from this client**: one plain `/health/live` costs 0.9–3.2 s per request over this link (a new TLS connection per call). Run on the EC2 host itself: **4 / 4 pass, 0.8 s per run** of 12 parallel flows, `/health/live` 13 ms. A client-network limit, not a server one; the first full run also exposed a suite bug (fixed in `57cadb1`) |
+| Flutter release APK | builds; **not yet run on a handset** (OPPO not connected) |
+
+Deployed to the test stack: `/opt/device_trust_server.py` = this build (backup
+`.bak-20260930-144242`), drop-in gains `TRUSTED_PROXY_COUNT=1` (Caddy terminates TLS in front of
+`127.0.0.1:5000`; backup in `/root/test.conf.bak-20260930-144242`). `/health/ready` 200 `ready`.
+
+### 63.3 Deliberate defaults, and decisions left to the owner
+
+1. **What insufficient evidence costs, per operation class (F2/F4).** Today: a requested probe that
+   failed or came back without its measurements costs +30 (→ `elevated`, refused in enforce mode); a
+   code-integrity bucket measured only in part is *report-only*. Rationale: only the honest collector
+   reports partial coverage (a platform refusing to make execute-only code readable); a malicious one
+   fabricates `complete:true`. Recommendation: keep it report-only until the observe-mode pilot measures
+   how often real devices report it.
+2. **Windowed step-up keys (Android 9/10)** stay accepted and reported as `policy_downgrade` (the §53
+   decision). The review asks that operation-level assurance say so explicitly; a DBA could refuse
+   windowed keys per path if the owner wants that option.
+3. **F6 — reinstall-hint poisoning.** Anyone holding a device's hint can register keys against it
+   without proving them, and those rows count toward that device's installation/reinstall totals (five
+   reach the reinstall block). Recommendation: count only installations that completed
+   challenge/verify, and let a hint-correlated installation affect another installation's reputation
+   only once it is proven and account-bound; record link provenance so a false association can be undone.
+4. **F9 — admission.** Registration and `/v1/installations/challenge` are public and unthrottled; five
+   open challenges per installation can be exhausted by anyone who knows the installation ID; account
+   attempt buckets key on a client-chosen installation ID. Recommendation: per-source and per-handle
+   budgets at the edge and in Redis, provisional registrations that expire unless verified, and
+   retention/cleanup off the request path.
+5. **F11 — recovery.** `integrity_step_up_required` cannot be satisfied by anything today, `review` has
+   no workflow, and device-account links have no lifecycle (lifetime counts). Recommendation: let a
+   valid step-up proof satisfy an `elevated` integrity verdict on a gated path; add an unlink/retire
+   state that stops counting toward admission while keeping history for fraud evidence.
+6. **Access-proof query string.** Step-up v2 binds the query; the access proof still binds `path` only.
+   Binding it means access proof v2 in every SDK.
+7. **Revocation and secrets.** A revoked refresh family does not revoke already-issued access JWTs (≤
+   10 min); a rotated refresh token can trigger family revocation without key proof (a DoS lever); the
+   root secret has no versioned rotation (it derives JWT, hint and handle keys together).
+8. **Release signing.** The Android release build is still debug-signed. Moving to a production key
+   changes ANDROID_ID (so the reinstall hint) and the certificate pin — an owner step.
+
+### 63.3a Owner decisions on 63.3 (2026-10-04)
+
+- **Device-account links are permanent.** Nothing in this project retires, expires or deletes a link —
+  "this is the core of our project". Where a legitimate account is held back by the count, a DBA marks
+  it as reviewed/safe; rows are never removed. (The server has no such mark yet — the policy reads
+  only the counts — so honouring one is an open item.) (Item 5's "unlink/retire state" is withdrawn.) Checked:
+  the server only INSERTs links and UPDATEs `last_seen_at`; the one DELETE anywhere was in
+  `tools/race_first_link.py`, which on 2026-09-30 removed the two throwaway links it had created. It
+  now uses its own synthetic device and deletes nothing.
+- **1 (partial coverage)**: stays report-only until pilot data. **F6** and **F9**: approved as
+  recommended. **F11**: a valid step-up proof may satisfy an `elevated` integrity verdict — approved.
+- **Access-proof query binding (6)**: approved, as access proof v2.
+- **Root secret and release signing (7, 8)** belong to the customer's deployment and app; the test
+  harness keeps its own secret and its debug-signed release build. For the integration guide: pin the
+  customer's production signing certificate (Google's app-signing certificate under Play App
+  Signing), never a debug one; and changing `DEVICE_ID_MASTER_SECRET` today makes stored reinstall
+  hints and account lookups unmatchable, so the guide must say so until the server supports rotation.
+
+### 63.4 What the review says about claims, adopted
+
+A registered key proves possession or use of that key, nothing more. A custom client can generate an
+ordinary key and fabricate a schema-valid clean report; on a genuine enrolled device, compromise of the
+app *process* (not only the OS) is enough to use the installation key through its normal signing API.
+Schema checks catch broken collectors and omissions, not liars. "Trusted" is a policy outcome on the
+evidence received, not a certificate of a clean device; memory-versus-disk comparison is periodic
+(10-minute freshness), not continuous. Keep account authorisation, limits and recovery enforced by the
+business server independently.
+
+### 63.5 Breaking changes for other clients
+
+- **Step-up proof v2 is mandatory** (the .NET SDK sends v1 — handoff in `HANDOFF_TO_DOTNET_2026-09-30.md`).
+- `stepup_key_auth` is required whenever `stepup_public_key` is sent; the step-up key must differ from
+  the installation key.
+- `collector_version` must be ≥ 1; malformed probe fields are 400.
+- Behind a TLS-terminating proxy with `REQUIRE_HTTPS=1`, set `TRUSTED_PROXY_COUNT`, or every request is 426.
+- `/health/ready` can now answer 503.
+
+### 63.6 Still to do in this round
+
+On the OPPO (release APK, observe): a native scan — expect the same `18 / trusted` with every bucket
+`complete` and `elapsed_ms` recorded — and the step-up v2 button (expect `verified`). On the iPhone: a
+Codemagic build of this code, since the installed build still sends v1 (its step-up will now be refused
+with `stepup_proof_version_unsupported`, by design). SQL Server: the suite and `race_first_link.py`
+once the owner wants an RDS round. Test stack: `stepup_required_paths` is set to
+`/v1/account/sensitive-echo` for these runs; reset it to `''` afterwards.
+
+### 63.7 State at end of session (2026-09-30)
+
+- **EC2** `i-0559685f02c4013b1` **stopped**; no Elastic IP, no RDS instance, no manual RDS snapshot.
+  `/opt/device_trust_server.py` = this round's server (md5 `eb2003c6…`, identical to the repo file);
+  previous copy `.bak-20260930-144242`. The drop-in now carries `TRUSTED_PROXY_COUNT=1` (previous drop-in in
+  `/root/test.conf.bak-20260930-144242`). PostgreSQL 16.15, schema 7, observe/observe.
+- **Left on for tomorrow's handset run:** `risk_policy_settings.stepup_required_paths` =
+  `/v1/account/sensitive-echo` (set 2026-09-30 for the suite and the OPPO step-up test). Reset it to `''`
+  when the round ends.
+- A root-owned `/tmp/racecheck/__pycache__` from the race run may survive on the host; delete it with sudo
+  on next start if the boot-time `/tmp` clean did not.
+- **Resume with 63.6:** connect the OPPO, install the release APK built from this code, run a native scan
+  and the step-up v2 test; then the iPhone after a Codemagic build. The owner decisions are in 63.3.
+
+### 63.8 On hardware — OPPO CPH2083, Android 9, PostgreSQL, observe (2026-10-04)
+
+Release APK of this round's client (step-up v2, HTTPS-only, full-coverage scanner).
+
+| Check | Result |
+|---|---|
+| Native scan (two runs) | **18 / trusted** — `android_developer_options` +8, `android_adb_enabled` +10, as before |
+| Coverage, every bucket `complete:true`, all diffs 0 | core **7,106,560** bytes (was 5,058,560 under the old 4 MiB cap — libart was being cut off), ext 5,742,592 (unchanged), app **15,151,104** (was 4,194,304); `xom_regions_*` 0, `protect_restore_failures` 0 |
+| Scan cost | `elapsed_ms` **434 / 446** for ~28 MB compared |
+| Step-up | key re-enrolled (passcode, windowed 30 s — the Android 9 shape, `policy_downgrade=True` as designed), then **step-up v2 verified, 200** |
+
+**Found on the way: a dead-key state the app did not recognise.** The OPPO's screen lock had been off
+since the last session and was set again today. The step-up alias then still existed but held no private
+key (`containsAlias` true, `isKeyEntry` false), `getEntry` threw a bare `UnsupportedOperationException`,
+and the app showed only "The Android native operation failed" with the step-up button disabled and no
+re-enrol offer. Diagnosed with `e3c2b56` (unmapped native exceptions now carry their class, cause and
+top frames; the OPPO suppresses a release build's logcat output, so the in-app message is the only
+diagnostic) and fixed in `b74ff1e` (such an alias is a dead key: removed, `STEPUP_KEY_INVALIDATED`,
+re-enrolment offered). Re-enrolment needed the account password; the owner created a new account for it.
+
+### 63.9 The owner's decisions, implemented (2026-10-04)
+
+| Decision | Commit | What changed |
+|---|---|---|
+| Access-proof query binding | `5f02cac` | **Access proof v2** adds `query` (the raw query string as sent). `ACCESS_PROOF_MIN_VERSION` defaults to 2; the test stack runs **1** for the transition (the installed iPhone build and the .NET harness still send v1). A v1 proof is refused on any request carrying a query string. |
+| F11 | `16a2a7a` | On authenticated account requests a step-up proof v2 for that request satisfies an `elevated` integrity verdict (`satisfied_by_step_up`); an invalid offered proof refuses. Login, account registration and refresh accept none and now answer `integrity_elevated` instead of a step-up they cannot use. |
+| F9 | `3ee520d` | Per-source budgets (`RATE_LIMIT_SOURCE_MAX_ATTEMPTS`, 120) on registration, challenge, verify, account registration and login; per-handle budget on login; at the open-challenge cap the oldest unused challenge is dropped instead of refusing; expired-row housekeeping at most once per `MAINTENANCE_INTERVAL_SECONDS` per worker. No nonce-expiry index added: the review asks for indexes from measured plans. |
+| F6 | `940b37e` | **Schema 8**: `app_installations.verified_at`, set at the first consumed challenge; installation and reinstall counts include only proven installations (plus the caller). Backfill on the test stack: 3,933 of 4,076 installations proven; 143 never were. |
+| Integration guide | `8a837d0` | `INTEGRATION_GUIDE.md`: root secret (what it derives; changing it orphans hints and handle lookups; customer-owned), production signing pins (Google's app-signing certificate under Play App Signing), transport, least-privilege grants (DELETE only on the three ephemeral tables), modes, the DBA-owned policy, permanent links and customer-side "mark safe". |
+| Dead-key gap | `e3c2b56`, `b74ff1e` | Found on the OPPO, see 63.8. |
+
+**F6, the part not implemented.** The 63.3 recommendation also said a hint-correlated installation should
+affect a device only once "account-bound". Worked through, that is worse than nothing: a device farm that
+reinstalls and opens a new account each time would leave the accounts-per-device count; a compromised
+installation that never logged in could launder its block by reinstalling; and an attacker holding the
+hint can open an account anyway. Only the unauthenticated half of the poisoning (keys registered without
+being proven) is closed. The remaining case needs the victim's reinstall hint — on Android 8+ a hash of an
+ANDROID_ID scoped to the app's signing key, user and device — and a proven key; recorded as a limit.
+
+**Results.**
+
+| Check | Result |
+|---|---|
+| `tools/check_security_regressions.py` | **31 / 31** |
+| Conformance suite, PostgreSQL 16.15, observe, schema 8, **59 checks** | **54 passed, 0 failed, 5 skipped** (three enforce-mode checks, two opt-in signals); this time `check_parallel_clients` passed from the dev machine too |
+| The three enforce-mode checks, with the stack briefly in `INTEGRITY_MODE=enforce` | **3 / 3** — blocked device refused, device memory survives reinstall, **step-up satisfies an elevated verdict** |
+| OPPO, release build, with the server refusing v1 (`ACCESS_PROOF_MIN_VERSION=2`) | start-up register/verify/scan/`device/me`, refresh, `account/me` all 200; **step-up v2 verified** — the client speaks v2 |
+
+**State.** Test stack on this round's server (backup `.bak-20261004-155703`), schema 8, observe/observe,
+`TRUSTED_PROXY_COUNT=1`, `ACCESS_PROOF_MIN_VERSION=1`, `stepup_required_paths` gated for the handset
+runs. Next: an iPhone build from Codemagic (its installed build still sends step-up v1, now refused);
+the .NET session's move to access proof v2 and step-up v2, after which the stack goes back to v2 only;
+a SQL Server round (suite, enforce checks, `race_first_link.py`) when the owner wants one.
+
+### 63.10 On hardware — iPhone 7, iOS 15.8.5, TrollStore, PostgreSQL, observe (2026-10-04)
+
+Codemagic build of this round's client, pre-signed for TrollStore, server refusing v1 access proofs for
+the run (`ACCESS_PROOF_MIN_VERSION=2`, set back to 1 afterwards).
+
+| Check | Result |
+|---|---|
+| Start-up register / verify / scan / `device/me`, refresh, `account/me` | all 200 with v1 refused — the iOS client speaks access proof v2 |
+| Native scan | **0 / trusted**; the two fake-signature reasons present and report-only (0 points), as designed for a TrollStore install; `code_integrity` requested (iOS code-integrity scoring is on here) and present: app bucket 10,540,264 bytes compared, 0 differing |
+| Step-up | re-enrolled for the signed-in account (passcode, **per-use**, no downgrade), then **step-up v2 verified, 200** |
+
+**Found on the way: the app offered an unbound step-up key.** The passcode had been off at launch, so the
+old key was dead and none was offered at registration; with the passcode back on, a re-enrolment attempt
+created a fresh key and was refused (wrong password, 401), yet the step-up button enabled, because the app
+excluded only a key the server had *reported* as different. The server refused the fresh key's signature
+(`stepup_signature_invalid`) — correct. Fixed client-side in `215768b`: step-up is offered only for the key
+the server last confirmed as bound. A relaunch put the installed build into the right state for this run.
+
+**Which account a re-enrolled key belongs to.** Re-enrolment checks the password of the account the app is
+signed in as (the access token's subject) and scopes the key to that account (`stepup_key_account_id`):
+here `1519b153…`, one of six accounts linked to this iPhone's device record. The other five would be
+refused with `stepup_key_other_account` until they re-enrol with their own password while signed in.
+

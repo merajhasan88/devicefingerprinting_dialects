@@ -9,6 +9,7 @@ using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using DeviceTrust.Client;
+using DeviceTrust.Client.Integrity;
 using DeviceTrust.Client.Internal;
 using DeviceTrust.Client.Keys;
 using DeviceTrust.Client.Protocol;
@@ -51,7 +52,8 @@ namespace DeviceTrust.Cli.Harness
                 CheckStepUpKeyRegistrationAsync);
             runner.Add("step-up: re-registration can never attach or replace a step-up key",
                 CheckStepUpKeyImmutableAsync);
-            runner.Add("step-up: a sensitive path requires a valid step-up proof", CheckStepUpAsync);
+            runner.Add("step-up: a sensitive path requires a valid step-up proof for that exact request", CheckStepUpAsync);
+            runner.Add("enforcement: a step-up proof satisfies an elevated integrity verdict", CheckElevatedStepUpAsync);
             runner.Add("step-up: re-enrolment needs the password and the new key's own proof",
                 CheckStepUpReenrolAsync);
             runner.Add("risk: accounts per device follow the DBA policy (defaults 2 elevated, 3 review, 4 block)",
@@ -179,13 +181,93 @@ namespace DeviceTrust.Cli.Harness
 
             // The same key, the same request shape, a factor the policy does not
             // accept: the proof is genuine, the claim is wrong.
+            var access = device.Session!.AccessToken;
+            var sent = Json.SerializeToUtf8Bytes(body);
             var wrong = factor == StepUpKeyAuth.FactorBiometric
                 ? StepUpKeyAuth.FactorPasscode
                 : StepUpKeyAuth.FactorBiometric;
             var mismatch = await HarnessContext.ExpectApiFailureAsync(
-                () => SendStepUpWithFactorAsync(device, store, wrong, body, device.Session!.AccessToken, token),
+                () => SendCraftedStepUpAsync(device, store, access, sent, wrong, token),
                 "a step-up proof naming the wrong factor").ConfigureAwait(false);
             ExpectRejection(mismatch, 403, "stepup_factor_mismatch");
+
+            // The review's reproduction (F1): an approval signed for one body,
+            // attached to a different body under a freshly signed access proof
+            // with the same nonce. Step-up v2 binds the body, so it is refused
+            // and the server names the field.
+            var retargeted = await HarnessContext.ExpectApiFailureAsync(
+                () => SendCraftedStepUpAsync(device, store, access,
+                    Json.SerializeToUtf8Bytes(new Dictionary<string, object?>(StringComparer.Ordinal)
+                    {
+                        ["move"] = "all the money",
+                    }),
+                    factor, token, approvedBody: sent),
+                "an approval moved onto a different body").ConfigureAwait(false);
+            ExpectRejection(retargeted, 403, "stepup_binding_mismatch");
+            ExpectField(retargeted, "body_sha256");
+
+            var otherPath = await HarnessContext.ExpectApiFailureAsync(
+                () => SendCraftedStepUpAsync(device, store, access, sent, factor, token,
+                    approvedPath: "/v1/account/protected-echo"),
+                "an approval for another path").ConfigureAwait(false);
+            ExpectRejection(otherPath, 403, "stepup_binding_mismatch");
+            ExpectField(otherPath, "path");
+
+            var version1 = await HarnessContext.ExpectApiFailureAsync(
+                () => SendCraftedStepUpAsync(device, store, access, sent, factor, token, version: 1),
+                "a version 1 step-up proof").ConfigureAwait(false);
+            ExpectRejection(version1, 403, "stepup_proof_version_unsupported");
+
+            // The key's registered factor counts too, not only the proof's claim.
+            var otherStore = new SoftwareStepUpKeyStore(true, new StepUpKeyAuth(wrong, StepUpKeyAuth.ModePerUse, 0));
+            var other = _context.CreateEphemeralDevice("stepup-factor", stepUpKeyStore: otherStore);
+            await other.RegisterInstallationAsync(FreshHint(), token).ConfigureAwait(false);
+            var otherSession = await other.RegisterAccountAsync(NewHandle("sf"), Password, token).ConfigureAwait(false);
+            var registeredFactor = await HarnessContext.ExpectApiFailureAsync(
+                () => SendCraftedStepUpAsync(other, otherStore, otherSession.AccessToken, sent, factor, token),
+                "a proof claiming the policy factor from a key registered with another").ConfigureAwait(false);
+            ExpectRejection(registeredFactor, 403, "stepup_factor_mismatch");
+        }
+
+        private async Task CheckElevatedStepUpAsync(CancellationToken token)
+        {
+            // Review F11: an elevated integrity verdict used to answer
+            // integrity_step_up_required with nothing able to satisfy it. On an
+            // authenticated account request a step-up proof for that request now
+            // does; without one the refusal stands.
+            var probe = _context.CreateEphemeralDevice("elevated-mode");
+            var health = await probe.Api.HealthReadyAsync(token).ConfigureAwait(false);
+            if (Json.GetString(health, "integrity_mode") != "enforce")
+            {
+                throw new SkipCheckException("server is in observe mode");
+            }
+
+            var factor = Setting(RiskSettings(health), "stepup_factor") ?? StepUpKeyAuth.FactorPasscode;
+            var collector = new ConformanceProbeCollector();
+            var device = _context.CreateEphemeralDevice(
+                "elevated", collector, new SoftwareStepUpKeyStore(true, new StepUpKeyAuth(factor, StepUpKeyAuth.ModePerUse, 0)));
+            await device.RegisterInstallationAsync(FreshHint(), token).ConfigureAwait(false);
+            var session = await device.RegisterAccountAsync(NewHandle("el"), Password, token).ConfigureAwait(false);
+
+            collector.ClearScenarios().WithScenario("broken_probe",
+                probes => probes["mounts"] = ProbeResult.Error("IOException", "permission denied"));
+            var deviceToken = await device.AcquireDeviceTokenAsync(token).ConfigureAwait(false);
+            var decision = await device.SubmitIntegrityReportAsync(deviceToken, token).ConfigureAwait(false);
+            collector.ClearScenarios();
+            CheckRunner.Expect(decision.Verdict == "elevated", "setup: expected elevated, got " + decision.Verdict);
+
+            var body = Json.SerializeToUtf8Bytes(new Dictionary<string, object?>(StringComparer.Ordinal) { ["x"] = 1 });
+            var refused = await HarnessContext.ExpectApiFailureAsync(
+                () => device.SendProtectedAsync("POST", "/v1/account/protected-echo", body, session.AccessToken,
+                    cancellationToken: token),
+                "a protected request on an elevated verdict without step-up").ConfigureAwait(false);
+            ExpectRejection(refused, 403, "integrity_step_up_required");
+
+            var allowed = await device.SendStepUpProtectedAsync(
+                "POST", "/v1/account/protected-echo", body, session.AccessToken, "conformance", token).ConfigureAwait(false);
+            var integrity = Json.GetObject(allowed, "integrity");
+            CheckRunner.Expect(integrity is not null && Json.GetBoolean(integrity.Value, "satisfied_by_step_up"),
+                "a step-up proof must satisfy the elevated verdict (integrity.satisfied_by_step_up)");
         }
 
         private async Task CheckStepUpReenrolAsync(CancellationToken token)
@@ -404,21 +486,48 @@ namespace DeviceTrust.Cli.Harness
                 + "s under parallel load (the handset timeout is 15s)");
         }
 
-        private static async Task<JsonElement> SendStepUpWithFactorAsync(
+        /// <summary>
+        /// Sends <paramref name="sentBody"/> to the sensitive path with a genuine
+        /// access proof and a step-up proof the caller shapes: another factor,
+        /// an approval of a different body or path, or the retired version 1.
+        /// Everything not overridden describes the request actually sent.
+        /// </summary>
+        private static async Task<JsonElement> SendCraftedStepUpAsync(
             DeviceTrustClient device,
             IStepUpKeyStore store,
-            string factor,
-            IReadOnlyDictionary<string, object?> body,
             string accessToken,
-            CancellationToken token)
+            byte[] sentBody,
+            string factor,
+            CancellationToken token,
+            byte[]? approvedBody = null,
+            string? approvedPath = null,
+            int version = DeviceTrustClient.StepUpProofVersion)
         {
             var identity = await device.LoadIdentityAsync(token).ConfigureAwait(false);
             var nonce = AccessProof.CreateNonce();
-            var proof = DeviceTrustClient.BuildStepUpProof(
-                identity.InstallationId, factor, nonce, AccessProof.CurrentTimestamp());
+            var (signedPath, query) = device.Api.ResolveSignedTarget(SensitivePath);
+            var proof = version == DeviceTrustClient.StepUpProofVersion
+                ? DeviceTrustClient.BuildStepUpProof(
+                    identity.InstallationId,
+                    Hex.Sha256Hex(accessToken),
+                    "POST",
+                    approvedPath ?? signedPath,
+                    query,
+                    AccessProof.BodyHash(approvedBody ?? sentBody),
+                    factor,
+                    nonce,
+                    AccessProof.CurrentTimestamp())
+                : Serialize(writer =>
+                {
+                    writer.WriteNumber("version", 1);
+                    writer.WriteString("installation_id", identity.InstallationId);
+                    writer.WriteString("factor", factor);
+                    writer.WriteString("nonce", nonce);
+                    writer.WriteNumber("timestamp", AccessProof.CurrentTimestamp());
+                });
             var signature = await store.SignAsync(proof, "conformance", token).ConfigureAwait(false);
             var fixture = await device.BuildAccessProofFixtureAsync(
-                "POST", SensitivePath, Json.SerializeToUtf8Bytes(body), accessToken, nonce: nonce,
+                "POST", SensitivePath, sentBody, accessToken, nonce: nonce,
                 cancellationToken: token).ConfigureAwait(false);
             return await device.SendAccessProofFixtureAsync(
                 fixture,
@@ -530,6 +639,15 @@ namespace DeviceTrust.Cli.Harness
             CheckRunner.Expect(failure.StatusCode == status && failure.Code == code,
                 "expected " + status.ToString(CultureInfo.InvariantCulture) + " " + code + ", got "
                 + failure.StatusCode.ToString(CultureInfo.InvariantCulture) + " " + (failure.Code ?? "<no code>"));
+        }
+
+        private static void ExpectField(DeviceTrustApiException failure, string field)
+        {
+            var named = failure.Details.TryGetValue("field", out var value) && value.ValueKind == JsonValueKind.String
+                ? value.GetString()
+                : null;
+            CheckRunner.Expect(named == field,
+                "expected the refusal to name " + field + ", it named " + (named ?? "<nothing>"));
         }
 
         private static ReinstallHint FreshHint()

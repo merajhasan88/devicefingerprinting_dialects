@@ -587,6 +587,7 @@ namespace DeviceTrust.Android.Harness
                 var server = registration is null ? "not registered yet"
                     : !registration.StepUpKeyRegistered ? "not bound on the server: re-enrol it with your password"
                     : registration.StepUpKeyMatches == false ? "the server holds a different step-up key: re-enrol it"
+                    : !client.StepUpUsable ? "not confirmed as the bound key: re-enrol it with your password"
                     : "bound on the server";
                 text = "Step-up key: " + key.Auth.Description + ", " + key.SecurityLevel + "; " + server
                        + (registration?.StepUpPolicyDowngrade == true ? "; weaker than server policy (downgrade recorded)" : string.Empty);
@@ -597,7 +598,9 @@ namespace DeviceTrust.Android.Harness
                  + " matches=" + (registration?.StepUpKeyMatches?.ToString() ?? "null")
                  + " auth=" + (registration?.StepUpKeyAuth?.Description ?? "null")
                  + " policy_downgrade=" + (registration?.StepUpPolicyDowngrade?.ToString() ?? "null")
-                 + " usable=" + client.StepUpUsable);
+                 + " usable=" + client.StepUpUsable
+                 + " bound=" + (client.BoundStepUpThumbprint is null ? "none" : client.BoundStepUpThumbprint.Substring(0, 12))
+                 + " local=" + (client.StepUpKey is null ? "none" : client.StepUpKey.Thumbprint.Substring(0, 12)));
             RunOnUiThread(() =>
             {
                 if (_stepUpView is not null)

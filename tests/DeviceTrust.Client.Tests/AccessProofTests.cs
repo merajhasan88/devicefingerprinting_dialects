@@ -25,7 +25,7 @@ namespace DeviceTrust.Client.Tests
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
         [Fact]
-        public void Serialize_ContainsExactlyTheEightProtocolFields()
+        public void Serialize_ContainsExactlyTheNineVersion2Fields()
         {
             var proof = Serialize();
 
@@ -40,7 +40,7 @@ namespace DeviceTrust.Client.Tests
                 new[]
                 {
                     "access_token_sha256", "body_sha256", "installation_id", "method",
-                    "nonce", "path", "timestamp", "version",
+                    "nonce", "path", "query", "timestamp", "version",
                 },
                 names);
         }
@@ -53,7 +53,7 @@ namespace DeviceTrust.Client.Tests
 
             Assert.Equal(JsonValueKind.Number, root.GetProperty("timestamp").ValueKind);
             Assert.Equal(JsonValueKind.Number, root.GetProperty("version").ValueKind);
-            Assert.Equal(1, root.GetProperty("version").GetInt32());
+            Assert.Equal(2, root.GetProperty("version").GetInt32());
             Assert.Equal(1_700_000_000L, root.GetProperty("timestamp").GetInt64());
         }
 
@@ -66,6 +66,20 @@ namespace DeviceTrust.Client.Tests
 
             using var document = JsonDocument.Parse(proof);
             Assert.Equal("get", document.RootElement.GetProperty("method").GetString());
+        }
+
+        [Fact]
+        public void Serialize_WritesTheQueryAsAStringEvenWhenEmpty()
+        {
+            // The server compares a v2 proof's query with the raw query string,
+            // and a missing or null query is a mismatch, not "no query".
+            using var empty = JsonDocument.Parse(Serialize());
+            Assert.Equal(JsonValueKind.String, empty.RootElement.GetProperty("query").ValueKind);
+            Assert.Equal(string.Empty, empty.RootElement.GetProperty("query").GetString());
+
+            using var given = JsonDocument.Parse(Serialize(query: "to=me&note=a%20b"));
+            Assert.Equal("to=me&note=a%20b", given.RootElement.GetProperty("query").GetString());
+            Assert.Equal("/v1/account/protected-echo", given.RootElement.GetProperty("path").GetString());
         }
 
         [Fact]
@@ -115,7 +129,7 @@ namespace DeviceTrust.Client.Tests
             Assert.InRange(timestamp, before - 2, before + 2);
         }
 
-        private static byte[] Serialize(string method = "POST")
+        private static byte[] Serialize(string method = "POST", string query = "")
         {
             return AccessProof.Serialize(
                 accessTokenSha256Hex: Hex.Sha256Hex("token"),
@@ -124,6 +138,7 @@ namespace DeviceTrust.Client.Tests
                 method: method,
                 nonce: AccessProof.CreateNonce(),
                 path: "/v1/account/protected-echo",
+                query: query,
                 timestamp: 1_700_000_000L);
         }
     }

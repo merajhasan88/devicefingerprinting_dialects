@@ -308,6 +308,76 @@ namespace DeviceTrust.Cli.Harness
                 ExpectRejection(failure, 401, "access_proof_path_mismatch");
             });
 
+            runner.Add("access proof: the client signs v2, and a query added after signing is rejected", async token =>
+            {
+                // Access proof v2 (DESIGN.md 63.9) signs the raw query string; v1
+                // never covered it, so a parameter appended after signing went
+                // through. The control is a query the client did sign.
+                var device = await EnsureDeviceAsync(token).ConfigureAwait(false);
+                var body = Json.SerializeToUtf8Bytes(
+                    new Dictionary<string, object?>(StringComparer.Ordinal) { ["x"] = 1 });
+                var fixture = await device.BuildAccessProofFixtureAsync(
+                    "POST", "/v1/account/protected-echo", body, _session!.AccessToken,
+                    cancellationToken: token).ConfigureAwait(false);
+
+                using (var proof = JsonDocument.Parse(Base64Url.Decode(fixture.ProofPayload)))
+                {
+                    CheckRunner.Expect(
+                        proof.RootElement.GetProperty("version").GetInt32() == AccessProof.Version
+                        && proof.RootElement.GetProperty("query").GetString() == string.Empty,
+                        "the client's proof is not version " + AccessProof.Version + " with an empty query");
+                }
+
+                var failure = await HarnessContext.ExpectApiFailureAsync(
+                    () => device.SendAccessProofFixtureAsync(
+                        fixture, actualPath: "/v1/account/protected-echo?to=someone-else", cancellationToken: token),
+                    "a query string appended after the proof was signed").ConfigureAwait(false);
+                ExpectRejection(failure, 401, "access_proof_query_mismatch");
+
+                var signed = await device.SendProtectedAsync(
+                    "POST", "/v1/account/protected-echo?to=me&note=a%20b", body, _session.AccessToken,
+                    cancellationToken: token).ConfigureAwait(false);
+                CheckRunner.Expect(
+                    Json.GetString(signed, "access_proof") == "accepted",
+                    "a query string the client signed was not accepted");
+            });
+
+            runner.Add("access proof: v1 only where the server allows it, and never with a query", async token =>
+            {
+                // ACCESS_PROOF_MIN_VERSION (default 2) refuses v1 outright; a
+                // server in transition may allow it, and then a v1 proof still
+                // cannot cover a query string. The v1 bytes are built here, not by
+                // the SDK, which no longer emits them.
+                var device = await EnsureDeviceAsync(token).ConfigureAwait(false);
+                var health = await device.Api.HealthReadyAsync(token).ConfigureAwait(false);
+                var allowsV1 = health.TryGetProperty("access_proof_versions", out var versions)
+                    ? versions.ValueKind == JsonValueKind.Array
+                      && versions.EnumerateArray().Any(v => v.ValueKind == JsonValueKind.Number && v.GetInt32() == 1)
+                    : true;
+                var body = Json.SerializeToUtf8Bytes(
+                    new Dictionary<string, object?>(StringComparer.Ordinal) { ["x"] = 1 });
+
+                if (!allowsV1)
+                {
+                    var refused = await HarnessContext.ExpectApiFailureAsync(
+                        () => SendVersion1Async(device, "/v1/account/protected-echo", body, token),
+                        "a version 1 access proof on a server that requires version 2").ConfigureAwait(false);
+                    ExpectRejection(refused, 400, "unsupported_access_proof_version");
+                    return;
+                }
+
+                var accepted = await SendVersion1Async(device, "/v1/account/protected-echo", body, token)
+                    .ConfigureAwait(false);
+                CheckRunner.Expect(
+                    Json.GetString(accepted, "access_proof") == "accepted",
+                    "this server allows v1, but a v1 proof was not accepted");
+
+                var withQuery = await HarnessContext.ExpectApiFailureAsync(
+                    () => SendVersion1Async(device, "/v1/account/protected-echo?to=x", body, token),
+                    "a version 1 access proof on a request with a query string").ConfigureAwait(false);
+                ExpectRejection(withQuery, 401, "access_proof_query_mismatch");
+            });
+
             runner.Add("access proof: a tampered method is rejected", async token =>
             {
                 var device = await EnsureDeviceAsync(token).ConfigureAwait(false);
@@ -550,6 +620,53 @@ namespace DeviceTrust.Cli.Harness
             CheckRunner.Expect(
                 failure.Code == code,
                 "expected " + code + ", got " + (failure.Code ?? "<no code>"));
+        }
+
+        /// <summary>
+        /// Sends a version 1 access proof — the pre-2026-10-04 shape, without
+        /// <c>query</c> — signed by this installation's own key.
+        /// </summary>
+        private async Task<JsonElement> SendVersion1Async(
+            DeviceTrustClient device,
+            string pathAndQuery,
+            byte[] body,
+            CancellationToken token)
+        {
+            var identity = await device.LoadIdentityAsync(token).ConfigureAwait(false);
+            var route = pathAndQuery.Split('?')[0];
+            byte[] proof;
+            using (var buffer = new System.IO.MemoryStream())
+            {
+                using (var writer = new Utf8JsonWriter(buffer))
+                {
+                    writer.WriteStartObject();
+                    writer.WriteString("access_token_sha256", Hex.Sha256Hex(_session!.AccessToken));
+                    writer.WriteString("body_sha256", AccessProof.BodyHash(body));
+                    writer.WriteString("installation_id", identity.InstallationId);
+                    writer.WriteString("method", "POST");
+                    writer.WriteString("nonce", AccessProof.CreateNonce());
+                    writer.WriteString("path", device.Api.ResolveSignedPath(route));
+                    writer.WriteNumber("timestamp", AccessProof.CurrentTimestamp());
+                    writer.WriteNumber("version", 1);
+                    writer.WriteEndObject();
+                }
+
+                proof = buffer.ToArray();
+            }
+
+            var payload = Base64Url.Encode(proof);
+            var signature = await device.SignBase64UrlPayloadAsync(payload, token).ConfigureAwait(false);
+            return await device.Api.SendAsync(
+                "POST",
+                pathAndQuery,
+                body,
+                _session.AccessToken,
+                new Dictionary<string, string>(StringComparer.Ordinal)
+                {
+                    [DeviceTrustApi.AccessProofHeader] = payload,
+                    [DeviceTrustApi.AccessSignatureHeader] = signature,
+                },
+                token).ConfigureAwait(false);
         }
 
         private static string NewHandle()

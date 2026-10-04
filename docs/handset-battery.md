@@ -7,6 +7,23 @@ it was regenerated once after the original was lost with a cleaned temp director
 certificate digest a server allow-list needs is whatever `apksigner verify --print-certs` reports for
 the current build (at the time of writing, `664e9c8e…e3`).
 
+Build it with `dotnet publish`, not `dotnet build`: a plain build signs with the .NET Android debug
+key (`e05bdfd2…`), which the handset's installed copy does not share, so `adb install -r` would fail
+and the server would score `android_signing_certificate_mismatch`. One environment variable carries
+the password, because apksigner reads a `file:` password once per line and fails when the store and
+key passwords name the same one-line file:
+
+```bash
+K=~/.devicetrust-harness; export DT_HARNESS_PASS="$(head -1 $K/keystore.pass)"
+dotnet publish src/DeviceTrust.Android.Harness -c Release -p:AndroidKeyStore=true \
+  -p:AndroidSigningKeyStore=$K/harness.keystore -p:AndroidSigningKeyAlias=devicetrust-harness \
+  -p:AndroidSigningKeyPass=env:DT_HARNESS_PASS -p:AndroidSigningStorePass=env:DT_HARNESS_PASS
+# -> bin/Release/net8.0-android/publish/com.example.devicefingerprinting_dotnet-Signed.apk
+```
+
+Every new APK has a new hash, so it needs its own `INTEGRITY_ANDROID_WX_BASELINES` entry
+(`docs/wx-baseline-process.md`) before it can read trusted.
+
 | Device | Model | Android | Build | Verified boot | Key |
 |---|---|---|---|---|---|
 | Huawei | AQM-LX1 | 10 (API 29) | user | green | AndroidKeyStore, `secure_hardware`, non-exportable |

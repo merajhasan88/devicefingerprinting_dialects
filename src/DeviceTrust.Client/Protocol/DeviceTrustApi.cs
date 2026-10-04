@@ -84,6 +84,40 @@ namespace DeviceTrust.Client.Protocol
             return prefix.Length == 0 ? path : prefix + path;
         }
 
+        /// <summary>The absolute URI a request for <paramref name="path"/> is sent to.</summary>
+        /// <param name="path">An API path, optionally with a query string.</param>
+        public Uri BuildRequestUri(string path)
+        {
+            if (string.IsNullOrEmpty(path) || path[0] != '/')
+            {
+                throw new ArgumentException("An API path must start with '/'.", nameof(path));
+            }
+
+            return new Uri(BaseUri.AbsoluteUri.TrimEnd('/') + path);
+        }
+
+        /// <summary>
+        /// The path and query string the proofs must name for a request target
+        /// such as <c>/v1/account/me?view=full</c>.
+        /// </summary>
+        /// <remarks>
+        /// The path is compared with the server's decoded <c>request.path</c>, so
+        /// it is the route as given, prefixed as <see cref="ResolveSignedPath"/>
+        /// does. The query is compared with the raw query string the server
+        /// received, so it is taken from the <see cref="Uri"/> the request is
+        /// actually sent to — after any escaping <see cref="Uri"/> applies — never
+        /// from the caller's string. Signing the caller's text would turn a query
+        /// containing a space into a <c>access_proof_query_mismatch</c>.
+        /// </remarks>
+        public (string Path, string Query) ResolveSignedTarget(string pathAndQuery)
+        {
+            var uri = BuildRequestUri(pathAndQuery);
+            var questionMark = pathAndQuery.IndexOf('?');
+            var route = questionMark < 0 ? pathAndQuery : pathAndQuery.Substring(0, questionMark);
+            var query = uri.Query.StartsWith("?", StringComparison.Ordinal) ? uri.Query.Substring(1) : uri.Query;
+            return (ResolveSignedPath(route), query);
+        }
+
         /// <summary>Sends a request and returns the parsed JSON body, throwing on any non-2xx status.</summary>
         public async Task<JsonElement> SendAsync(
             string method,
@@ -99,9 +133,7 @@ namespace DeviceTrust.Client.Protocol
             }
 
             var normalizedMethod = method.ToUpperInvariant();
-            using var request = new HttpRequestMessage(
-                new HttpMethod(normalizedMethod),
-                new Uri(BaseUri.AbsoluteUri.TrimEnd('/') + path));
+            using var request = new HttpRequestMessage(new HttpMethod(normalizedMethod), BuildRequestUri(path));
 
             request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
             if (!string.IsNullOrEmpty(bearerToken))

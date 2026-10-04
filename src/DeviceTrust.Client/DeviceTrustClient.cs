@@ -139,15 +139,34 @@ namespace DeviceTrust.Client
         public InstallationKeyException? StepUpUnavailable { get; private set; }
 
         /// <summary>
-        /// Whether a step-up signature from this device will be accepted: a
-        /// local key exists, the server has one bound, and it has not reported
-        /// the local key as a different one. Offer the step-up action only when
-        /// this is true; otherwise offer re-enrolment.
+        /// The thumbprint of the step-up key the server last confirmed as bound
+        /// to this installation, or null when it has confirmed none.
         /// </summary>
+        /// <remarks>
+        /// Set at each registration from the key this client offered: bound
+        /// there (a new installation binds the offered key) or reported as
+        /// matching (a known installation). A registration that offered no key
+        /// confirms nothing, even though the server still holds one, because
+        /// "not asked" is not "matches" (DESIGN.md 63.10).
+        /// </remarks>
+        public string? BoundStepUpThumbprint { get; private set; }
+
+        /// <summary>
+        /// Whether a step-up signature from this device will be accepted: the
+        /// local key is the one the server last confirmed as bound. Offer the
+        /// step-up action only when this is true; otherwise offer re-enrolment.
+        /// </summary>
+        /// <remarks>
+        /// Found on the reference iPhone, 2026-10-04: with the passcode off at
+        /// launch no key was offered at registration (<c>stepup_key_matches</c>
+        /// null); with it back on, a refused re-enrolment left a fresh, unbound
+        /// key behind, and a rule that excluded only a key reported as different
+        /// offered that one for step-up. The server refused its signature with
+        /// <c>stepup_signature_invalid</c>, correctly.
+        /// </remarks>
         public bool StepUpUsable => StepUpKey is not null
-                                    && Registration is not null
-                                    && Registration.StepUpKeyRegistered
-                                    && Registration.StepUpKeyMatches != false;
+                                    && BoundStepUpThumbprint is not null
+                                    && string.Equals(StepUpKey.Thumbprint, BoundStepUpThumbprint, StringComparison.Ordinal);
 
         /// <summary>
         /// Loads the installation identity, creating the key and the UUID if this
@@ -252,6 +271,12 @@ namespace DeviceTrust.Client
             }
 
             Registration = registration;
+            var offered = StepUpKey;
+            BoundStepUpThumbprint = offered is not null
+                                    && registration.StepUpKeyRegistered
+                                    && registration.StepUpKeyMatches != false
+                ? offered.Thumbprint
+                : null;
 
             var state = await _stateStore.LoadAsync(cancellationToken).ConfigureAwait(false);
             state.InstallationId = registration.InstallationId;
@@ -479,17 +504,29 @@ namespace DeviceTrust.Client
 
         /// <summary>
         /// Sends a protected request that also carries a step-up proof: the user
-        /// authenticates, the step-up key signs a proof bound to this request's
-        /// access-proof nonce, and only then is the access proof signed.
+        /// authenticates, the step-up key signs an approval of this exact
+        /// request, and only then is the access proof signed.
         /// </summary>
         /// <remarks>
-        /// The order is deliberate. The prompt can take a while, and the access
-        /// proof's ±120-second timestamp window should start after the user has
-        /// answered, not before. The nonce is generated first so both proofs can
-        /// name it; the access proof's nonce is what the server's replay store
-        /// already protects, so the step-up proof needs no challenge of its own.
-        /// A key found dead at signing is discarded by the store and
-        /// <see cref="StepUpKey"/> is cleared, so the caller stops offering it.
+        /// <para>
+        /// Step-up proof v2 (DESIGN.md 63) approves one complete request: the
+        /// token hash, method, path, query, body hash and the access proof's
+        /// nonce, each compared by the server with the request it receives
+        /// (<c>stepup_binding_mismatch</c> names any that differ). Version 1
+        /// signed only the installation, factor and nonce, so whoever held the
+        /// installation signer could move a fresh approval onto a different body
+        /// under a re-signed access proof with the same nonce; the server now
+        /// refuses it with <c>stepup_proof_version_unsupported</c>.
+        /// </para>
+        /// <para>
+        /// The order is deliberate: the body and nonce are frozen first, the
+        /// step-up proof is signed (the prompt can take a while), and the access
+        /// proof is signed last so its ±120-second window starts after the user
+        /// has answered. Both proofs are built from one description of the
+        /// request, so they cannot disagree. A key found dead at signing is
+        /// discarded by the store and <see cref="StepUpKey"/> is cleared, so the
+        /// caller stops offering it.
+        /// </para>
         /// </remarks>
         public async Task<JsonElement> SendStepUpProtectedAsync(
             string method,
@@ -499,11 +536,26 @@ namespace DeviceTrust.Client
             string reason,
             CancellationToken cancellationToken = default)
         {
+            if (string.IsNullOrEmpty(bearerToken))
+            {
+                throw new ArgumentException("A bearer token is required.", nameof(bearerToken));
+            }
+
             var key = StepUpKey ?? throw StepUpKeyMissing();
             var identity = await LoadIdentityAsync(cancellationToken).ConfigureAwait(false);
             var nonce = AccessProof.CreateNonce();
+            var target = DescribeRequest(method, path, body);
 
-            var proof = BuildStepUpProof(identity.InstallationId, key.Auth.Factor, nonce, AccessProof.CurrentTimestamp());
+            var proof = BuildStepUpProof(
+                identity.InstallationId,
+                Hex.Sha256Hex(bearerToken),
+                target.Method,
+                target.SignedPath,
+                target.Query,
+                AccessProof.BodyHash(target.Body),
+                key.Auth.Factor,
+                nonce,
+                AccessProof.CurrentTimestamp());
             var signature = await SignWithStepUpKeyAsync(proof, reason, cancellationToken).ConfigureAwait(false);
 
             var fixture = await BuildAccessProofFixtureAsync(
@@ -513,6 +565,14 @@ namespace DeviceTrust.Client
                 bearerToken,
                 nonce: nonce,
                 cancellationToken: cancellationToken).ConfigureAwait(false);
+            if (!fixture.EncodedBody.AsSpan().SequenceEqual(target.Body))
+            {
+                // The approval covers these exact bytes; sending others would be
+                // refused as stepup_binding_mismatch, so fail here instead.
+                throw new DeviceTrustProtocolException(
+                    "The request body changed after it was approved.",
+                    "stepup_body_changed");
+            }
 
             return await SendAccessProofFixtureAsync(
                 fixture,
@@ -702,7 +762,10 @@ namespace DeviceTrust.Client
         /// Builds a signed access proof without sending it.
         /// </summary>
         /// <param name="method">The HTTP method to name in the proof.</param>
-        /// <param name="path">The API path to name in the proof.</param>
+        /// <param name="path">
+        /// The API path to name in the proof, optionally with a query string;
+        /// the query is signed as the request will carry it (access proof v2).
+        /// </param>
         /// <param name="body">The exact body bytes to hash into the proof; null for GET.</param>
         /// <param name="bearerToken">The token to bind the proof to.</param>
         /// <param name="proofInstallationId">
@@ -731,16 +794,16 @@ namespace DeviceTrust.Client
             }
 
             var identity = await LoadIdentityAsync(cancellationToken).ConfigureAwait(false);
-            var normalizedMethod = method.ToUpperInvariant();
-            var encodedBody = normalizedMethod == "GET" ? Array.Empty<byte>() : body ?? Array.Empty<byte>();
+            var target = DescribeRequest(method, path, body);
 
             var proofBytes = AccessProof.Serialize(
                 Hex.Sha256Hex(bearerToken),
-                AccessProof.BodyHash(encodedBody),
+                AccessProof.BodyHash(target.Body),
                 proofInstallationId ?? identity.InstallationId,
-                normalizedMethod,
+                target.Method,
                 nonce ?? AccessProof.CreateNonce(),
-                _api.ResolveSignedPath(path),
+                target.SignedPath,
+                target.Query,
                 timestampSeconds ?? AccessProof.CurrentTimestamp());
 
             var signature = await _keyStore.SignAsync(proofBytes, cancellationToken).ConfigureAwait(false);
@@ -748,9 +811,9 @@ namespace DeviceTrust.Client
             using var document = JsonDocument.Parse(proofBytes);
             return new AccessProofFixture(
                 bearerToken,
-                normalizedMethod,
+                target.Method,
                 path,
-                encodedBody,
+                target.Body,
                 Base64Url.Encode(proofBytes),
                 Base64Url.Encode(signature),
                 document.RootElement.GetProperty("timestamp").GetInt64(),
@@ -800,18 +863,44 @@ namespace DeviceTrust.Client
         /// <summary>The header carrying the base64url DER step-up signature.</summary>
         public const string StepUpSignatureHeader = "X-Step-Up-Signature";
 
+        /// <summary>The step-up proof version this SDK emits; the server refuses any other.</summary>
+        public const int StepUpProofVersion = 2;
+
         /// <summary>
-        /// Serialises a step-up proof: <c>{version, installation_id, factor,
-        /// nonce, timestamp}</c>, where the nonce is the access proof's.
+        /// Serialises a step-up proof v2: the approval of one complete request.
         /// </summary>
-        public static byte[] BuildStepUpProof(string installationId, string factor, string nonce, long timestamp)
+        /// <param name="installationId">The canonical installation id.</param>
+        /// <param name="accessTokenSha256Hex">Lowercase hex SHA-256 of the bearer token string.</param>
+        /// <param name="method">The HTTP method, upper-case.</param>
+        /// <param name="path">The path exactly as the access proof names it.</param>
+        /// <param name="query">The raw query string as sent, without <c>?</c>; empty when none.</param>
+        /// <param name="bodySha256Hex">Lowercase hex SHA-256 of the same body bytes the access proof hashes.</param>
+        /// <param name="factor">The factor the key was registered with; must also match the policy.</param>
+        /// <param name="nonce">The access proof's nonce.</param>
+        /// <param name="timestamp">Unix seconds.</param>
+        public static byte[] BuildStepUpProof(
+            string installationId,
+            string accessTokenSha256Hex,
+            string method,
+            string path,
+            string query,
+            string bodySha256Hex,
+            string factor,
+            string nonce,
+            long timestamp)
         {
             using var buffer = new MemoryStream();
             using (var writer = new Utf8JsonWriter(buffer))
             {
                 writer.WriteStartObject();
-                writer.WriteNumber("version", 1);
+                writer.WriteNumber("version", StepUpProofVersion);
+                writer.WriteString("purpose", "stepup");
                 writer.WriteString("installation_id", installationId);
+                writer.WriteString("access_token_sha256", accessTokenSha256Hex);
+                writer.WriteString("method", method);
+                writer.WriteString("path", path);
+                writer.WriteString("query", query ?? string.Empty);
+                writer.WriteString("body_sha256", bodySha256Hex);
                 writer.WriteString("factor", factor);
                 writer.WriteString("nonce", nonce);
                 writer.WriteNumber("timestamp", timestamp);
@@ -819,6 +908,45 @@ namespace DeviceTrust.Client
             }
 
             return buffer.ToArray();
+        }
+
+        /// <summary>
+        /// The request as both proofs describe it: upper-case method, the body
+        /// bytes that will be sent (none for GET), and the signed path and query.
+        /// </summary>
+        private RequestTarget DescribeRequest(string method, string path, byte[]? body)
+        {
+            if (string.IsNullOrEmpty(method))
+            {
+                throw new ArgumentException("An HTTP method is required.", nameof(method));
+            }
+
+            var normalizedMethod = method.ToUpperInvariant();
+            var (signedPath, query) = _api.ResolveSignedTarget(path);
+            return new RequestTarget(
+                normalizedMethod,
+                signedPath,
+                query,
+                normalizedMethod == "GET" ? Array.Empty<byte>() : body ?? Array.Empty<byte>());
+        }
+
+        private sealed class RequestTarget
+        {
+            public RequestTarget(string method, string signedPath, string query, byte[] body)
+            {
+                Method = method;
+                SignedPath = signedPath;
+                Query = query;
+                Body = body;
+            }
+
+            public string Method { get; }
+
+            public string SignedPath { get; }
+
+            public string Query { get; }
+
+            public byte[] Body { get; }
         }
 
         /// <summary>Builds a fresh proof and sends the request it describes.</summary>
@@ -895,6 +1023,7 @@ namespace DeviceTrust.Client
             Registration = null;
             StepUpKey = null;
             StepUpUnavailable = null;
+            BoundStepUpThumbprint = null;
             Session = null;
             DeviceToken = null;
             DeviceRecord = null;
