@@ -253,8 +253,8 @@ covered by code review against the reference fix only; and the "refused re-enrol
 unbound key" sequence, covered by an offline test.
 
 **The W^X baseline does not cover a session (open).** The pinned figure is measured at the first
-report after a cold start, and cold starts agree (18 of 20 measurements of build `58396d51…` read
-exactly `3735552`; the other two were the first launch, which created the step-up key, and one
+report after a cold start, and cold starts agree (16 of 18 `baseline` runs of build `58396d51…`
+read exactly `3735552`; the other two were the first launch, which created the step-up key, and one
 unexplained run). But Mono compiles code as each new flow runs, so any later report in the same
 process reads more — up to 4,194,304 (+12 %) after a login, a re-enrolment and a step-up — and scores
 `android_wx_above_baseline` +15. On this handset that is 33 / `elevated`, which enforce mode refuses
@@ -263,7 +263,7 @@ would be 15 / trusted. A baseline taken at one point of one flow cannot describe
 keeps compiling. Candidate fixes: a full-AOT build (most code precompiled, so the anonymous RWX is
 mostly trampolines — to be measured; the harness currently builds with `RunAOTCompilation=false`),
 measuring the baseline at the end of a full session, or a server-side tolerance — the last is the
-server owner's decision.
+server owner's decision. Full analysis and options: `docs/wx-session-growth.md`.
 
 **The biometric factor.** Not exercised anywhere; the iOS harness also lacks the
 `NSFaceIDUsageDescription` a Face ID device would need.
