@@ -5191,59 +5191,69 @@ Their new OPPO build's W^X entry, `58396d51…:3735552:65536`, was appended to
 build's (env backed up to `/root/devicetrust.env.bak-20261004-180233`); `/health/ready` reports
 `android_wx_baselines: 3`. Their iPhone build is served from `/srv/artifacts/e2a890/dt-dotnet-15418ad.ipa`.
 
-## 64. Design (not implemented): a per-app W^X allowance, so .NET apps are not re-pinned every release (2026-10-04)
+## 64. Open question for the reviewer: keeping a .NET app's W^X allowance across releases (2026-10-04)
 
-**The problem.** The .NET runtime on Android (Mono) maps writable-and-executable memory by design, which
-the server cannot tell apart from injected code by the memory map alone, so it scores +60 (§62). The
-allowance that removes that for a clean .NET device is keyed on the **APK hash** (§62). Every release
-has a new hash, so every release needs a new `INTEGRITY_ANDROID_WX_BASELINES` entry; until someone adds
-it, every clean device on that release reads 78 / review. For a customer that is a per-release
-operational step whose failure mode is a false refusal for all their users — not acceptable in
-production. A separate server for .NET would not change this (each customer already runs their own
-deployment, and a second scoring implementation is the divergence risk §0 rules out).
+**Status: not decided, nothing implemented.** The server still uses per-build pins (§62). Two options are
+set out below for the external reviewer; the owner considers option 1 somewhat unsafe and has not
+adopted either.
 
-**What the evidence says** (every stored .NET report carrying `wx_bytes`, 2026-09-19 … 10-04): every
-clean region is a whole multiple of **64 KiB** (classes 64, 128 and 192 KiB). The total varies by app
-build — about 1.0–1.2 MB for the September harness, 3.67–3.74 MB for the later builds — and is
-identical across the two phones measured. The three runs with an injected gadget each added regions of
-**4,096 and 28,672 bytes**: the granularity test caught them; the total alone would have caught
-only one of them. The granularity is a property of the runtime; the total is a property of the app.
+**The problem.** The .NET runtime on Android (Mono) maps writable-and-executable memory by design, and
+the server cannot tell that apart from injected code by the memory map alone, so it scores +60 (§62).
+The allowance that removes this for a clean .NET device is keyed on the **APK hash**. Every release has
+a new hash, so every release needs a new `INTEGRITY_ANDROID_WX_BASELINES` entry; until one is added,
+every clean device on that release reads 78 / review. For a customer this is a per-release step whose
+failure mode is a false refusal for all of that release's users. A separate server for .NET would not
+remove it: each customer already runs their own deployment, and a second scoring implementation is the
+divergence risk §24 rules out ("one server, many clients").
 
-**Proposal.** Allow per **app** rather than per build, keep the granularity rule exactly, and bound the
-total with an operator-set ceiling that has headroom.
+**What the evidence says** (all stored .NET reports carrying `wx_bytes`, 2026-09-19 … 10-04):
 
-- **Configuration**, next to the certificate pin it depends on:
-  `INTEGRITY_ANDROID_WX_APP_ALLOWANCES=<package>@<cert_sha256>:<ceiling_bytes>:<granularity>[,…]`.
-  Operator-declared, never client-claimed (a client able to say "I am .NET" could grant itself the
-  allowance from inside a compromised app — the trap §62 recorded).
-- **Matching.** An entry applies only when the report's package name equals `<package>`, its
-  certificate list contains `<cert_sha256>`, **and** the deployment pins that certificate in
-  `INTEGRITY_ANDROID_CERT_SHA256` (otherwise the entry is ignored and a startup warning names it).
-  A repackaged app is already a hard block on the certificate pin; this keeps the allowance from ever
-  being the weaker key.
-- **Precedence.** An exact per-APK entry (§62) wins; then the app entry; with neither, today's +60.
-- **Rule** — the §62/§63 rule with the ceiling in place of one build's measurement: no W^X → 0;
-  `wx_bytes` absent, size classes missing or figures inconsistent → +60; any region not a multiple of
-  the granularity → `android_wx_foreign_allocator` +45; total above the ceiling → +15, above twice it
-  → +40. The reason names the entry that matched, so an operator can see which allowance was used.
-- **Choosing the ceiling.** In observe mode, collect the app's clean reports across its supported
-  devices, OS versions and at least two releases; ceiling = the largest clean total × 1.5, rounded up to
-  the granularity. With today's data that would be about 5.6 MB. A release whose footprint outgrows it
-  shows `android_wx_above_baseline` in observe mode before any enforcement — the signal to raise it.
-- **Optional:** a CI step that pins each release exactly (option 2 of the discussion) stays available
-  for customers who want the tighter per-build bound; the two co-exist through the precedence above.
+- Every region in a clean report is a whole multiple of **64 KiB** (classes of 64, 128 and 192 KiB).
+- The total depends on the app build: about 1.0–1.2 MB for the September harness, 3.67–3.74 MB for the
+  later builds. One build measured identically on the Huawei (Android 10) and the OPPO (Android 9)
+  (`DESIGN_UPDATE_FROM_DOTNET.md`).
+- Three stored reports also carry regions of **4,096 and 28,672 bytes** — the shape §62 records for the
+  .NET session's injected-gadget runs. The granularity rule catches all three (+45). Their totals
+  (3,768,320; 4,030,464; 4,096,000 bytes) are only slightly above a 3,735,552-byte build pin (+15
+  each) and would be under any ceiling with headroom.
 
-**The trade-off, stated plainly.** Within the ceiling, injected code that allocates in whole 64 KiB
-blocks is not caught by this rule — as today within a per-build baseline, but with more room (the 1.5×
-headroom). The granularity test, which caught every injected gadget observed, is unchanged, and the
-structural probes (instrumentation threads, code integrity) are independent of it.
+So the granularity looks like a property of the runtime, and the total like a property of the app — on
+two phones, a handful of builds and one workload. That is thin evidence for either option.
 
-**Before enabling it under enforcement:** clean measurements of the customer's own app on its own
-device range in observe mode, as above; and a conformance check — an app entry for the conformance
-package and certificate: within the ceiling 0, a foreign size +45, above the ceiling +15, and the same
-entry with no certificate pin still +60.
+### Option 1 — one allowance per app, with a ceiling
 
-**Owner decisions:** the headroom factor (1.5 proposed); whether the configuration lives in the
-environment (proposed: beside the certificate pin) or in a DBA-managed table like
-`risk_policy_settings`.
+- Configured once per app beside the certificate pin, e.g.
+  `INTEGRITY_ANDROID_WX_APP_ALLOWANCES=<package>@<cert_sha256>:<ceiling_bytes>:<granularity>`.
+  Operator-declared, never client-claimed.
+- Applies only when the report's package and certificate match the entry **and** the deployment pins
+  that certificate (`INTEGRITY_ANDROID_CERT_SHA256`), so a repackaged app (already a hard block) can
+  never use it. An exact per-build pin, when present, takes precedence.
+- Same rule as §62/§63 with the ceiling in place of one build's measurement: absent or inconsistent
+  figures +60; a region off the granularity +45; above the ceiling +15, above twice it +40.
+- Ceiling = the largest clean total seen in observe mode across devices, OS versions and releases,
+  times a headroom factor (1.5 would give about 5.6 MB today).
 
+*For:* configured once; no release can cause a fleet-wide false refusal. *Against:* within the ceiling,
+injected code that allocates in whole 64 KiB blocks is not caught by this rule — with headroom, more room
+than a per-build pin leaves; a compromised genuine app (same package and certificate) gets that room;
+the ceiling rests on fleet data that does not exist yet; and the granularity "invariant" is observed,
+not established (a future runtime version may allocate differently).
+
+### Option 2 — keep exact per-build pins, automate them in the customer's release pipeline
+
+- The customer's CI installs each release build on a device or emulator, exercises it until the
+  runtime has compiled its hot paths (measured at report time, not launch — §62), runs the .NET SDK's
+  `baseline` command, and publishes `<apk_sha256>:<bytes>:<granularity>` to the server's configuration
+  as part of the release, **before** the build reaches users.
+- No server change.
+
+*For:* the tightest bound — exactly what the shipped build measured; no new trust in app identity.
+*Against:* a device run per release in CI; release and server configuration become coupled, and a
+missed or late step reproduces the fleet-wide false refusal; the CI workload must resemble real use or
+the pin is too tight; an emulator may not measure what a phone does.
+
+### What we ask the reviewer
+
+Which option (or a better one); whether the 64 KiB granularity is a sound basis for detection across
+.NET runtime versions; and, for option 1, whether any headroom is acceptable, or the ceiling should
+be per release after all. Both options keep the operator, not the client, in charge of the allowance.
