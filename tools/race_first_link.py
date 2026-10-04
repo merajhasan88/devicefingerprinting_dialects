@@ -17,8 +17,11 @@ through the same race first.
     python3 tools/race_first_link.py [--compare path/to/old_device_trust_server.py]
 
 Uses the server's own environment (DB_ENGINE, DB_HOST, DB_USERNAME, ...,
-DEVICE_ID_MASTER_SECRET) and the newest app_installations row as the device.
-It inserts one throwaway demo account per run and deletes it afterwards.
+DEVICE_ID_MASTER_SECRET). Each race runs on its own synthetic device,
+installation and account (registration_method 'race_test'), so no real device's
+account count moves. Nothing is deleted afterwards: device-account links are
+permanent evidence and nothing in this project removes one (owner rule,
+DESIGN.md 63.3) -- so run it against a TEST database only.
 """
 import argparse
 import importlib.util
@@ -46,10 +49,14 @@ def race(module):
 
     setup = module.DIALECT.connect()
     cur = cursor(setup)
-    cur.execute("SELECT installation_id, device_id FROM app_installations "
-                "ORDER BY created_at DESC LIMIT 1")
-    installation, device = [str(x) for x in cur.fetchone()]
-    account = str(uuid.uuid4())
+    device, installation, account = (str(uuid.uuid4()) for _ in range(3))
+    cur.execute("INSERT INTO recognized_devices (device_id, platform) VALUES (%s, %s)",
+                (device, "android"))
+    cur.execute("INSERT INTO app_installations (installation_id, device_id, key_algorithm, "
+                "public_key_jwk, key_thumbprint, registration_method, registration_confidence) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                (installation, device, "ES256", module.DIALECT.json_param({"race_test": True}),
+                 secrets.token_hex(32), "race_test", "synthetic"))
     cur.execute("INSERT INTO demo_accounts (account_id, handle_lookup, password_hash) "
                 "VALUES (%s, %s, %s)", (account, secrets.token_hex(32), b"race-test"))
     setup.commit()
@@ -80,9 +87,7 @@ def race(module):
 
     cur.execute("SELECT COUNT(*) FROM device_account_links WHERE account_id = %s", (account,))
     links = cur.fetchone()[0]
-    cur.execute("DELETE FROM device_account_links WHERE account_id = %s", (account,))
-    cur.execute("DELETE FROM demo_accounts WHERE account_id = %s", (account,))
-    setup.commit()
+    setup.rollback()
     setup.close()
     return outcome.get("loser", "loser did not finish"), links
 
