@@ -37,6 +37,7 @@ Apply migrations **in ascending version order**; each one records its own row in
 | 5 | `005_stepup_key_auth.sql` | reported step-up key `stepup_key_factor` / `stepup_key_mode` / `stepup_key_window_seconds` |
 | 6 | `006_device_account_policy.sql` | seeds the DBA-tunable accounts-per-device policy (owner defaults: 2 elevated, 3 review, 4 block; elevated never refuses) |
 | 7 | `007_stepup_key_account.sql` | `app_installations.stepup_key_account_id`: the account a re-enrolled step-up key belongs to |
+| 8 | `008_installation_verified.sql` | `app_installations.verified_at`: when the installation first proved its key; only proven installations count toward a device (backfilled from existing evidence; no row deleted) |
 
 All scripts are guarded and safe to re-run.
 

@@ -1149,7 +1149,7 @@ def _get_backend_identity():
 # against a schema it does not understand. /health/* still answers so operators
 # can see why.
 
-REQUIRED_SCHEMA_VERSION = 7
+REQUIRED_SCHEMA_VERSION = 8
 
 _schema_state = None
 _schema_lock = threading.Lock()
@@ -2785,9 +2785,18 @@ def _evaluate_risk_policy(
         )
         device_account_count = int(cursor.fetchone()[0])
 
+        # Only installations that have proven their key count toward a device
+        # (review F6): registration is public, so anyone holding a device's
+        # reinstall hint could otherwise add rows to it and push it to the
+        # reinstall block without ever holding a key. The calling installation
+        # counts regardless. Links and integrity reports need a device token,
+        # so they come from proven installations already.
         cursor.execute(
-            "SELECT COUNT(*) FROM app_installations WHERE device_id = %s",
-            (device_id,),
+            """
+            SELECT COUNT(*) FROM app_installations
+            WHERE device_id = %s AND (verified_at IS NOT NULL OR installation_id = %s)
+            """,
+            (device_id, installation_id),
         )
         device_installation_count = int(cursor.fetchone()[0])
 
@@ -2801,8 +2810,9 @@ def _evaluate_risk_policy(
             WHERE device_id = %s
               AND registration_method = 'reinstall_hint'
               AND created_at >= %s
+              AND (verified_at IS NOT NULL OR installation_id = %s)
             """,
-            (device_id, reinstall_cutoff),
+            (device_id, reinstall_cutoff, installation_id),
         )
         recent_reinstall_count = int(cursor.fetchone()[0])
 
@@ -3699,10 +3709,14 @@ def _verify_challenge(
                 401,
                 "challenge_not_consumable",
             )
+        # The first consumed challenge is the installation's first proof that
+        # it holds its key; only proven installations count toward a device
+        # (migration 008, review F6).
         cursor.execute(
             """
             UPDATE app_installations
-            SET last_seen_at = NOW()
+            SET last_seen_at = NOW(),
+                verified_at = COALESCE(verified_at, NOW())
             WHERE installation_id = %s
             """,
             (installation_id,),
@@ -4623,7 +4637,9 @@ def device_me():
                    i.created_at,
                    i.last_seen_at,
                    (SELECT COUNT(*) FROM app_installations i2
-                    WHERE i2.device_id = i.device_id) AS installation_count,
+                    WHERE i2.device_id = i.device_id
+                      AND (i2.verified_at IS NOT NULL
+                           OR i2.installation_id = i.installation_id)) AS installation_count,
                    (SELECT COUNT(*) FROM device_account_links l
                     WHERE l.device_id = i.device_id) AS linked_account_count
             FROM app_installations i

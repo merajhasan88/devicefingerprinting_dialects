@@ -2102,6 +2102,48 @@ def check_stepup_reenrol(api, ctx):
                          second_access, body, factor)
     expect(st == 200, "the second account's own key expected 200, got %s %s" % (st, pl))
 
+@check("identity: registrations that never prove their key do not count toward a device", db_sensitive=True)
+def check_unproven_registrations(api, ctx):
+    """Review F6 (DESIGN.md 63). Registration is public: anyone holding a
+    device's reinstall hint could register keys against it without ever proving
+    them, and five such rows reached the reinstall block. Only installations
+    that have answered a challenge with their key count; a proven reinstall
+    still does."""
+    owner, hint = Installation(), fresh_hint()
+    st, pl = enrol(api, owner, hint)
+    expect(st in (200, 201), "enrol failed: %s %s" % (st, pl))
+    tok = device_token(api, owner)
+    submit_report(api, owner, tok)
+    st, pl = open_account(api, owner, tok, "f6-%s" % secrets.token_hex(4))
+    expect(st in (200, 201), "account open failed: %s %s" % (st, pl))
+    access = pl["access_token"]
+    for _ in range(5):
+        st, pl = enrol(api, Installation(), hint)
+        expect(st in (200, 201) and pl.get("device_id") == owner.device_id,
+               "the hint must still correlate an unproven key: %s %s" % (st, pl))
+    st, pl = protected(api, owner, "GET", "/v1/policy/me", access)
+    policy = _policy_of(pl)
+    context = policy.get("context") or {}
+    expect(st == 200 and not {"rapid_reinstall_block_threshold", "rapid_reinstall_high",
+                              "rapid_reinstall_elevated"} & _reason_codes(policy),
+           "five unproven registrations must not raise reinstall reasons: %s %s"
+           % (st, sorted(_reason_codes(policy))))
+    expect(context.get("device_installation_count") == 1
+           and context.get("recent_reinstall_count") == 0,
+           "unproven registrations counted: installations=%s reinstalls=%s"
+           % (context.get("device_installation_count"), context.get("recent_reinstall_count")))
+    proven = Installation()
+    st, pl = enrol(api, proven, hint)
+    expect(st in (200, 201), "enrol failed: %s %s" % (st, pl))
+    device_token(api, proven)
+    st, pl = protected(api, owner, "GET", "/v1/policy/me", access)
+    context = _policy_of(pl).get("context") or {}
+    expect(context.get("device_installation_count") == 2
+           and context.get("recent_reinstall_count") == 1,
+           "a proven reinstall must still count: installations=%s reinstalls=%s"
+           % (context.get("device_installation_count"), context.get("recent_reinstall_count")))
+
+
 @check("concurrency: parallel clients neither crash nor stall the server", db_sensitive=True)
 def check_parallel_clients(api, ctx):
     """Four phone-like clients enrol, prove possession, report integrity and read
