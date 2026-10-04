@@ -5044,7 +5044,8 @@ Deployed to the test stack: `/opt/device_trust_server.py` = this build (backup
 
 - **Device-account links are permanent.** Nothing in this project retires, expires or deletes a link —
   "this is the core of our project". Where a legitimate account is held back by the count, a DBA marks
-  it as reviewed/safe; rows are never removed. (Item 5's "unlink/retire state" is withdrawn.) Checked:
+  it as reviewed/safe; rows are never removed. (The server has no such mark yet — the policy reads
+  only the counts — so honouring one is an open item.) (Item 5's "unlink/retire state" is withdrawn.) Checked:
   the server only INSERTs links and UPDATEs `last_seen_at`; the one DELETE anywhere was in
   `tools/race_first_link.py`, which on 2026-09-30 removed the two throwaway links it had created. It
   now uses its own synthetic device and deletes nothing.
