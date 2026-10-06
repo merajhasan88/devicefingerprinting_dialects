@@ -2051,15 +2051,12 @@ def _apply_hardware_backing_policy(cursor, installation_id, scored):
     )
 
 
-_WX_MAX_SIZE_CLASSES = 12
-
-
 def _wx_size_classes(exec_maps):
     """[(size, count), ...] from wx_size_classes, or None if absent or malformed.
 
-    The collector lists "<bytes>:<count>" pairs largest first, at most twelve
-    classes, so smaller classes may be cut off; wx_smallest_bytes and
-    wx_largest_bytes still name the extremes.
+    The collector lists "<bytes>:<count>" pairs, largest first, for the
+    writable-executable mappings; wx_smallest_bytes and wx_largest_bytes name
+    the extremes.
     """
     raw = exec_maps.get("wx_size_classes")
     if not isinstance(raw, str):
@@ -2080,8 +2077,11 @@ def _wx_shape_consistent(exec_maps, wx_count, wx_bytes, classes):
 
     The baseline allowance trusts sizes the client reports, so figures that
     contradict one another are not a measurement and earn no allowance (review
-    F2). A class list shorter than the cap must account for every mapping and
-    byte exactly; a full one may be truncated but must fit inside the totals.
+    F2). The class list must account for every mapping and every byte: a list
+    cut short (the .NET collector sends at most twelve classes) leaves sizes
+    unexamined, and a size the runtime never allocates can hide among the
+    omitted ones (joint review R8, DESIGN.md 66.2). A truncated list therefore
+    earns no allowance either.
     """
     if wx_count <= 0 or wx_bytes <= 0:
         return False
@@ -2089,11 +2089,7 @@ def _wx_shape_consistent(exec_maps, wx_count, wx_bytes, classes):
         return False
     listed = sum(count for _, count in classes)
     listed_bytes = sum(size * count for size, count in classes)
-    if listed > wx_count or listed_bytes > wx_bytes:
-        return False
-    if len(classes) < _WX_MAX_SIZE_CLASSES and listed != wx_count:
-        return False
-    if listed == wx_count and listed_bytes != wx_bytes:
+    if listed != wx_count or listed_bytes != wx_bytes:
         return False
     sizes = [size for size, _ in classes]
     smallest = _as_int(exec_maps.get("wx_smallest_bytes"))

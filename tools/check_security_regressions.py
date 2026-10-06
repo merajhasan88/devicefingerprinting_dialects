@@ -377,6 +377,23 @@ def inconsistent_wx_shape_earns_no_baseline_allowance():
                   "wx_smallest_bytes": 65536, "wx_largest_bytes": 65536}
         points, found = score(honest)
         expect(points == 0, "the measured .NET shape must score 0, got %s %s" % (points, found))
+        # Joint review R8: fourteen classes, one of them a size the runtime never
+        # allocates, listed in full (caught) and cut to the twelve largest with
+        # the totals kept (used to pass as clean).
+        big = dict(honest)
+        sizes = [65536 * n for n in range(14, 2, -1)] + [98304, 65536]
+        full = ",".join("%d:1" % size for size in sizes)
+        big.update(wx_mappings=len(sizes), wx_bytes=sum(sizes), wx_size_classes=full,
+                   wx_smallest_bytes=min(sizes), wx_largest_bytes=max(sizes))
+        s.ANDROID_WX_BASELINES[apk] = (65536 * 128, 65536)
+        points, found = score(big)
+        expect("android_wx_foreign_allocator" in found,
+               "control: the full list must expose the foreign size, got %s %s" % (points, found))
+        big["wx_size_classes"] = ",".join(full.split(",")[:12])
+        points, found = score(big)
+        expect("android_wx_memory" in found and points >= 60,
+               "a list cut to twelve classes earned the allowance (%s %s)" % (points, found))
+        s.ANDROID_WX_BASELINES[apk] = (1048576, 65536)
         for lie in ({"wx_mappings": 40},                       # count disagrees with the classes
                     {"wx_bytes": 65536},                       # bytes disagree with the classes
                     {"wx_mappings": 0},                        # bytes without mappings
