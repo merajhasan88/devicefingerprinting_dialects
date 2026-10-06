@@ -23,6 +23,14 @@ Be precise about what that proves:
   Integrity reports are periodic (fresh for 10 minutes), not continuous.
 - Keep account authorisation, transaction limits and recovery enforced by your own business server.
   Treat this system as strong defence in depth and a risk input.
+- No platform attestation is used — not Google's or Apple's verdict services, and not local
+  verification of Android key-attestation chains. So a fully synthetic client (a script or emulator
+  that invents a clean report and signs it with its own key) looks like a genuine phone. Catching those,
+  and fraud farms in general, is a job for **velocity measured on things a client cannot mint for
+  free**: source networks and address ranges, the rate of new accounts across your whole service,
+  timing and behaviour, and business data (identity checks, payment instruments). This server's device
+  counts (accounts per device, reinstall velocity) key on installation keys and reinstall hints, which a
+  farm can regenerate for every account, so they will not catch it on their own.
 
 ## 2. The root secret — `DEVICE_ID_MASTER_SECRET`
 
@@ -151,7 +159,9 @@ a fraudster's record would be laundered. If your review decides that an account 
 counts is legitimate, **record that decision in your own systems** — for example a reviewed-accounts
 table your API layer consults when it receives `risk_review_required` or `risk_policy_blocked`, or a
 DBA change to the thresholds above. Never delete or edit link rows to get the same effect. The server
-has no built-in "mark safe" flag; how you mark and honour one is yours.
+has no built-in "mark safe" flag, and **nothing you record elsewhere changes its decision**: it will
+keep answering `risk_review_required` or `risk_policy_blocked` (in enforce mode) for that account on
+that device, so it is your API layer that must act on your review. How you mark and honour one is yours.
 
 **Step-up.** The optional step-up key needs the device passcode (or biometric) for each signature.
 Android 9 and 10 cannot bind a passcode to each use; there the key unlocks for a 30-second window and
