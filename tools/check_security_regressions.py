@@ -74,8 +74,7 @@ class Rows(object):
         self.hardware_backed = None
         self.fail_settings = False
         self.settings = dict(SETTINGS)
-        self.open_challenges = 0
-        self.oldest_challenge = None
+        self.consumed = set()
 
     def execute(self, sql, params=None):
         q = " ".join(sql.split())
@@ -84,6 +83,9 @@ class Rows(object):
         self.rowcount = 1
         if q == "SELECT 1":
             self.result = (1,)
+        elif q.startswith("SELECT i.key_algorithm, i.public_key_jwk, i.device_id, i.key_thumbprint"):
+            self.result = ("ES256", inst.jwk, inst.device_id,
+                           s._parse_public_key(inst.jwk)["thumbprint"], "active", "active")
         elif q.startswith("SELECT i.key_algorithm, i.public_key_jwk"):
             self.result = ("ES256", inst.jwk, inst.device_id, "active", "active")
         elif q.startswith("SELECT c.installation_id, c.device_id, c.platform"):
@@ -97,11 +99,12 @@ class Rows(object):
             self.result = self.reenrol_row
         elif q.startswith("SELECT i.status, d.status FROM app_installations i"):
             self.result = ("active", "active")
-        elif q.startswith("SELECT COUNT(*) FROM installation_challenges"):
-            self.result = (self.open_challenges,)
-        elif q.startswith("SELECT challenge_id FROM installation_challenges"):
-            self.result = (self.oldest_challenge,)
-        elif q.startswith(("INSERT INTO installation_challenges", "DELETE FROM installation_challenges")):
+        elif q.startswith("INSERT INTO installation_challenges"):
+            if params[0] in self.consumed:
+                raise s.DIALECT._driver.errors.UniqueViolation("challenge already consumed")
+            self.consumed.add(params[0])
+            self.writes.append((q, params))
+        elif q.startswith("DELETE FROM installation_challenges"):
             self.writes.append((q, params))
         elif q.startswith("SELECT setting_key, setting_value"):
             if self.fail_settings:
@@ -893,22 +896,59 @@ class FakeRedis(object):
 
 
 @check
-def challenge_flood_drops_the_oldest_instead_of_refusing():
+def challenge_flood_cannot_cancel_a_pending_challenge():
+    """Joint review R5: five public challenge requests used to drop the owner's
+    pending challenge. Challenges are now stateless until consumed."""
     db.writes = []
-    db.open_challenges = s.MAX_OPEN_CHALLENGES_PER_INSTALLATION
-    db.oldest_challenge = str(uuid.uuid4())
+    route = "/v1/installations/challenge"
+    owner = client.post(route, json={"installation_id": inst.installation_id}).get_json()
+    for _ in range(12):
+        reply = client.post(route, json={"installation_id": inst.installation_id})
+        expect(reply.status_code == 200, "a challenge request was refused: %s" % reply.status_code)
+    expect(not [q for q, _ in db.writes if "installation_challenges" in q],
+           "issuing a challenge must store nothing, writes were %s" % db.writes)
+    proof = {"installation_id": inst.installation_id, "challenge_id": owner["challenge_id"],
+             "payload": owner["payload"], "signature": inst.sign_b64(owner["payload"])}
+    reply = client.post("/v1/installations/verify", json=proof)
+    expect(reply.status_code == 200 and "device_token" in (reply.get_json() or {}),
+           "the owner's challenge must survive a flood: %s %s" % (reply.status_code, reply.get_json()))
+    replay = client.post("/v1/installations/verify", json=proof)
+    expect(replay.status_code == 401 and error_code(replay) == "challenge_used",
+           "a consumed challenge must not verify twice: %s %s" % (replay.status_code, error_code(replay)))
+
+
+@check
+def challenges_are_bound_by_the_server_mac():
+    route = "/v1/installations/challenge"
+    issued = client.post(route, json={"installation_id": inst.installation_id}).get_json()
+    payload = json.loads(c.b64u_decode(issued["payload"]))
+
+    def verify(fields, challenge_id=None):
+        raw = c.b64u(encode(fields))
+        return client.post("/v1/installations/verify", json={
+            "installation_id": inst.installation_id,
+            "challenge_id": challenge_id or fields.get("challenge_id"),
+            "payload": raw, "signature": inst.sign_b64(raw)})
+
+    for label, change in (("nonce", {"nonce": c.b64u(os.urandom(32))}),
+                          ("expiry", {"expires_at": "2099-01-01T00:00:00Z"}),
+                          ("purpose", {"purpose": "refresh:someone-else"})):
+        reply = verify(dict(payload, **change))
+        expect(reply.status_code == 401 and error_code(reply) == "challenge_payload_mismatch",
+               "a payload with a changed %s verified: %s %s" % (label, reply.status_code, error_code(reply)))
+    forged = dict(payload, challenge_id=str(uuid.uuid4()), mac="A" * 43)
+    reply = verify(forged)
+    expect(reply.status_code == 401 and error_code(reply) == "challenge_payload_mismatch",
+           "a challenge the server never issued verified: %s" % error_code(reply))
+    saved = s.CHALLENGE_LIFETIME
     try:
-        reply = client.post("/v1/installations/challenge",
-                            json={"installation_id": inst.installation_id})
-        expect(reply.status_code == 200,
-               "a full challenge allowance must not lock the client out, got %s %s"
-               % (reply.status_code, reply.get_json()))
-        dropped = [p for q, p in db.writes if q.startswith("DELETE FROM installation_challenges WHERE challenge_id")]
-        expect(dropped and dropped[0][0] == db.oldest_challenge,
-               "the oldest unused challenge must be dropped, writes were %s" % db.writes)
+        s.CHALLENGE_LIFETIME = s.timedelta(seconds=-1)
+        stale = client.post(route, json={"installation_id": inst.installation_id}).get_json()
     finally:
-        db.open_challenges = 0
-        db.oldest_challenge = None
+        s.CHALLENGE_LIFETIME = saved
+    reply = verify(json.loads(c.b64u_decode(stale["payload"])))
+    expect(reply.status_code == 401 and error_code(reply) == "challenge_expired",
+           "an expired challenge verified: %s %s" % (reply.status_code, error_code(reply)))
 
 
 @check

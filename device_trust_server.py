@@ -100,6 +100,9 @@ _REINSTALL_PEPPER = hmac.new(
 _ACCOUNT_LOOKUP_PEPPER = hmac.new(
     _ROOT_SECRET, b"account-lookup-v1", hashlib.sha256
 ).digest()
+_CHALLENGE_MAC_KEY = hmac.new(
+    _ROOT_SECRET, b"installation-challenge-mac-v1", hashlib.sha256
+).digest()
 
 ACCESS_TOKEN_LIFETIME = timedelta(minutes=10)
 DEVICE_TOKEN_LIFETIME = timedelta(minutes=10)
@@ -312,7 +315,6 @@ TRUSTED_PROXY_COUNT = int(os.environ.get("TRUSTED_PROXY_COUNT", "0"))
 # Whole-request body limit, enforced before JSON parsing (413). The largest
 # legitimate body, a signed integrity report, is well under 140 KiB.
 MAX_REQUEST_BYTES = int(os.environ.get("MAX_REQUEST_BYTES", str(256 * 1024)))
-MAX_OPEN_CHALLENGES_PER_INSTALLATION = 5
 
 app = Flask(__name__)
 if TRUSTED_PROXY_COUNT > 0:
@@ -3495,24 +3497,25 @@ def _require_trusted_account_request(event_type="protected_request"):
 # ---------------------------------------------------------------------------
 
 
-def _create_challenge(installation_id, purpose):
-    now = _utc_now()
-    expires_at = now + CHALLENGE_LIFETIME
-    challenge_id = str(uuid.uuid4())
-    payload = {
-        "challenge_id": challenge_id,
-        "expires_at": _iso_z(expires_at),
-        "installation_id": installation_id,
-        "nonce": _b64url_encode(secrets.token_bytes(32)),
-        "purpose": purpose,
-        "version": 1,
-    }
-    payload_bytes = json.dumps(
-        payload, sort_keys=True, separators=(",", ":")
-    ).encode("utf-8")
-    payload_hash = hashlib.sha256(payload_bytes).hexdigest()
+# Installation challenges are stateless until they are used (DESIGN.md 66.2,
+# joint review R5). The server MACs the payload it issues with a key derived
+# from the root secret, and stores nothing at issue time; a challenge is written
+# down only when it is consumed -- MAC intact, unexpired, signed by the
+# installation key -- and the primary key on that record is the replay defence.
+# Issuing used to store each challenge under a five-per-installation cap, and
+# the public endpoint needs only an installation ID: a flood first refused the
+# real client a challenge, then, once the oldest was dropped instead, cancelled
+# the one the real client was about to sign. With nothing stored, a flood has
+# nothing to fill or displace. Clients pass the payload through untouched.
 
-    with _cursor(commit=True) as cursor:
+
+def _challenge_mac(fields):
+    canonical = json.dumps(fields, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return _b64url_encode(hmac.new(_CHALLENGE_MAC_KEY, canonical, hashlib.sha256).digest())
+
+
+def _create_challenge(installation_id, purpose):
+    with _cursor() as cursor:
         cursor.execute(
             """
             SELECT i.status, d.status
@@ -3523,78 +3526,36 @@ def _create_challenge(installation_id, purpose):
             (installation_id,),
         )
         row = cursor.fetchone()
-        if row is None:
-            raise ApiProblem(
-                "The installation is not registered.", 404, "installation_not_found"
-            )
-        if row[0] != "active":
-            raise ApiProblem(
-                "The installation is not active.", 403, "installation_inactive"
-            )
-        if row[1] != "active":
-            raise ApiProblem(
-                "The recognized device is not active.", 403, "device_inactive"
-            )
-
-        if _maintenance_due("installation_challenges"):
-            cursor.execute(
-                """
-                DELETE FROM installation_challenges
-                WHERE expires_at < NOW() - INTERVAL '1 day'
-                """
-            )
-        cursor.execute(
-            """
-            SELECT COUNT(*)
-            FROM installation_challenges
-            WHERE installation_id = %s
-              AND used_at IS NULL
-              AND expires_at > NOW()
-            """,
-            (installation_id,),
+    if row is None:
+        raise ApiProblem(
+            "The installation is not registered.", 404, "installation_not_found"
         )
-        if cursor.fetchone()[0] >= MAX_OPEN_CHALLENGES_PER_INSTALLATION:
-            # The public challenge endpoint needs only the installation ID, so
-            # refusing at the cap let anyone who knew it lock the real client
-            # out until the open challenges expired (review F9). Drop the
-            # oldest unused one instead: a flood then only churns, and the
-            # client always gets a fresh challenge. Unused challenges are
-            # ephemeral -- never evidence.
-            cursor.execute(
-                """
-                SELECT challenge_id
-                FROM installation_challenges
-                WHERE installation_id = %s
-                  AND used_at IS NULL
-                  AND expires_at > NOW()
-                ORDER BY expires_at ASC
-                LIMIT 1
-                """,
-                (installation_id,),
-            )
-            oldest = cursor.fetchone()
-            if oldest is not None:
-                cursor.execute(
-                    """
-                    DELETE FROM installation_challenges
-                    WHERE challenge_id = %s AND used_at IS NULL
-                    """,
-                    (str(oldest[0]),),
-                )
-
-        cursor.execute(
-            """
-            INSERT INTO installation_challenges
-                (challenge_id, installation_id, purpose, payload_sha256, expires_at)
-            VALUES (%s, %s, %s, %s, %s)
-            """,
-            (challenge_id, installation_id, purpose, payload_hash, expires_at),
+    if row[0] != "active":
+        raise ApiProblem(
+            "The installation is not active.", 403, "installation_inactive"
+        )
+    if row[1] != "active":
+        raise ApiProblem(
+            "The recognized device is not active.", 403, "device_inactive"
         )
 
-    return {
-        "challenge_id": challenge_id,
-        "payload": _b64url_encode(payload_bytes),
+    expires_at = _utc_now() + CHALLENGE_LIFETIME
+    fields = {
+        "challenge_id": str(uuid.uuid4()),
         "expires_at": _iso_z(expires_at),
+        "installation_id": installation_id,
+        "nonce": _b64url_encode(secrets.token_bytes(32)),
+        "purpose": purpose,
+        "version": 2,
+    }
+    payload = dict(fields, mac=_challenge_mac(fields))
+    payload_bytes = json.dumps(
+        payload, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return {
+        "challenge_id": fields["challenge_id"],
+        "payload": _b64url_encode(payload_bytes),
+        "expires_at": fields["expires_at"],
     }
 
 
@@ -3604,79 +3565,6 @@ def _verify_challenge(
     payload_bytes = _b64url_decode(payload_b64, "payload", 4096)
     signature = _b64url_decode(signature_b64, "signature", 1024)
     payload_hash = hashlib.sha256(payload_bytes).hexdigest()
-
-    with _cursor() as cursor:
-        cursor.execute(
-            """
-            SELECT c.installation_id,
-                   c.purpose,
-                   c.payload_sha256,
-                   c.expires_at,
-                   c.used_at,
-                   i.key_algorithm,
-                   i.public_key_jwk,
-                   i.device_id,
-                   i.key_thumbprint,
-                   i.status,
-                   d.status
-            FROM installation_challenges c
-            JOIN app_installations i
-              ON i.installation_id = c.installation_id
-            JOIN recognized_devices d
-              ON d.device_id = i.device_id
-            WHERE c.challenge_id = %s
-            """,
-            (challenge_id,),
-        )
-        row = cursor.fetchone()
-
-    if row is None:
-        raise ApiProblem("The challenge was not found.", 404, "challenge_not_found")
-
-    (
-        stored_installation_id,
-        purpose,
-        stored_payload_hash,
-        expires_at,
-        used_at,
-        key_algorithm,
-        public_key_jwk,
-        device_id,
-        key_thumbprint,
-        installation_status,
-        device_status,
-    ) = row
-    stored_installation_id = str(stored_installation_id)
-    device_id = str(device_id)
-
-    if stored_installation_id != installation_id:
-        raise ApiProblem(
-            "The challenge belongs to another installation.",
-            401,
-            "challenge_installation_mismatch",
-        )
-    if purpose != expected_purpose:
-        raise ApiProblem(
-            "The challenge purpose does not match this operation.",
-            401,
-            "challenge_purpose_mismatch",
-        )
-    if installation_status != "active":
-        raise ApiProblem(
-            "The installation is not active.", 403, "installation_inactive"
-        )
-    if device_status != "active":
-        raise ApiProblem(
-            "The recognized device is not active.", 403, "device_inactive"
-        )
-    if used_at is not None:
-        raise ApiProblem("The challenge has already been used.", 401, "challenge_used")
-    if expires_at <= _utc_now():
-        raise ApiProblem("The challenge has expired.", 401, "challenge_expired")
-    if not hmac.compare_digest(stored_payload_hash, payload_hash):
-        raise ApiProblem(
-            "The challenge payload was modified.", 401, "challenge_payload_mismatch"
-        )
 
     try:
         decoded_payload = json.loads(payload_bytes.decode("utf-8"))
@@ -3690,41 +3578,116 @@ def _verify_challenge(
         raise ApiProblem(
             "The challenge payload is invalid.", 400, "invalid_challenge_payload"
         )
+    mac = decoded_payload.get("mac")
+    fields = {key: value for key, value in decoded_payload.items() if key != "mac"}
     if (
-        decoded_payload.get("challenge_id") != challenge_id
-        or decoded_payload.get("installation_id") != installation_id
-        or decoded_payload.get("purpose") != expected_purpose
+        not isinstance(mac, str)
+        or fields.get("version") != 2
+        or not hmac.compare_digest(
+            mac.encode("utf-8"), _challenge_mac(fields).encode("utf-8")
+        )
     ):
         raise ApiProblem(
-            "The challenge payload fields do not match the server record.",
+            "The challenge was not issued by this server, or was modified.",
             401,
             "challenge_payload_mismatch",
+        )
+    if fields.get("challenge_id") != challenge_id:
+        raise ApiProblem(
+            "The challenge payload does not match the challenge ID.",
+            401,
+            "challenge_payload_mismatch",
+        )
+    if fields.get("installation_id") != installation_id:
+        raise ApiProblem(
+            "The challenge belongs to another installation.",
+            401,
+            "challenge_installation_mismatch",
+        )
+    if fields.get("purpose") != expected_purpose:
+        raise ApiProblem(
+            "The challenge purpose does not match this operation.",
+            401,
+            "challenge_purpose_mismatch",
+        )
+    try:
+        expires_at = datetime.fromisoformat(str(fields.get("expires_at")).replace("Z", "+00:00"))
+    except ValueError:
+        raise ApiProblem(
+            "The challenge payload is invalid.", 400, "invalid_challenge_payload"
+        )
+    if expires_at <= _utc_now():
+        raise ApiProblem("The challenge has expired.", 401, "challenge_expired")
+
+    with _cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT i.key_algorithm,
+                   i.public_key_jwk,
+                   i.device_id,
+                   i.key_thumbprint,
+                   i.status,
+                   d.status
+            FROM app_installations i
+            JOIN recognized_devices d
+              ON d.device_id = i.device_id
+            WHERE i.installation_id = %s
+            """,
+            (installation_id,),
+        )
+        row = cursor.fetchone()
+    if row is None:
+        raise ApiProblem(
+            "The installation is not registered.", 404, "installation_not_found"
+        )
+    (
+        key_algorithm,
+        public_key_jwk,
+        device_id,
+        key_thumbprint,
+        installation_status,
+        device_status,
+    ) = row
+    device_id = str(device_id)
+    if installation_status != "active":
+        raise ApiProblem(
+            "The installation is not active.", 403, "installation_inactive"
+        )
+    if device_status != "active":
+        raise ApiProblem(
+            "The recognized device is not active.", 403, "device_inactive"
         )
 
     _verify_installation_signature(
         key_algorithm, public_key_jwk, payload_bytes, signature
     )
 
-    # Consume the challenge atomically after cryptographic verification.
+    # Consume the challenge after cryptographic verification. The INSERT is
+    # the single-use check: a second use of the same challenge hits the
+    # primary key, on both engines, however the two requests interleave.
     with _cursor(commit=True) as cursor:
-        cursor.execute(
-            """
-            UPDATE installation_challenges
-            SET used_at = NOW()
-            WHERE challenge_id = %s
-              AND used_at IS NULL
-              AND expires_at > NOW()
-            """,
-            (challenge_id,),
-        )
-        # rowcount, not RETURNING/OUTPUT: the conditional UPDATE is itself the
-        # atomic single-use check on both engines, and rowcount reports it
-        # portably. SET NOCOUNT must stay OFF for this to hold on SQL Server.
-        if cursor.rowcount == 0:
+        if _maintenance_due("installation_challenges"):
+            cursor.execute(
+                """
+                DELETE FROM installation_challenges
+                WHERE expires_at < NOW() - INTERVAL '1 day'
+                """
+            )
+        try:
+            cursor.execute(
+                """
+                INSERT INTO installation_challenges
+                    (challenge_id, installation_id, purpose, payload_sha256,
+                     expires_at, used_at)
+                VALUES (%s, %s, %s, %s, %s, NOW())
+                """,
+                (challenge_id, installation_id, expected_purpose, payload_hash, expires_at),
+            )
+        except Exception as error:
+            if not DIALECT.is_unique_violation(error):
+                raise
             raise ApiProblem(
-                "The challenge was already consumed or expired.",
-                401,
-                "challenge_not_consumable",
+                "The challenge has already been used.", 401, "challenge_used"
             )
         # The first consumed challenge is the installation's first proof that
         # it holds its key; only proven installations count toward a device
@@ -4591,7 +4554,9 @@ def installation_challenge():
     _limit_source("installations_challenge")
     body = _json_body()
     installation_id = _uuid_text(body.get("installation_id"), "installation_id")
-    _enforce_rate_limit("installations_challenge", installation_id)
+    # No per-installation budget: issuing stores nothing now, so a bucket keyed
+    # on a public installation ID would only let a third party lock its owner
+    # out (joint review R5).
     return jsonify(_create_challenge(installation_id, "device_auth"))
 
 
