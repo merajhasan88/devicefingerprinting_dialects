@@ -5322,3 +5322,50 @@ therefore rests on source network, account-creation rate across the service, tim
 business data — today mostly the customer's systems, plus this server's opt-in per-source budgets.
 `INTEGRATION_GUIDE.md` says so.
 
+### 66.2 Repaired: the joint review's server defects (2026-10-06)
+
+| Finding | Commit | Change |
+|---|---|---|
+| R3 empty scans | `fad5c20` | A requested `code_integrity` with `checked=true` but zero bytes compared in a bucket that always holds code — Android core, ext and app; iOS the app bucket only, since iOS system libraries are never readable — is `integrity_probe_incomplete` (+30), like `checked=false`. Partial coverage stays report-only (owner decision). Checked first against every stored report with `checked=true`: Android 4,592 (none with a zero bucket), iOS 133 (core/ext always 0 by design, app never 0) — no stored outcome changes. |
+| R5 challenge eviction | `5adbab7` | Installation challenges are **stateless until used**: the payload carries an HMAC over its fields (key derived from the root secret, `installation-challenge-mac-v1`, payload version 2) and nothing is stored at issue; verification checks MAC, ID, installation, purpose and expiry, then the key's signature, and only then records the challenge — its primary key is the single-use check (401 `challenge_used`). The open-challenge cap, the eviction and the per-installation challenge budget are gone; refresh challenges share the path. All three clients pass the payload through untouched. |
+| R7 refresh revocation (server half) | `b8ec78a` | `/v1/auth/refresh/challenge` only issues the challenge; reuse is judged, and the family revoked, in `/v1/auth/refresh` after the key signs. A key-less holder of an old token can no longer log the user out. |
+| R8 truncated size classes | `56ec6d8` | The W^X allowance needs a class list that accounts for every mapping and byte; the old tolerance for a list cut to twelve let a size the runtime never allocates hide (reviewer's example: 45 when listed, 0 when cut). All 60 stored W^X reports are complete lists. |
+
+The joint review's own observations against this code: the four that asserted R3 and R8 defects now
+come out the other way (30/elevated and 60/review instead of 0/trusted), and its eviction observation
+no longer runs — the cap it counts against is gone; `check_security_regressions.py` covers the flood
+instead. The R1 observations are unchanged: that policy is the owner's open decision (66.3).
+
+### 66.3 Open for the owner (joint review)
+
+- **R1, runtime growth.** The reviewer recommends per-release memory profiles measured over full
+  sessions, expected growth scored 0 but kept as an advisory reason, out-of-profile totals treated as an
+  anomaly needing corroboration, and developer options plus ADB not able to add up to a refusal (a
+  customer wanting them off makes that an eligibility rule). It also rejects a single ceiling across
+  releases — the owner's view of §64 option 1. Until decided: a warm .NET session on a phone with
+  developer options and ADB reads 33 / elevated (refused in enforce mode).
+- **R4, reinstall-hint propagation.** Proving a new key does not prove it belongs to the device named
+  by a copied hint; its adverse report still reaches the device's history. The reviewer's direction —
+  keep all evidence, but separate an observed hint correlation from the decision to propagate a block
+  (approval from an existing trusted association, an enrolment authority, or manual adjudication) —
+  is compatible with "links are permanent". With it: the server has no reviewed/safe override, so a
+  customer's own mark cannot change the server's verdict (the guide now says so).
+- **Login recovery for soft risk** (a limited session or account MFA instead of a refusal at login):
+  a product decision; not implemented.
+
+### 66.4 Results (2026-10-06)
+
+| Check | Result |
+|---|---|
+| `tools/check_security_regressions.py` | **34 / 34** |
+| Conformance suite, PostgreSQL 16.15, schema 8, step-up gated for the run, **60 checks** | **55 passed, 0 failed, 5 skipped** (three enforce-mode checks, two opt-in signals) |
+| The three enforce-mode checks, `INTEGRITY_MODE=enforce` briefly on | **3 / 3** |
+| iOS scoring rules, SQL Server translation (55 statements), module order, 3.9 syntax | OK |
+| Handsets | not run this round — the OPPO was not attached; no client code changed |
+
+### 66.5 State at end of session (2026-10-06)
+
+EC2 stopped. Server `/opt/device_trust_server.py` = this round (md5 `589e931d…`, backup
+`.bak-20261006-105814`); schema 8; observe/observe; v2-only access proofs; `stepup_required_paths` `''`.
+Both phones' step-up keys in the harness app still need re-enrolling (§65).
+
