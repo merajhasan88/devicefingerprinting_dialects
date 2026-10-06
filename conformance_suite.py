@@ -611,6 +611,26 @@ def check_refresh_rotate(api, ctx):
     ctx["access_token"] = rotated["access_token"]
 
 
+@check("refresh: a rotated token without the key cannot revoke the family")
+def check_refresh_reuse_needs_key(api, ctx):
+    """Joint review R7. Presenting an old, rotated refresh token to the
+    challenge endpoint used to revoke the whole family on the bearer token
+    alone, so anyone holding it -- but not the installation key -- could log
+    the user out. Revocation now needs the key's signature (next check)."""
+    status, payload = api.call("POST", "/v1/auth/refresh/challenge", bearer=ctx["old_refresh_token"])
+    expect(status == 200, "the challenge step must not judge the token, got %s %s" % (status, payload))
+    status, challenge = api.call("POST", "/v1/auth/refresh/challenge", bearer=ctx["refresh_token"])
+    expect(status == 200, "refresh challenge failed: %s %s" % (status, challenge))
+    body = {"challenge_id": challenge["challenge_id"], "payload": challenge["payload"],
+            "signature": ctx["installation"].sign_b64(challenge["payload"])}
+    status, rotated = api.call("POST", "/v1/auth/refresh", body_text=json.dumps(body),
+                               bearer=ctx["refresh_token"])
+    expect(status == 200, "the family must survive a key-less reuse attempt, got %s %s"
+           % (status, rotated))
+    ctx["refresh_token"] = rotated["refresh_token"]
+    ctx["access_token"] = rotated["access_token"]
+
+
 @check("refresh: reusing a rotated token revokes the family", db_sensitive=True)
 def check_refresh_reuse(api, ctx):
     """The row-locking check. Postgres SELECT .. FOR UPDATE; SQL Server needs
@@ -633,6 +653,15 @@ def check_refresh_reuse(api, ctx):
         error_code(payload) in ("refresh_token_reuse", "refresh_session_revoked"),
         "expected a reuse/revocation code, got %s" % error_code(payload),
     )
+    # A reuse proven with the key revokes the whole family: the newest token
+    # stops working too.
+    status, challenge = api.call("POST", "/v1/auth/refresh/challenge", bearer=ctx["refresh_token"])
+    if status == 200:
+        body = {"challenge_id": challenge["challenge_id"], "payload": challenge["payload"],
+                "signature": ctx["installation"].sign_b64(challenge["payload"])}
+        status, payload = api.call("POST", "/v1/auth/refresh", body_text=json.dumps(body),
+                                   bearer=ctx["refresh_token"])
+    expect(status == 401, "after a proven reuse the family's newest token must fail, got %s" % status)
 
 
 

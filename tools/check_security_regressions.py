@@ -75,6 +75,7 @@ class Rows(object):
         self.fail_settings = False
         self.settings = dict(SETTINGS)
         self.consumed = set()
+        self.refresh_row = None
 
     def execute(self, sql, params=None):
         q = " ".join(sql.split())
@@ -97,6 +98,8 @@ class Rows(object):
                            s._parse_public_key(inst.jwk)["thumbprint"])
         elif q.startswith("SELECT installation_id, device_id, registration_method"):
             self.result = self.reenrol_row
+        elif q.startswith("SELECT family_id, account_id, device_id, installation_id, expires_at, revoked_at FROM refresh_sessions"):
+            self.result = self.refresh_row
         elif q.startswith("SELECT i.status, d.status FROM app_installations i"):
             self.result = ("active", "active")
         elif q.startswith("INSERT INTO installation_challenges"):
@@ -949,6 +952,29 @@ def challenges_are_bound_by_the_server_mac():
     reply = verify(json.loads(c.b64u_decode(stale["payload"])))
     expect(reply.status_code == 401 and error_code(reply) == "challenge_expired",
            "an expired challenge verified: %s %s" % (reply.status_code, error_code(reply)))
+
+
+@check
+def a_keyless_reuse_cannot_revoke_the_family():
+    """Joint review R7: the challenge step revoked a refresh family on an old
+    rotated token alone. It now issues a challenge and changes nothing."""
+    family, session = str(uuid.uuid4()), str(uuid.uuid4())
+    with s.app.app_context():
+        old = s.create_refresh_token(identity=account, additional_claims={
+            "role": "account", "iid": inst.installation_id, "did": inst.device_id,
+            "sid": session, "family": family})
+    db.refresh_row = (family, account, inst.device_id, inst.installation_id,
+                      s._utc_now() + s.REFRESH_TOKEN_LIFETIME, s._utc_now())
+    db.writes = []
+    try:
+        reply = client.post("/v1/auth/refresh/challenge", headers={"Authorization": "Bearer " + old})
+        expect(reply.status_code == 200 and "payload" in (reply.get_json() or {}),
+               "the challenge step must only issue a challenge: %s %s"
+               % (reply.status_code, reply.get_json()))
+        revoked = [q for q, _ in db.writes if q.startswith("UPDATE refresh_sessions")]
+        expect(not revoked, "the challenge step revoked a family without key proof: %s" % revoked)
+    finally:
+        db.refresh_row = None
 
 
 @check

@@ -5311,26 +5311,17 @@ def account_protected_echo():
 @app.post("/v1/auth/refresh/challenge")
 @jwt_required(refresh=True)
 def refresh_challenge():
+    """Issue the installation-key challenge for a refresh; change nothing.
+
+    Reuse of a rotated refresh token is detected -- and its whole family
+    revoked -- only in /v1/auth/refresh, after the installation key has signed
+    the challenge. Revoking here, on the bearer token alone, let anyone holding
+    an old rotated token but not the key log the user out (joint review R7,
+    DESIGN.md 66.2).
+    """
     claims = _require_role("account")
-    reused = False
-    with _cursor(commit=True) as cursor:
+    with _cursor() as cursor:
         session = _refresh_session(cursor, claims, lock=False)
-        if session["revoked"]:
-            cursor.execute(
-                """
-                UPDATE refresh_sessions
-                SET revoked_at = COALESCE(revoked_at, NOW())
-                WHERE family_id = %s
-                """,
-                (session["family_id"],),
-            )
-            reused = True
-    if reused:
-        raise ApiProblem(
-            "A rotated refresh token was reused; the token family was revoked.",
-            401,
-            "refresh_token_reuse",
-        )
     purpose = "refresh:%s" % session["session_id"]
     return jsonify(_create_challenge(session["installation_id"], purpose))
 
