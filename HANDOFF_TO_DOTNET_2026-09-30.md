@@ -132,3 +132,52 @@ re-enrolment. Your `AndroidStepUpKeyStore` follows the same `ContainsAlias` → 
 (18/trusted, every code-integrity bucket complete — core 7.1 MB, ext 5.7 MB, app 15.2 MB in ~440 ms —
 step-up v2 verified) and the iPhone (0/trusted, step-up v2 verified, per-use passcode). The stack is back
 to `ACCESS_PROOF_MIN_VERSION=1` until you move to v2.
+
+## 8. From the joint review (2026-10-05) — the .NET items
+
+The reviewer read your SDK at `924c42e` (nothing in your repository was changed here). Server-side
+items from the same review are fixed in the reference (DESIGN.md 66); these are yours.
+
+- **R2, code-integrity coverage.** `ManagedCodeIntegrity.cs` still spends a 4 MiB budget per backing
+  file from the lowest address (`MaxBytesPerLibrary`), so later pages are never compared — and libraries
+  mapped out of one APK share one budget. Port the reference scanner's contract (`904b383`/`6e846eb`):
+  compare every target mapping in full, in chunks, under a large ceiling; report
+  `<bucket>_expected_bytes / _skipped_bytes / _unreadable_bytes / _complete`; report failed protection
+  restores (`protect_restore_failures`; your restore at line 328 ignores `mprotect`'s result). Also:
+  `Checked=true` is set even when no target contributed a byte, an unreadable backing file adds nothing
+  to a denominator, and W+X mappings are skipped wholesale. The iOS scanner's 64 MiB per-image cap has
+  the same missing denominator.
+- **The server now refuses empty scans** (R3, `fad5c20`): a requested `code_integrity` with
+  `checked=true` but zero bytes compared in a bucket that always holds code (Android core/ext/app; the
+  iOS app bucket) is `integrity_probe_incomplete` +30. Your stored reports all pass; a scanner fault
+  that zeroes a bucket will now show.
+- **R3, swallowed read failures.** `ReadLines` returns an empty array on `IOException` /
+  `UnauthorizedAccessException`, and its callers then report `status: ok` with clean defaults (no
+  suspicious lines, tracer PID 0, no executable mappings). Let the failure reach the probe as an error.
+- **R6, command deadline.** `RunCommand` calls `StandardOutput.ReadToEnd()` before
+  `WaitForExit(2000)`, so a child that keeps stdout open blocks forever; stderr is never drained and the
+  timeout result is ignored. Use one deadline over start, both reads and exit, kill the child on expiry,
+  and return a failed observation (the reference did this in `e24cae2`).
+- **R7, concurrent refresh.** Only identity loading is serialised; two callers can rotate the same
+  refresh token and the second trips family revocation. Coalesce refreshes into one in-flight operation
+  and persist the replacement before dependents continue. Server side, the challenge step no longer
+  revokes anything (`b8ec78a`): reuse is judged only after the key signs, in `/v1/auth/refresh`; your
+  harness already accepts either point.
+- **R8, size classes.** Send the complete W^X class list (no `Take(12)`), or an aggregate the server
+  can check (allocation-size GCD, class count, a truncation flag). The server now gives the allowance
+  only to a list that accounts for every mapping and byte (`56ec6d8`), so a report with more than twelve
+  classes scores +60 until this is fixed. Your stored reports have three to five classes.
+- **Docs.** `docs/wx-baseline-process.md` says the operator-pinned APK hash cannot be forged by the
+  process under suspicion. The allow-list is server-controlled; the hash that selects an entry is
+  client-supplied — the reviewer changed only that claim and moved a report from 60 to 0.
+- **Mono AOT experiment** the reviewer suggests: Release with `RunAOTCompilation=true`,
+  `AndroidEnableProfiledAot=false`; capture the evaluated properties and build log, then repeat the full
+  session measurement. Not promised to remove runtime-generated code.
+- **Still open on the server side (owner decision):** how W^X growth within a session is scored (R1).
+  Until decided, a warm session on a phone with developer options and ADB reads 33 / elevated.
+
+Server behaviour you may see from these changes: installation challenges are now stateless until used
+(`5adbab7`) — the payload is still opaque to you. Verification answers **401 `challenge_used`** on a
+second use and **401 `challenge_payload_mismatch`** for a challenge the server did not issue or that was
+modified (an unknown challenge ID used to be 404 `challenge_not_found`). There is no longer a
+five-open-challenges cap or a per-installation challenge budget.
