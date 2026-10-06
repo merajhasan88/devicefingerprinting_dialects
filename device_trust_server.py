@@ -1887,6 +1887,12 @@ _PROBE_OPTIONAL_FIELDS = {
     },
 }
 _CODE_BUCKETS = ("core", "ext", "app")
+# Buckets a working scanner always measures something in (DESIGN.md 66.2,
+# joint review R3). Android: libc/libart, the extended system libraries and the
+# app's own native code are mapped in every app process. iOS: only the app's
+# own images -- its system libraries live in the shared cache and are never
+# readable, so a zero there is the platform, not a failure.
+_MUST_MEASURE_BUCKETS = {"android": ("core", "ext", "app"), "ios": ("app",)}
 
 
 def _code_coverage_consistent(code):
@@ -1928,7 +1934,9 @@ def _check_probe_evidence(platform, probes, required_probes):
     Returns [(probe, [missing field, ...])] for every server-requested probe
     that answered "ok" without its measurements. A code_integrity probe
     reporting checked=false measured nothing and is listed too, whatever else
-    it carries -- "the native component did not run" is not a clean result.
+    it carries -- "the native component did not run" is not a clean result --
+    and so is one reporting checked=true that compared zero bytes in a bucket
+    that always holds code on its platform.
     """
     required_fields = _PROBE_REQUIRED_FIELDS.get(platform, {})
     optional_fields = _PROBE_OPTIONAL_FIELDS.get(platform, {})
@@ -1954,6 +1962,15 @@ def _check_probe_evidence(platform, probes, required_probes):
         missing = [f for f in required_fields.get(name, {}) if value.get(f) is None]
         if name == "code_integrity" and value.get("checked") is False and not missing:
             missing = ["checked=false"]
+        # checked=true only says the scanner ran. A bucket that must contain
+        # code but compared zero bytes measured nothing, and "no differences in
+        # nothing" used to score as a clean scan (joint review R3).
+        if name == "code_integrity" and value.get("checked") is True and not missing:
+            missing = [
+                "%s_compared_bytes above 0" % bucket
+                for bucket in _MUST_MEASURE_BUCKETS.get(platform, ())
+                if value.get("%s_compared_bytes" % bucket) == 0
+            ]
         if (name == "code_integrity" and platform == "android" and not missing
                 and not _code_coverage_consistent(value)):
             missing = ["coverage figures that add up"]

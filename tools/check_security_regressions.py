@@ -301,6 +301,37 @@ def native_measurement_unavailable_is_incomplete():
 
 
 @check
+def zero_coverage_is_incomplete_not_clean():
+    """Joint review R3: checked=true with nothing compared scored 0/trusted."""
+    probes = clean("android")
+    probes["code_integrity"].update(core_compared_bytes=0, ext_compared_bytes=0, app_compared_bytes=0)
+    status, payload = send_report("android", probes)
+    expect(status == 200 and "integrity_probe_incomplete:code_integrity" in codes(payload)
+           and payload["integrity"]["score"] >= 30,
+           "android checked=true with zero coverage must be incomplete, got %s" % payload)
+    for bucket in ("core", "ext", "app"):
+        probes = clean("android")
+        probes["code_integrity"]["%s_compared_bytes" % bucket] = 0
+        status, payload = send_report("android", probes)
+        expect("integrity_probe_incomplete:code_integrity" in codes(payload),
+               "android %s bucket with zero coverage passed as clean" % bucket)
+    saved = s.INTEGRITY_SCORE_IOS_CODE_INTEGRITY
+    try:
+        s.INTEGRITY_SCORE_IOS_CODE_INTEGRITY = True
+        probes = clean("ios")
+        status, payload = send_report("ios", probes)
+        expect(status == 200 and payload["integrity"]["score"] == 0,
+               "control: iOS system buckets at 0 are the platform, not a failure: %s" % payload)
+        probes = clean("ios")
+        probes["code_integrity"]["app_compared_bytes"] = 0
+        status, payload = send_report("ios", probes)
+        expect("integrity_probe_incomplete:code_integrity" in codes(payload),
+               "iOS app bucket with zero coverage passed as clean: %s" % payload)
+    finally:
+        s.INTEGRITY_SCORE_IOS_CODE_INTEGRITY = saved
+
+
+@check
 def explicit_probe_error_control():
     probes = clean("android")
     probes["runtime_maps"] = {"status": "error"}
