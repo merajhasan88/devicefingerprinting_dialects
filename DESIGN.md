@@ -5290,3 +5290,35 @@ client, in charge of the allowance.
   SQL Server has not been run on this round's code (suite, enforce checks, `race_first_link.py`); the
   review's remaining items (file split and SDK boundaries; race tests beyond the first link) stand.
 
+## 66. Joint review (2026-10-05) and the attestation proposal (2026-10-06)
+
+**Inputs.** `device_trust_joint_review_2026-10-05.md` with its check bundle — the external reviewer's
+second pass, over this repository at `7e11403` and the .NET SDK at `924c42e` — and
+`device_trust_attestation_proposal_2026-10-06.md`, written after the owner argued that Android
+certificate-chain attestation could be verified on our own server. All 20 of the joint review's
+observations reproduce on `7e11403`.
+
+### 66.1 Attestation: declined (owner decision, 2026-10-06)
+
+The proposal was to verify Android key-attestation certificate chains on this server, offline against
+Google's published roots with administrator-imported revocation data; iOS App Attest was excluded
+because the phone must contact Apple for every key. Worked through with the owner:
+
+- What attestation would add is a key the app and the OS cannot use for their own statements: the
+  secure chip certifies that the installation key lives in it and reports the bootloader-lock and
+  verified-boot state the bootloader handed it before Android started.
+- What it does not change: a compromised app or OS still signs with the genuine key; the app identity
+  in the certificate comes from Android, not the chip, so a compromised OS can name any app; an
+  exploit-based root leaves the bootloader locked; leaked attestation keys forge chains until revoked.
+- The one gap it would close — a fully synthetic client (script or emulator) indistinguishable from a
+  genuine phone — the owner assigns to velocity and fraud signals instead.
+
+**Decision:** no attestation of any kind, local chain verification included. Remote Key Provisioning
+is not banned; nothing relies on it. Phone signals stay untrusted evidence, and the server's own logic
+— with velocity, fraud and risk alerts — decides the score. **The caveat recorded with it:** velocity
+catches farms only when it counts things a client cannot mint for free. Device-level counts key on
+installation keys and reinstall hints, which a farm can regenerate per account; farm detection
+therefore rests on source network, account-creation rate across the service, timing and behaviour, and
+business data — today mostly the customer's systems, plus this server's opt-in per-source budgets.
+`INTEGRATION_GUIDE.md` says so.
+

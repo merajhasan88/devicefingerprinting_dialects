@@ -11,7 +11,10 @@ with non-exportable device-bound keys, makes stolen tokens useless on another de
 root, Frida, hooking frameworks and tampering.
 
 The server, not Google or Apple, owns the risk score. There is deliberately no Play Integrity,
-SafetyNet, App Attest or DeviceCheck. Do not introduce one.
+SafetyNet, App Attest or DeviceCheck, and — owner decision of 2026-10-06, DESIGN.md 66 — no local
+verification of Android key-attestation chains either (Remote Key Provisioning is not banned, but
+nothing relies on it). Phone signals are untrusted evidence; the server's own logic, with velocity
+and fraud signals, decides. Do not introduce attestation.
 
 The headline requirement is **database portability**. Payactiv runs mostly **SQL Server** with some
 **PostgreSQL**, so the same server must behave identically on both across a wide version range.
