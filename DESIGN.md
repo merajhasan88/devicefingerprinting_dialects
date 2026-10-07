@@ -5432,6 +5432,30 @@ a limited session; a limited token is refused off-list and accepted on-list; eac
 a full session once (replay refused); a block is never upgraded; refreshing a limited session stays
 limited.
 
+### 67.1 Owner decisions (2026-10-07) and the settings they imply — still not implemented
+
+**Decided.** (1) All three upgrade routes are available, each switched on or off by the DBA. (2) The
+soft outcomes are as proposed: integrity `elevated` and relationship `step_up` / `review` get a limited
+session; integrity `review` and `block`, a device-memory block and a relationship `block` refuse.
+Everything below is a DBA-tunable default in `risk_policy_settings`, following the owner's rule that a
+stated policy value is a default, never a constant.
+
+| Proposed setting | Proposed default | Meaning |
+|---|---|---|
+| `limited_session_paths` | `''` | paths a limited token may reach besides the upgrade endpoint (same 256-character limit as `stepup_required_paths`) |
+| `limited_session_integrity_verdicts` | `elevated` | integrity verdicts at login/registration/refresh that yield a limited session instead of 403 |
+| `limited_session_policy_actions` | `step_up,review` | relationship outcomes that do the same |
+| `upgrade_stepup_same_device` | `0` | route 1; when 1, only for integrity-elevated soft risk, never for relationship risk |
+| `upgrade_other_device_approval` | `1` | route 2 |
+| `upgrade_mfa_assertion` | `0` | route 3; needs the customer's verification key configured |
+
+Defaults for the three routes follow the recommendation above: the independent routes (2, 3) for full
+access, the same-phone step-up only where a DBA turns it on and only for integrity-elevated risk. The
+route-3 verification keys are deployment configuration (an environment variable or file next to the
+other secrets), not a policy row: they rotate with the customer's identity system. The owner may
+overrule any default before implementation. `INTEGRATION_GUIDE.md` §7 describes the plan and its
+caveats for customers, marked as not yet available.
+
 ## 68. R4 implemented: an integrity block spreads one way only (2026-10-07)
 
 **Owner decisions (2026-10-07).** Keep the accounts-per-device counts as they are and rely on the

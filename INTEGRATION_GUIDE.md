@@ -264,3 +264,38 @@ registration and refresh accept none.
   behind (it never deletes a link), so run it against a test database only.
 - Pilot in observe mode with your release builds and measure the false-refusal rate, the share of
   reports with incomplete evidence, and scan latency before enabling enforcement.
+
+## 7. Planned, not yet available: a limited session instead of a refusal at login
+
+Designed in `DESIGN.md` §67 with the product owner's decisions; **not implemented**. Today, in enforce
+mode, login, account registration and refresh refuse outright when the integrity verdict is
+`elevated` or the relationship decision is `step_up`, `review` or `block`. Authenticated requests can
+clear an elevated verdict with a step-up proof, but at login nobody is signed in yet, so a legitimate
+user caught by a weak signal is locked out.
+
+**What will change.** On a *soft* outcome — by default an integrity `elevated` verdict or a relationship
+`step_up` / `review` decision — a user with a valid key proof and password gets a **limited session**
+instead of a 403. Hard outcomes keep refusing: an integrity `review` or `block`, a device-memory block,
+a relationship `block`, and every invalid signature, replay or revoked device. Which outcomes count as
+soft is a DBA setting.
+
+- **What a limited session can reach** is a DBA-configured list of paths, like the step-up paths;
+  empty by default, meaning nothing but the upgrade endpoint. Anything else answers 403
+  `session_limited` with the available upgrade routes.
+- **Upgrading.** `POST /v1/auth/upgrade` with one accepted proof issues a full session in the same
+  refresh family. It re-runs the integrity and relationship gates: an upgrade never overrides a block.
+  Refreshing a limited session yields a limited session.
+
+**The three upgrade routes, each switched on or off by your DBA:**
+
+| Route | Proposed default | Proves | Caveats |
+|---|---|---|---|
+| 1. Step-up on the same phone (device passcode or biometric) | off | possession of the phone and its screen lock | It is the same phone the soft risk came from, and it proves nothing about who the user is. On Android 9 and 10 the key unlocks for a 30-second window rather than per use. Even when enabled, it only upgrades an integrity-elevated session, never relationship risk (accounts per device, devices per account). |
+| 2. Approval from another of the user's devices | on | that someone holding another installation already signed in to the account, with its own step-up, approved | Works only for users with a second device. The approving device must show what it approves (which device, when), or users will approve prompts they did not cause; budget the prompts. One approval upgrades one limited session once. |
+| 3. A signed MFA assertion from your identity backend | off | whatever your MFA proves (SMS, e-mail, authenticator app) | Its strength is your MFA's: SMS codes inherit SIM-swap risk. You hold the signing key; this server verifies with your public key, configured next to its other secrets, and you rotate it. The assertion is short-lived, single-use, and names the account, installation and limited session. |
+
+**Before you rely on it** (once available): list only low-value paths for limited sessions; decide per
+route whether its proof is enough for your users; make your app handle `session_limited` and the
+upgrade flow — the Flutter and .NET SDKs do not yet; and measure in observe mode how many sign-ins
+would have been limited.
+
