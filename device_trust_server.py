@@ -1151,7 +1151,7 @@ def _get_backend_identity():
 # against a schema it does not understand. /health/* still answers so operators
 # can see why.
 
-REQUIRED_SCHEMA_VERSION = 10
+REQUIRED_SCHEMA_VERSION = 11
 
 _schema_state = None
 _schema_lock = threading.Lock()
@@ -1272,10 +1272,21 @@ _RISK_SETTING_KINDS = {
     "wx_far_above_baseline_percent": "int",
     "developer_options_refuses": "bool",
     "adb_enabled_refuses": "bool",
+    "limited_session_paths": "paths",
+    "limited_session_integrity_verdicts": "list:elevated,review",
+    "limited_session_policy_actions": "list:step_up,review",
+    "upgrade_stepup_same_device": "bool",
+    "upgrade_other_device_approval": "bool",
+    "upgrade_mfa_assertion": "bool",
+    "upgrade_request_ttl_seconds": "int",
+    "upgrade_approvals_per_hour": "int",
 }
 # Lower bounds a value must also meet. Below 100 the "far above the baseline"
 # rule would fire for memory inside the build's own measured envelope.
-_RISK_SETTING_MINIMUMS = {"wx_far_above_baseline_percent": 100}
+_RISK_SETTING_MINIMUMS = {
+    "wx_far_above_baseline_percent": 100,
+    "upgrade_request_ttl_seconds": 30,
+}
 _RISK_SETTING_BOOL_WORDS = ("0", "1", "true", "false", "yes", "no", "on", "off")
 # Rows whose absence would silently weaken a gate instead of restoring the
 # owner's default. An EMPTY stepup_required_paths is a valid choice (step-up
@@ -1300,6 +1311,15 @@ def _validate_risk_settings(values):
                 path.strip().startswith("/")
                 for path in value.replace(";", ",").split(",")
                 if path.strip()
+            )
+        elif isinstance(kind, str) and kind.startswith("list:"):
+            # A comma-separated subset of fixed words; empty is a valid choice.
+            # "block" is never among them: a block always refuses.
+            allowed = kind[len("list:"):].split(",")
+            valid = all(
+                item.strip() in allowed
+                for item in value.replace(";", ",").split(",")
+                if item.strip()
             )
         else:
             valid = value in kind
@@ -1381,6 +1401,12 @@ def _risk_setting_bool(key, default=False):
     if value is None:
         return default
     return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _risk_setting_words(key, default):
+    """A comma-separated setting as a set of trimmed words (empty allowed)."""
+    raw = _risk_setting_str(key, default)
+    return {word.strip() for word in raw.replace(";", ",").split(",") if word.strip()}
 
 
 # ---------------------------------------------------------------------------
@@ -2714,7 +2740,9 @@ def _eligibility_failures(state):
     ]
 
 
-def _enforce_integrity_gate(device_id, installation_id, step_up=None, step_up_accepted=False):
+def _enforce_integrity_gate(
+    device_id, installation_id, step_up=None, step_up_accepted=False, limited_ok=False
+):
     """Refuse the request unless the latest integrity verdict allows it.
 
     An elevated verdict is satisfied by a step-up proof verified for this very
@@ -2723,6 +2751,13 @@ def _enforce_integrity_gate(device_id, installation_id, step_up=None, step_up_ac
     answer integrity_step_up_required even where no step-up proof could ever
     satisfy it; where none is accepted (login, registration, refresh) it now
     says so: integrity_elevated, and the remedy is a clean scan.
+
+    limited_ok (login, registration, refresh and the session upgrade, DESIGN.md
+    70): a verdict the DBA lists in limited_session_integrity_verdicts (owner
+    default: elevated) does not refuse; the returned state carries
+    limited_cause and the caller issues a limited session. Everything else --
+    block, an unlisted review, an eligibility rule, a device-memory block --
+    still refuses here, before any password is compared.
     """
     state = _latest_integrity_state(installation_id)
     ineligible = _eligibility_failures(state)
@@ -2745,7 +2780,14 @@ def _enforce_integrity_gate(device_id, installation_id, step_up=None, step_up_ac
             "integrity_blocked",
             details={"integrity": state},
         )
-    if verdict == "review":
+    soft = (
+        _risk_setting_words("limited_session_integrity_verdicts", "elevated")
+        if limited_ok
+        else set()
+    )
+    if verdict == "review" and "review" in soft:
+        state = dict(state, limited_cause="integrity_review")
+    elif verdict == "review":
         raise ApiProblem(
             "The latest device-integrity verdict requires review.",
             403,
@@ -2770,6 +2812,8 @@ def _enforce_integrity_gate(device_id, installation_id, step_up=None, step_up_ac
             "integrity_step_up_required",
             details={"integrity": state},
         )
+    elif verdict == "elevated" and "elevated" in soft:
+        state = dict(state, limited_cause="integrity_elevated")
     elif verdict == "elevated":
         raise ApiProblem(
             "The latest device-integrity verdict is elevated and this operation "
@@ -3248,7 +3292,7 @@ def _evaluate_risk_policy(
     return decision
 
 
-def _enforce_risk_policy(decision):
+def _enforce_risk_policy(decision, limited_ok=False):
     """Refuse review and block; refuse elevated (step_up) only if a DBA opts in.
 
     By default an elevated decision is recorded and returned but does not
@@ -3257,12 +3301,23 @@ def _enforce_risk_policy(decision):
     other risk it escalates to review or block. Step-up itself is enforced where
     it has meaning -- the DBA-designated sensitive paths (_enforce_step_up).
     risk_policy_settings.elevated_risk_refuses = 1 restores a flat refusal.
+
+    limited_ok (DESIGN.md 70): an outcome that would refuse and that the DBA
+    lists in limited_session_policy_actions (owner default: step_up,review)
+    returns its cause instead -- risk_step_up or risk_review -- and the caller
+    issues a limited session. A block always refuses. Returns None otherwise.
     """
     action = decision.get("effective_action")
     if action == "allow":
-        return
+        return None
     if action == "step_up" and not _risk_setting_bool("elevated_risk_refuses", False):
-        return
+        return None
+    if (
+        limited_ok
+        and action in ("step_up", "review")
+        and action in _risk_setting_words("limited_session_policy_actions", "step_up,review")
+    ):
+        return "risk_%s" % action
 
     if action == "step_up":
         code = "risk_step_up_required"
@@ -4105,7 +4160,46 @@ def _require_access_proof(required_role="account"):
             (device_id,),
         )
 
+    if required_role == "account" and claims.get("scope") == "limited":
+        _require_limited_session_path(claims)
     return claims
+
+
+# A limited session (DESIGN.md 70) always reaches the upgrade endpoints and the
+# integrity scan -- a new clean scan is how an elevated verdict clears -- and
+# otherwise only the paths a DBA lists in limited_session_paths.
+_LIMITED_SESSION_ALWAYS_PATHS = frozenset(
+    (
+        "/v1/auth/upgrade",
+        "/v1/auth/upgrade/request",
+        "/v1/integrity/challenge",
+        "/v1/integrity/report",
+        "/v1/integrity/me",
+    )
+)
+
+
+def _require_limited_session_path(claims):
+    if request.path in _LIMITED_SESSION_ALWAYS_PATHS:
+        return
+    if request.path in _risk_setting_words("limited_session_paths", ""):
+        return
+    causes = claims.get("limited") or []
+    with _cursor() as cursor:
+        routes = _upgrade_routes(
+            cursor, str(get_jwt_identity()), claims.get("iid"), causes
+        )
+    raise ApiProblem(
+        "This session is limited and cannot reach this path; upgrade it first.",
+        403,
+        "session_limited",
+        details={"limited_causes": causes, "upgrade_routes": routes},
+    )
+
+
+def _upgrade_routes(cursor, account_id, installation_id, causes):
+    """The upgrade routes the DBA enabled AND that are open to this user."""
+    return []
 
 
 def _issue_device_token(installation_id, device_id, key_thumbprint):
@@ -4198,17 +4292,34 @@ def _link_device_account(cursor, device_id, account_id, installation_id):
 
 
 def _issue_account_tokens(
-    cursor, account_id, device_id, installation_id, family_id=None, policy=None
+    cursor,
+    account_id,
+    device_id,
+    installation_id,
+    family_id=None,
+    policy=None,
+    limited_causes=(),
 ):
+    """Issue an access and refresh token pair and record the refresh session.
+
+    With limited_causes the session is LIMITED (DESIGN.md 70): the scope rides
+    in both server-signed tokens and in refresh_sessions, so neither the client
+    nor a refresh can widen it; only /v1/auth/upgrade issues a full session.
+    """
     family_id = family_id or str(uuid.uuid4())
     session_id = str(uuid.uuid4())
+    limited = sorted(set(limited_causes))
+    scope = "limited" if limited else "full"
     claims = {
         "role": "account",
         "did": device_id,
         "iid": installation_id,
         "sid": session_id,
         "family": family_id,
+        "scope": scope,
     }
+    if limited:
+        claims["limited"] = limited
     access_token = create_access_token(
         identity=account_id,
         additional_claims=claims,
@@ -4222,8 +4333,9 @@ def _issue_account_tokens(
     cursor.execute(
         """
         INSERT INTO refresh_sessions
-            (session_id, family_id, account_id, device_id, installation_id, expires_at)
-        VALUES (%s, %s, %s, %s, %s, %s)
+            (session_id, family_id, account_id, device_id, installation_id,
+             expires_at, scope, limited_causes)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
         """,
         (
             session_id,
@@ -4232,9 +4344,11 @@ def _issue_account_tokens(
             device_id,
             installation_id,
             _utc_now() + REFRESH_TOKEN_LIFETIME,
+            scope,
+            ",".join(limited) or None,
         ),
     )
-    return {
+    tokens = {
         "access_token": access_token,
         "refresh_token": refresh_token,
         "refresh_session_id": session_id,
@@ -4242,7 +4356,14 @@ def _issue_account_tokens(
         "device_id": device_id,
         "installation_id": installation_id,
         "policy": policy,
+        "scope": scope,
     }
+    if limited:
+        tokens["limited_causes"] = limited
+        tokens["upgrade_routes"] = _upgrade_routes(
+            cursor, account_id, installation_id, limited
+        )
+    return tokens
 
 
 def _refresh_session(cursor, claims, lock=False):
@@ -4263,7 +4384,7 @@ def _refresh_session(cursor, claims, lock=False):
     cursor.execute(
         """
         SELECT family_id, account_id, device_id, installation_id,
-               expires_at, revoked_at
+               expires_at, revoked_at, scope, limited_causes
         FROM refresh_sessions""" + hint + """
         WHERE session_id = %s
         """
@@ -4276,7 +4397,16 @@ def _refresh_session(cursor, claims, lock=False):
             "The refresh session is unknown.", 401, "unknown_refresh_session"
         )
 
-    stored_family, stored_account, stored_device, stored_installation, expires_at, revoked_at = row
+    (
+        stored_family,
+        stored_account,
+        stored_device,
+        stored_installation,
+        expires_at,
+        revoked_at,
+        stored_scope,
+        stored_causes,
+    ) = row
     if (
         str(stored_family) != family_id
         or str(stored_account) != account_id
@@ -4299,6 +4429,8 @@ def _refresh_session(cursor, claims, lock=False):
         "account_id": account_id,
         "device_id": device_id,
         "installation_id": installation_id,
+        "scope": stored_scope or "full",
+        "limited_causes": [c for c in (stored_causes or "").split(",") if c],
     }
 
 
@@ -5109,7 +5241,7 @@ def account_register():
     account_id = str(uuid.uuid4())
     device_id = claims.get("did")
     installation_id = claims.get("iid")
-    _enforce_integrity_gate(device_id, installation_id)
+    integrity = _enforce_integrity_gate(device_id, installation_id, limited_ok=True)
 
     password_hash = _bcrypt_hash_bytes(password)
 
@@ -5121,7 +5253,9 @@ def account_register():
         account_link_pending=True,
         persist=True,
     )
-    _enforce_risk_policy(policy)
+    # On soft risk the account is still created -- and linked, permanently --
+    # but its session starts limited (DESIGN.md 70).
+    limited = _limited_causes(integrity, _enforce_risk_policy(policy, limited_ok=True))
 
     try:
         with _cursor(commit=True) as cursor:
@@ -5139,6 +5273,7 @@ def account_register():
                 device_id,
                 installation_id,
                 policy=policy,
+                limited_causes=limited,
             )
     except Exception as error:
         if not DIALECT.is_unique_violation(error):
@@ -5174,8 +5309,11 @@ def account_login():
     # device - exactly the device class this gate exists to distrust - could
     # confirm which passwords are valid and reuse them on a clean device or
     # another channel. Refusing before the lookup makes both cases identical.
-    # /v1/accounts/register already had this ordering.
-    _enforce_integrity_gate(device_id, installation_id)
+    # /v1/accounts/register already had this ordering. Only a SOFT verdict the
+    # DBA lists is deferred past the password, to a limited session (DESIGN.md
+    # 70); a soft-risk device therefore learns whether a password is right, as
+    # any client does from a successful login.
+    integrity = _enforce_integrity_gate(device_id, installation_id, limited_ok=True)
 
     with _cursor(commit=True) as cursor:
         cursor.execute(
@@ -5202,7 +5340,7 @@ def account_login():
         account_link_pending=True,
         persist=True,
     )
-    _enforce_risk_policy(policy)
+    limited = _limited_causes(integrity, _enforce_risk_policy(policy, limited_ok=True))
 
     with _cursor(commit=True) as cursor:
         _confirm_hint_installation(cursor, device_id, account_id, installation_id)
@@ -5213,6 +5351,7 @@ def account_login():
             device_id,
             installation_id,
             policy=policy,
+            limited_causes=limited,
         )
 
     return jsonify(tokens)
@@ -5478,9 +5617,10 @@ def refresh_account_tokens():
     with _cursor() as cursor:
         policy_session = _refresh_session(cursor, claims, lock=False)
 
-    _enforce_integrity_gate(
+    integrity = _enforce_integrity_gate(
         policy_session["device_id"],
         policy_session["installation_id"],
+        limited_ok=True,
     )
     policy = _evaluate_risk_policy(
         "refresh",
@@ -5490,7 +5630,7 @@ def refresh_account_tokens():
         account_link_pending=False,
         persist=True,
     )
-    _enforce_risk_policy(policy)
+    limited = _limited_causes(integrity, _enforce_risk_policy(policy, limited_ok=True))
 
     reused = False
     tokens = None
@@ -5515,6 +5655,12 @@ def refresh_account_tokens():
                 """,
                 (session["session_id"],),
             )
+            # A refresh never widens a session: a limited one stays limited
+            # (with its causes) unless soft risk is found now, and a full one
+            # becomes limited when it is (DESIGN.md 70). Only the upgrade
+            # endpoint issues a full session from a limited one.
+            if not limited and session["scope"] == "limited":
+                limited = session["limited_causes"] or ["session_limited"]
             tokens = _issue_account_tokens(
                 cursor,
                 session["account_id"],
@@ -5522,6 +5668,7 @@ def refresh_account_tokens():
                 session["installation_id"],
                 family_id=session["family_id"],
                 policy=policy,
+                limited_causes=limited,
             )
             cursor.execute(
                 """
@@ -5539,6 +5686,126 @@ def refresh_account_tokens():
             "refresh_token_reuse",
         )
     return jsonify(tokens)
+
+
+# ---------------------------------------------------------------------------
+# Routes: limited sessions and their upgrade (DESIGN.md 67, 70)
+# ---------------------------------------------------------------------------
+
+
+def _limited_causes(integrity, risk_cause):
+    causes = []
+    if isinstance(integrity, dict) and integrity.get("limited_cause"):
+        causes.append(integrity["limited_cause"])
+    if risk_cause:
+        causes.append(risk_cause)
+    return causes
+
+
+_UPGRADE_ROUTES = ("recheck", "stepup", "approval", "assertion")
+
+
+@app.post("/v1/auth/upgrade")
+@jwt_required()
+def upgrade_session():
+    """Turn a limited session into a full one, in the same refresh family.
+
+    The integrity and relationship gates run again first, so an upgrade never
+    overrides a hard outcome. If no soft cause remains -- a new clean scan has
+    cleared an elevated verdict -- no proof is needed ("recheck"). Otherwise
+    the request must carry one proof from a route the DBA enabled and that is
+    open to this user.
+    """
+    _enforce_rate_limit("auth_upgrade", get_jwt().get("iid") or request.remote_addr)
+    claims = _require_access_proof("account")
+    if claims.get("scope") != "limited":
+        raise ApiProblem("This session is not limited.", 409, "session_not_limited")
+    account_id = str(get_jwt_identity())
+    device_id = claims.get("did")
+    installation_id = claims.get("iid")
+    body = _json_body()
+    route = body.get("route", "recheck")
+    if route not in _UPGRADE_ROUTES:
+        raise ApiProblem(
+            "route must be one of %s." % ", ".join(_UPGRADE_ROUTES),
+            400,
+            "invalid_route",
+        )
+
+    integrity = _enforce_integrity_gate(device_id, installation_id, limited_ok=True)
+    policy = _evaluate_risk_policy(
+        "session_upgrade",
+        device_id,
+        installation_id,
+        account_id=account_id,
+        account_link_pending=False,
+        persist=True,
+    )
+    causes = _limited_causes(integrity, _enforce_risk_policy(policy, limited_ok=True))
+    if causes:
+        _verify_upgrade_proof(route, body, claims, account_id, installation_id, causes)
+
+    with _cursor(commit=True) as cursor:
+        session = _refresh_session(cursor, claims, lock=True)
+        if session["revoked"]:
+            raise ApiProblem(
+                "This session was already rotated; upgrade with the newest token.",
+                401,
+                "session_rotated",
+            )
+        if causes:
+            _consume_upgrade_proof(route, body, cursor, session)
+        cursor.execute(
+            """
+            UPDATE refresh_sessions
+            SET revoked_at = NOW()
+            WHERE session_id = %s AND revoked_at IS NULL
+            """,
+            (session["session_id"],),
+        )
+        tokens = _issue_account_tokens(
+            cursor,
+            account_id,
+            device_id,
+            installation_id,
+            family_id=session["family_id"],
+            policy=policy,
+        )
+        cursor.execute(
+            """
+            UPDATE refresh_sessions
+            SET replaced_by = %s
+            WHERE session_id = %s
+            """,
+            (tokens["refresh_session_id"], session["session_id"]),
+        )
+    tokens["upgraded_by"] = route if causes else "recheck"
+    logger.info(
+        "Session upgraded: installation=%s route=%s causes=%s",
+        installation_id,
+        tokens["upgraded_by"],
+        ",".join(causes) or "-",
+    )
+    return jsonify(tokens)
+
+
+def _verify_upgrade_proof(route, body, claims, account_id, installation_id, causes):
+    """Check the proof a still-limited session offers (before any write)."""
+    with _cursor() as cursor:
+        routes = _upgrade_routes(cursor, account_id, installation_id, causes)
+    if route == "recheck" or route not in routes:
+        raise ApiProblem(
+            "The session is still limited (%s); upgrade through one of the routes "
+            "open to it." % ", ".join(causes),
+            403,
+            "upgrade_proof_required" if route == "recheck" else "upgrade_route_unavailable",
+            details={"limited_causes": causes, "upgrade_routes": routes},
+        )
+
+
+def _consume_upgrade_proof(route, body, cursor, session):
+    """Consume a single-use proof inside the upgrade's transaction."""
+    return None
 
 
 if __name__ == "__main__":

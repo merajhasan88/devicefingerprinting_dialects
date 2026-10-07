@@ -105,8 +105,12 @@ class Rows(object):
                            s._parse_public_key(inst.jwk)["thumbprint"])
         elif q.startswith("SELECT installation_id, device_id, registration_method"):
             self.result = self.reenrol_row
-        elif q.startswith("SELECT family_id, account_id, device_id, installation_id, expires_at, revoked_at FROM refresh_sessions"):
+        elif q.startswith("SELECT family_id, account_id, device_id, installation_id, expires_at, revoked_at, scope, limited_causes FROM refresh_sessions"):
             self.result = self.refresh_row
+        elif q.startswith("INSERT INTO refresh_sessions"):
+            self.writes.append((q, params))
+        elif q.startswith("SELECT account_id, password_hash FROM demo_accounts"):
+            self.result = None
         elif q.startswith("SELECT i.status, d.status FROM app_installations i"):
             self.result = ("active", "active")
         elif q.startswith("INSERT INTO installation_challenges"):
@@ -728,12 +732,16 @@ def elevated_integrity_is_satisfied_by_a_step_up_proof():
         expect(reply.status_code == 403 and error_code(reply) == "stepup_signature_invalid",
                "an invalid offered step-up proof must refuse, not be ignored: %s %s"
                % (reply.status_code, error_code(reply)))
-        login = encode({"handle": "someone", "password": "Passw0rd123"})
-        reply = client.post("/v1/accounts/login", data=login,
-                            headers=access_headers("POST", "/v1/accounts/login", login, device_token))
-        expect(reply.status_code == 403 and error_code(reply) == "integrity_elevated",
-               "where no step-up is accepted the code must say so, got %s %s"
-               % (reply.status_code, error_code(reply)))
+        # Where no step-up is accepted and the DBA has not made elevated a
+        # limited-session outcome (DESIGN.md 70), the code must say so.
+        with policy(limited_session_integrity_verdicts=""):
+            login = encode({"handle": "someone", "password": "Passw0rd123"})
+            reply = client.post("/v1/accounts/login", data=login,
+                                headers=access_headers("POST", "/v1/accounts/login", login,
+                                                       device_token))
+            expect(reply.status_code == 403 and error_code(reply) == "integrity_elevated",
+                   "where no step-up is accepted the code must say so, got %s %s"
+                   % (reply.status_code, error_code(reply)))
 
 
 # ---------------------------------------------------------------------------
@@ -988,7 +996,7 @@ def a_keyless_reuse_cannot_revoke_the_family():
             "role": "account", "iid": inst.installation_id, "did": inst.device_id,
             "sid": session, "family": family})
     db.refresh_row = (family, account, inst.device_id, inst.installation_id,
-                      s._utc_now() + s.REFRESH_TOKEN_LIFETIME, s._utc_now())
+                      s._utc_now() + s.REFRESH_TOKEN_LIFETIME, s._utc_now(), "full", None)
     db.writes = []
     try:
         reply = client.post("/v1/auth/refresh/challenge", headers={"Authorization": "Bearer " + old})
@@ -1468,6 +1476,168 @@ def one_directional_memory_is_never_stricter_than_device_wide():
                 lifted += (old[0] and not new[0]) or (old[1] and not new[1])
     expect(identical > 0 and lifted > 0,
            "the sample exercised neither case: identical=%d lifted=%d" % (identical, lifted))
+
+
+# ---------------------------------------------------------------------------
+# Limited sessions (DESIGN.md 67, 70)
+# ---------------------------------------------------------------------------
+
+
+def _verdict_state(verdict, *codes):
+    score = {"trusted": 0, "elevated": 30, "review": 60, "block": 95}[verdict]
+    return lambda iid: {"score": score, "verdict": verdict, "fresh": True,
+                        "reasons": [{"code": code, "points": 0} for code in codes]}
+
+
+def _refused(call):
+    try:
+        call()
+    except s.ApiProblem as problem:
+        return problem.code
+    return None
+
+
+@check
+def soft_outcomes_defer_only_where_the_dba_lists_them():
+    """Only the DBA-listed soft outcomes defer to a limited session; block, an
+    unlisted review, eligibility and device memory still refuse in the gate,
+    before any password is compared."""
+    did, iid = inst.device_id, inst.installation_id
+    gate = lambda limited_ok=True: s._enforce_integrity_gate(did, iid, limited_ok=limited_ok)
+    saved = (s._latest_integrity_state, s._device_integrity_memory)
+    s._device_integrity_memory = lambda d, i: None
+    try:
+        with policy():
+            s._latest_integrity_state = _verdict_state("elevated")
+            expect(gate().get("limited_cause") == "integrity_elevated",
+                   "an elevated verdict must defer to a limited session by default")
+            expect(_refused(lambda: gate(limited_ok=False)) == "integrity_elevated",
+                   "without limited_ok an elevated verdict must still refuse")
+            for verdict, code in (("review", "integrity_review_required"),
+                                  ("block", "integrity_blocked")):
+                s._latest_integrity_state = _verdict_state(verdict)
+                expect(_refused(gate) == code, "%s must refuse with %s by default" % (verdict, code))
+            s._latest_integrity_state = _verdict_state("elevated")
+            s._device_integrity_memory = lambda d, i: {"verdict": "block", "hard_block": True,
+                                                      "installation_id": str(uuid.uuid4())}
+            expect(_refused(gate) == "integrity_device_blocked_recently",
+                   "a device-memory block must refuse even when the verdict is soft")
+            s._device_integrity_memory = lambda d, i: None
+        with policy(developer_options_refuses=1):
+            s._latest_integrity_state = _verdict_state("elevated", "android_developer_options")
+            expect(_refused(gate) == "integrity_device_ineligible",
+                   "an eligibility rule must refuse even when the verdict is soft")
+        with policy(limited_session_integrity_verdicts="elevated,review"):
+            s._latest_integrity_state = _verdict_state("review")
+            expect(gate().get("limited_cause") == "integrity_review",
+                   "a DBA-listed review must defer")
+        with policy(limited_session_integrity_verdicts=""):
+            s._latest_integrity_state = _verdict_state("elevated")
+            expect(_refused(gate) == "integrity_elevated", "an empty list must restore the refusal")
+        risk = lambda action, limited_ok=True: s._enforce_risk_policy(
+            {"effective_action": action}, limited_ok=limited_ok)
+        with policy():
+            expect(risk("review") == "risk_review", "a relationship review must defer by default")
+            expect(_refused(lambda: risk("block")) == "risk_policy_blocked", "a block must refuse")
+            expect(risk("step_up") is None, "step_up refuses only with elevated_risk_refuses=1")
+            expect(_refused(lambda: risk("review", limited_ok=False)) == "risk_review_required",
+                   "without limited_ok a review must still refuse")
+        with policy(elevated_risk_refuses=1):
+            expect(risk("step_up") == "risk_step_up", "a refusing step_up must defer when listed")
+        with policy(limited_session_policy_actions=""):
+            expect(_refused(lambda: risk("review")) == "risk_review_required",
+                   "an empty list must restore the refusal")
+    finally:
+        s._latest_integrity_state, s._device_integrity_memory = saved
+
+
+@check
+def a_soft_login_is_deferred_past_the_gate_and_a_hard_one_is_not():
+    login = encode({"handle": "someone", "password": "Passw0rd123"})
+
+    def attempt():
+        return client.post("/v1/accounts/login", data=login,
+                           headers=access_headers("POST", "/v1/accounts/login", login, device_token))
+    with elevated_integrity(), policy():
+        reply = attempt()
+        expect(reply.status_code == 401 and error_code(reply) == "invalid_credentials",
+               "a soft verdict must reach the password check, got %s %s"
+               % (reply.status_code, error_code(reply)))
+        s._latest_integrity_state = _verdict_state("block")
+        reply = attempt()
+        expect(reply.status_code == 403 and error_code(reply) == "integrity_blocked",
+               "a block must refuse before the password check, got %s %s"
+               % (reply.status_code, error_code(reply)))
+
+
+@check
+def a_limited_session_is_written_into_both_tokens_and_its_row():
+    from flask_jwt_extended import decode_token
+    db.writes = []
+    with s.app.app_context():
+        tokens = s._issue_account_tokens(db, account, inst.device_id, inst.installation_id,
+                                         limited_causes=["risk_review", "integrity_elevated"])
+        access, refresh = decode_token(tokens["access_token"]), decode_token(tokens["refresh_token"])
+        full = s._issue_account_tokens(db, account, inst.device_id, inst.installation_id)
+        full_access = decode_token(full["access_token"])
+    expect(tokens["scope"] == "limited" and access.get("scope") == "limited"
+           and refresh.get("scope") == "limited"
+           and access.get("limited") == ["integrity_elevated", "risk_review"]
+           and tokens.get("limited_causes") == ["integrity_elevated", "risk_review"]
+           and tokens.get("upgrade_routes") == [],
+           "a limited session must say so in both tokens and the response: %s %s" % (tokens, access))
+    rows = [params for q, params in db.writes if q.startswith("INSERT INTO refresh_sessions")]
+    expect(rows[0][6:] == ("limited", "integrity_elevated,risk_review") and rows[1][6:] == ("full", None),
+           "the refresh session row must carry the scope and causes: %s" % rows)
+    expect(full["scope"] == "full" and full_access.get("scope") == "full"
+           and "limited_causes" not in full and "limited" not in full_access,
+           "a full session must not carry limited claims: %s" % full)
+
+
+@check
+def a_limited_token_reaches_only_its_paths():
+    with s.app.app_context():
+        limited = s.create_access_token(identity=account, additional_claims={
+            "role": "account", "iid": inst.installation_id, "did": inst.device_id,
+            "sid": str(uuid.uuid4()), "family": str(uuid.uuid4()),
+            "scope": "limited", "limited": ["integrity_elevated"]})
+    me = "/v1/account/me"
+    with elevated_integrity(), policy():
+        s._latest_integrity_state = _verdict_state("trusted")
+        reply = client.get(me, headers=access_headers("GET", me, bearer=limited))
+        details = ((reply.get_json() or {}).get("error") or {}).get("details") or {}
+        expect(reply.status_code == 403 and error_code(reply) == "session_limited"
+               and details.get("limited_causes") == ["integrity_elevated"]
+               and details.get("upgrade_routes") == [],
+               "a limited token off its paths must get session_limited, got %s %s"
+               % (reply.status_code, reply.get_json()))
+        reply = client.get(me, headers=access_headers("GET", me))
+        expect(reply.status_code == 200, "a full token must pass, got %s %s"
+               % (reply.status_code, error_code(reply)))
+    with elevated_integrity(), policy(limited_session_paths="/v1/policy/me, /v1/account/me"):
+        s._latest_integrity_state = _verdict_state("trusted")
+        reply = client.get(me, headers=access_headers("GET", me, bearer=limited))
+        expect(reply.status_code == 200, "a DBA-listed path must be reachable, got %s %s"
+               % (reply.status_code, error_code(reply)))
+    with policy():
+        for path in ("/v1/auth/upgrade", "/v1/auth/upgrade/request", "/v1/integrity/challenge",
+                     "/v1/integrity/report", "/v1/integrity/me"):
+            with s.app.test_request_context(path):
+                s._require_limited_session_path({"limited": ["integrity_elevated"]})
+    for key, value, valid in (
+            ("limited_session_integrity_verdicts", "elevated,review", True),
+            ("limited_session_integrity_verdicts", "", True),
+            ("limited_session_integrity_verdicts", "block", False),
+            ("limited_session_policy_actions", "review, block", False),
+            ("limited_session_paths", "v1/no-slash", False),
+            ("upgrade_request_ttl_seconds", "29", False),
+            ("upgrade_request_ttl_seconds", "30", True)):
+        try:
+            s._validate_risk_settings(dict(SETTINGS, **{key: value}))
+            accepted = True
+        except ValueError:
+            accepted = False
+        expect(accepted == valid, "%s=%r: accepted=%s" % (key, value, accepted))
 
 
 def main():

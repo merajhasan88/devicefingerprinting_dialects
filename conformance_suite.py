@@ -1257,6 +1257,11 @@ def check_wx_baseline(api, ctx):
            % absent)
 
 
+def _setting_words(settings, key, default):
+    raw = str(settings.get(key, default))
+    return {word.strip() for word in raw.replace(";", ",").split(",") if word.strip()}
+
+
 def live_settings(api):
     """The server's risk_policy_settings, as /health/ready publishes them."""
     _, health = api.call("GET", "/health/ready")
@@ -1692,6 +1697,124 @@ def check_reinstall_self_confirmation(api, ctx):
     expect(blocked["verdict"] == "block", "setup failed, expected block: %s" % blocked)
     _expect_owner_unaffected(api, ctx, owner, owner_token, handle, access,
                              "self-confirmed reinstall")
+
+
+def _refresh(api, installation, refresh_token):
+    status, challenge = api.call("POST", "/v1/auth/refresh/challenge", bearer=refresh_token)
+    expect(status == 200, "refresh challenge failed: %s %s" % (status, challenge))
+    body = {"challenge_id": challenge["challenge_id"], "payload": challenge["payload"],
+            "signature": installation.sign_b64(challenge["payload"])}
+    return api.call("POST", "/v1/auth/refresh", body_text=json.dumps(body), bearer=refresh_token)
+
+
+def _elevate(probes):
+    probes["mounts"] = {"status": "error", "error": "permission denied"}  # one failed probe, +30
+
+
+def _limited_setup(api, ctx):
+    """An installation with an account, whose latest scan is elevated (+30)."""
+    if ctx["mode"] != "enforce":
+        raise Skip("server is in observe mode; limited sessions exist only in enforce mode")
+    if "elevated" not in _setting_words(live_settings(api), "limited_session_integrity_verdicts",
+                                        "elevated"):
+        raise Skip("elevated is not a limited-session outcome on this server")
+    integrity_context(ctx)
+    inst = Installation()
+    st, pl = enrol(api, inst, fresh_hint())
+    expect(st in (200, 201), "enrol failed: %s %s" % (st, pl))
+    token = device_token(api, inst)
+    submit_report(api, inst, token)
+    handle = "lim-%s" % secrets.token_hex(4)
+    st, pl = open_account(api, inst, token, handle)
+    expect(st in (200, 201) and pl.get("scope") == "full", "setup: account open: %s %s" % (st, pl))
+    decision = submit_report(api, inst, token, _elevate)
+    expect(decision["verdict"] == "elevated", "setup: expected elevated, got %s" % decision)
+    return inst, token, handle
+
+
+def _details(payload):
+    return ((payload.get("error") or {}).get("details") or {}) if isinstance(payload, dict) else {}
+
+
+@check("limited session: a soft verdict at login gives a limited session; a clean scan upgrades it")
+def check_limited_session_login(api, ctx):
+    """DESIGN.md 67, 70. An elevated integrity verdict at login no longer
+    refuses: a valid password and key proof get a limited session, which
+    reaches only the upgrade endpoints and the integrity scan. Once a new clean
+    scan clears the cause, the upgrade needs no proof; the old limited token
+    stays limited and cannot upgrade twice."""
+    inst, token, handle = _limited_setup(api, ctx)
+    st, pl = sign_in(api, inst, token, handle)
+    expect(st == 200 and pl.get("scope") == "limited"
+           and pl.get("limited_causes") == ["integrity_elevated"]
+           and isinstance(pl.get("upgrade_routes"), list),
+           "a soft verdict at login must give a limited session, got %s %s" % (st, pl))
+    limited = pl["access_token"]
+    st, me = protected(api, inst, "GET", "/v1/account/me", limited)
+    expect(st == 403 and error_code(me) == "session_limited"
+           and _details(me).get("limited_causes") == ["integrity_elevated"],
+           "a limited token off its paths must get session_limited, got %s %s" % (st, me))
+    submit_report(api, inst, limited, _elevate)
+    st, up = protected(api, inst, "POST", "/v1/auth/upgrade", limited, {})
+    expect(st == 403 and error_code(up) == "upgrade_proof_required",
+           "still elevated, a proof-less upgrade must be refused, got %s %s" % (st, error_code(up)))
+    clean = submit_report(api, inst, limited)
+    expect(clean["verdict"] == "trusted", "setup: the clean scan must be trusted: %s" % clean)
+    st, up = protected(api, inst, "POST", "/v1/auth/upgrade", limited, {})
+    expect(st == 200 and up.get("scope") == "full" and up.get("upgraded_by") == "recheck",
+           "with the cause cleared the upgrade must need no proof, got %s %s" % (st, up))
+    st, me = protected(api, inst, "GET", "/v1/account/me", up["access_token"])
+    expect(st == 200, "the upgraded session must be full, got %s %s" % (st, error_code(me)))
+    st, me = protected(api, inst, "GET", "/v1/account/me", limited)
+    expect(st == 403 and error_code(me) == "session_limited",
+           "the old limited token must stay limited, got %s %s" % (st, error_code(me)))
+    st, again = protected(api, inst, "POST", "/v1/auth/upgrade", limited, {})
+    expect(st == 401 and error_code(again) == "session_rotated",
+           "the same limited session must not upgrade twice, got %s %s" % (st, error_code(again)))
+
+
+@check("limited session: a refresh never widens a session, and narrows a full one on soft risk")
+def check_limited_session_refresh(api, ctx):
+    inst, token, handle = _limited_setup(api, ctx)
+    st, pl = sign_in(api, inst, token, handle)
+    expect(st == 200 and pl.get("scope") == "limited", "setup: limited login: %s %s" % (st, pl))
+    submit_report(api, inst, token)
+    st, rotated = _refresh(api, inst, pl["refresh_token"])
+    expect(st == 200 and rotated.get("scope") == "limited"
+           and rotated.get("limited_causes") == ["integrity_elevated"],
+           "a refresh must keep a limited session limited, got %s %s" % (st, rotated))
+    st, up = protected(api, inst, "POST", "/v1/auth/upgrade", rotated["access_token"], {})
+    expect(st == 200 and up.get("scope") == "full", "upgrade after the clean scan: %s %s" % (st, up))
+    st, full = _refresh(api, inst, up["refresh_token"])
+    expect(st == 200 and full.get("scope") == "full", "a full session must refresh full: %s %s"
+           % (st, full))
+    submit_report(api, inst, token, _elevate)
+    st, narrowed = _refresh(api, inst, full["refresh_token"])
+    expect(st == 200 and narrowed.get("scope") == "limited",
+           "a full session must become limited when soft risk is found at refresh, got %s %s"
+           % (st, narrowed))
+
+
+@check("limited session: registration on soft risk creates the account, limited")
+def check_limited_session_registration(api, ctx):
+    """DESIGN.md 70: on a soft outcome the account is created and linked to the
+    device -- links are permanent -- and its first session is limited."""
+    if ctx["mode"] != "enforce":
+        raise Skip("server is in observe mode; limited sessions exist only in enforce mode")
+    if "elevated" not in _setting_words(live_settings(api), "limited_session_integrity_verdicts",
+                                        "elevated"):
+        raise Skip("elevated is not a limited-session outcome on this server")
+    integrity_context(ctx)
+    inst = Installation()
+    st, pl = enrol(api, inst, fresh_hint())
+    expect(st in (200, 201), "enrol failed: %s %s" % (st, pl))
+    token = device_token(api, inst)
+    decision = submit_report(api, inst, token, _elevate)
+    expect(decision["verdict"] == "elevated", "setup: expected elevated, got %s" % decision)
+    st, pl = open_account(api, inst, token, "limreg-%s" % secrets.token_hex(4))
+    expect(st in (200, 201) and pl.get("scope") == "limited"
+           and pl.get("limited_causes") == ["integrity_elevated"],
+           "registration on soft risk must give a limited session, got %s %s" % (st, pl))
 
 
 @check("enforcement: a step-up proof satisfies an elevated integrity verdict")
@@ -2252,9 +2375,17 @@ def check_device_account_bands(api, ctx):
            "account %d must be scored for review, got %s %s"
            % (review, pol.get("recommended_action"), sorted(_reason_codes(pol))))
     if enforce:
-        expect(st == 403 and error_code(pl) in ("risk_review_required", "risk_policy_blocked"),
-               "enforce: account %d must be held for review, got %s %s"
-               % (review, st, error_code(pl)))
+        soft = "review" in _setting_words(settings, "limited_session_policy_actions", "step_up,review")
+        if soft and pol.get("recommended_action") == "review":
+            # DESIGN.md 70: the account is created -- and linked -- but limited.
+            expect(st in (200, 201) and pl.get("scope") == "limited"
+                   and "risk_review" in (pl.get("limited_causes") or []),
+                   "enforce: account %d must get a limited session (risk_review), got %s %s %s"
+                   % (review, st, pl.get("scope"), error_code(pl)))
+        else:
+            expect(st == 403 and error_code(pl) in ("risk_review_required", "risk_policy_blocked"),
+                   "enforce: account %d must be held for review, got %s %s"
+                   % (review, st, error_code(pl)))
         return
     st, pl, pol = results[block]
     expect(st in (200, 201)

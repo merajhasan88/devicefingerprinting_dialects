@@ -40,6 +40,7 @@ Apply migrations **in ascending version order**; each one records its own row in
 | 8 | `008_installation_verified.sql` | `app_installations.verified_at`: when the installation first proved its key; only proven installations count toward a device (backfilled from existing evidence; no row deleted) |
 | 9 | `009_installation_device_confirmed.sql` | `app_installations.device_confirmed_at`: a hint-linked installation confirmed by a returning account; only established installations spread an integrity block to the rest of the device (existing hint-linked rows backfilled as confirmed; no row deleted) |
 | 10 | `010_runtime_growth_and_eligibility.sql` | seeds `wx_far_above_baseline_percent` (200), `developer_options_refuses` (0), `adb_enabled_refuses` (0): W^X growth up to the percentage is advisory, developer options and ADB become optional eligibility rules (joint review R1) |
+| 11 | `011_limited_sessions.sql` | `refresh_sessions.scope` / `limited_causes`, the `session_upgrade_requests` table (audit evidence: grant SELECT, INSERT, UPDATE — never DELETE), and the eight limited-session settings at the owner's defaults |
 
 All scripts are guarded and safe to re-run.
 
