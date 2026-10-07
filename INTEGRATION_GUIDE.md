@@ -78,9 +78,35 @@ The server can pin what it expects the app to be. Pin your **production** values
 - IDFV changes when every app from your vendor ID is removed and one is reinstalled; such a reinstall
   is a new device.
 
-**.NET on Android** maps writable-and-executable memory by design. Pin each build's measured shape in
-`INTEGRITY_ANDROID_WX_BASELINES=<apk_sha256>:<bytes>:<granularity>` (the SDK's `baseline` command
-prints it); without an entry the build scores +60. Every new build needs its own entry.
+**.NET on Android** maps writable-and-executable (W^X) memory by design, and keeps generating code as a
+session warms. Pin each build's envelope in
+`INTEGRITY_ANDROID_WX_BASELINES=<apk_sha256>:<bytes>:<granularity>`; every new build needs its own
+entry, and a build without one scores +60.
+
+- **Pin the largest W^X total the build reaches over full sessions on your own clean test phones,** not
+  the first scan's figure: install, first scan, login, registration, refresh, step-up, background and
+  resume, repeated scans, a long session. When this was written the .NET SDK's `baseline` command
+  measured the first scan after four cold starts (which must agree); until it profiles a session, run
+  the release build through representative sessions on controlled phones against a test server in
+  observe mode, and pin the largest value those scans report. Never derive the pin from production
+  data: a compromised session's memory would become the allowance.
+
+  ```sql
+  -- PostgreSQL; on SQL Server use JSON_VALUE(probe_results, '$.exec_mappings.wx_bytes').
+  SELECT probe_results->'app_identity'->>'apk_sha256' AS apk_sha256,
+         MAX((probe_results->'exec_mappings'->>'wx_bytes')::bigint) AS largest_wx_bytes,
+         COUNT(*) AS scans
+  FROM integrity_reports
+  WHERE platform = 'android' AND probe_results->'exec_mappings' ? 'wx_bytes'
+  GROUP BY 1;
+  ```
+- Growth above the pin up to `wx_far_above_baseline_percent` (section 5; default 200, twice the pin)
+  is expected runtime growth: recorded as `android_wx_above_baseline` at 0 points. Beyond it,
+  `android_wx_far_above_baseline` scores +40 (elevated) on its own. Allocation sizes the runtime never
+  produces still score +45 whatever the total.
+- What the size rule cannot do: code injected in the runtime's own allocation sizes, inside the
+  allowance, looks exactly like normal growth. Hooks in existing code are caught by the code comparison
+  (+90), odd allocation sizes by the shape rule; the rest falls to your server-side controls.
 
 ## 4. Deploying the server
 
@@ -101,7 +127,7 @@ statement timeout `DB_QUERY_TIMEOUT` (15 s).
   cleartext; require the same of every client build you ship.
 
 **Database.** PostgreSQL 13+ or SQL Server 2017+ (`DB_ENGINE`). Your DBA applies
-`migrations/<engine>/001…009` in order; the server only reads `schema_migrations` and refuses to serve
+`migrations/<engine>/001…010` in order; the server only reads `schema_migrations` and refuses to serve
 on any other version (`/health/ready` says why). Use verified TLS: PostgreSQL `DB_SSLMODE=verify-full`
 with `DB_SSLROOTCERT`; SQL Server always connects with `Encrypt=yes` and `TrustServerCertificate=no`.
 
@@ -145,7 +171,26 @@ defaults and changed by your DBA, never by the server. Notable keys:
 | `elevated_risk_refuses` | 0 | 1 makes an elevated decision refuse in enforce mode |
 | `stepup_required_paths` | empty | comma-separated request paths that require a step-up proof |
 | `stepup_factor` / `stepup_mode` / `stepup_window_seconds` | passcode / per_use / 0 | the step-up policy |
+| `wx_far_above_baseline_percent` | 200 | W^X growth above a build's pin is advisory up to this percentage of it and +40 beyond (section 3); minimum 100 |
+| `developer_options_refuses` / `adb_enabled_refuses` | 0 / 0 | eligibility rules: 1 refuses a device whose latest scan reports the setting on (below) |
 | `rate_anomaly_*`, `population_baseline_*` | off | advisory signals |
+
+**Developer options and USB debugging (ADB)** are measured on every Android scan and recorded
+(`android_developer_options`, `android_adb_enabled`), but cost no points: they are common on legitimate
+phones and are not evidence of compromise, so they must not add up with other weak signals into a
+refusal. If your deployment requires them off, set `developer_options_refuses` and/or
+`adb_enabled_refuses` to 1. That is an **eligibility rule**, not a score:
+
+- In enforce mode, a request from an installation whose latest scan reports the setting on is refused
+  with **403 `integrity_device_ineligible`**; `details.eligibility` names each rule broken with a remedy
+  your app should show ("Turn off Developer options, then send a new integrity scan"). A new scan with
+  the setting off clears it at once. In observe mode nothing is refused; the integrity state carries
+  the same `eligibility` list.
+- It applies from the moment the DBA sets it, to every installation's latest stored scan: users with
+  the setting on are refused at their next request, so tell them before you turn it on.
+- A step-up proof does not satisfy it; only the setting does.
+- The phone reports the setting. A modified client can claim it is off, so this is a policy for honest
+  and managed devices, not a compromise check.
 
 The server re-reads the table every `RISK_SETTINGS_CACHE_TTL_SECONDS` (30). A value that does not parse,
 or a missing `stepup_required_paths` / `stepup_factor` / `stepup_mode` row, makes the snapshot invalid:

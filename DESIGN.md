@@ -5343,7 +5343,8 @@ instead. The R1 observations are unchanged: that policy is the owner's open deci
   anomaly needing corroboration, and developer options plus ADB not able to add up to a refusal (a
   customer wanting them off makes that an eligibility rule). It also rejects a single ceiling across
   releases — the owner's view of §64 option 1. Until decided: a warm .NET session on a phone with
-  developer options and ADB reads 33 / elevated (refused in enforce mode).
+  developer options and ADB reads 33 / elevated (refused in enforce mode). **Implemented 2026-10-07 with
+  one owner-approved amendment, §69.**
 - **R4, reinstall-hint propagation.** Proving a new key does not prove it belongs to the device named
   by a copied hint; its adverse report still reaches the device's history. The reviewer's direction —
   keep all evidence, but separate an observed hint correlation from the decision to propagate a block
@@ -5514,4 +5515,79 @@ window. The stolen password is the larger loss there.
 
 **State.** EC2 stopped. Server `/opt/device_trust_server.py` = `1b7d3c5` (md5 `51beaddb…`, backup
 `.bak-20261007-074011`); schema 9; observe/observe; v2-only access proofs; `stepup_required_paths` `''`.
+
+## 69. R1 implemented: runtime growth, developer settings and eligibility (2026-10-07)
+
+**Owner decisions (2026-10-07).** The reviewer's R1 recipe, with my amendment for case D below: "2x
+should be default but make it configurable by DBAs. D giving 40 elevated is fine." The +40 itself
+stays a scorer constant like every other integrity weight; the owner asked for the factor only.
+
+**The amendment.** The recipe treats a total outside the measured envelope as an anomaly needing
+corroboration. An injector that keeps the runtime's 64 KiB allocation sizes and patches no existing
+code produces no second signal, so under the recipe it would score 0 however large it grew. The
+amendment splits the range: up to the DBA's percentage of the envelope is advisory; beyond it, +40 on
+its own.
+
+**Changes** (`c966ffb`, migration 010).
+
+- `_score_wx_memory`: above the pinned baseline and up to `wx_far_above_baseline_percent` (owner
+  default 200, minimum 100, validated), `android_wx_above_baseline` is recorded at **0 points** with
+  the bytes and percentage in its message; beyond it `android_wx_far_above_baseline` scores **+40**.
+  The foreign-allocator rule (+45), the no-pin rule (+60) and the shape-consistency fallback are
+  unchanged.
+- `android_developer_options` and `android_adb_enabled` are recorded at **0 points** (were +8, +10).
+- **Eligibility rules**: `developer_options_refuses`, `adb_enabled_refuses` (default 0). When one is 1,
+  `_enforce_integrity_gate` refuses an installation whose latest stored report carries the matching
+  reason — in enforce mode, after the block and review checks and before elevated — with
+  **403 `integrity_device_ineligible`** and `details.eligibility` (rule, reason, remedy). Observe mode
+  attaches the same list to the integrity state. A step-up proof does not satisfy it; a new scan with
+  the setting off clears it. It reads stored reasons, so a DBA change applies at once.
+- `developer_settings` is requested on every Android scan (it is policy input now). With the default
+  `INTEGRITY_RANDOM_OPTIONAL_PROBES=4` it already was, so no client sees a change.
+- New dependency: a report whose W^X total exceeds its build's pin now reads the policy snapshot. If
+  the settings table is unreadable past `RISK_SETTINGS_MAX_STALE_SECONDS`, that report is refused with
+  503 `risk_policy_unavailable` (fail closed, like every other policy-dependent request). The report
+  route read no settings before.
+
+**Measured — the five cases put to the owner,** through the real report route against the gate's
+fixture database, a .NET-like pin of 3,735,552 bytes at 64 KiB, default 200 %:
+
+| Case | Before (developer options + ADB off / on) | Now (off / on) |
+|---|---|---|
+| A genuine warm .NET session, 4,194,304 B (112 %) | 15 / 33 elevated | **0 / 0** |
+| B gadget shape, 4 KiB and 28 KiB pieces | 60 / 78 review | **45 / 45** elevated |
+| C runtime-shaped copycat, 3,932,160 B (105 %) | 15 / 33 | **0 / 0** |
+| D runtime-shaped copycat, 9,437,184 B (253 %) | 40 / 58 elevated | **40 / 40** elevated |
+| E inline hook in libc | 90 / 100 block | **90 / 90** block |
+
+**On the stored data** (test database, read-only re-weighting of every stored Android report's reasons
+with the new points): of 4,699 reports, 11 move from elevated to trusted — all
+`com.example.devicefingerprinting_dotnet` at 33 (`wx_above_baseline` +15, developer options +8, ADB
++10), exactly R1's false positive. None moves to a stricter band. The OPPO's clean scan (18 = developer
+options + ADB) should now read 0; **not yet measured on the handset.**
+
+**What it does not solve.** Case C — code injected in the runtime's own sizes inside the allowance —
+is indistinguishable from normal growth; only the code comparison, the shape rule and server-side
+controls catch it. 200 % is a judgment: a genuine build whose sessions really exceed it reads elevated,
+which is why the pin must be the full-session maximum on clean test phones, never derived from
+production data. The .NET SDK's `baseline` command measures the first scan after four cold starts;
+profiling full sessions is its change to make (handoff §9). Login, account registration and refresh
+still refuse an elevated verdict in enforce mode (D among them) until the limited session of §67 is
+built.
+
+**Results (2026-10-07).**
+
+| Check | Result |
+|---|---|
+| `tools/check_security_regressions.py` | **42 / 42** — three new: the five cases with developer settings off and on; the allowance following the setting (300 %, 100 %, exactly 200 % advisory, one granule more +40) and its validation (99, non-numeric, empty refused); the eligibility gate (off, each rule, observe reporting, settings off on the phone) |
+| Mutation runs | five deliberately broken servers — developer points restored, +15 restored, the factor hard-coded, eligibility never refusing, no minimum — each failed the gate |
+| Migration 010, PostgreSQL 16.15 | applied; the three rows seeded at the owner's defaults |
+| Conformance suite, observe, **65 checks** | **59 passed, 0 failed, 6 skipped** (three enforce-mode checks, two opt-in signals, the eligibility check with no rule set); the tightened W^X check reads the live percentage and asserts points |
+| Both eligibility rules set to 1 | observe: eligibility and developer-settings checks pass; enforce: those two plus the three enforce-mode checks, the three R4 checks and the W^X check, **10 / 10**; settings back to 0 |
+| Server journal during the runs | no errors |
+| Not run | handsets (no client code changed); SQL Server (migration 010 is a plain seed; translation-checked) |
+
+**State.** EC2 stopped. Server `/opt/device_trust_server.py` = `c966ffb` (md5 `3903bb23…`, backup
+`.bak-20261007-080855`); schema 10; observe/observe; v2-only access proofs; `stepup_required_paths`
+`''`; eligibility rules 0; `wx_far_above_baseline_percent` 200.
 

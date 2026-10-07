@@ -196,3 +196,23 @@ DESIGN.md §68, `1b7d3c5`, **schema 9** (migration 009, `app_installations.devic
   reinstall does not reach the device's owner; a reinstall confirmed by a returning account carries its
   block to the device; accounts opened on a reinstall cannot confirm another reinstall.
 
+## 10. Added 2026-10-07 — R1 (server; one SDK change requested)
+
+DESIGN.md §69, `c966ffb`, **schema 10** (migration 010 seeds three settings).
+
+- **Requested: profile a full session in the `baseline` command.** The pin is now treated as the
+  build's full-session envelope (the reviewer's R1): growth above it is advisory only up to
+  `wx_far_above_baseline_percent` (default 200 %), and +40 beyond. Your command measures the first scan
+  after four cold starts; it should drive representative sessions (login, registration, refresh,
+  step-up, background and resume, repeated scans, a long session) and print the largest total, still
+  refusing to emit anything when runs show a foreign allocation size. `docs/wx-baseline-process.md`'s
+  scoring table (+15 above the baseline) is out of date.
+- `android_wx_above_baseline` is now 0 points (advisory); `android_developer_options` and
+  `android_adb_enabled` are 0 points. Your warm session on a developer phone reads 0 / trusted (was 33).
+- New refusal, only when a DBA sets `developer_options_refuses` or `adb_enabled_refuses` to 1:
+  **403 `integrity_device_ineligible`**, `details.eligibility[]` = {rule, reason, remedy}. Show the
+  remedy; the fix is the phone setting plus a new scan, not step-up.
+- `developer_settings` is requested on every Android scan (it already was with the default draw count).
+- The reference suite has 65 checks: the W^X check now asserts points and reads the live percentage;
+  new: developer settings advisory, and an eligibility check that runs when a rule is set.
+

@@ -24,7 +24,7 @@ device-level counts key on keys and hints a farm can regenerate.
 
 | ID | Disposition | Commit |
 |---|---|---|
-| R1 runtime growth | **Open, owner decision.** Your recommendation (per-release session profiles, expected growth advisory, developer options + ADB not adding up to a refusal) is recorded in §66.3. Unchanged: a warm .NET session on a developer phone reads 33 / elevated. | — |
+| R1 runtime growth | **Fixed 2026-10-07, your recipe with one owner-approved amendment** (§69): growth above the pinned full-session envelope is advisory (0 points) up to a DBA percentage, default 200 %; beyond it +40 stands alone, because an injector that copies the runtime's allocation sizes produces no corroborating signal and would otherwise grow without limit. Developer options and ADB are advisory; a deployment that wants them off sets an eligibility rule (403 `integrity_device_ineligible` with a remedy). The warm .NET session on a developer phone now reads 0 / trusted; the 11 stored reports with that false positive would all be trusted. Login on soft risk: the limited session (§67), not yet built. | `c966ffb` |
 | R2 .NET scanner coverage | .NET SDK; passed on. | handoff §8 |
 | R3 empty scans | **Fixed.** `checked=true` with zero bytes compared in a bucket that always holds code (Android core/ext/app; iOS app only) is incomplete (+30). Your two zero-coverage observations now score 30 / elevated. Stored reports: none affected. | `fad5c20` |
 | R4 hint propagation | **Fixed 2026-10-07, your direction** (§68): a block spreads only from the device's established installations — the original, or a hint-linked one confirmed when an account first linked through an established installation signs in on it. Evidence and links are all kept; account counts unchanged by the owner's decision, with a support-team procedure in the guide. Never stricter than before for any installation; on every stored installation the pick is unchanged. | `ba63ecd` (guide), `1b7d3c5` |
@@ -45,4 +45,9 @@ only, not proven.
 failed it). Migration 009 on PostgreSQL 16.15: 0 of 4,228 stored installations changed their memory
 pick. Suite (63 checks): 58 passed, 0 failed, 5 skipped in observe; the enforce-mode and R4 checks 6/6
 in enforce. SQL Server: the new statements are translation-checked only.
+
+**Added 2026-10-07 (R1).** Gate 42/42 (the five cases A–E with developer settings off and on, the
+allowance and its validation, the eligibility gate; five deliberately broken servers each failed it).
+Suite (65 checks) on PostgreSQL 16.15: 59 passed, 0 failed, 6 skipped in observe; with both eligibility
+rules set, 10/10 targeted checks in enforce.
 
