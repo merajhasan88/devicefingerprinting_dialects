@@ -1282,6 +1282,10 @@ def check_developer_settings_advisory(api, ctx):
         reason = reason_for(decision, code)
         expect(reason is not None and reason["points"] == 0,
                "%s must be recorded at 0 points, got %s" % (code, reason))
+    # Leave the shared installation's latest scan clean: with an eligibility
+    # rule set and enforcement on, a later check would otherwise be refused
+    # integrity_device_ineligible for a reason that is not its own.
+    submit_report(api, installation, token)
     expect(decision["score"] == 0 and decision["verdict"] == "trusted",
            "developer options and ADB alone must leave a clean device trusted, got %s %s"
            % (decision["score"], decision["verdict"]))
