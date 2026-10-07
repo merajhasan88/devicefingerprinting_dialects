@@ -1238,8 +1238,15 @@ def schema_guard():
 # requests with 503 risk_policy_unavailable.
 
 # Route-3 verification keys (DESIGN.md 70): the customer's identity backend
-# signs upgrade assertions; its public keys are deployment configuration.
-UPGRADE_ASSERTION_KEYS = {}
+# signs upgrade assertions (ES256 JWS); its public keys are deployment
+# configuration -- a JWKS file next to the other secrets, read once per process,
+# so a key rotation is a restart. UPGRADE_ASSERTION_ISSUER, when set, must
+# equal each assertion's "iss".
+UPGRADE_ASSERTION_JWKS_FILE = os.environ.get("UPGRADE_ASSERTION_JWKS_FILE", "").strip()
+UPGRADE_ASSERTION_ISSUER = os.environ.get("UPGRADE_ASSERTION_ISSUER", "").strip()
+UPGRADE_ASSERTION_AUDIENCE = "device-trust-upgrade"
+UPGRADE_ASSERTION_MAX_LIFETIME_SECONDS = 600
+_upgrade_assertion_cache = {}
 
 RISK_SETTINGS_CACHE_TTL_SECONDS = int(
     os.environ.get("RISK_SETTINGS_CACHE_TTL_SECONDS", "30")
@@ -4220,7 +4227,7 @@ def _enabled_upgrade_routes(causes):
         routes.append("stepup")
     if _risk_setting_bool("upgrade_other_device_approval", True):
         routes.append("approval")
-    if _risk_setting_bool("upgrade_mfa_assertion", False) and UPGRADE_ASSERTION_KEYS:
+    if _risk_setting_bool("upgrade_mfa_assertion", False) and _upgrade_assertion_keys()[0]:
         routes.append("assertion")
     return routes
 
@@ -4539,6 +4546,9 @@ def health_ready():
     redis_state = _redis_status()
     if NONCE_BACKEND == "redis" and not redis_state.get("reachable"):
         problems.append("nonce_store_unavailable")
+    assertion_keys, assertion_error = _upgrade_assertion_keys()
+    if UPGRADE_ASSERTION_JWKS_FILE and assertion_error:
+        problems.append("upgrade_assertion_keys_invalid")
     return jsonify(
         {
             "status": "not_ready" if problems else "ready",
@@ -4561,6 +4571,10 @@ def health_ready():
                 "hardware_backing_policy": INTEGRITY_HARDWARE_BACKING_POLICY,
                 "android_wx_baselines": len(ANDROID_WX_BASELINES),
                 "risk_policy_settings": policy_values or {},
+                "limited_sessions": {
+                    "assertion_key_ids": sorted(assertion_keys),
+                    "assertion_issuer_pinned": bool(UPGRADE_ASSERTION_ISSUER),
+                },
             },
             "remote_attestation": "not_used",
             "redis": redis_state,
@@ -5875,6 +5889,13 @@ def _verify_upgrade_proof(route, body, claims, account_id, installation_id, caus
         # Bound to this very upgrade request, like any step-up proof v2; the
         # access proof's nonce, claimed once, makes it single-use.
         _verify_step_up(installation_id, account_id)
+    elif route == "assertion":
+        g.upgrade_assertion = _verify_upgrade_assertion(
+            body.get("assertion"),
+            account_id,
+            installation_id,
+            _uuid_text(body.get("request_id"), "request_id"),
+        )
 
 
 def _consume_upgrade_proof(route, body, cursor, session):
@@ -5887,6 +5908,136 @@ def _consume_upgrade_proof(route, body, cursor, session):
                 "approval_not_granted",
                 details={"state": "used"},
             )
+    elif route == "assertion":
+        if _consume_assertion(cursor, body.get("request_id"), session, g.upgrade_assertion) != 1:
+            raise ApiProblem(
+                "The upgrade assertion does not match an open request of this session.",
+                403,
+                "upgrade_assertion_invalid",
+                details={"field": "request"},
+            )
+
+
+def _upgrade_assertion_keys():
+    """kid -> P-256 key from UPGRADE_ASSERTION_JWKS_FILE; (keys, error)."""
+    if "keys" not in _upgrade_assertion_cache:
+        keys, error = {}, None
+        if UPGRADE_ASSERTION_JWKS_FILE:
+            try:
+                with open(UPGRADE_ASSERTION_JWKS_FILE, "r", encoding="utf-8") as handle:
+                    document = json.load(handle)
+                for jwk in document.get("keys") or []:
+                    parsed = _parse_public_key(dict(jwk, alg=jwk.get("alg", "ES256")))
+                    keys[str(jwk.get("kid") or parsed["thumbprint"])] = parsed["key"]
+                if not keys:
+                    error = "no_keys"
+            except (OSError, ValueError, TypeError, AttributeError, ApiProblem) as exc:
+                keys, error = {}, type(exc).__name__
+            if error:
+                logger.error("UPGRADE_ASSERTION_JWKS_FILE could not be used: %s", error)
+        _upgrade_assertion_cache.update(keys=keys, error=error)
+    return _upgrade_assertion_cache["keys"], _upgrade_assertion_cache["error"]
+
+
+def _verify_upgrade_assertion(token, account_id, installation_id, request_id):
+    """Verify a route-3 assertion: an ES256 compact JWS by the customer's backend.
+
+    Only ES256 with a raw r||s signature, by a configured key (by kid when the
+    header names one); no "crit" extensions. The payload must name this
+    deployment's audience, the account, the installation and the upgrade
+    request, carry the request's nonce, and live at most ten minutes. The
+    nonce is checked against the request -- and consumed -- in the upgrade's
+    transaction.
+    """
+    def invalid(field):
+        return ApiProblem(
+            "The upgrade assertion is not valid (%s)." % field,
+            403,
+            "upgrade_assertion_invalid",
+            details={"field": field},
+        )
+
+    if not isinstance(token, str) or token.count(".") != 2 or len(token) > 8192:
+        raise invalid("format")
+    head_b64, body_b64, signature_b64 = token.split(".")
+    try:
+        header = json.loads(_b64url_decode(head_b64, "assertion_header", 2048).decode("utf-8"))
+        payload = json.loads(_b64url_decode(body_b64, "assertion_payload", 4096).decode("utf-8"))
+        signature = _b64url_decode(signature_b64, "assertion_signature", 128)
+    except (ApiProblem, ValueError, UnicodeDecodeError):
+        raise invalid("format")
+    if not isinstance(header, dict) or not isinstance(payload, dict):
+        raise invalid("format")
+    if header.get("alg") != "ES256" or "crit" in header:
+        raise invalid("alg")
+    keys, _ = _upgrade_assertion_keys()
+    kid = header.get("kid")
+    if kid is None:
+        candidates = list(keys.values())
+    else:
+        candidates = [keys[kid]] if isinstance(kid, str) and kid in keys else []
+    signed = (head_b64 + "." + body_b64).encode("ascii")
+    verified = False
+    if len(signature) == 64:
+        for key in candidates:
+            try:
+                DSS.new(key, "fips-186-3", encoding="binary").verify(
+                    SHA256.new(signed), signature
+                )
+            except ValueError:
+                continue
+            verified = True
+            break
+    if not verified:
+        raise invalid("signature")
+    audience = payload.get("aud")
+    if audience != UPGRADE_ASSERTION_AUDIENCE and not (
+        isinstance(audience, list) and UPGRADE_ASSERTION_AUDIENCE in audience
+    ):
+        raise invalid("aud")
+    if UPGRADE_ASSERTION_ISSUER and payload.get("iss") != UPGRADE_ASSERTION_ISSUER:
+        raise invalid("iss")
+    for field, expected in (("sub", account_id), ("iid", installation_id), ("rid", request_id)):
+        if payload.get(field) != expected:
+            raise invalid(field)
+    issued, expires = payload.get("iat"), payload.get("exp")
+    now = int(_utc_now().timestamp())
+    if (
+        not all(isinstance(v, int) and not isinstance(v, bool) for v in (issued, expires))
+        or expires <= now
+        or issued > now + ACCESS_PROOF_MAX_SKEW_SECONDS
+        or expires - issued > UPGRADE_ASSERTION_MAX_LIFETIME_SECONDS
+    ):
+        raise invalid("exp")
+    if not isinstance(payload.get("nonce"), str) or not payload["nonce"]:
+        raise invalid("nonce")
+    return payload
+
+
+def _consume_assertion(cursor, request_id, session, payload):
+    """Use an open assertion request of this session, exactly once."""
+    method = payload.get("amr")
+    if isinstance(method, list):
+        method = ",".join(str(m) for m in method)
+    cursor.execute(
+        """
+        UPDATE session_upgrade_requests
+        SET consumed_at = NOW(), assertion_method = %s
+        WHERE request_id = %s AND route = 'assertion' AND account_id = %s
+          AND installation_id = %s AND family_id = %s AND nonce_sha256 = %s
+          AND consumed_at IS NULL AND expires_at > %s
+        """,
+        (
+            (str(method)[:64] or None) if method else None,
+            _uuid_text(request_id, "request_id"),
+            session["account_id"],
+            session["installation_id"],
+            session["family_id"],
+            hashlib.sha256(payload["nonce"].encode("utf-8")).hexdigest(),
+            _utc_now(),
+        ),
+    )
+    return cursor.rowcount
 
 
 def _approval_state(cursor, body, claims, account_id, installation_id, required=False):
@@ -6054,6 +6205,19 @@ def upgrade_request():
                     "upgrade_budget_exhausted",
                 )
         nonce_sha256 = None
+        if route == "assertion":
+            # What the customer's identity backend must sign once its MFA has
+            # passed for this account: only the nonce's hash is stored.
+            nonce = _b64url_encode(secrets.token_bytes(32))
+            nonce_sha256 = hashlib.sha256(nonce.encode("ascii")).hexdigest()
+            response["assertion_claims"] = {
+                "aud": UPGRADE_ASSERTION_AUDIENCE,
+                "sub": account_id,
+                "iid": installation_id,
+                "rid": request_id,
+                "nonce": nonce,
+            }
+            response["assertion_max_lifetime_seconds"] = UPGRADE_ASSERTION_MAX_LIFETIME_SECONDS
         cursor.execute(
             """
             INSERT INTO session_upgrade_requests

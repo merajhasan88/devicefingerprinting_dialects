@@ -1947,6 +1947,76 @@ def check_upgrade_route_approval(api, ctx):
            % (budget + 1, budget, st, error_code(pl)))
 
 
+# The suite's deterministic route-3 signing key: a server configured with its
+# public JWK (printed when the check skips) can run the assertion check.
+P256_ORDER = 0xFFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551
+
+
+def conformance_assertion_key():
+    seed = int.from_bytes(hashlib.sha256(b"conformance-upgrade-assertion").digest(), "big")
+    private = ec.derive_private_key(seed % (P256_ORDER - 1) + 1, ec.SECP256R1())
+    nums = private.public_key().public_numbers()
+    return private, {"kty": "EC", "crv": "P-256", "alg": "ES256", "kid": "conformance-upgrade",
+                     "x": b64u(nums.x.to_bytes(32, "big")), "y": b64u(nums.y.to_bytes(32, "big"))}
+
+
+def es256_assertion(private, header, payload):
+    from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
+    head = b64u(json.dumps(header, separators=(",", ":")).encode("utf-8"))
+    body = b64u(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
+    r, s_ = decode_dss_signature(private.sign((head + "." + body).encode("ascii"),
+                                              ec.ECDSA(hashes.SHA256())))
+    return head + "." + body + "." + b64u(r.to_bytes(32, "big") + s_.to_bytes(32, "big"))
+
+
+@check("limited session: route 3, an assertion from the customer's identity backend")
+def check_upgrade_route_assertion(api, ctx):
+    """DESIGN.md 70. The customer's backend, after its own MFA, signs the claims
+    the server handed out for this request; the session upgrades once, and the
+    same assertion cannot serve another login."""
+    private, jwk = conformance_assertion_key()
+    _, health = api.call("GET", "/health/ready")
+    health = health if isinstance(health, dict) else {}
+    flags = (health.get("scoring_flags") or {}).get("limited_sessions") or {}
+    if jwk["kid"] not in (flags.get("assertion_key_ids") or []):
+        raise Skip("the server does not hold the conformance assertion key; to run this check "
+                   "put %s in the file named by UPGRADE_ASSERTION_JWKS_FILE"
+                   % json.dumps({"keys": [jwk]}, separators=(",", ":")))
+    if not _setting_on(live_settings(api), "upgrade_mfa_assertion"):
+        raise Skip("upgrade_mfa_assertion is off (the owner's default); set it to 1 to run this check")
+    if flags.get("assertion_issuer_pinned"):
+        raise Skip("the server pins UPGRADE_ASSERTION_ISSUER; this check signs without one")
+    inst, token, handle = _limited_setup(api, ctx)
+    st, pl = sign_in(api, inst, token, handle)
+    expect(st == 200 and "assertion" in (pl.get("upgrade_routes") or []),
+           "the limited login must offer route 3, got %s %s" % (st, pl))
+    limited = pl["access_token"]
+    st, req = protected(api, inst, "POST", "/v1/auth/upgrade/request", limited, {"route": "assertion"})
+    claims = (req or {}).get("assertion_claims") or {}
+    expect(st == 201 and claims.get("rid") == req.get("request_id") and claims.get("nonce")
+           and claims.get("iid") == inst.installation_id,
+           "the server must hand out the claims to sign, got %s %s" % (st, req))
+    now = int(time.time())
+    header = {"alg": "ES256", "kid": jwk["kid"]}
+    signed = dict(claims, iat=now, exp=now + 120, amr=["otp"])
+    wrong = es256_assertion(private, header, dict(signed, nonce="not-the-nonce"))
+    st, up = protected(api, inst, "POST", "/v1/auth/upgrade", limited,
+                       {"route": "assertion", "request_id": claims["rid"], "assertion": wrong})
+    expect(st == 403 and error_code(up) == "upgrade_assertion_invalid",
+           "an assertion over another nonce must be refused, got %s %s" % (st, error_code(up)))
+    good = es256_assertion(private, header, signed)
+    st, up = protected(api, inst, "POST", "/v1/auth/upgrade", limited,
+                       {"route": "assertion", "request_id": claims["rid"], "assertion": good})
+    expect(st == 200 and up.get("scope") == "full" and up.get("upgraded_by") == "assertion",
+           "a valid assertion must upgrade, got %s %s" % (st, up))
+    st, pl = sign_in(api, inst, token, handle)
+    expect(st == 200 and pl.get("scope") == "limited", "setup: second limited login: %s %s" % (st, pl))
+    st, up = protected(api, inst, "POST", "/v1/auth/upgrade", pl["access_token"],
+                       {"route": "assertion", "request_id": claims["rid"], "assertion": good})
+    expect(st == 403 and error_code(up) == "upgrade_assertion_invalid",
+           "a used assertion must not serve another login, got %s %s" % (st, error_code(up)))
+
+
 @check("enforcement: a step-up proof satisfies an elevated integrity verdict")
 def check_elevated_step_up(api, ctx):
     """Review F11 (DESIGN.md 63). An elevated verdict used to answer

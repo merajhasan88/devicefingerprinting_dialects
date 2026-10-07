@@ -1739,7 +1739,9 @@ CREATE TABLE session_upgrade_requests (
     approved_by_installation TEXT,
     approved_at              TSZ,
     denied_at                TSZ,
-    consumed_at              TSZ
+    consumed_at              TSZ,
+    nonce_sha256             TEXT,
+    assertion_method         TEXT
 );
 """
 
@@ -1854,6 +1856,168 @@ def approving_needs_a_current_full_session_and_a_step_up():
                    and granted[-1][0] == inst.installation_id,
                    "a current full session with step-up must approve, got %s %s"
                    % (reply.status_code, reply.get_json()))
+    finally:
+        db.refresh_row = None
+
+
+
+@contextmanager
+def assertion_keys(**keys):
+    saved = dict(s._upgrade_assertion_cache)
+    s._upgrade_assertion_cache.clear()
+    s._upgrade_assertion_cache.update(
+        keys={kid: s._parse_public_key(jwk)["key"] for kid, jwk in keys.items()}, error=None)
+    try:
+        yield
+    finally:
+        s._upgrade_assertion_cache.clear()
+        s._upgrade_assertion_cache.update(saved)
+
+
+def es256_jws(private_key, header, payload, raw=True):
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
+    head = c.b64u(json.dumps(header, separators=(",", ":")).encode())
+    body = c.b64u(json.dumps(payload, separators=(",", ":")).encode())
+    der = private_key.sign((head + "." + body).encode(), ec.ECDSA(hashes.SHA256()))
+    if raw:
+        r, s_ = decode_dss_signature(der)
+        signature = r.to_bytes(32, "big") + s_.to_bytes(32, "big")
+    else:
+        signature = der
+    return head + "." + body + "." + c.b64u(signature)
+
+
+@check
+def upgrade_assertions_are_verified_exactly():
+    """Route 3: only an ES256 JWS with a raw signature, by a configured key,
+    naming this audience, account, installation and request, with a nonce and
+    at most ten minutes of life."""
+    good_key, good_jwk = c.stepup_jwk_pair()
+    other_key, _ = c.stepup_jwk_pair()
+    rid, now = str(uuid.uuid4()), int(time.time())
+    base = {"aud": s.UPGRADE_ASSERTION_AUDIENCE, "sub": account, "iid": inst.installation_id,
+            "rid": rid, "nonce": "n0nce", "iat": now, "exp": now + 300, "amr": ["otp"]}
+
+    def verdict(token):
+        try:
+            s._verify_upgrade_assertion(token, account, inst.installation_id, rid)
+            return "ok"
+        except s.ApiProblem as problem:
+            return (problem.details or {}).get("field") or problem.code
+
+    with assertion_keys(k1=good_jwk):
+        cases = [
+            ("valid with kid", es256_jws(good_key, {"alg": "ES256", "kid": "k1"}, base), "ok"),
+            ("valid without kid", es256_jws(good_key, {"alg": "ES256"}, base), "ok"),
+            ("audience in a list", es256_jws(good_key, {"alg": "ES256"},
+                                             dict(base, aud=["x", s.UPGRADE_ASSERTION_AUDIENCE])), "ok"),
+            ("unknown kid", es256_jws(good_key, {"alg": "ES256", "kid": "k2"}, base), "signature"),
+            ("another key", es256_jws(other_key, {"alg": "ES256"}, base), "signature"),
+            ("DER signature", es256_jws(good_key, {"alg": "ES256"}, base, raw=False), "signature"),
+            ("alg none", es256_jws(good_key, {"alg": "none"}, base), "alg"),
+            ("alg HS256", es256_jws(good_key, {"alg": "HS256"}, base), "alg"),
+            ("crit header", es256_jws(good_key, {"alg": "ES256", "crit": ["x"]}, base), "alg"),
+            ("wrong audience", es256_jws(good_key, {"alg": "ES256"}, dict(base, aud="other")), "aud"),
+            ("other account", es256_jws(good_key, {"alg": "ES256"}, dict(base, sub="x")), "sub"),
+            ("other installation", es256_jws(good_key, {"alg": "ES256"}, dict(base, iid="x")), "iid"),
+            ("other request", es256_jws(good_key, {"alg": "ES256"}, dict(base, rid="x")), "rid"),
+            ("expired", es256_jws(good_key, {"alg": "ES256"}, dict(base, exp=now - 1)), "exp"),
+            ("too long-lived", es256_jws(good_key, {"alg": "ES256"},
+                                         dict(base, exp=now + s.UPGRADE_ASSERTION_MAX_LIFETIME_SECONDS + 1)), "exp"),
+            ("issued in the future", es256_jws(good_key, {"alg": "ES256"},
+                                               dict(base, iat=now + 600, exp=now + 900)), "exp"),
+            ("no nonce", es256_jws(good_key, {"alg": "ES256"},
+                                   {k: v for k, v in base.items() if k != "nonce"}), "nonce"),
+            ("not a JWS", "abc.def", "format"),
+        ]
+        for name, token, expected in cases:
+            got = verdict(token)
+            expect(got == expected, "%s: expected %s, got %s" % (name, expected, got))
+        saved_issuer = s.UPGRADE_ASSERTION_ISSUER
+        s.UPGRADE_ASSERTION_ISSUER = "https://idp.example"
+        try:
+            expect(verdict(es256_jws(good_key, {"alg": "ES256"}, base)) == "iss",
+                   "a pinned issuer must be required")
+            expect(verdict(es256_jws(good_key, {"alg": "ES256"}, dict(base, iss="https://idp.example"))) == "ok",
+                   "the pinned issuer must be accepted")
+        finally:
+            s.UPGRADE_ASSERTION_ISSUER = saved_issuer
+
+
+@check
+def assertion_requests_are_single_use_and_bound():
+    connection = sqlite3.connect(":memory:", detect_types=sqlite3.PARSE_DECLTYPES)
+    connection.executescript(UPGRADE_LITE_SCHEMA)
+    cur = LiteCursor(connection)
+    now = s._utc_now()
+    acct, phone, family = str(uuid.uuid4()), str(uuid.uuid4()), str(uuid.uuid4())
+    mine = {"account_id": acct, "installation_id": phone, "family_id": family}
+    nonce = "n-%s" % uuid.uuid4()
+
+    def request(route="assertion", expires=now + timedelta(minutes=5)):
+        rid = str(uuid.uuid4())
+        connection.execute(
+            "INSERT INTO session_upgrade_requests (request_id, route, account_id, installation_id, "
+            "family_id, expires_at, nonce_sha256) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (rid, route, acct, phone, family, expires,
+             __import__("hashlib").sha256(nonce.encode()).hexdigest()))
+        return rid
+
+    rid = request()
+    good = {"nonce": nonce, "amr": ["otp", "sms"]}
+    expect(s._consume_assertion(cur, rid, mine, {"nonce": "other"}) == 0, "the nonce must match")
+    for wrong in ({"installation_id": str(uuid.uuid4())}, {"family_id": str(uuid.uuid4())},
+                  {"account_id": str(uuid.uuid4())}):
+        expect(s._consume_assertion(cur, rid, dict(mine, **wrong), good) == 0,
+               "an assertion request must not be usable by %s" % wrong)
+    expect(s._consume_assertion(cur, request(route="approval"), mine, good) == 0,
+           "an approval request is not an assertion request")
+    expect(s._consume_assertion(cur, request(expires=now - timedelta(seconds=1)), mine, good) == 0,
+           "an expired request must not be usable")
+    expect(s._consume_assertion(cur, rid, mine, good) == 1 and s._consume_assertion(cur, rid, mine, good) == 0,
+           "an assertion request is used exactly once")
+    method = connection.execute("SELECT assertion_method FROM session_upgrade_requests "
+                                "WHERE request_id = ?", (rid,)).fetchone()[0]
+    expect(method == "otp,sms", "the MFA method must be recorded, got %r" % method)
+    connection.close()
+
+
+@check
+def a_limited_session_upgrades_with_an_assertion_only_where_enabled():
+    key, jwk = c.stepup_jwk_pair()
+    rid, now = str(uuid.uuid4()), int(time.time())
+    payload = {"aud": s.UPGRADE_ASSERTION_AUDIENCE, "sub": account, "iid": inst.installation_id,
+               "rid": rid, "nonce": "n0nce", "iat": now, "exp": now + 300}
+    token = es256_jws(key, {"alg": "ES256"}, payload)
+    body = {"route": "assertion", "request_id": rid, "assertion": token}
+    db.writes = []
+    try:
+        with elevated_integrity():
+            s._latest_integrity_state = _verdict_state("elevated")
+            with policy(), assertion_keys(k1=jwk):
+                reply = _upgrade(_limited_session("integrity_elevated"), body)
+                expect(reply.status_code == 403 and error_code(reply) == "upgrade_route_unavailable",
+                       "route 3 is off by default, got %s %s" % (reply.status_code, error_code(reply)))
+            with policy(upgrade_mfa_assertion=1), assertion_keys():
+                reply = _upgrade(_limited_session("integrity_elevated"), body)
+                expect(reply.status_code == 403 and error_code(reply) == "upgrade_route_unavailable",
+                       "route 3 without configured keys must be unavailable, got %s %s"
+                       % (reply.status_code, error_code(reply)))
+            with policy(upgrade_mfa_assertion=1), assertion_keys(k1=jwk):
+                forged = dict(body, assertion=es256_jws(key, {"alg": "ES256"}, dict(payload, sub="x")))
+                reply = _upgrade(_limited_session("integrity_elevated"), forged)
+                expect(reply.status_code == 403 and error_code(reply) == "upgrade_assertion_invalid",
+                       "an assertion for another account must be refused, got %s %s"
+                       % (reply.status_code, error_code(reply)))
+                reply = _upgrade(_limited_session("integrity_elevated", "risk_review"), body)
+                payload_out = reply.get_json() or {}
+                consumed = [p for q, p in db.writes if q.startswith("UPDATE session_upgrade_requests")]
+                expect(reply.status_code == 200 and payload_out.get("upgraded_by") == "assertion"
+                       and consumed and consumed[-1][1] == rid,
+                       "a valid assertion must upgrade, relationship risk included: %s %s"
+                       % (reply.status_code, payload_out))
     finally:
         db.refresh_row = None
 
