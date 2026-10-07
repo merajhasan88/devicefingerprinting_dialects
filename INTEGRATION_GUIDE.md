@@ -101,7 +101,7 @@ statement timeout `DB_QUERY_TIMEOUT` (15 s).
   cleartext; require the same of every client build you ship.
 
 **Database.** PostgreSQL 13+ or SQL Server 2017+ (`DB_ENGINE`). Your DBA applies
-`migrations/<engine>/001…008` in order; the server only reads `schema_migrations` and refuses to serve
+`migrations/<engine>/001…009` in order; the server only reads `schema_migrations` and refuses to serve
 on any other version (`/health/ready` says why). Use verified TLS: PostgreSQL `DB_SSLMODE=verify-full`
 with `DB_SSLROOTCERT`; SQL Server always connects with `Encrypt=yes` and `TrustServerCertificate=no`.
 
@@ -162,6 +162,47 @@ DBA change to the thresholds above. Never delete or edit link rows to get the sa
 has no built-in "mark safe" flag, and **nothing you record elsewhere changes its decision**: it will
 keep answering `risk_review_required` or `risk_policy_blocked` (in enforce mode) for that account on
 that device, so it is your API layer that must act on your review. How you mark and honour one is yours.
+
+**Reviewing a device held back by its account count.** The counts include every account linked to the
+device, whoever opened it; the server discounts none. When a device reaches review or block, look first
+at accounts whose link was made from a **hint-linked installation that was never confirmed**: the
+reinstall hint (a hash of ANDROID_ID or IDFV) is sent by the client, so someone who obtained the
+device's hint could have linked their own installation and opened those accounts from it. Each link
+records the installation that made it, and each installation how it joined the device:
+
+```sql
+-- PostgreSQL; on SQL Server prefix the tables with dbo.
+SELECT l.account_id, l.first_seen_at, l.last_seen_at,
+       i.installation_id, i.registration_method,
+       i.created_at AS installation_created_at, i.device_confirmed_at
+FROM device_account_links l
+JOIN app_installations i ON i.installation_id = l.first_installation_id
+WHERE l.device_id = '<device_id>'
+ORDER BY l.first_seen_at;
+```
+
+- `registration_method = 'new_device'`: opened from the device's original installation.
+- `'reinstall_hint'` with `device_confirmed_at` set: from a reinstall on which an account that already
+  belonged to the device later signed in.
+- `'reinstall_hint'` with `device_confirmed_at` NULL: from a reinstall no existing account has signed in
+  on — look here first.
+- Installations that existed when migration 009 ran were treated as confirmed and carry
+  `device_confirmed_at = created_at`.
+- A confirmation shows that someone holding an existing account's password used that installation, not
+  that it is the same physical phone.
+
+Each risk decision's `context` carries the same facts for the installation that made the request
+(`registration_method`, `installation_established`, `installation_device_confirmed_at`). Record your
+conclusion in your own systems as above; never edit or delete the rows.
+
+**A blocked integrity verdict follows the device, one way.** A scan that ends in block keeps refusing
+the device's installations for `INTEGRITY_DEVICE_MEMORY_HOURS` (default 24) after it, so reinstalling
+the app does not clear it (`integrity_device_blocked_recently`). Only the device's **established**
+installations spread a block to the others: its original installation, and reinstalls confirmed as
+above. A block reported by an unconfirmed hint-linked installation refuses only that installation, so
+someone holding a copied hint cannot lock the real owner out. The trade-off: a block first recorded on
+an unconfirmed reinstall does not follow the device into the next reinstall; reinstall velocity still
+counts every proven reinstall.
 
 **Step-up.** The optional step-up key needs the device passcode (or biometric) for each signature.
 Android 9 and 10 cannot bind a passcode to each use; there the key unlocks for a 30-second window and

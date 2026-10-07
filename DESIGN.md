@@ -5349,9 +5349,10 @@ instead. The R1 observations are unchanged: that policy is the owner's open deci
   keep all evidence, but separate an observed hint correlation from the decision to propagate a block
   (approval from an existing trusted association, an enrolment authority, or manual adjudication) —
   is compatible with "links are permanent". With it: the server has no reviewed/safe override, so a
-  customer's own mark cannot change the server's verdict (the guide now says so).
+  customer's own mark cannot change the server's verdict (the guide now says so). **Implemented
+  2026-10-07, §68.**
 - **Login recovery for soft risk** (a limited session or account MFA instead of a refusal at login):
-  a product decision; not implemented.
+  a product decision; designed in §67, not implemented.
 
 ### 66.4 Results (2026-10-06)
 
@@ -5429,4 +5430,88 @@ both SDKs handling `session_limited` and the upgrade; conformance checks for: a 
 a limited session; a limited token is refused off-list and accepted on-list; each upgrade route issues
 a full session once (replay refused); a block is never upgraded; refreshing a limited session stays
 limited.
+
+## 68. R4 implemented: an integrity block spreads one way only (2026-10-07)
+
+**Owner decisions (2026-10-07).** Keep the accounts-per-device counts as they are and rely on the
+records already kept (each link's first installation, and how that installation joined the device);
+make the spreading of an integrity block one-directional — on the condition that no legitimate user's
+sign-in is affected, including on a device that was tampered with or rooted in the past.
+
+**The rule** (`1b7d3c5`, migration 009).
+
+- An installation is **established** if it is the device's original installation (any
+  `registration_method` other than `reinstall_hint`), or a hint-linked one that has been **confirmed**:
+  an account whose link to the device was first made through an established installation signed in on
+  it. `_confirm_hint_installation` does that at login only, before the link upsert, so a first login on
+  the installation is not mistaken for a returning one; `app_installations.device_confirmed_at`
+  records when. Opening a new account confirms nothing, and neither does an account first linked
+  through the installation itself or through another unconfirmed one — otherwise anyone holding the hint
+  could confirm their own installations.
+- `_device_integrity_memory(device_id, installation_id)` picks the worst report inside the window
+  among the installation's **own** reports and those of the device's **established** installations.
+  Both users of it — the gate's `integrity_device_blocked_recently` and the policy's
+  `device_integrity_history_block` +50 — pass the calling installation.
+- The policy context reports `installation_established` and `installation_device_confirmed_at`.
+- Account counts are unchanged: every link counts, whoever made it. The guide now shows support teams
+  how to find accounts opened from hint-linked, unconfirmed installations.
+- Migration 009 treats every hint-linked installation that already existed as confirmed
+  (`device_confirmed_at = created_at`). No row is deleted.
+
+**Why it cannot refuse a sign-in that was allowed before.**
+
+1. *Subset.* For every installation, the reports considered are a subset of the device-wide set used
+   before, and always include the installation's own. The pick is the worst under the same ordering, so
+   it is never worse: the gate refuses only where it refused before.
+2. *The +50.* It fires when the pick is a block from another installation. If the device-wide pick was
+   the installation's own report, that report is still in the subset and still wins, so no +50 appears
+   where there was none. This is what the "own reports" term is for: in a mutation run without it, a
+   reinstall's own block lost to an older established block and +50 appeared — the differential check
+   below caught it. The final ordering term (own report first) only decides exact timestamp ties, which
+   real reports practically never have; it makes that corner deterministic and nothing more. Moving it
+   earlier would also be safe but would change the pick on devices whose installations are all
+   established, which the backfill guarantee below rules out.
+3. *Confirmation.* It only adds an installation's reports back into what the others consider —
+   restoring the old behaviour for them, never going beyond it.
+4. *Existing data.* With the backfill every installation present at migration time is established, so
+   on that data the rule is identical to the old one. Measured on the test database after migration
+   009: 4,228 installations, **0** picks differing — over the 24 h window (30 installations with a
+   memory) and over all time (4,057).
+5. *Time.* The window (`INTEGRITY_DEVICE_MEMORY_HOURS`, 24 h) is unchanged. A block more than 24 h old
+   affects nobody under either rule. Inside the window, a block on an established installation still
+   refuses every installation of the device, and an installation's own block still refuses it.
+
+For a legitimate user the change only ever lifts a refusal: a block on a hint-linked installation that
+no returning account has signed in to — someone else holding the hint, or the user's own lapse on such
+a reinstall — no longer refuses the device's other installations.
+
+**What it costs (a correction).** I first told the owner that this did not weaken reinstall detection;
+that was wrong, and corrected the same day. A block recorded on an **unconfirmed** reinstall no longer
+follows the device to the next reinstall: install → reinstall → tamper (block recorded on the reinstall)
+→ reinstall again, and the newest installation does not inherit the block. What still holds: a block on
+the original installation, or on any confirmed reinstall, follows every later installation; every new
+installation must pass its own fresh scan; every proven reinstall still counts toward reinstall
+velocity (3 in 24 h +35, 4 +60, 5 block). A device can already escape the memory entirely by not
+sending the hint, so it only ever caught cooperative reinstalls. "Unconfirmed" is never a mark against
+a user — it decides only whether that installation's block reaches *other* installations; an account
+first opened on a reinstall leaves later reinstalls that sign in with it unconfirmed, harmlessly.
+
+**Residual.** Someone holding both a device's hint and the password of an account already on the
+device can confirm an installation of their own and then make its block reach the device for the
+window. The stolen password is the larger loss there.
+
+**Results (2026-10-07).**
+
+| Check | Result |
+|---|---|
+| `tools/check_security_regressions.py` | **39 / 39** — five new: an unconfirmed reinstall cannot spread its block; an established block still follows the device; the window; seven confirmation cases; a differential over 500 random device histories against the old device-wide query (never stricter; identical when all installations are established). They run the server's own SQL on in-memory SQLite: the predicate's logic, not an engine's behaviour |
+| Mutation runs | four deliberately broken servers — the old device-wide predicate, confirmation without the established-first-link condition, no window, no "own reports" term — each failed the gate |
+| Migration 009, PostgreSQL 16.15 | applied; the 36 existing hint-linked installations backfilled; old-vs-new picks over all 4,228 installations: 0 differing |
+| Conformance suite, observe, **63 checks** | **58 passed, 0 failed, 5 skipped** (three enforce-mode checks, two opt-in signals); the three new R4 checks pass |
+| Enforce mode, briefly on | the three enforce-mode checks and the three R4 checks in their enforce branches: **6 / 6** |
+| Server journal during the runs | no errors |
+| **Not yet proven** | SQL Server: the memory query (`TOP 1`, `CASE` in `ORDER BY`), the confirmation `UPDATE … EXISTS … JOIN` and migration 009 are translation-checked only, not executed — the next SQL Server round, with the challenge INSERT from §66.4 |
+
+**State.** EC2 stopped. Server `/opt/device_trust_server.py` = `1b7d3c5` (md5 `51beaddb…`, backup
+`.bak-20261007-074011`); schema 9; observe/observe; v2-only access proofs; `stepup_required_paths` `''`.
 

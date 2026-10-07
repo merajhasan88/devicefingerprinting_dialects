@@ -181,3 +181,18 @@ Server behaviour you may see from these changes: installation challenges are now
 second use and **401 `challenge_payload_mismatch`** for a challenge the server did not issue or that was
 modified (an unknown challenge ID used to be 404 `challenge_not_found`). There is no longer a
 five-open-challenges cap or a per-installation challenge budget.
+
+## 9. Added 2026-10-07 — R4 (server only, no client change)
+
+DESIGN.md §68, `1b7d3c5`, **schema 9** (migration 009, `app_installations.device_confirmed_at`).
+
+- An integrity block now spreads only from a device's **established** installations: the original one,
+  or a hint-linked one confirmed when an account first linked through an established installation signs
+  in on it. A block reported by an unconfirmed hint-linked installation refuses only that installation.
+  Nothing changed for data that existed before the migration.
+- Two additive fields in every risk decision's `context`: `installation_established` (bool) and
+  `installation_device_confirmed_at` (ISO time or null). Nothing to parse unless you want to show them.
+- The reference suite gained three checks you may want to mirror (63 now): a block from an unconfirmed
+  reinstall does not reach the device's owner; a reinstall confirmed by a returning account carries its
+  block to the device; accounts opened on a reinstall cannot confirm another reinstall.
+
