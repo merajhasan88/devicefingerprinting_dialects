@@ -2027,11 +2027,13 @@ def a_limited_session_upgrades_with_an_assertion_only_where_enabled():
 
 
 @check
-def relationship_risk_never_admits_a_new_device_link():
+def relationship_risk_never_admits_a_link_to_a_shared_device():
     """DESIGN.md 70. A first login or a new account on a device writes a
     permanent link; admitting it under relationship risk, even limited, would
-    raise the device's counts for every account on it. It is refused as before;
-    an account already linked to the device gets the limited session."""
+    raise the device's counts for every account already on it. It is refused
+    as before; an account already linked to the device, or a first login on a
+    device no other account uses, gets the limited session. A new account under
+    relationship risk is always refused."""
     import bcrypt as _bcrypt
     login = encode({"handle": "someone", "password": "Passw0rd123"})
     signup = encode({"handle": "newcomer", "password": "Passw0rd123"})
@@ -2039,9 +2041,10 @@ def relationship_risk_never_admits_a_new_device_link():
     def post(path, raw):
         return client.post(path, data=raw, headers=access_headers("POST", path, raw, device_token))
 
-    def review(linked):
+    def review(linked, others=1):
         return lambda *a, **k: {"effective_action": "review", "recommended_action": "review",
-                                "context": {"account_already_linked_to_device": linked}}
+                                "context": {"account_already_linked_to_device": linked,
+                                            "device_account_count": others}}
     db.account_row = (account, _bcrypt.hashpw(b"Passw0rd123", _bcrypt.gensalt(4)))
     db.writes = []
     try:
@@ -2057,13 +2060,20 @@ def relationship_risk_never_admits_a_new_device_link():
                    and not [q for q, _ in db.writes if q.startswith("INSERT INTO demo_accounts")],
                    "a new account under relationship review must be refused and not created, got %s %s"
                    % (reply.status_code, error_code(reply)))
-            s._evaluate_risk_policy = review(True)
-            reply = post("/v1/accounts/login", login)
-            payload = reply.get_json() or {}
-            expect(reply.status_code == 200 and payload.get("scope") == "limited"
-                   and payload.get("limited_causes") == ["risk_review"],
-                   "an already-linked account under review must get a limited session, got %s %s"
-                   % (reply.status_code, payload))
+            s._evaluate_risk_policy = review(False, others=0)
+            reply = post("/v1/accounts/register", signup)
+            expect(reply.status_code == 403 and error_code(reply) == "risk_review_required",
+                   "a new account under relationship review must be refused even on an empty "
+                   "device, got %s %s" % (reply.status_code, error_code(reply)))
+            for linked, others, why in ((True, 2, "an already-linked account"),
+                                        (False, 0, "a first login on a device no one else uses")):
+                s._evaluate_risk_policy = review(linked, others)
+                reply = post("/v1/accounts/login", login)
+                payload = reply.get_json() or {}
+                expect(reply.status_code == 200 and payload.get("scope") == "limited"
+                       and payload.get("limited_causes") == ["risk_review"],
+                       "%s under review must get a limited session, got %s %s"
+                       % (why, reply.status_code, payload))
     finally:
         db.account_row = None
 

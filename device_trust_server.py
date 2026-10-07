@@ -5422,7 +5422,7 @@ def account_login():
     )
     limited = _limited_causes(
         integrity,
-        _enforce_risk_policy(policy, limited_ok=_adds_no_device_link(policy)),
+        _enforce_risk_policy(policy, limited_ok=_links_no_shared_device(policy)),
     )
 
     with _cursor(commit=True) as cursor:
@@ -5776,17 +5776,23 @@ def refresh_account_tokens():
 # ---------------------------------------------------------------------------
 
 
-def _adds_no_device_link(policy):
-    """Relationship risk may limit a login only if it links nothing new.
+def _links_no_shared_device(policy):
+    """Relationship risk may limit a login only if no OTHER account pays for it.
 
     A first login of an account on a device writes a device-account link, and
-    links are permanent: admitting it, even limited, would raise the device's
-    account count for every account on it -- a phone shared by two people would
-    put both into review because a third person was let in. Such a login is
-    refused as before; an account already linked here may get a limited session.
+    links are permanent: admitting it, even limited, raises that device's
+    account count for every account already on it -- a phone shared by two
+    people would put both into review because a third person was let in. So a
+    limited session under relationship risk is given only to an account already
+    linked to the device, or to a first login on a device no other account
+    uses (a user's own new phone): there the new link weighs on this account
+    alone, which the limited session and its upgrade already govern. Anything
+    else is refused as before.
     """
     context = (policy or {}).get("context") or {}
-    return context.get("account_already_linked_to_device") is True
+    if context.get("account_already_linked_to_device") is True:
+        return True
+    return context.get("device_account_count") == 0
 
 
 def _limited_causes(integrity, risk_cause):
