@@ -5331,9 +5331,11 @@ def account_register():
         account_link_pending=True,
         persist=True,
     )
-    # On soft risk the account is still created -- and linked, permanently --
-    # but its session starts limited (DESIGN.md 70).
-    limited = _limited_causes(integrity, _enforce_risk_policy(policy, limited_ok=True))
+    # On a soft INTEGRITY verdict the account is still created -- and linked,
+    # permanently -- but its session starts limited (DESIGN.md 70). Relationship
+    # risk is never admitted here: the new account's link would raise the
+    # device's counts for every account on it, for good.
+    limited = _limited_causes(integrity, _enforce_risk_policy(policy))
 
     try:
         with _cursor(commit=True) as cursor:
@@ -5418,7 +5420,10 @@ def account_login():
         account_link_pending=True,
         persist=True,
     )
-    limited = _limited_causes(integrity, _enforce_risk_policy(policy, limited_ok=True))
+    limited = _limited_causes(
+        integrity,
+        _enforce_risk_policy(policy, limited_ok=_adds_no_device_link(policy)),
+    )
 
     with _cursor(commit=True) as cursor:
         _confirm_hint_installation(cursor, device_id, account_id, installation_id)
@@ -5769,6 +5774,19 @@ def refresh_account_tokens():
 # ---------------------------------------------------------------------------
 # Routes: limited sessions and their upgrade (DESIGN.md 67, 70)
 # ---------------------------------------------------------------------------
+
+
+def _adds_no_device_link(policy):
+    """Relationship risk may limit a login only if it links nothing new.
+
+    A first login of an account on a device writes a device-account link, and
+    links are permanent: admitting it, even limited, would raise the device's
+    account count for every account on it -- a phone shared by two people would
+    put both into review because a third person was let in. Such a login is
+    refused as before; an account already linked here may get a limited session.
+    """
+    context = (policy or {}).get("context") or {}
+    return context.get("account_already_linked_to_device") is True
 
 
 def _limited_causes(integrity, risk_cause):

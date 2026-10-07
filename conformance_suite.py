@@ -2575,17 +2575,11 @@ def check_device_account_bands(api, ctx):
            "account %d must be scored for review, got %s %s"
            % (review, pol.get("recommended_action"), sorted(_reason_codes(pol))))
     if enforce:
-        soft = "review" in _setting_words(settings, "limited_session_policy_actions", "step_up,review")
-        if soft and pol.get("recommended_action") == "review":
-            # DESIGN.md 70: the account is created -- and linked -- but limited.
-            expect(st in (200, 201) and pl.get("scope") == "limited"
-                   and "risk_review" in (pl.get("limited_causes") or []),
-                   "enforce: account %d must get a limited session (risk_review), got %s %s %s"
-                   % (review, st, pl.get("scope"), error_code(pl)))
-        else:
-            expect(st == 403 and error_code(pl) in ("risk_review_required", "risk_policy_blocked"),
-                   "enforce: account %d must be held for review, got %s %s"
-                   % (review, st, error_code(pl)))
+        # Never a limited session here (DESIGN.md 70): admitting the account
+        # would link it for good and put every account on the device into review.
+        expect(st == 403 and error_code(pl) in ("risk_review_required", "risk_policy_blocked"),
+               "enforce: account %d must be held for review, got %s %s"
+               % (review, st, error_code(pl)))
         return
     st, pl, pol = results[block]
     expect(st in (200, 201)

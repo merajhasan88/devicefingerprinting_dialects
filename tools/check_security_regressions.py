@@ -84,6 +84,7 @@ class Rows(object):
         self.consumed = set()
         self.refresh_row = None
         self.other_full_session = None
+        self.account_row = None
 
     def execute(self, sql, params=None):
         q = " ".join(sql.split())
@@ -117,7 +118,9 @@ class Rows(object):
         elif q.startswith("SELECT stepup_key_account_id, stepup_public_key_jwk"):
             self.result = (None, self.step_jwk)
         elif q.startswith("SELECT account_id, password_hash FROM demo_accounts"):
-            self.result = None
+            self.result = self.account_row
+        elif q.startswith(("UPDATE device_account_links", "INSERT INTO demo_accounts")):
+            self.writes.append((q, params))
         elif q.startswith("SELECT i.status, d.status FROM app_installations i"):
             self.result = ("active", "active")
         elif q.startswith("INSERT INTO installation_challenges"):
@@ -2020,6 +2023,49 @@ def a_limited_session_upgrades_with_an_assertion_only_where_enabled():
                        % (reply.status_code, payload_out))
     finally:
         db.refresh_row = None
+
+
+
+@check
+def relationship_risk_never_admits_a_new_device_link():
+    """DESIGN.md 70. A first login or a new account on a device writes a
+    permanent link; admitting it under relationship risk, even limited, would
+    raise the device's counts for every account on it. It is refused as before;
+    an account already linked to the device gets the limited session."""
+    import bcrypt as _bcrypt
+    login = encode({"handle": "someone", "password": "Passw0rd123"})
+    signup = encode({"handle": "newcomer", "password": "Passw0rd123"})
+
+    def post(path, raw):
+        return client.post(path, data=raw, headers=access_headers("POST", path, raw, device_token))
+
+    def review(linked):
+        return lambda *a, **k: {"effective_action": "review", "recommended_action": "review",
+                                "context": {"account_already_linked_to_device": linked}}
+    db.account_row = (account, _bcrypt.hashpw(b"Passw0rd123", _bcrypt.gensalt(4)))
+    db.writes = []
+    try:
+        with elevated_integrity(), policy():
+            s._latest_integrity_state = _verdict_state("trusted")
+            s._evaluate_risk_policy = review(False)
+            reply = post("/v1/accounts/login", login)
+            expect(reply.status_code == 403 and error_code(reply) == "risk_review_required",
+                   "a first login under relationship review must be refused, got %s %s"
+                   % (reply.status_code, error_code(reply)))
+            reply = post("/v1/accounts/register", signup)
+            expect(reply.status_code == 403 and error_code(reply) == "risk_review_required"
+                   and not [q for q, _ in db.writes if q.startswith("INSERT INTO demo_accounts")],
+                   "a new account under relationship review must be refused and not created, got %s %s"
+                   % (reply.status_code, error_code(reply)))
+            s._evaluate_risk_policy = review(True)
+            reply = post("/v1/accounts/login", login)
+            payload = reply.get_json() or {}
+            expect(reply.status_code == 200 and payload.get("scope") == "limited"
+                   and payload.get("limited_causes") == ["risk_review"],
+                   "an already-linked account under review must get a limited session, got %s %s"
+                   % (reply.status_code, payload))
+    finally:
+        db.account_row = None
 
 
 def main():
