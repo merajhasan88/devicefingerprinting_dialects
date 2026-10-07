@@ -1063,6 +1063,156 @@ def link_race_rolls_back_to_a_savepoint():
 
 
 # ---------------------------------------------------------------------------
+# R1 (joint review 2026-10-05) -- runtime growth, developer settings, eligibility
+# ---------------------------------------------------------------------------
+
+
+@contextmanager
+def policy(**values):
+    """Run with these risk_policy_settings rows and a cold settings cache."""
+    with real_policy_reader():
+        db.settings.update({key: str(value) for key, value in values.items()})
+        s._risk_settings_cache.update(at=0.0, values=None, failed_at=None, error=None)
+        yield
+
+
+R1_ENVELOPE = (3735552, 65536)  # a .NET build's pinned shape (57 granules)
+R1_CASES = (
+    # the five cases put to the owner, with the score each must now get
+    ("A genuine warm .NET session, 4,194,304 bytes", "196608:5,131072:4,65536:41", None, 0),
+    ("B gadget shape, 4 KiB and 28 KiB pieces", "196608:1,131072:7,65536:45,28672:1,4096:1",
+     None, 45),
+    ("C runtime-shaped copycat, 3,932,160 bytes", "65536:60", None, 0),
+    ("D runtime-shaped copycat, 9,437,184 bytes", "65536:144", None, 40),
+    ("E inline hook in libc", "65536:57",
+     lambda p: p["code_integrity"].update(diff_bytes=71, core_diff_bytes=71), 90),
+)
+
+
+def r1_decision(classes, developer=False, extra=None):
+    probes = clean("android")
+    apk = probes["app_identity"]["apk_sha256"]
+    pairs = [tuple(int(part) for part in item.split(":")) for item in classes.split(",")]
+    probes["exec_mappings"].update(
+        wx_mappings=sum(n for _, n in pairs), wx_bytes=sum(size * n for size, n in pairs),
+        wx_size_classes=classes, wx_smallest_bytes=min(size for size, _ in pairs),
+        wx_largest_bytes=max(size for size, _ in pairs))
+    probes["developer_settings"].update(developer_options_enabled=developer,
+                                        adb_enabled=developer)
+    if extra:
+        extra(probes)
+    saved = dict(s.ANDROID_WX_BASELINES)
+    s.ANDROID_WX_BASELINES[apk] = R1_ENVELOPE
+    try:
+        status, payload = send_report("android", probes)
+    finally:
+        s.ANDROID_WX_BASELINES.clear()
+        s.ANDROID_WX_BASELINES.update(saved)
+    expect(status == 200, "report failed: %s %s" % (status, payload))
+    return payload["integrity"]
+
+
+def points_of(decision):
+    return {reason["code"]: reason["points"] for reason in decision["reasons"]}
+
+
+@check
+def runtime_growth_is_advisory_up_to_the_allowance():
+    """The owner-approved R1 table (DESIGN.md 69), at the default 200 %: growth
+    inside twice the envelope scores nothing but stays visible; the copycat
+    beyond it keeps +40; shape and code checks are unchanged; developer options
+    and ADB add nothing to any case."""
+    with policy():
+        for name, classes, extra, expected in R1_CASES:
+            for developer in (False, True):
+                decision = r1_decision(classes, developer, extra)
+                expect(decision["score"] == expected,
+                       "%s, developer settings %s: expected %d, got %d %s"
+                       % (name, "on" if developer else "off", expected,
+                          decision["score"], points_of(decision)))
+        found = points_of(r1_decision(R1_CASES[0][1], developer=True))
+        expect(found.get("android_wx_above_baseline") == 0,
+               "growth inside the allowance must stay visible at 0 points: %s" % found)
+        expect(found.get("android_developer_options") == 0 and found.get("android_adb_enabled") == 0,
+               "developer options and ADB must be advisory: %s" % found)
+
+
+@check
+def the_growth_allowance_follows_the_dba_setting():
+    granules = R1_ENVELOPE[0] // R1_ENVELOPE[1]
+    with policy(wx_far_above_baseline_percent=300):
+        decision = r1_decision(R1_CASES[3][1])
+        expect(decision["score"] == 0, "at 300 %% the 253 %% copycat must be advisory, got %s %s"
+               % (decision["score"], points_of(decision)))
+    with policy(wx_far_above_baseline_percent=100):
+        decision = r1_decision(R1_CASES[0][1])
+        expect(decision["score"] == 40, "at 100 %% any growth must score +40, got %s %s"
+               % (decision["score"], points_of(decision)))
+    with policy():
+        at = r1_decision("65536:%d" % (2 * granules))
+        over = r1_decision("65536:%d" % (2 * granules + 1))
+        expect(at["score"] == 0 and over["score"] == 40,
+               "exactly 200 %% is within the allowance and one granule more is not: %s / %s"
+               % (at["score"], over["score"]))
+    for value, valid in (("100", True), ("250", True), ("99", False), ("two", False), ("", False)):
+        try:
+            s._validate_risk_settings(dict(SETTINGS, wx_far_above_baseline_percent=value))
+            accepted = True
+        except ValueError:
+            accepted = False
+        expect(accepted == valid, "wx_far_above_baseline_percent=%r: accepted=%s" % (value, accepted))
+
+
+@check
+def eligibility_rules_refuse_with_their_own_code_only_when_set():
+    """Developer options and ADB never cost points; a deployment that wants them
+    off sets an eligibility rule, refused in enforce mode with
+    integrity_device_ineligible and a remedy, and shown in observe mode."""
+    def state_with(*found):
+        return lambda iid: {"score": 0, "verdict": "trusted", "fresh": True,
+                            "reasons": [{"code": code, "points": 0} for code in found]}
+
+    def gate():
+        try:
+            return s._enforce_integrity_gate(inst.device_id, inst.installation_id), None
+        except s.ApiProblem as problem:
+            return None, problem
+
+    expect("developer_settings" in s._integrity_probe_plan("android"),
+           "developer settings must be measured on every Android scan")
+    saved = (s._latest_integrity_state, s._device_integrity_memory, s.INTEGRITY_MODE)
+    s._device_integrity_memory = lambda did, iid: None
+    both = ("android_developer_options", "android_adb_enabled")
+    try:
+        s._latest_integrity_state = state_with(*both)
+        with policy():
+            state, problem = gate()
+            expect(problem is None and "eligibility" not in state,
+                   "no rule set, but refused or flagged: %s %s" % (problem and problem.code, state))
+        for rule, expected in (("developer_options_refuses", "android_developer_options"),
+                               ("adb_enabled_refuses", "android_adb_enabled")):
+            with policy(**{rule: 1}):
+                state, problem = gate()
+                expect(problem is not None and problem.code == "integrity_device_ineligible"
+                       and [e["reason"] for e in problem.details["eligibility"]] == [expected]
+                       and problem.details["eligibility"][0]["remedy"],
+                       "%s=1 must refuse with its own code and remedy, got %s"
+                       % (rule, problem and (problem.code, problem.details.get("eligibility"))))
+                s.INTEGRITY_MODE = "observe"
+                state, problem = gate()
+                s.INTEGRITY_MODE = "enforce"
+                expect(problem is None and [e["rule"] for e in state.get("eligibility", [])] == [rule],
+                       "observe mode must report, not refuse: %s %s" % (problem, state))
+        with policy(developer_options_refuses=1, adb_enabled_refuses=1):
+            s._latest_integrity_state = state_with()
+            state, problem = gate()
+            expect(problem is None, "both settings off on the phone must pass, got %s"
+                   % (problem and problem.code))
+    finally:
+        s._latest_integrity_state, s._device_integrity_memory, s.INTEGRITY_MODE = saved
+
+
+# ---------------------------------------------------------------------------
 # R4 (joint review 2026-10-05) -- an integrity block spreads one way only
 # ---------------------------------------------------------------------------
 

@@ -1151,7 +1151,7 @@ def _get_backend_identity():
 # against a schema it does not understand. /health/* still answers so operators
 # can see why.
 
-REQUIRED_SCHEMA_VERSION = 9
+REQUIRED_SCHEMA_VERSION = 10
 
 _schema_state = None
 _schema_lock = threading.Lock()
@@ -1269,7 +1269,13 @@ _RISK_SETTING_KINDS = {
     "device_accounts_review_points": "int",
     "device_accounts_block_count": "int",
     "elevated_risk_refuses": "bool",
+    "wx_far_above_baseline_percent": "int",
+    "developer_options_refuses": "bool",
+    "adb_enabled_refuses": "bool",
 }
+# Lower bounds a value must also meet. Below 100 the "far above the baseline"
+# rule would fire for memory inside the build's own measured envelope.
+_RISK_SETTING_MINIMUMS = {"wx_far_above_baseline_percent": 100}
 _RISK_SETTING_BOOL_WORDS = ("0", "1", "true", "false", "yes", "no", "on", "off")
 # Rows whose absence would silently weaken a gate instead of restoring the
 # owner's default. An EMPTY stepup_required_paths is a valid choice (step-up
@@ -1297,6 +1303,8 @@ def _validate_risk_settings(values):
             )
         else:
             valid = value in kind
+        if valid and key in _RISK_SETTING_MINIMUMS:
+            valid = int(value) >= _RISK_SETTING_MINIMUMS[key]
         if not valid:
             raise ValueError("risk_policy_settings.%s has an invalid value" % key)
 
@@ -1750,10 +1758,14 @@ def _integrity_probe_plan(platform):
             "instrumentation_threads",
             "exec_mappings",
             "code_integrity",
+            # Policy input since joint review R1: a deployment may make
+            # developer options or ADB an eligibility rule (DESIGN.md 69), so
+            # the setting is measured on every scan. With the default four
+            # optional draws it was already requested every time.
+            "developer_settings",
         ]
         optional = [
             "emulator",
-            "developer_settings",
         ]
     elif platform == "ios":
         mandatory = [
@@ -2141,14 +2153,27 @@ def _score_wx_memory(reasons, exec_maps, apk_hash):
                           "Writable-executable memory of a size this build's runtime "
                           "never allocates is mapped into the process.")
         points += 45
-    if wx_bytes > 2 * baseline_bytes:
-        _integrity_reason(reasons, "android_wx_far_above_baseline", 40,
-                          "Writable-executable memory is more than twice this build's baseline.")
-        points += 40
-    elif wx_bytes > baseline_bytes:
-        _integrity_reason(reasons, "android_wx_above_baseline", 15,
-                          "Writable-executable memory exceeds this build's baseline.")
-        points += 15
+    # Growth beyond the pinned envelope (joint review R1, DESIGN.md 69). The pin
+    # is the build's measured full-session maximum; a runtime that keeps
+    # generating code as a session warms can exceed it legitimately, so growth
+    # up to the DBA's wx_far_above_baseline_percent (owner default 200: twice
+    # the envelope) is advisory and scores nothing. Beyond that it scores +40
+    # on its own, without waiting for a second signal: an injector that copies
+    # the runtime's allocation sizes produces no other signal, and would
+    # otherwise get unlimited room for its code.
+    if wx_bytes > baseline_bytes:
+        percent = _risk_setting_int("wx_far_above_baseline_percent", 200)
+        if wx_bytes * 100 > baseline_bytes * percent:
+            _integrity_reason(reasons, "android_wx_far_above_baseline", 40,
+                              "Writable-executable memory (%d bytes) is more than %d%% of "
+                              "this build's baseline (%d bytes)."
+                              % (wx_bytes, percent, baseline_bytes))
+            points += 40
+        else:
+            _integrity_reason(reasons, "android_wx_above_baseline", 0,
+                              "Writable-executable memory (%d bytes) exceeds this build's "
+                              "baseline (%d bytes) within the expected growth of up to %d%%; "
+                              "advisory." % (wx_bytes, baseline_bytes, percent))
     return points
 
 
@@ -2388,13 +2413,17 @@ def _score_android_integrity(probes):
         _integrity_reason(reasons, "android_emulator", 25, "The runtime resembles an Android emulator.")
         score += 25
 
+    # Advisory since joint review R1 (DESIGN.md 69): common on legitimate
+    # developer and power-user phones, and not evidence of compromise, so they
+    # must not add up with other weak signals into a refusal. A deployment that
+    # wants them off makes that an eligibility rule (developer_options_refuses,
+    # adb_enabled_refuses), refused with its own code and remedy by the gate.
     dev = _probe(probes, "developer_settings")
     if _as_bool(dev.get("developer_options_enabled")):
-        _integrity_reason(reasons, "android_developer_options", 8, "Developer options are enabled.")
-        score += 8
+        _integrity_reason(reasons, "android_developer_options", 0,
+                          "Developer options are enabled (advisory).")
     if _as_bool(dev.get("adb_enabled")):
-        _integrity_reason(reasons, "android_adb_enabled", 10, "ADB is enabled.")
-        score += 10
+        _integrity_reason(reasons, "android_adb_enabled", 0, "ADB is enabled (advisory).")
 
     return score, hard_block, reasons
 
@@ -2660,6 +2689,31 @@ def _device_integrity_memory(device_id, installation_id):
     }
 
 
+# DBA eligibility rules (joint review R1, DESIGN.md 69): a deployment may
+# require a phone setting to be off. Not a compromise finding and never scored:
+# an explicit refusal with its own code and remedy. Read from the latest stored
+# report's reasons, so a DBA change applies at once and a new scan clears it.
+_ELIGIBILITY_RULES = (
+    ("developer_options_refuses", "android_developer_options",
+     "Turn off Developer options, then send a new integrity scan."),
+    ("adb_enabled_refuses", "android_adb_enabled",
+     "Turn off USB debugging (ADB), then send a new integrity scan."),
+)
+
+
+def _eligibility_failures(state):
+    found = {
+        reason.get("code")
+        for reason in _as_list((state or {}).get("reasons"))
+        if isinstance(reason, dict)
+    }
+    return [
+        {"rule": setting, "reason": code, "remedy": remedy}
+        for setting, code, remedy in _ELIGIBILITY_RULES
+        if code in found and _risk_setting_bool(setting)
+    ]
+
+
 def _enforce_integrity_gate(device_id, installation_id, step_up=None, step_up_accepted=False):
     """Refuse the request unless the latest integrity verdict allows it.
 
@@ -2671,6 +2725,9 @@ def _enforce_integrity_gate(device_id, installation_id, step_up=None, step_up_ac
     says so: integrity_elevated, and the remedy is a clean scan.
     """
     state = _latest_integrity_state(installation_id)
+    ineligible = _eligibility_failures(state)
+    if ineligible:
+        state = dict(state, eligibility=ineligible)
     if INTEGRITY_MODE != "enforce":
         return state
     if state is None or not state.get("fresh"):
@@ -2694,6 +2751,14 @@ def _enforce_integrity_gate(device_id, installation_id, step_up=None, step_up_ac
             403,
             "integrity_review_required",
             details={"integrity": state},
+        )
+    if ineligible:
+        raise ApiProblem(
+            "This device does not meet the deployment's eligibility rules: %s"
+            % " ".join(item["remedy"] for item in ineligible),
+            403,
+            "integrity_device_ineligible",
+            details={"integrity": state, "eligibility": ineligible},
         )
     if verdict == "elevated" and step_up:
         state = dict(state, satisfied_by_step_up=True)

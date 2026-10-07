@@ -1197,50 +1197,135 @@ CONFORMANCE_WX_BASELINE = (1048576, 65536)  # the .NET build's measured shape (D
 
 @check("integrity: writable-executable memory is scored against the build's pinned baseline")
 def check_wx_baseline(api, ctx):
-    """DESIGN.md 62. With a baseline pinned for the conformance APK, a report at
-    the baseline in whole granules scores nothing; a size the runtime never
-    allocates scores the foreign-allocator reason; above and far above the
-    baseline score their own reasons; and a report without wx_bytes still
-    scores today's +60 even for a baselined build. Skips unless the server pins
-    INTEGRITY_ANDROID_WX_BASELINES=<conformance apk sha256>:1048576:65536."""
+    """DESIGN.md 62 and 69. With a baseline pinned for the conformance APK, a
+    report at the baseline in whole granules scores nothing; a size the runtime
+    never allocates scores the foreign-allocator reason; growth above the
+    baseline up to the DBA's wx_far_above_baseline_percent (owner default 200)
+    is advisory -- visible, 0 points -- and beyond it scores +40; a report
+    without wx_bytes still scores today's +60 even for a baselined build. Skips
+    unless the server pins INTEGRITY_ANDROID_WX_BASELINES=<conformance apk
+    sha256>:1048576:65536."""
     installation, token, _ = integrity_context(ctx)
     total, granule = CONFORMANCE_WX_BASELINE
+    percent = int(live_settings(api).get("wx_far_above_baseline_percent", "200"))
 
-    def shape(wx_bytes, classes, drop_bytes=False):
+    def shape(granules, extra_classes="", drop_bytes=False):
+        classes = "%d:%d%s" % (granule, granules, extra_classes)
+
         def mutate(probes):
             em = probes["exec_mappings"]
             em.update({"wx_mappings": sum(int(c.split(":")[1]) for c in classes.split(",")),
-                       "wx_bytes": wx_bytes, "wx_size_classes": classes})
+                       "wx_bytes": sum(int(c.split(":")[0]) * int(c.split(":")[1])
+                                       for c in classes.split(",")),
+                       "wx_size_classes": classes})
             if drop_bytes:
                 em.pop("wx_bytes", None)
-        return codes(submit_report(api, installation, token, mutate))
+        return submit_report(api, installation, token, mutate)
 
-    wx_codes = {"android_wx_memory", "android_wx_foreign_allocator",
-                "android_wx_above_baseline", "android_wx_far_above_baseline"}
-    clean = shape(total, "%d:%d" % (granule, total // granule))
+    def wx(decision):
+        return {r["code"]: r["points"] for r in decision.get("reasons", [])
+                if r["code"] in ("android_wx_memory", "android_wx_foreign_allocator",
+                                 "android_wx_above_baseline", "android_wx_far_above_baseline")}
+
+    base = total // granule
+    clean = wx(shape(base))
     if "android_wx_memory" in clean:
         raise Skip("no baseline pinned for the conformance APK; set "
                    "INTEGRITY_ANDROID_WX_BASELINES=%s:%d:%d to run this check"
                    % (CONFORMANCE_APK_SHA256, total, granule))
-    expect(not (wx_codes & set(clean)),
-           "a report at the baseline in whole granules must score no W^X reason, got %s"
-           % sorted(wx_codes & set(clean)))
-    foreign = shape(total - granule + 4096, "%d:%d,4096:1" % (granule, total // granule - 1))
-    expect("android_wx_foreign_allocator" in foreign and "android_wx_memory" not in foreign,
-           "a 4096-byte W^X region must score android_wx_foreign_allocator, got %s"
-           % sorted(wx_codes & set(foreign)))
-    above = shape(total + granule, "%d:%d" % (granule, total // granule + 1))
-    expect("android_wx_above_baseline" in above,
-           "W^X above the baseline must score android_wx_above_baseline, got %s"
-           % sorted(wx_codes & set(above)))
-    far = shape(2 * total + granule, "%d:%d" % (granule, 2 * total // granule + 1))
-    expect("android_wx_far_above_baseline" in far,
-           "W^X beyond twice the baseline must score android_wx_far_above_baseline, got %s"
-           % sorted(wx_codes & set(far)))
-    absent = shape(total, "%d:%d" % (granule, total // granule), drop_bytes=True)
-    expect("android_wx_memory" in absent,
+    expect(not clean, "a report at the baseline in whole granules must score no W^X reason, got %s"
+           % clean)
+    foreign = wx(shape(base - 1, ",4096:1"))
+    expect(foreign.get("android_wx_foreign_allocator") == 45 and "android_wx_memory" not in foreign,
+           "a 4096-byte W^X region must score android_wx_foreign_allocator, got %s" % foreign)
+    if (base + 1) * granule * 100 <= total * percent:
+        above = wx(shape(base + 1))
+        expect(above == {"android_wx_above_baseline": 0},
+               "growth just above the baseline must be advisory (0 points), got %s" % above)
+    limit = total * percent // 100
+    at = limit // granule
+    if at * granule * 100 == total * percent:
+        edge = wx(shape(at))
+        expect(edge == {"android_wx_above_baseline": 0},
+               "exactly %d%% of the baseline is still within the allowance, got %s" % (percent, edge))
+    far = wx(shape(at + 1))
+    expect(far == {"android_wx_far_above_baseline": 40},
+           "growth beyond %d%% of the baseline must score +40, got %s" % (percent, far))
+    absent = wx(shape(base, drop_bytes=True))
+    expect(absent.get("android_wx_memory") == 60,
            "a baselined build's report without wx_bytes must still score android_wx_memory, got %s"
-           % sorted(wx_codes & set(absent)))
+           % absent)
+
+
+def live_settings(api):
+    """The server's risk_policy_settings, as /health/ready publishes them."""
+    _, health = api.call("GET", "/health/ready")
+    health = health if isinstance(health, dict) else {}
+    return (health.get("scoring_flags") or {}).get("risk_policy_settings") or {}
+
+
+def _setting_on(settings, key):
+    return str(settings.get(key, "0")).strip().lower() in ("1", "true", "yes", "on")
+
+
+@check("integrity: developer options and ADB are advisory and cost no points")
+def check_developer_settings_advisory(api, ctx):
+    """Joint review R1 (DESIGN.md 69): common on legitimate phones and not
+    evidence of compromise, so they are recorded but never add up into a
+    refusal. A deployment that wants them off uses an eligibility rule."""
+    installation, token, _ = integrity_context(ctx)
+    decision = submit_report(
+        api, installation, token,
+        lambda probes: probes["developer_settings"].update(
+            {"developer_options_enabled": True, "adb_enabled": True}))
+    for code in ("android_developer_options", "android_adb_enabled"):
+        reason = reason_for(decision, code)
+        expect(reason is not None and reason["points"] == 0,
+               "%s must be recorded at 0 points, got %s" % (code, reason))
+    expect(decision["score"] == 0 and decision["verdict"] == "trusted",
+           "developer options and ADB alone must leave a clean device trusted, got %s %s"
+           % (decision["score"], decision["verdict"]))
+
+
+@check("integrity: an eligibility rule refuses with its own code and remedy")
+def check_eligibility_rule(api, ctx):
+    """DESIGN.md 69. With developer_options_refuses or adb_enabled_refuses set to
+    1, a scan reporting that setting on is refused in enforce mode with
+    integrity_device_ineligible and a remedy, and reported in observe mode; a
+    new scan with the setting off clears it. Skips unless a rule is set."""
+    settings = live_settings(api)
+    rules = [key for key in ("developer_options_refuses", "adb_enabled_refuses")
+             if _setting_on(settings, key)]
+    if not rules:
+        raise Skip("no eligibility rule is set; set developer_options_refuses or "
+                   "adb_enabled_refuses to 1 to run this check")
+    integrity_context(ctx)
+    inst, hint = Installation(), fresh_hint()
+    st, pl = enrol(api, inst, hint)
+    expect(st in (200, 201), "enrol failed: %s %s" % (st, pl))
+    token = device_token(api, inst)
+    submit_report(api, inst, token)
+    st, pl = open_account(api, inst, token, "elig-%s" % secrets.token_hex(4))
+    expect(st in (200, 201), "account open failed: %s %s" % (st, pl))
+    access = pl["access_token"]
+    submit_report(api, inst, token, lambda probes: probes["developer_settings"].update(
+        {"developer_options_enabled": True, "adb_enabled": True}))
+    st, pl = protected(api, inst, "GET", "/v1/account/me", access)
+    if ctx["mode"] == "enforce":
+        found = ((pl.get("error") or {}).get("details") or {}).get("eligibility") or []
+        expect(st == 403 and error_code(pl) == "integrity_device_ineligible"
+               and sorted(e.get("rule") for e in found) == sorted(rules)
+               and all(e.get("remedy") for e in found),
+               "expected 403 integrity_device_ineligible naming %s with a remedy, got %s %s %s"
+               % (rules, st, error_code(pl), found))
+    else:
+        found = (pl.get("integrity") or {}).get("eligibility") or []
+        expect(st == 200 and sorted(e.get("rule") for e in found) == sorted(rules),
+               "observe mode must report the failed rules %s, got %s %s" % (rules, st, found))
+    submit_report(api, inst, token)
+    st, pl = protected(api, inst, "GET", "/v1/account/me", access)
+    expect(st == 200 and not (pl.get("integrity") or {}).get("eligibility"),
+           "a new scan with the settings off must clear it, got %s %s" % (st, error_code(pl)))
 
 @check("integrity: the ART JIT code cache is not mistaken for injection")
 def check_jit_not_flagged(api, ctx):
