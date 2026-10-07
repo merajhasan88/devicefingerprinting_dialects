@@ -12,7 +12,11 @@ that answers the handful of statements each check reaches and rejects any
 other SQL, so a check cannot pass by silently skipping a query. For the
 step-up checks the downstream integrity and relationship gates are stubbed, to
 isolate the binding under test. Database transaction semantics are NOT covered
-here: those need the conformance suite against a live engine.
+here: those need the conformance suite against a live engine. The R4 checks are
+the one exception to the scripted cursor: which integrity reports reach an
+installation is decided in SQL, so they run the server's own statements on an
+in-memory SQLite database (stdlib) -- a check of the predicate's logic, not of
+PostgreSQL or SQL Server.
 
     python3 tools/check_security_regressions.py [path/to/repo]
 
@@ -21,10 +25,13 @@ suite's software key), exactly like conformance_suite.py.
 """
 import json
 import os
+import random
+import sqlite3
 import sys
 import time
 import uuid
 from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 # Deterministic local configuration; never inherit a real database, Redis or
@@ -690,7 +697,7 @@ def access_proof_v1_only_by_setting_and_never_with_a_query():
 def elevated_integrity():
     saved = (s._latest_integrity_state, s._device_integrity_memory, s._evaluate_risk_policy)
     s._latest_integrity_state = lambda iid: {"score": 30, "verdict": "elevated", "fresh": True}
-    s._device_integrity_memory = lambda did: None
+    s._device_integrity_memory = lambda did, iid: None
     s._evaluate_risk_policy = lambda *a, **k: {"effective_action": "allow"}
     try:
         yield
@@ -1053,6 +1060,264 @@ def link_race_rolls_back_to_a_savepoint():
            "a lost INSERT race must roll back to a savepoint, statements were %s" % race.statements)
     expect(kinds.index("SAVEPOINT") < kinds.index("INSERT") < kinds.index("ROLLBACK TO"),
            "savepoint ordering wrong: %s" % kinds)
+
+
+# ---------------------------------------------------------------------------
+# R4 (joint review 2026-10-05) -- an integrity block spreads one way only
+# ---------------------------------------------------------------------------
+
+LITE_SCHEMA = """
+CREATE TABLE app_installations (
+    installation_id     TEXT PRIMARY KEY,
+    device_id           TEXT NOT NULL,
+    registration_method TEXT NOT NULL,
+    created_at          TSZ NOT NULL,
+    device_confirmed_at TSZ
+);
+CREATE TABLE integrity_reports (
+    report_id       TEXT PRIMARY KEY,
+    installation_id TEXT NOT NULL REFERENCES app_installations(installation_id),
+    device_id       TEXT NOT NULL,
+    score           INTEGER NOT NULL,
+    verdict         TEXT NOT NULL,
+    hard_block      BOOLEAN NOT NULL,
+    created_at      TSZ NOT NULL
+);
+CREATE TABLE device_account_links (
+    device_id             TEXT NOT NULL,
+    account_id            TEXT NOT NULL,
+    first_installation_id TEXT NOT NULL REFERENCES app_installations(installation_id),
+    PRIMARY KEY (device_id, account_id)
+);
+"""
+
+# The device memory before R4, verbatim but for placeholders: the worst report
+# of every installation on the device. The one-directional rule must never be
+# stricter than this, for any installation.
+DEVICE_WIDE_MEMORY_SQL = """
+    SELECT report_id, installation_id, score, verdict, hard_block, created_at
+    FROM integrity_reports
+    WHERE device_id = ? AND created_at >= ?
+    ORDER BY hard_block DESC, score DESC, created_at DESC
+    LIMIT 1
+"""
+
+sqlite3.register_adapter(
+    datetime, lambda d: d.astimezone(timezone.utc).isoformat(timespec="microseconds"))
+sqlite3.register_converter("TSZ", lambda raw: datetime.fromisoformat(raw.decode()))
+
+
+class LiteCursor(object):
+    """The server's own SQL on SQLite: only placeholders and NOW() adapted."""
+
+    def __init__(self, connection):
+        self.cursor = connection.cursor()
+        self.rowcount = 0
+
+    def execute(self, sql, params=()):
+        self.cursor.execute(sql.replace("%s", "?").replace("NOW()", "CURRENT_TIMESTAMP"),
+                            tuple(params or ()))
+        self.rowcount = self.cursor.rowcount
+
+    def fetchone(self):
+        return self.cursor.fetchone()
+
+
+@contextmanager
+def lite_store():
+    connection = sqlite3.connect(":memory:", detect_types=sqlite3.PARSE_DECLTYPES)
+    connection.executescript(LITE_SCHEMA)
+
+    @contextmanager
+    def lite_cursor(commit=False):
+        yield LiteCursor(connection)
+        connection.commit()
+
+    saved = (s._cursor, s._latest_integrity_state)
+    s._cursor = lite_cursor
+    # Each installation's own latest scan is clean and fresh, so the gate
+    # reaches the device memory -- the only thing these checks vary.
+    s._latest_integrity_state = lambda iid: {"score": 0, "verdict": "trusted", "fresh": True}
+    try:
+        yield connection
+    finally:
+        s._cursor, s._latest_integrity_state = saved
+        connection.close()
+
+
+def lite_installation(connection, device_id, method, confirmed=False):
+    installation_id = str(uuid.uuid4())
+    now = s._utc_now()
+    connection.execute("INSERT INTO app_installations VALUES (?, ?, ?, ?, ?)",
+                       (installation_id, device_id, method, now, now if confirmed else None))
+    return installation_id
+
+
+def lite_report(connection, installation_id, device_id, score, hard_block=False, age_hours=0.0):
+    connection.execute(
+        "INSERT INTO integrity_reports VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (str(uuid.uuid4()), installation_id, device_id, score,
+         s._integrity_verdict(score, hard_block), hard_block,
+         s._utc_now() - timedelta(hours=age_hours)))
+
+
+def memory_outcome(device_id, installation_id):
+    """(the gate refuses on device memory, the policy adds +50, the report used)
+    under the server's current rule. The refusal is the real gate's; +50 mirrors
+    _evaluate_risk_policy's condition, a block from another installation."""
+    try:
+        s._enforce_integrity_gate(device_id, installation_id)
+        refused = False
+    except s.ApiProblem as problem:
+        expect(problem.code == "integrity_device_blocked_recently",
+               "unexpected gate refusal %s" % problem.code)
+        refused = True
+    memory = s._device_integrity_memory(device_id, installation_id)
+    blocked = memory is not None and (memory["hard_block"] or memory["verdict"] == "block")
+    expect(blocked == refused, "gate and memory disagree: %s %s" % (refused, memory))
+    plus50 = blocked and memory["installation_id"] != installation_id
+    return refused, plus50, memory and memory["report_id"]
+
+
+def device_wide_outcome(connection, device_id, installation_id):
+    cutoff = s._utc_now() - timedelta(hours=s.INTEGRITY_DEVICE_MEMORY_HOURS)
+    row = connection.execute(DEVICE_WIDE_MEMORY_SQL, (device_id, cutoff)).fetchone()
+    blocked = row is not None and (bool(row[4]) or row[3] == "block")
+    return blocked, blocked and row[1] != installation_id, row and row[0]
+
+
+@check
+def an_unconfirmed_reinstall_cannot_spread_its_block():
+    with lite_store() as db_:
+        device = str(uuid.uuid4())
+        owner = lite_installation(db_, device, "new_device")
+        lite_report(db_, owner, device, 18)
+        intruder = lite_installation(db_, device, "reinstall_hint")
+        lite_report(db_, intruder, device, 100, hard_block=True)
+        refused, plus50, _ = memory_outcome(device, owner)
+        expect(not refused and not plus50,
+               "a block from an unconfirmed hint-linked installation reached the "
+               "device's original installation: refused=%s +50=%s" % (refused, plus50))
+        refused, plus50, _ = memory_outcome(device, intruder)
+        expect(refused and not plus50,
+               "an installation's own block must still refuse it, without +50: %s %s"
+               % (refused, plus50))
+
+
+@check
+def an_established_block_still_follows_the_device():
+    with lite_store() as db_:
+        device = str(uuid.uuid4())
+        owner = lite_installation(db_, device, "new_device")
+        lite_report(db_, owner, device, 95)
+        reinstall = lite_installation(db_, device, "reinstall_hint")
+        lite_report(db_, reinstall, device, 0)
+        refused, plus50, _ = memory_outcome(device, reinstall)
+        expect(refused and plus50,
+               "the original installation's block must reach a reinstall: %s %s"
+               % (refused, plus50))
+        other = str(uuid.uuid4())
+        first = lite_installation(db_, other, "new_device")
+        confirmed = lite_installation(db_, other, "reinstall_hint", confirmed=True)
+        lite_report(db_, confirmed, other, 90)
+        refused, plus50, _ = memory_outcome(other, first)
+        expect(refused and plus50,
+               "a confirmed reinstall's block must reach the rest of the device: %s %s"
+               % (refused, plus50))
+
+
+@check
+def reports_outside_the_memory_window_never_count():
+    with lite_store() as db_:
+        device = str(uuid.uuid4())
+        owner = lite_installation(db_, device, "new_device")
+        lite_report(db_, owner, device, 100, hard_block=True,
+                    age_hours=s.INTEGRITY_DEVICE_MEMORY_HOURS + 0.5)
+        reinstall = lite_installation(db_, device, "reinstall_hint")
+        for installation in (owner, reinstall):
+            refused, plus50, _ = memory_outcome(device, installation)
+            old_refused, old_plus50, _ = device_wide_outcome(db_, device, installation)
+            expect(not (refused or plus50 or old_refused or old_plus50),
+                   "a block older than %d h must not count under either rule"
+                   % s.INTEGRITY_DEVICE_MEMORY_HOURS)
+
+
+@check
+def only_an_account_from_an_established_installation_confirms_a_reinstall():
+    def link(db_, device, account_id, first):
+        db_.execute("INSERT INTO device_account_links VALUES (?, ?, ?)", (device, account_id, first))
+
+    def login(db_, device, account_id, installation):
+        s._confirm_hint_installation(LiteCursor(db_), device, account_id, installation)
+        db_.commit()
+        return db_.execute("SELECT device_confirmed_at FROM app_installations "
+                           "WHERE installation_id = ?", (installation,)).fetchone()[0] is not None
+
+    with lite_store() as db_:
+        device, elsewhere = str(uuid.uuid4()), str(uuid.uuid4())
+        owner = lite_installation(db_, device, "new_device")
+        b, c, d, e = (lite_installation(db_, device, "reinstall_hint") for _ in range(4))
+        other_owner = lite_installation(db_, elsewhere, "new_device")
+        returning, own_made, foreign = str(uuid.uuid4()), str(uuid.uuid4()), str(uuid.uuid4())
+        link(db_, device, returning, owner)
+        link(db_, device, own_made, c)
+        link(db_, elsewhere, foreign, other_owner)
+        expect(not login(db_, device, str(uuid.uuid4()), b),
+               "a first login on the installation itself must not confirm it")
+        expect(not login(db_, device, own_made, c),
+               "an account first linked through the installation itself must not confirm it")
+        expect(not login(db_, device, own_made, d),
+               "an account first linked through an unconfirmed reinstall must not confirm another")
+        expect(not login(db_, device, foreign, e),
+               "an account linked only to another device must not confirm this one")
+        expect(login(db_, device, returning, b),
+               "an account first linked through the original installation must confirm a reinstall")
+        expect(not login(db_, device, returning, owner),
+               "the original installation is established already and must not be rewritten")
+        chained = str(uuid.uuid4())
+        link(db_, device, chained, b)
+        expect(login(db_, device, chained, e),
+               "an account first linked through a confirmed reinstall must confirm the next one")
+
+
+@check
+def one_directional_memory_is_never_stricter_than_device_wide():
+    """For every installation of 500 random device histories: the new rule
+    refuses, or adds +50, only where the device-wide rule already did; and on a
+    device whose installations are all established -- every row existing when
+    migration 009 ran -- it picks the very same report."""
+    rng = random.Random(20261007)
+    window = s.INTEGRITY_DEVICE_MEMORY_HOURS
+    lifted = identical = 0
+    with lite_store() as db_:
+        for _ in range(500):
+            device = str(uuid.uuid4())
+            all_established = rng.random() < 0.3
+            installations = [lite_installation(db_, device, "new_device")]
+            for _ in range(rng.randint(0, 4)):
+                installations.append(lite_installation(
+                    db_, device, "reinstall_hint",
+                    confirmed=all_established or rng.random() < 0.4))
+            ages = rng.sample(range(0, int((window + 6) * 3600)), 15)
+            for installation in installations:
+                for _ in range(rng.randint(0, 3)):
+                    hard = rng.random() < 0.1
+                    lite_report(db_, installation, device,
+                                100 if hard else rng.choice([0, 8, 18, 30, 45, 60, 75, 90, 100]),
+                                hard_block=hard, age_hours=ages.pop() / 3600.0)
+            for installation in installations:
+                new = memory_outcome(device, installation)
+                old = device_wide_outcome(db_, device, installation)
+                expect(not (new[0] and not old[0]) and not (new[1] and not old[1]),
+                       "stricter than device-wide for %s on %s: new=%s old=%s"
+                       % (installation, device, new, old))
+                if all_established:
+                    expect(new == old, "an all-established device must behave exactly as "
+                           "before: new=%s old=%s" % (new, old))
+                    identical += 1
+                lifted += (old[0] and not new[0]) or (old[1] and not new[1])
+    expect(identical > 0 and lifted > 0,
+           "the sample exercised neither case: identical=%d lifted=%d" % (identical, lifted))
 
 
 def main():

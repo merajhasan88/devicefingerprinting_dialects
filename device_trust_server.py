@@ -1151,7 +1151,7 @@ def _get_backend_identity():
 # against a schema it does not understand. /health/* still answers so operators
 # can see why.
 
-REQUIRED_SCHEMA_VERSION = 8
+REQUIRED_SCHEMA_VERSION = 9
 
 _schema_state = None
 _schema_lock = threading.Lock()
@@ -2608,8 +2608,8 @@ def _latest_integrity_state(installation_id):
     }
 
 
-def _device_integrity_memory(device_id):
-    """Worst native-integrity outcome for this device across all installations.
+def _device_integrity_memory(device_id, installation_id):
+    """Worst native-integrity outcome this installation inherits from its device.
 
     Reports are stored per installation, so a reinstall hands the attacker a
     clean slate: the new installation_id has no history of its own. Recognition
@@ -2617,6 +2617,14 @@ def _device_integrity_memory(device_id):
     too. This returns the worst report recorded against the canonical device_id
     inside the memory window, which is what stops a compromised device from
     laundering a block by reinstalling the app.
+
+    One-directional (DESIGN.md 68, joint review R4): the reports considered are
+    this installation's own and those of the device's ESTABLISHED installations
+    -- its original one, and hint-linked ones confirmed by a returning account
+    (migration 009). A hint is client input, so a hint-linked installation
+    nobody has confirmed can no longer push its block onto the rest of the
+    device. The set is always a subset of what was considered before, so this
+    can only lift refusals, never add one.
     """
     if INTEGRITY_DEVICE_MEMORY_HOURS <= 0:
         return None
@@ -2624,13 +2632,19 @@ def _device_integrity_memory(device_id):
     with _cursor() as cursor:
         cursor.execute(
             """
-            SELECT report_id, installation_id, score, verdict, hard_block, created_at
-            FROM integrity_reports
-            WHERE device_id = %s AND created_at >= %s
-            ORDER BY hard_block DESC, score DESC, created_at DESC
+            SELECT r.report_id, r.installation_id, r.score, r.verdict,
+                   r.hard_block, r.created_at
+            FROM integrity_reports r
+            JOIN app_installations i ON i.installation_id = r.installation_id
+            WHERE r.device_id = %s AND r.created_at >= %s
+              AND (r.installation_id = %s
+                   OR i.registration_method <> 'reinstall_hint'
+                   OR i.device_confirmed_at IS NOT NULL)
+            ORDER BY r.hard_block DESC, r.score DESC, r.created_at DESC,
+                     CASE WHEN r.installation_id = %s THEN 0 ELSE 1 END
             LIMIT 1
             """,
-            (device_id, cutoff),
+            (device_id, cutoff, installation_id, installation_id),
         )
         row = cursor.fetchone()
     if row is None:
@@ -2702,7 +2716,7 @@ def _enforce_integrity_gate(device_id, installation_id, step_up=None, step_up_ac
     # This installation's own scan is clean. Before allowing the request, check
     # whether the physical device was blocked recently under any installation:
     # reinstalling must not clear a compromised device's record.
-    memory = _device_integrity_memory(device_id)
+    memory = _device_integrity_memory(device_id, installation_id)
     if memory is not None and (
         memory.get("hard_block") or memory.get("verdict") == "block"
     ):
@@ -2769,7 +2783,8 @@ def _evaluate_risk_policy(
                    i.created_at,
                    d.status,
                    d.platform,
-                   d.created_at
+                   d.created_at,
+                   i.device_confirmed_at
             FROM app_installations i
             JOIN recognized_devices d ON d.device_id = i.device_id
             WHERE i.installation_id = %s AND i.device_id = %s
@@ -2792,6 +2807,7 @@ def _evaluate_risk_policy(
             device_status,
             platform,
             device_created_at,
+            device_confirmed_at,
         ) = installation_row
 
         cursor.execute(
@@ -2858,7 +2874,7 @@ def _evaluate_risk_policy(
     projected_device_account_count = device_account_count + (1 if add_link else 0)
     projected_account_device_count = account_device_count + (1 if add_link else 0)
     integrity_state = _latest_integrity_state(installation_id)
-    device_integrity_memory = _device_integrity_memory(device_id)
+    device_integrity_memory = _device_integrity_memory(device_id, installation_id)
 
     reasons = []
     score = 0
@@ -3091,6 +3107,15 @@ def _evaluate_risk_policy(
         "platform": platform,
         "registration_method": registration_method,
         "registration_confidence": registration_confidence,
+        # Whether a block on this installation spreads to the rest of the
+        # device (DESIGN.md 68): the original installation, or a hint-linked
+        # one confirmed when a returning account signed in on it.
+        "installation_established": (
+            registration_method != "reinstall_hint" or device_confirmed_at is not None
+        ),
+        "installation_device_confirmed_at": (
+            _iso_z(device_confirmed_at) if device_confirmed_at is not None else None
+        ),
         "installation_created_at": _iso_z(installation_created_at),
         "installation_status": installation_status,
         "device_status": device_status,
@@ -4029,6 +4054,43 @@ def _issue_device_token(installation_id, device_id, key_thumbprint):
         identity=installation_id,
         additional_claims=claims,
         expires_delta=DEVICE_TOKEN_LIFETIME,
+    )
+
+
+def _confirm_hint_installation(cursor, device_id, account_id, installation_id):
+    """Mark a hint-linked installation as belonging to its device (DESIGN.md 68).
+
+    Called when an account signs in on the installation. It is confirmed when
+    that account already belonged to the device -- linked first through an
+    ESTABLISHED installation, the device's original one or a hint-linked one
+    already confirmed. Requiring an established first link is what stops
+    someone confirming their own hint-linked installations with accounts they
+    opened on them. Only established installations spread an integrity block to
+    the rest of the device (_device_integrity_memory). Login is the only caller:
+    opening a new account proves nothing about the device, and refresh only
+    continues a session on the installation. Must run before the link upsert,
+    so a first login on this installation is not mistaken for a returning one.
+    """
+    cursor.execute(
+        """
+        UPDATE app_installations
+        SET device_confirmed_at = NOW()
+        WHERE installation_id = %s
+          AND device_confirmed_at IS NULL
+          AND registration_method = 'reinstall_hint'
+          AND EXISTS (
+              SELECT 1
+              FROM device_account_links l
+              JOIN app_installations first_i
+                ON first_i.installation_id = l.first_installation_id
+              WHERE l.device_id = %s
+                AND l.account_id = %s
+                AND l.first_installation_id <> %s
+                AND (first_i.registration_method <> 'reinstall_hint'
+                     OR first_i.device_confirmed_at IS NOT NULL)
+          )
+        """,
+        (installation_id, device_id, account_id, installation_id),
     )
 
 
@@ -5078,6 +5140,7 @@ def account_login():
     _enforce_risk_policy(policy)
 
     with _cursor(commit=True) as cursor:
+        _confirm_hint_installation(cursor, device_id, account_id, installation_id)
         _link_device_account(cursor, device_id, account_id, installation_id)
         tokens = _issue_account_tokens(
             cursor,

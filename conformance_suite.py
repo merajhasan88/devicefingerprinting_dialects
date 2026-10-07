@@ -311,6 +311,17 @@ def open_account(api, installation, token, handle, password="Passw0rd123"):
     )
 
 
+def sign_in(api, installation, token, handle, password="Passw0rd123"):
+    return protected(
+        api,
+        installation,
+        "POST",
+        "/v1/accounts/login",
+        token,
+        {"handle": handle, "password": password},
+    )
+
+
 # ---------------------------------------------------------------------------
 # checks
 # ---------------------------------------------------------------------------
@@ -1468,6 +1479,130 @@ def check_device_memory(api, ctx):
         error_code(payload) == "integrity_device_blocked_recently",
         "expected integrity_device_blocked_recently, got %s" % error_code(payload),
     )
+
+
+def _frida(probes):
+    probes["runtime_maps"].update({"suspicious_tokens": ["frida"]})
+
+
+def _device_with_owner(api):
+    """The device's original installation, scanned clean, with one account."""
+    owner, hint = Installation(), fresh_hint()
+    st, pl = enrol(api, owner, hint)
+    expect(st in (200, 201), "enrol failed: %s %s" % (st, pl))
+    token = device_token(api, owner)
+    clean = submit_report(api, owner, token)
+    expect(clean["verdict"] == "trusted", "setup: owner scan %s" % clean["verdict"])
+    handle = "r4-%s" % secrets.token_hex(4)
+    st, pl = open_account(api, owner, token, handle)
+    expect(st in (200, 201), "setup: account open failed: %s %s" % (st, pl))
+    return owner, hint, token, handle, pl["access_token"]
+
+
+def _reinstall(api, hint, owner, clean=True):
+    installation = Installation()
+    st, pl = enrol(api, installation, hint)
+    expect(st in (200, 201) and pl.get("device_id") == owner.device_id,
+           "the hint must correlate the reinstall: %s %s" % (st, pl))
+    token = device_token(api, installation)
+    if clean:
+        submit_report(api, installation, token)
+    return installation, token
+
+
+def _expect_owner_unaffected(api, ctx, owner, owner_token, handle, access, why):
+    st, pl = sign_in(api, owner, owner_token, handle)
+    expect(st == 200, "%s: the owner's sign-in expected 200, got %s %s"
+           % (why, st, error_code(pl)))
+    st, pl = protected(api, owner, "GET", "/v1/policy/me", access)
+    policy = _policy_of(pl)
+    expect(st == 200 and "device_integrity_history_block" not in _reason_codes(policy),
+           "%s: the owner must not inherit the block, got %s %s"
+           % (why, st, sorted(_reason_codes(policy)) or error_code(pl)))
+
+
+@check("integrity: a block from an unconfirmed reinstall does not reach the device's owner", db_sensitive=True)
+def check_unconfirmed_reinstall_block(api, ctx):
+    """Joint review R4 (DESIGN.md 68). A reinstall hint is client input: anyone
+    holding a device's hint could link a proven key to it and report a block,
+    which refused every installation on the device for the memory window. Only
+    an established installation -- the original, or a reinstall confirmed by a
+    returning account -- spreads its block now. The block still counts against
+    the installation that reported it."""
+    integrity_context(ctx)
+    owner, hint, owner_token, handle, access = _device_with_owner(api)
+    intruder, intruder_token = _reinstall(api, hint, owner, clean=False)
+    blocked = submit_report(api, intruder, intruder_token, _frida)
+    expect(blocked["verdict"] == "block", "setup failed, expected block: %s" % blocked)
+    _expect_owner_unaffected(api, ctx, owner, owner_token, handle, access,
+                             "unconfirmed reinstall")
+    if ctx["mode"] == "enforce":
+        st, pl = sign_in(api, intruder, intruder_token, handle)
+        expect(st == 403 and error_code(pl) == "integrity_blocked",
+               "the blocked installation itself expected 403 integrity_blocked, got %s %s"
+               % (st, error_code(pl)))
+
+
+@check("integrity: a reinstall confirmed by a returning account carries its block to the device", db_sensitive=True)
+def check_confirmed_reinstall_block(api, ctx):
+    """DESIGN.md 68: an account that already belonged to the device, signing in
+    on a reinstall, confirms it; from then on its block reaches the rest of the
+    device as before R4. The policy context reports which installations are
+    established."""
+    integrity_context(ctx)
+    owner, hint, owner_token, handle, access = _device_with_owner(api)
+    reinstall, token = _reinstall(api, hint, owner)
+    st, pl = sign_in(api, reinstall, token, handle)
+    expect(st == 200, "the returning account's sign-in expected 200, got %s %s"
+           % (st, error_code(pl)))
+    context = _policy_of(pl).get("context") or {}
+    expect(context.get("installation_established") is False,
+           "before confirmation the reinstall is not established: %s"
+           % context.get("installation_established"))
+    st, pl = protected(api, reinstall, "GET", "/v1/policy/me", pl["access_token"])
+    context = _policy_of(pl).get("context") or {}
+    expect(st == 200 and context.get("installation_established") is True
+           and context.get("installation_device_confirmed_at"),
+           "the sign-in must confirm the reinstall: %s %s %s"
+           % (st, context.get("installation_established"),
+              context.get("installation_device_confirmed_at")))
+    blocked = submit_report(api, reinstall, token, _frida)
+    expect(blocked["verdict"] == "block", "setup failed, expected block: %s" % blocked)
+    st, pl = protected(api, owner, "GET", "/v1/policy/me", access)
+    if ctx["mode"] == "enforce":
+        expect(st == 403 and error_code(pl) == "integrity_device_blocked_recently",
+               "expected 403 integrity_device_blocked_recently, got %s %s"
+               % (st, error_code(pl)))
+    else:
+        expect(st == 200 and "device_integrity_history_block" in _reason_codes(_policy_of(pl)),
+               "the confirmed reinstall's block must reach the owner (+50), got %s %s"
+               % (st, sorted(_reason_codes(_policy_of(pl)))))
+
+
+@check("integrity: accounts opened on a reinstall cannot confirm another reinstall", db_sensitive=True)
+def check_reinstall_self_confirmation(api, ctx):
+    """DESIGN.md 68: only an account first linked through an established
+    installation confirms. Someone holding the hint who opens an account on one
+    reinstall and signs in with it on a second has confirmed nothing, so a block
+    on the second still does not reach the owner."""
+    integrity_context(ctx)
+    owner, hint, owner_token, handle, access = _device_with_owner(api)
+    first, first_token = _reinstall(api, hint, owner)
+    own_handle = "r4-%s" % secrets.token_hex(4)
+    st, pl = open_account(api, first, first_token, own_handle)
+    expect(st in (200, 201), "account open on the reinstall failed: %s %s" % (st, pl))
+    second, second_token = _reinstall(api, hint, owner)
+    st, pl = sign_in(api, second, second_token, own_handle)
+    expect(st == 200, "sign-in on the second reinstall expected 200, got %s %s"
+           % (st, error_code(pl)))
+    st, pl = protected(api, second, "GET", "/v1/policy/me", pl["access_token"])
+    expect((_policy_of(pl).get("context") or {}).get("installation_established") is False,
+           "an account opened on a reinstall must not confirm another: %s %s"
+           % (st, _policy_of(pl).get("context")))
+    blocked = submit_report(api, second, second_token, _frida)
+    expect(blocked["verdict"] == "block", "setup failed, expected block: %s" % blocked)
+    _expect_owner_unaffected(api, ctx, owner, owner_token, handle, access,
+                             "self-confirmed reinstall")
 
 
 @check("enforcement: a step-up proof satisfies an elevated integrity verdict")
