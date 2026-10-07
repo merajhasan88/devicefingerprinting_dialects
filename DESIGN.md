@@ -5370,3 +5370,63 @@ EC2 stopped. Server `/opt/device_trust_server.py` = this round (md5 `589e931d…
 `.bak-20261006-105814`); schema 8; observe/observe; v2-only access proofs; `stepup_required_paths` `''`.
 Both phones' step-up keys in the harness app still need re-enrolling (§65).
 
+## 67. Design (not implemented): a limited session instead of a refusal at login on soft risk (2026-10-07)
+
+**Why.** In enforce mode, login, account registration and refresh refuse outright on an elevated
+integrity verdict (`integrity_elevated`) or a relationship review/block. Authenticated requests can
+clear an elevated verdict with a step-up proof (§66, F11), but login cannot: nobody is signed in yet.
+A legitimate user caught by a weak signal — a warm .NET session on a phone with developer options on
+(33 / elevated, §66.3) — is simply locked out. The joint review (R1, its recommendation 5) proposes
+a limited session plus an upgrade route instead. **Owner decisions so far (2026-10-07):** what a
+limited session may reach is a DBA-configurable list of paths, like the step-up paths; **this server
+issues the upgrade.**
+
+**Proposed behaviour (enforce mode only; observe mode already refuses nothing).**
+
+| Outcome at login / registration / refresh | Today | Proposed |
+|---|---|---|
+| Valid key proof and password, soft risk (see the open decision below) | 403 | **Limited session**: tokens issued with `scope: "limited"` |
+| Integrity block, device memory block, relationship block | 403 | 403, unchanged |
+| Invalid signature, replay, wrong binding, revoked installation or device | 401/403 | unchanged |
+
+**Mechanics.**
+
+- **Tokens.** Access and refresh tokens carry `scope` (`full` or `limited`); `refresh_sessions` stores
+  it, so refreshing a limited session yields a limited session.
+- **Where it is enforced.** `_require_access_proof` reads `scope`; a limited token is accepted only on
+  paths listed in a new `risk_policy_settings` row, `limited_session_paths` (default: empty — a limited
+  session reaches nothing but the upgrade endpoint until a DBA lists paths), checked exactly where
+  `stepup_required_paths` is. Anything else: 403 `session_limited`, with the upgrade routes in
+  `details`.
+- **Upgrade.** `POST /v1/auth/upgrade` with the limited access token and an access proof v2, plus one
+  accepted proof (below). On success it issues a full access and refresh token **in the same refresh
+  family** and retires the limited session the way a refresh rotates it. It re-runs the integrity and
+  relationship gates: an upgrade never overrides a block.
+
+**Open decision — which proofs may upgrade a session.** Each has a different source of trust:
+
+1. **A step-up proof v2 over the upgrade request** — the device passcode on the same phone. Already
+   built and cheap, but it is the same device the soft risk came from, and proves possession of the
+   device, which was never the question for relationship risk.
+2. **Approval from another installation already linked to the account** — a different phone, signed in
+   with a full session, approves with its own step-up proof. Strong; needs a small pending-approvals
+   table and a way for the other phone to see the request; only works for users with a second device.
+3. **A signed MFA assertion from the customer's identity backend** — the customer runs its own MFA
+   (SMS, e-mail, authenticator) and signs a short assertion naming the account, the installation, the
+   limited session and a nonce; this server verifies it with a configured public key and consumes the
+   nonce once. An independent factor; needs a key-configuration step and an assertion format we define.
+
+**Recommendation:** (2) or (3) for full access; (1) only as a DBA-enabled option for integrity-elevated
+soft risk, never alone for relationship risk.
+
+**Also open:** which outcomes count as soft. Proposed default: integrity `elevated` and relationship
+`step_up`/`review` get a limited session; integrity `review` and `block`, device-memory blocks and
+relationship `block` refuse — DBA-tunable like the other bands.
+
+**What it needs.** A migration (the settings rows; `refresh_sessions.scope`; a pending-approvals table
+for route 2); server changes in the three login paths, `_require_access_proof` and the new endpoint;
+both SDKs handling `session_limited` and the upgrade; conformance checks for: a soft-risk login yields
+a limited session; a limited token is refused off-list and accepted on-list; each upgrade route issues
+a full session once (replay refused); a block is never upgraded; refreshing a limited session stays
+limited.
+
