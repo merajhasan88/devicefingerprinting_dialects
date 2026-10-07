@@ -5456,6 +5456,61 @@ other secrets), not a policy row: they rotate with the customer's identity syste
 overrule any default before implementation. `INTEGRATION_GUIDE.md` §7 describes the plan and its
 caveats for customers, marked as not yet available.
 
+A relationship `step_up` is refused today only where a DBA set `elevated_risk_refuses` to 1 (§54);
+by default it is recorded and allowed, so `limited_session_policy_actions` changes nothing for it
+unless that setting is on.
+
+**Clarified with the owner (2026-10-07): users with one device, laptops, enforcement.**
+
+*Users with one device.* Route 2 needs another installation of the app, enrolled with this server,
+linked to the same account and holding a full session; a user with one phone has none. With the
+defaults (routes 1 and 3 off) that user stays limited until the cause clears — a new clean scan for an
+elevated integrity verdict, the customer's own review for a relationship review — or until the
+customer turns on route 3. Route 3 is therefore the route that covers every user, and the guide makes
+it a requirement for any deployment where single-device users must be able to recover. It is also
+the support-assisted recovery: the customer's support verifies the user by its own means, and the
+customer's backend signs the assertion for that one limited session. Nothing is marked safe on this
+server and no link or device record changes; the assertion upgrades one session.
+
+*Laptops.* Route 2 cannot use one. Only Android and iOS installations can enrol (registration answers
+400 `unsupported_platform` for anything else), and a laptop's browser session belongs to the
+customer's website, which this server never sees. A laptop helps through route 3: the user, signed in
+to the customer's website, approves there and the customer's backend signs the assertion — as strong
+as that website's own login. Enrolling laptops natively (a platform passkey as a new kind of
+installation, without attestation, like the phones) would be a separate project; not designed.
+
+*Enforcement.* Everything is checked by the server; a modified app gains nothing.
+
+- The scope is a claim in the server-signed token, and each request's access proof binds the token to
+  the installation key, so it can be neither edited nor used from another device.
+  `_require_access_proof` compares every request's path with `limited_session_paths`; anything else
+  is 403 `session_limited`. `refresh_sessions.scope` keeps it across refreshes, so a limited session
+  cannot refresh into a full one.
+- The limited login response and every `session_limited` refusal carry `upgrade_routes`: the routes
+  the DBA enabled **and that are open to this user** — route 2 only when the account has another
+  installation with an active full session, route 1 only when every soft cause is integrity-elevated.
+  An empty list tells the app to send the user to support.
+- **Route 2.** The limited session asks `POST /v1/auth/upgrade` for an approval; the server records a
+  pending approval with its own id and nonce, a short expiry (proposed 300 s, a setting) and what the
+  approving phone must show: the requesting installation's platform, when it was first seen and how it
+  joined the device — no hardware attributes or PII. The approving installation lists pending approvals
+  under its own full session (`GET /v1/auth/approvals`, read when the app opens; a push notification to
+  wake it is the customer's infrastructure) and approves with an access proof plus a step-up proof v2
+  over the approval request. The server accepts it only from a **different** installation, linked to
+  the **same account**, holding an **active full session**, that passes the integrity and relationship
+  gates itself, with the nonce unused and unexpired. Consuming the nonce upgrades exactly one limited
+  session once. Approval requests per account are budgeted (proposed 3 per hour, a setting) against
+  prompt fatigue.
+- **Route 3.** An ES256 JWS from the customer's backend over the account, the installation, the limited
+  session, a nonce this server issued for that session, an expiry of a few minutes and the method used;
+  verified with the configured public keys. The nonce is recorded only after the signature verifies —
+  the access-proof pattern — so a replay fails atomically.
+- **Route 1.** A step-up proof v2 over the upgrade request by the same installation's step-up key, only
+  where the DBA enabled it and only when every soft cause is integrity-elevated.
+- After any route the integrity and relationship gates run again, and a hard outcome refuses as before.
+  The full session is issued in the same refresh family; the limited session is retired like a
+  rotation.
+
 ## 68. R4 implemented: an integrity block spreads one way only (2026-10-07)
 
 **Owner decisions (2026-10-07).** Keep the accounts-per-device counts as they are and rely on the
