@@ -1854,6 +1854,99 @@ def check_upgrade_route_stepup(api, ctx):
            "route 1 with a valid step-up proof must upgrade, got %s %s" % (st, up))
 
 
+@check("limited session: route 2, approval from another installation of the account", db_sensitive=True)
+def check_upgrade_route_approval(api, ctx):
+    """DESIGN.md 70. A second installation of the account, holding a full
+    session, lists the request (no hardware attributes), approves it with its
+    own step-up proof, and the limited session upgrades once. Without step-up,
+    or denied, it does not; requests per account are budgeted."""
+    settings = live_settings(api)
+    if not _setting_on(settings, "upgrade_other_device_approval") and \
+            "upgrade_other_device_approval" in settings:
+        raise Skip("upgrade_other_device_approval is off on this server")
+    if ctx["mode"] != "enforce":
+        raise Skip("server is in observe mode; limited sessions exist only in enforce mode")
+    if int(settings.get("upgrade_approvals_per_hour", "3")) < 2:
+        raise Skip("upgrade_approvals_per_hour is below 2; this check raises two requests")
+    integrity_context(ctx)
+    factor = settings.get("stepup_factor", "passcode")
+    approver = Installation()
+    stepup_priv, stepup_jwk = stepup_jwk_pair()
+    st, pl = enrol(api, approver, fresh_hint(), stepup_public_key=stepup_jwk,
+                   stepup_key_auth={"factor": factor, "mode": "per_use", "window_seconds": 0})
+    expect(st in (200, 201), "enrol failed: %s %s" % (st, pl))
+    approver_token = device_token(api, approver)
+    submit_report(api, approver, approver_token)
+    handle = "r2-%s" % secrets.token_hex(4)
+    st, pl = open_account(api, approver, approver_token, handle)
+    expect(st in (200, 201) and pl.get("scope") == "full", "setup: approver account: %s %s" % (st, pl))
+    approver_access = pl["access_token"]
+
+    phone = Installation()
+    st, pl = enrol(api, phone, fresh_hint())
+    expect(st in (200, 201), "enrol failed: %s %s" % (st, pl))
+    phone_token = device_token(api, phone)
+    submit_report(api, phone, phone_token, _elevate)
+
+    def limited_login():
+        st, pl = sign_in(api, phone, phone_token, handle)
+        expect(st == 200 and pl.get("scope") == "limited"
+               and "approval" in (pl.get("upgrade_routes") or []),
+               "the second phone must get a limited session offering approval, got %s %s" % (st, pl))
+        return pl["access_token"]
+
+    def ask(access):
+        st, pl = protected(api, phone, "POST", "/v1/auth/upgrade/request", access, {"route": "approval"})
+        return st, pl
+
+    limited = limited_login()
+    st, req = ask(limited)
+    expect(st == 201 and req.get("request_id"), "approval request failed: %s %s" % (st, req))
+    rid = req["request_id"]
+    st, up = protected(api, phone, "POST", "/v1/auth/upgrade", limited,
+                       {"route": "approval", "request_id": rid})
+    expect(st == 403 and error_code(up) == "approval_not_granted"
+           and _details(up).get("state") == "pending",
+           "a pending approval must not upgrade, got %s %s" % (st, up))
+    st, listed = protected(api, approver, "GET", "/v1/auth/approvals", approver_access)
+    mine = [a for a in (listed.get("approvals") or []) if a.get("request_id") == rid] if st == 200 else []
+    expect(len(mine) == 1 and set(mine[0].get("requesting_installation") or {})
+           == {"platform", "first_seen_at", "registration_method"},
+           "the approver must see the request and only what it needs, got %s %s" % (st, listed))
+    path = "/v1/auth/approvals/%s/approve" % rid
+    st, pl = protected(api, approver, "POST", path, approver_access, {})
+    expect(st == 403 and error_code(pl) == "stepup_required",
+           "approving without step-up must be refused, got %s %s" % (st, error_code(pl)))
+    st, pl = stepup_call(api, approver, stepup_priv, "POST", path, approver_access, {}, factor)
+    expect(st == 200 and pl.get("approved") is True, "approving with step-up failed: %s %s" % (st, pl))
+    st, up = protected(api, phone, "POST", "/v1/auth/upgrade", limited,
+                       {"route": "approval", "request_id": rid})
+    expect(st == 200 and up.get("scope") == "full" and up.get("upgraded_by") == "approval",
+           "an approved request must upgrade, got %s %s" % (st, up))
+
+    second = limited_login()
+    st, up = protected(api, phone, "POST", "/v1/auth/upgrade", second,
+                       {"route": "approval", "request_id": rid})
+    expect(st == 403 and error_code(up) == "approval_not_granted",
+           "an approval must not upgrade another login, got %s %s" % (st, error_code(up)))
+    st, req = ask(second)
+    expect(st == 201, "second approval request failed: %s %s" % (st, req))
+    st, pl = protected(api, approver, "POST", "/v1/auth/approvals/%s/deny" % req["request_id"],
+                       approver_access, {})
+    expect(st == 200 and pl.get("denied") is True, "denying failed: %s %s" % (st, pl))
+    st, up = protected(api, phone, "POST", "/v1/auth/upgrade", second,
+                       {"route": "approval", "request_id": req["request_id"]})
+    expect(st == 403 and _details(up).get("state") == "denied",
+           "a denied request must not upgrade, got %s %s" % (st, up))
+    budget = int(settings.get("upgrade_approvals_per_hour", "3"))
+    for _ in range(max(0, budget - 2)):
+        ask(second)
+    st, pl = ask(second)
+    expect(st == 429 and error_code(pl) == "upgrade_budget_exhausted",
+           "request %d in an hour must exceed the budget of %d, got %s %s"
+           % (budget + 1, budget, st, error_code(pl)))
+
+
 @check("enforcement: a step-up proof satisfies an elevated integrity verdict")
 def check_elevated_step_up(api, ctx):
     """Review F11 (DESIGN.md 63). An elevated verdict used to answer

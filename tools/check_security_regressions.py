@@ -83,6 +83,7 @@ class Rows(object):
         self.settings = dict(SETTINGS)
         self.consumed = set()
         self.refresh_row = None
+        self.other_full_session = None
 
     def execute(self, sql, params=None):
         q = " ".join(sql.split())
@@ -108,6 +109,10 @@ class Rows(object):
         elif q.startswith("SELECT family_id, account_id, device_id, installation_id, expires_at, revoked_at, scope, limited_causes FROM refresh_sessions"):
             self.result = self.refresh_row
         elif q.startswith("INSERT INTO refresh_sessions"):
+            self.writes.append((q, params))
+        elif q.startswith("SELECT r.session_id FROM refresh_sessions r"):
+            self.result = self.other_full_session
+        elif q.startswith("UPDATE session_upgrade_requests"):
             self.writes.append((q, params))
         elif q.startswith("SELECT stepup_key_account_id, stepup_public_key_jwk"):
             self.result = (None, self.step_jwk)
@@ -1705,6 +1710,150 @@ def a_limited_session_upgrades_only_through_an_open_route():
             expect(reply.status_code == 403 and error_code(reply) == "upgrade_route_unavailable",
                    "route 1 must never clear relationship risk, got %s %s"
                    % (reply.status_code, error_code(reply)))
+    finally:
+        db.refresh_row = None
+
+
+UPGRADE_LITE_SCHEMA = """
+CREATE TABLE app_installations (
+    installation_id TEXT PRIMARY KEY,
+    device_id       TEXT NOT NULL,
+    status          TEXT NOT NULL
+);
+CREATE TABLE refresh_sessions (
+    session_id      TEXT PRIMARY KEY,
+    family_id       TEXT NOT NULL,
+    account_id      TEXT NOT NULL,
+    installation_id TEXT NOT NULL REFERENCES app_installations(installation_id),
+    expires_at      TSZ NOT NULL,
+    revoked_at      TSZ,
+    scope           TEXT NOT NULL
+);
+CREATE TABLE session_upgrade_requests (
+    request_id               TEXT PRIMARY KEY,
+    route                    TEXT NOT NULL,
+    account_id               TEXT NOT NULL,
+    installation_id          TEXT NOT NULL,
+    family_id                TEXT NOT NULL,
+    expires_at               TSZ NOT NULL,
+    approved_by_installation TEXT,
+    approved_at              TSZ,
+    denied_at                TSZ,
+    consumed_at              TSZ
+);
+"""
+
+
+@check
+def approvals_come_from_another_installation_of_the_account_and_are_single_use():
+    """Route 2's conditions are SQL, so they run on SQLite like R4's: who may
+    approve, which session may use an approval, once, before it expires."""
+    connection = sqlite3.connect(":memory:", detect_types=sqlite3.PARSE_DECLTYPES)
+    connection.executescript(UPGRADE_LITE_SCHEMA)
+    cur = LiteCursor(connection)
+    now = s._utc_now()
+    acct, stranger = str(uuid.uuid4()), str(uuid.uuid4())
+    phone, other, dead = (str(uuid.uuid4()) for _ in range(3))
+    for iid, status in ((phone, "active"), (other, "active"), (dead, "revoked")):
+        connection.execute("INSERT INTO app_installations VALUES (?, ?, ?)", (iid, "d", status))
+
+    def session(iid, scope="full", revoked=None, expires=now + timedelta(days=1), who=acct):
+        connection.execute("INSERT INTO refresh_sessions VALUES (?, ?, ?, ?, ?, ?, ?)",
+                           (str(uuid.uuid4()), str(uuid.uuid4()), who, iid, expires, revoked, scope))
+
+    for kwargs in ({"iid": other, "scope": "limited"}, {"iid": other, "revoked": now},
+                   {"iid": other, "expires": now - timedelta(seconds=1)}, {"iid": dead},
+                   {"iid": other, "who": stranger}):
+        session(**kwargs)
+    expect(not s._has_other_full_session(cur, acct, phone),
+           "limited, revoked, expired, inactive or foreign sessions must not count as an approver")
+    session(other)
+    expect(s._has_other_full_session(cur, acct, phone) and not s._has_other_full_session(cur, acct, other),
+           "only ANOTHER installation's current full session counts")
+
+    family = str(uuid.uuid4())
+
+    def request(expires=now + timedelta(minutes=5)):
+        rid = str(uuid.uuid4())
+        connection.execute("INSERT INTO session_upgrade_requests (request_id, route, account_id, "
+                           "installation_id, family_id, expires_at) VALUES (?, 'approval', ?, ?, ?, ?)",
+                           (rid, acct, phone, family, expires))
+        return rid
+
+    mine = {"account_id": acct, "installation_id": phone, "family_id": family}
+    state = lambda rid, fam=family: s._approval_state(cur, {"request_id": rid}, {"family": fam}, acct, phone)
+    rid = request()
+    expect(state(rid) == "pending" and s._consume_approval(cur, rid, mine) == 0,
+           "a pending request must not be usable")
+    expect(s._grant_approval(cur, rid, acct, phone) == 0, "the requester must not approve itself")
+    expect(s._grant_approval(cur, rid, stranger, other) == 0, "another account must not approve")
+    expect(s._grant_approval(cur, rid, acct, other) == 1, "another installation of the account approves")
+    expect(s._grant_approval(cur, rid, acct, other) == 0, "an approval is granted once")
+    expect(state(rid) == "approved" and state(rid, str(uuid.uuid4())) == "unknown",
+           "an approval belongs to its own session family")
+    for wrong in ({"installation_id": other}, {"family_id": str(uuid.uuid4())}, {"account_id": stranger}):
+        expect(s._consume_approval(cur, rid, dict(mine, **wrong)) == 0,
+               "an approval must not be usable by %s" % wrong)
+    expect(s._consume_approval(cur, rid, mine) == 1 and s._consume_approval(cur, rid, mine) == 0
+           and state(rid) == "used", "an approval upgrades exactly once")
+    late = request(expires=now - timedelta(seconds=1))
+    expect(s._grant_approval(cur, late, acct, other) == 0 and state(late) == "expired",
+           "an expired request must not be approved")
+    denied = request()
+    expect(s._deny_approval(cur, denied, acct, other) == 1 and s._grant_approval(cur, denied, acct, other) == 0
+           and s._consume_approval(cur, denied, mine) == 0 and state(denied) == "denied",
+           "a denied request stays denied")
+    expect(s._deny_approval(cur, request(), acct, phone) == 0, "the requester must not deny its own request")
+    connection.close()
+
+
+@check
+def approving_needs_a_current_full_session_and_a_step_up():
+    family, session = str(uuid.uuid4()), str(uuid.uuid4())
+    with s.app.app_context():
+        full = s.create_access_token(identity=account, additional_claims={
+            "role": "account", "iid": inst.installation_id, "did": inst.device_id,
+            "sid": session, "family": family, "scope": "full"})
+    rid = str(uuid.uuid4())
+    path = "/v1/auth/approvals/%s/approve" % rid
+
+    def approve(bearer, stepup=False):
+        raw = encode({})
+        nonce = fresh_nonce()
+        head = access_headers("POST", path, raw, bearer=bearer, nonce=nonce)
+        if stepup:
+            head.update(stepup_headers("POST", path, raw, nonce, bearer=bearer))
+        return client.post(path, data=raw, headers=head)
+
+    db.writes = []
+    try:
+        with elevated_integrity(), policy():
+            s._latest_integrity_state = _verdict_state("trusted")
+            reply = approve(_limited_session("integrity_elevated"), stepup=True)
+            expect(reply.status_code == 403 and error_code(reply) == "session_limited",
+                   "a limited session must not approve, got %s %s" % (reply.status_code, error_code(reply)))
+            db.refresh_row = (family, account, inst.device_id, inst.installation_id,
+                              s._utc_now() + s.REFRESH_TOKEN_LIFETIME, s._utc_now(), "full", None)
+            reply = approve(full, stepup=True)
+            expect(reply.status_code == 403 and error_code(reply) == "full_session_required",
+                   "a rotated or revoked session must not approve, got %s %s"
+                   % (reply.status_code, error_code(reply)))
+            db.refresh_row = db.refresh_row[:5] + (None, "full", None)
+            reply = approve(full)
+            expect(reply.status_code == 403 and error_code(reply) == "stepup_required",
+                   "approving must need a step-up proof, got %s %s" % (reply.status_code, error_code(reply)))
+            s._latest_integrity_state = _verdict_state("elevated")
+            reply = approve(full, stepup=True)
+            expect(reply.status_code == 403 and error_code(reply) == "integrity_elevated",
+                   "an elevated approver must not approve, even with step-up, got %s %s"
+                   % (reply.status_code, error_code(reply)))
+            s._latest_integrity_state = _verdict_state("trusted")
+            reply = approve(full, stepup=True)
+            granted = [p for q, p in db.writes if q.startswith("UPDATE session_upgrade_requests")]
+            expect(reply.status_code == 200 and granted and granted[-1][1] == rid
+                   and granted[-1][0] == inst.installation_id,
+                   "a current full session with step-up must approve, got %s %s"
+                   % (reply.status_code, reply.get_json()))
     finally:
         db.refresh_row = None
 

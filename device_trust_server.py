@@ -1237,6 +1237,10 @@ def schema_guard():
 # "stale"); a worker with none, or past that bound, refuses policy-dependent
 # requests with 503 risk_policy_unavailable.
 
+# Route-3 verification keys (DESIGN.md 70): the customer's identity backend
+# signs upgrade assertions; its public keys are deployment configuration.
+UPGRADE_ASSERTION_KEYS = {}
+
 RISK_SETTINGS_CACHE_TTL_SECONDS = int(
     os.environ.get("RISK_SETTINGS_CACHE_TTL_SECONDS", "30")
 )
@@ -4197,12 +4201,15 @@ def _require_limited_session_path(claims):
     )
 
 
-def _upgrade_routes(cursor, account_id, installation_id, causes):
-    """The upgrade routes the DBA enabled AND that are open to this user.
+def _enabled_upgrade_routes(causes):
+    """The proof routes the DBA enabled that can clear these causes.
 
     stepup (route 1): a step-up proof from this same phone -- off by default,
     and only when every cause is integrity-related: it proves the screen lock
     of the phone the risk came from, nothing about relationship risk.
+    approval (route 2): another installation of the account approves -- on.
+    assertion (route 3): the customer's identity backend signs -- off, and
+    unusable until its verification keys are configured.
     """
     routes = []
     if (
@@ -4210,6 +4217,19 @@ def _upgrade_routes(cursor, account_id, installation_id, causes):
         and causes
         and all(cause.startswith("integrity_") for cause in causes)
     ):
+        routes.append("stepup")
+    if _risk_setting_bool("upgrade_other_device_approval", True):
+        routes.append("approval")
+    if _risk_setting_bool("upgrade_mfa_assertion", False) and UPGRADE_ASSERTION_KEYS:
+        routes.append("assertion")
+    return routes
+
+
+def _upgrade_routes(cursor, account_id, installation_id, causes):
+    """The routes enabled for these causes AND open to this user right now."""
+    routes = []
+    enabled = _enabled_upgrade_routes(causes)
+    if "stepup" in enabled:
         cursor.execute(
             "SELECT stepup_key_account_id, stepup_public_key_jwk "
             "FROM app_installations WHERE installation_id = %s",
@@ -4220,7 +4240,30 @@ def _upgrade_routes(cursor, account_id, installation_id, causes):
             row[0] is None or str(row[0]) == str(account_id)
         ):
             routes.append("stepup")
+    if "approval" in enabled and _has_other_full_session(
+        cursor, account_id, installation_id
+    ):
+        routes.append("approval")
+    if "assertion" in enabled:
+        routes.append("assertion")
     return routes
+
+
+def _has_other_full_session(cursor, account_id, installation_id):
+    """Another active installation of this account holds a current full session."""
+    cursor.execute(
+        """
+        SELECT r.session_id
+        FROM refresh_sessions r
+        JOIN app_installations i ON i.installation_id = r.installation_id
+        WHERE r.account_id = %s AND r.installation_id <> %s
+          AND r.scope = 'full' AND r.revoked_at IS NULL AND r.expires_at > %s
+          AND i.status = 'active'
+        LIMIT 1
+        """,
+        (account_id, installation_id, _utc_now()),
+    )
+    return cursor.fetchone() is not None
 
 
 def _issue_device_token(installation_id, device_id, key_thumbprint):
@@ -5753,6 +5796,12 @@ def upgrade_session():
             "invalid_route",
         )
 
+    if route == "approval":
+        # Before the gates, so a client polling for the approval costs one
+        # cheap read per attempt and stores no risk decision until it is real.
+        with _cursor() as cursor:
+            _approval_state(cursor, body, claims, account_id, installation_id, required=True)
+
     integrity = _enforce_integrity_gate(device_id, installation_id, limited_ok=True)
     policy = _evaluate_risk_policy(
         "session_upgrade",
@@ -5814,7 +5863,7 @@ def _verify_upgrade_proof(route, body, claims, account_id, installation_id, caus
     """Check the proof a still-limited session offers (before any write)."""
     with _cursor() as cursor:
         routes = _upgrade_routes(cursor, account_id, installation_id, causes)
-    if route == "recheck" or route not in routes:
+    if route == "recheck" or route not in _enabled_upgrade_routes(causes):
         raise ApiProblem(
             "The session is still limited (%s); upgrade through one of the routes "
             "open to it." % ", ".join(causes),
@@ -5830,7 +5879,302 @@ def _verify_upgrade_proof(route, body, claims, account_id, installation_id, caus
 
 def _consume_upgrade_proof(route, body, cursor, session):
     """Consume a single-use proof inside the upgrade's transaction."""
-    return None
+    if route == "approval":
+        if _consume_approval(cursor, body.get("request_id"), session) != 1:
+            raise ApiProblem(
+                "The approval is no longer usable.",
+                403,
+                "approval_not_granted",
+                details={"state": "used"},
+            )
+
+
+def _approval_state(cursor, body, claims, account_id, installation_id, required=False):
+    """Where this limited session's approval request stands.
+
+    The request must belong to this account, this installation and this
+    session's refresh family -- so a refresh in between does not break it, and
+    no other login can use it.
+    """
+    request_id = _uuid_text(body.get("request_id"), "request_id")
+    cursor.execute(
+        """
+        SELECT approved_at, denied_at, consumed_at, expires_at
+        FROM session_upgrade_requests
+        WHERE request_id = %s AND route = 'approval' AND account_id = %s
+          AND installation_id = %s AND family_id = %s
+        """,
+        (request_id, account_id, installation_id, claims.get("family")),
+    )
+    row = cursor.fetchone()
+    if row is None:
+        state = "unknown"
+    elif row[2] is not None:
+        state = "used"
+    elif row[1] is not None:
+        state = "denied"
+    elif row[3] <= _utc_now():
+        state = "expired"
+    elif row[0] is None:
+        state = "pending"
+    else:
+        state = "approved"
+    if required and state != "approved":
+        raise ApiProblem(
+            "The approval request is %s." % state,
+            403,
+            "approval_not_granted",
+            details={"state": state},
+        )
+    return state
+
+
+def _consume_approval(cursor, request_id, session):
+    """Mark an approved request used, exactly once; returns the rows changed."""
+    cursor.execute(
+        """
+        UPDATE session_upgrade_requests
+        SET consumed_at = NOW()
+        WHERE request_id = %s AND route = 'approval' AND account_id = %s
+          AND installation_id = %s AND family_id = %s
+          AND approved_at IS NOT NULL AND denied_at IS NULL
+          AND consumed_at IS NULL AND expires_at > %s
+        """,
+        (
+            _uuid_text(request_id, "request_id"),
+            session["account_id"],
+            session["installation_id"],
+            session["family_id"],
+            _utc_now(),
+        ),
+    )
+    return cursor.rowcount
+
+
+def _grant_approval(cursor, request_id, account_id, approver_installation_id):
+    """Approve a pending request of the same account from ANOTHER installation."""
+    cursor.execute(
+        """
+        UPDATE session_upgrade_requests
+        SET approved_at = NOW(), approved_by_installation = %s
+        WHERE request_id = %s AND route = 'approval' AND account_id = %s
+          AND installation_id <> %s
+          AND approved_at IS NULL AND denied_at IS NULL
+          AND consumed_at IS NULL AND expires_at > %s
+        """,
+        (approver_installation_id, request_id, account_id, approver_installation_id,
+         _utc_now()),
+    )
+    return cursor.rowcount
+
+
+def _deny_approval(cursor, request_id, account_id, installation_id):
+    cursor.execute(
+        """
+        UPDATE session_upgrade_requests
+        SET denied_at = NOW()
+        WHERE request_id = %s AND route = 'approval' AND account_id = %s
+          AND installation_id <> %s
+          AND approved_at IS NULL AND denied_at IS NULL
+          AND consumed_at IS NULL AND expires_at > %s
+        """,
+        (request_id, account_id, installation_id, _utc_now()),
+    )
+    return cursor.rowcount
+
+
+def _require_full_session(claims):
+    """The caller holds a CURRENT full session, by its refresh-session row.
+
+    The scope claim alone is not enough: an access token outlives a revoked or
+    rotated refresh family by up to its lifetime.
+    """
+    with _cursor() as cursor:
+        session = _refresh_session(cursor, claims, lock=False)
+    if session["revoked"] or session["scope"] != "full":
+        raise ApiProblem(
+            "This needs a full, current session: use the newest access token.",
+            403,
+            "full_session_required",
+        )
+    return session
+
+
+@app.post("/v1/auth/upgrade/request")
+@jwt_required()
+def upgrade_request():
+    """Start an upgrade that needs a second party: an approval (route 2).
+
+    The request is bound to this account, installation and refresh family and
+    expires after upgrade_request_ttl_seconds. Approval requests are budgeted
+    per account (upgrade_approvals_per_hour) against prompt fatigue, and are
+    refused when no other installation of the account could approve.
+    """
+    _enforce_rate_limit("auth_upgrade", get_jwt().get("iid") or request.remote_addr)
+    claims = _require_access_proof("account")
+    if claims.get("scope") != "limited":
+        raise ApiProblem("This session is not limited.", 409, "session_not_limited")
+    account_id = str(get_jwt_identity())
+    device_id = claims.get("did")
+    installation_id = claims.get("iid")
+    route = _json_body().get("route")
+    if route not in ("approval", "assertion"):
+        raise ApiProblem("route must be approval or assertion.", 400, "invalid_route")
+    # A hard outcome refuses here too: a blocked device gets no prompt sent.
+    integrity = _enforce_integrity_gate(device_id, installation_id, limited_ok=True)
+    causes = _limited_causes(integrity, None) or list(claims.get("limited") or [])
+    if route not in _enabled_upgrade_routes(causes):
+        raise ApiProblem(
+            "That upgrade route is not enabled here.", 403, "upgrade_route_unavailable"
+        )
+    now = _utc_now()
+    ttl = timedelta(seconds=_risk_setting_int("upgrade_request_ttl_seconds", 300))
+    request_id = str(uuid.uuid4())
+    response = {"request_id": request_id, "route": route, "expires_at": _iso_z(now + ttl)}
+    with _cursor(commit=True) as cursor:
+        if route == "approval":
+            if not _has_other_full_session(cursor, account_id, installation_id):
+                raise ApiProblem(
+                    "No other installation of this account holds a full session to "
+                    "approve from.",
+                    409,
+                    "no_approving_device",
+                )
+            cursor.execute(
+                """
+                SELECT COUNT(*) FROM session_upgrade_requests
+                WHERE account_id = %s AND route = 'approval' AND created_at > %s
+                """,
+                (account_id, now - timedelta(hours=1)),
+            )
+            if int(cursor.fetchone()[0]) >= _risk_setting_int("upgrade_approvals_per_hour", 3):
+                raise ApiProblem(
+                    "Too many approval requests for this account in the last hour.",
+                    429,
+                    "upgrade_budget_exhausted",
+                )
+        nonce_sha256 = None
+        cursor.execute(
+            """
+            INSERT INTO session_upgrade_requests
+                (request_id, route, account_id, device_id, installation_id,
+                 session_id, family_id, nonce_sha256, created_at, expires_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """,
+            (request_id, route, account_id, device_id, installation_id,
+             claims.get("sid"), claims.get("family"), nonce_sha256, now, now + ttl),
+        )
+    logger.info(
+        "Upgrade requested: installation=%s route=%s request=%s",
+        installation_id, route, request_id,
+    )
+    return jsonify(response), 201
+
+
+@app.get("/v1/auth/approvals")
+@jwt_required()
+def list_approvals():
+    """Pending approval requests of this account, from its OTHER installations.
+
+    Shows only what the approving phone needs to judge the request -- the
+    platform, when the requesting installation was first seen and how it
+    joined its device; no hardware attributes or personal data.
+    """
+    _enforce_rate_limit("auth_approvals", str(get_jwt_identity()))
+    claims = _require_access_proof("account")
+    _require_full_session(claims)
+    with _cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT r.request_id, r.created_at, r.expires_at,
+                   d.platform, i.created_at, i.registration_method
+            FROM session_upgrade_requests r
+            JOIN app_installations i ON i.installation_id = r.installation_id
+            JOIN recognized_devices d ON d.device_id = i.device_id
+            WHERE r.account_id = %s AND r.route = 'approval'
+              AND r.installation_id <> %s
+              AND r.approved_at IS NULL AND r.denied_at IS NULL
+              AND r.consumed_at IS NULL AND r.expires_at > %s
+            ORDER BY r.created_at DESC
+            """,
+            (str(get_jwt_identity()), claims.get("iid"), _utc_now()),
+        )
+        rows = cursor.fetchall() or []
+    return jsonify(
+        {
+            "approvals": [
+                {
+                    "request_id": str(row[0]),
+                    "created_at": _iso_z(row[1]),
+                    "expires_at": _iso_z(row[2]),
+                    "requesting_installation": {
+                        "platform": row[3],
+                        "first_seen_at": _iso_z(row[4]),
+                        "registration_method": row[5],
+                    },
+                }
+                for row in rows
+            ]
+        }
+    )
+
+
+@app.post("/v1/auth/approvals/<request_id>/approve")
+@jwt_required()
+def approve_upgrade(request_id):
+    """Approve another installation's upgrade request (route 2).
+
+    The approver must hold a current full session on a DIFFERENT installation
+    of the same account, pass the integrity gate without any step-up allowance
+    and the relationship gate, and sign this very request with its step-up key.
+    """
+    _enforce_rate_limit("auth_approvals", str(get_jwt_identity()))
+    claims = _require_access_proof("account")
+    request_id = _uuid_text(request_id, "request_id")
+    account_id = str(get_jwt_identity())
+    installation_id = claims.get("iid")
+    _require_full_session(claims)
+    _enforce_integrity_gate(claims.get("did"), installation_id)
+    policy = _evaluate_risk_policy(
+        "approval_grant",
+        claims.get("did"),
+        installation_id,
+        account_id=account_id,
+        account_link_pending=False,
+        persist=True,
+    )
+    _enforce_risk_policy(policy)
+    _verify_step_up(installation_id, account_id)
+    with _cursor(commit=True) as cursor:
+        changed = _grant_approval(cursor, request_id, account_id, installation_id)
+    if changed != 1:
+        raise ApiProblem(
+            "There is no pending request with that ID that this installation can approve.",
+            404,
+            "approval_not_pending",
+        )
+    logger.info("Upgrade approved: request=%s approver=%s", request_id, installation_id)
+    return jsonify({"request_id": request_id, "approved": True})
+
+
+@app.post("/v1/auth/approvals/<request_id>/deny")
+@jwt_required()
+def deny_upgrade(request_id):
+    """Refuse another installation's upgrade request; recorded, not deleted."""
+    _enforce_rate_limit("auth_approvals", str(get_jwt_identity()))
+    claims = _require_access_proof("account")
+    request_id = _uuid_text(request_id, "request_id")
+    _require_full_session(claims)
+    with _cursor(commit=True) as cursor:
+        changed = _deny_approval(cursor, request_id, str(get_jwt_identity()), claims.get("iid"))
+    if changed != 1:
+        raise ApiProblem(
+            "There is no pending request with that ID that this installation can deny.",
+            404,
+            "approval_not_pending",
+        )
+    logger.warning("Upgrade denied: request=%s by=%s", request_id, claims.get("iid"))
+    return jsonify({"request_id": request_id, "denied": True})
 
 
 if __name__ == "__main__":
