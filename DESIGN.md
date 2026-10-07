@@ -5432,7 +5432,7 @@ a limited session; a limited token is refused off-list and accepted on-list; eac
 a full session once (replay refused); a block is never upgraded; refreshing a limited session stays
 limited.
 
-### 67.1 Owner decisions (2026-10-07) and the settings they imply — still not implemented
+### 67.1 Owner decisions (2026-10-07) and the settings they imply — implemented in §70
 
 **Decided.** (1) All three upgrade routes are available, each switched on or off by the DBA. (2) The
 soft outcomes are as proposed: integrity `elevated` and relationship `step_up` / `review` get a limited
@@ -5669,4 +5669,86 @@ built.
 **State.** EC2 stopped. Server `/opt/device_trust_server.py` = `c966ffb` (md5 `3903bb23…`, backup
 `.bak-20261007-080855`); schema 10; observe/observe; v2-only access proofs; `stepup_required_paths`
 `''`; eligibility rules 0; `wx_far_above_baseline_percent` 200.
+
+## 70. Limited sessions implemented (2026-10-07)
+
+Built as designed in §67 and §67.1 with the owner's defaults, in four phases plus one correction found
+by testing: `acd1b7c` (scope, issuance, path enforcement, `recheck`), `b7fdc49` (route 1), `4801eee`
+(route 2), `1427f06` (route 3), `5776a62` and `f6de5fd` (the correction below); migration 011.
+
+**Issuance.** Enforce mode only, each mode on its own: an integrity cause needs `INTEGRITY_MODE=enforce`,
+a relationship cause `DEVICE_POLICY_MODE=enforce`. `_enforce_integrity_gate(..., limited_ok=True)` and
+`_enforce_risk_policy(..., limited_ok=True)` return a cause instead of refusing for the outcomes the DBA
+lists (`limited_session_integrity_verdicts`, default `elevated`; `limited_session_policy_actions`,
+default `step_up,review` — `step_up` refuses at all only with `elevated_risk_refuses=1`); `block`
+cannot be listed. Login, registration and refresh pass `limited_ok`. At login the integrity gate still
+refuses every hard outcome — block, an unlisted review, an eligibility rule, a device-memory block —
+before the password; only a listed soft verdict is deferred past it, so a soft-risk device learns
+whether a password is right (inherent to the design).
+
+**The scope.** Both tokens carry `scope` (and `limited`, the causes); `refresh_sessions.scope` and
+`limited_causes` keep it. `_require_access_proof` refuses a limited account token with 403
+`session_limited` (`limited_causes`, `upgrade_routes`) everywhere except the upgrade endpoints, the
+integrity scan (the clients scan with the device token, but `/v1/integrity/*` accepts the account token
+too, and a new clean scan is how an elevated verdict clears) and `limited_session_paths`. A refresh
+keeps a limited session limited and narrows a full one when it finds soft risk.
+
+**The upgrade.** `POST /v1/auth/upgrade` re-runs both gates; with no soft cause left it issues a full
+session without a proof (`recheck`); otherwise one proof from a route that is enabled for these causes.
+It locks the session's refresh row, refuses a rotated one (401 `session_rotated`), revokes it and
+issues the full pair in the same family. `upgrade_routes` is what is enabled for the causes **and**
+open to the user now: route 1 needs a usable step-up key; route 2 another active installation of the
+account with a current full session; route 3 configured keys.
+
+- Route 1 verifies a step-up proof v2 over the upgrade request; integrity causes only.
+- Route 2: `POST /v1/auth/upgrade/request` writes a request bound to account, installation, session and
+  family (TTL `upgrade_request_ttl_seconds`, 300; per-account budget `upgrade_approvals_per_hour`, 3;
+  409 `no_approving_device` when nobody could approve); `GET /v1/auth/approvals` lists pending requests
+  of other installations with platform, first-seen time and registration method only;
+  `.../approve` needs a current full session by its refresh row (403 `full_session_required`), a clean
+  integrity verdict with no step-up allowance, the relationship gate and a step-up proof; `.../deny`
+  records a refusal. Completion pre-checks the request before any gate runs (so polling stores no
+  decisions) and consumes it once inside the upgrade's transaction.
+- Route 3: the request returns the claims to sign; the verifier accepts only ES256 compact JWS with a
+  raw r‖s signature by a key from `UPGRADE_ASSERTION_JWKS_FILE` (by `kid` if named), no `crit`,
+  audience `device-trust-upgrade`, matching `sub`/`iid`/`rid`, a nonce, `exp − iat` ≤ 600 s and, when
+  `UPGRADE_ASSERTION_ISSUER` is set, that `iss`; the nonce's hash is matched and the request consumed
+  once in the transaction, recording `amr`.
+- `session_upgrade_requests` is audit evidence, never deleted; the application principal needs
+  `SELECT, INSERT, UPDATE` on it (on the test database it needed an explicit grant).
+
+**Correction found by testing.** With relationship enforcement on, the accounts-per-device check failed:
+a third account admitted — limited — under review linked itself for good, the device reached the
+review count, and both existing users of a phone shared by two were refused on every request. The
+first fix (`5776a62`) refused relationship risk wherever a request would add a link; that in turn
+refused route 2's own case, a user's new phone (new device + second device for the account + elevated
+integrity = 75, review). The rule now (`f6de5fd`): a new account under relationship risk is refused
+as before; a first sign-in under relationship risk is refused when other accounts already use the
+device, and limited when none does (or when the account is already linked). Soft integrity verdicts
+are unaffected.
+
+**Consequences for the owner to weigh.**
+
+1. Registration under a soft *integrity* verdict creates the account and its permanent link, limited.
+2. A soft-risk device learns whether a password is right (above).
+3. A first sign-in under relationship risk on a device nobody else uses now writes its link — evidence
+   of the attempt — where it used to be refused; it counts toward that account's devices.
+4. Observe deployments see no change.
+
+**Results (2026-10-07).**
+
+| Check | Result |
+|---|---|
+| `tools/check_security_regressions.py` | **53 / 53** — eleven new: soft/hard deferral and its settings, login deferral past the gate, the scope in both tokens and the row, path enforcement, route 1, route 2's SQL on SQLite and the approve endpoint, the route-3 verifier against 20 forgeries and edge cases, route-3 single use, the route-3 endpoint, the shared-device rule |
+| Mutation runs | 26 deliberately broken servers across the phases, each failing the gate |
+| Migration 011, PostgreSQL 16.15 | applied; existing refresh sessions read `full`; the new table needed `GRANT SELECT, INSERT, UPDATE` for the application role |
+| Conformance suite, observe, **71 checks** | **59 passed, 0 failed, 12 skipped** (the enforce-mode and limited-session checks, the route checks, the eligibility rule, two opt-in signals) |
+| Integrity enforce, routes 1–3 on (conformance JWKS configured), final server | **68 passed, 0 failed, 3 skipped** |
+| Both modes enforcing, targeted, final server | **14 / 14** (accounts per device, the limited-session and route checks, the enforce-mode and R4 checks) |
+| Server journal during the runs | no errors |
+| Not done | SQL Server: translation-checked only (67 statements), not executed. Clients: the Flutter harness / Dart client and the .NET SDK do not handle limited sessions yet. Handsets: not run (the stack is in observe mode, where nothing changes for them) |
+
+**State.** EC2 stopped. Server `/opt/device_trust_server.py` = `f6de5fd` (md5 `1b63d41b…`, backup
+`.bak-20261007-094044`); schema 11; observe/observe; routes 1 and 3 off, route 2 on; no assertion keys
+configured; `stepup_required_paths` `''`; eligibility rules 0; `wx_far_above_baseline_percent` 200.
 

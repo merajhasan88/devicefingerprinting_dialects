@@ -127,7 +127,7 @@ statement timeout `DB_QUERY_TIMEOUT` (15 s).
   cleartext; require the same of every client build you ship.
 
 **Database.** PostgreSQL 13+ or SQL Server 2017+ (`DB_ENGINE`). Your DBA applies
-`migrations/<engine>/001…010` in order; the server only reads `schema_migrations` and refuses to serve
+`migrations/<engine>/001…011` in order; the server only reads `schema_migrations` and refuses to serve
 on any other version (`/health/ready` says why). Use verified TLS: PostgreSQL `DB_SSLMODE=verify-full`
 with `DB_SSLROOTCERT`; SQL Server always connects with `Encrypt=yes` and `TrustServerCertificate=no`.
 
@@ -265,60 +265,103 @@ registration and refresh accept none.
 - Pilot in observe mode with your release builds and measure the false-refusal rate, the share of
   reports with incomplete evidence, and scan latency before enabling enforcement.
 
-## 7. Planned, not yet available: a limited session instead of a refusal at login
+## 7. Limited sessions: soft risk at sign-in
 
-Designed in `DESIGN.md` §67 with the product owner's decisions; **not implemented**. Today, in enforce
-mode, login, account registration and refresh refuse outright when the integrity verdict is
-`elevated` or the relationship decision is `review` or `block` (and `step_up`, where your DBA set
-`elevated_risk_refuses` to 1). Authenticated requests can clear an elevated verdict with a step-up
-proof, but at login nobody is signed in yet, so a legitimate user caught by a weak signal is locked
-out.
+In enforce mode, a *soft* outcome at login, account registration or refresh no longer refuses: it
+issues a **limited session** (`DESIGN.md` §67, §70). Hard outcomes refuse exactly as before — an
+integrity `block` (or a `review` you have not listed), a device-memory block, an eligibility rule, a
+relationship `block`, and every invalid signature, replay or revoked device. At login the integrity
+checks still refuse hard outcomes before the password is compared; only a soft verdict is deferred, so
+a device with soft risk learns whether a password is right, as any client does from a successful
+login. Each mode applies separately (an integrity cause needs `INTEGRITY_MODE=enforce`, a relationship
+cause `DEVICE_POLICY_MODE=enforce`); observe mode issues no limited sessions.
 
-**What will change.** On a *soft* outcome that is refused today — by default an integrity `elevated`
-verdict or a relationship `review` (or `step_up`, where it refuses) — a user with a valid key proof and
-password gets a **limited session** instead of a 403. Hard outcomes keep refusing: an integrity `review` or `block`, a device-memory block,
-a relationship `block`, and every invalid signature, replay or revoked device. Which outcomes count as
-soft is a DBA setting.
+**What counts as soft** (DBA settings; `block` can never be listed):
 
-- **What a limited session can reach** is a DBA-configured list of paths, like the step-up paths;
-  empty by default, meaning nothing but the upgrade endpoint. Anything else answers 403
-  `session_limited`. That refusal, and the limited login itself, list the upgrade routes open to
-  **this** user (`upgrade_routes`); an empty list means none is, and your app should send the user to
-  support.
-- **Upgrading.** `POST /v1/auth/upgrade` with one accepted proof issues a full session in the same
-  refresh family. It re-runs the integrity and relationship gates: an upgrade never overrides a block.
-  Refreshing a limited session yields a limited session.
+| setting | default | meaning |
+|---|---|---|
+| `limited_session_integrity_verdicts` | `elevated` | integrity verdicts that give a limited session (`elevated` and/or `review`) |
+| `limited_session_policy_actions` | `step_up,review` | relationship outcomes that do (`step_up` refuses at all only where `elevated_risk_refuses` is 1) |
+| `limited_session_paths` | empty | what a limited session may reach besides the upgrade endpoints and the integrity scan |
 
-**The three upgrade routes, each switched on or off by your DBA:**
+Two rules, not settings, keep a limited session from costing anyone else, because device-account links
+are permanent:
 
-| Route | Proposed default | Proves | Caveats |
+- **A new account under relationship risk is refused**, as before. Under a soft *integrity* verdict
+  the account is created — and linked — with a limited session.
+- **A first sign-in under relationship risk on a device that other accounts use is refused**, as
+  before: its link would raise their account count, and a phone shared by two people would put both
+  into review because a third person was let in. An account already linked to the device, or a first
+  sign-in on a device no other account uses (a user's own new phone), gets the limited session; that
+  first sign-in still writes its link, which counts toward the account's devices.
+
+**What your app sees.** Login, registration and refresh responses carry `scope` (`full` or `limited`);
+a limited one also carries `limited_causes` (`integrity_elevated`, `integrity_review`, `risk_step_up`,
+`risk_review`) and `upgrade_routes` — the routes open to *this* user now; an empty list means none is,
+so send the user to support. A limited token reaches the upgrade endpoints, the integrity scan
+(`/v1/integrity/challenge`, `/report`, `/me`) and your `limited_session_paths`; anything else answers
+**403 `session_limited`** with the same two lists. A refresh never widens a session, and a full session
+refreshed under soft risk becomes limited.
+
+**Upgrading.** `POST /v1/auth/upgrade` with the limited token and its access proof, body
+`{"route": ...}`. The server re-runs the integrity and relationship checks first — an upgrade never
+overrides a hard outcome — and issues a full session in the same refresh family; the old limited
+token stays limited, and a second upgrade of the same session answers 401 `session_rotated`.
+
+- **`recheck`** (no proof): succeeds once no soft cause remains — for example after a new clean
+  integrity scan. A relationship review does not clear by itself (links are permanent): once your own
+  review is done, upgrade through route 3. While a cause remains: 403 `upgrade_proof_required`.
+- **Route 1, `stepup`** (`upgrade_stepup_same_device`, default 0): a step-up proof v2 over the upgrade
+  request itself; only when every cause is integrity-related.
+- **Route 2, `approval`** (`upgrade_other_device_approval`, default 1): the limited session calls
+  `POST /v1/auth/upgrade/request` with `{"route": "approval"}` and gets a `request_id`. Another
+  installation of the same account, holding a current full session (its newest token), lists pending
+  requests with `GET /v1/auth/approvals` and calls `POST /v1/auth/approvals/<request_id>/approve` with a
+  step-up proof — or `/deny`. The limited session then sends `{"route": "approval", "request_id": ...}`;
+  until the approval exists it answers 403 `approval_not_granted` with `details.state` (`pending`,
+  `denied`, `expired`, `used`), so poll no faster than every five seconds. Requests expire after
+  `upgrade_request_ttl_seconds` (300) and are budgeted per account, `upgrade_approvals_per_hour` (3,
+  then 429 `upgrade_budget_exhausted`); with no other full session to approve from, the request answers
+  409 `no_approving_device`.
+- **Route 3, `assertion`** (`upgrade_mfa_assertion`, default 0, and usable only once keys are
+  configured): `POST /v1/auth/upgrade/request` with `{"route": "assertion"}` returns
+  `assertion_claims` (`aud`, `sub`, `iid`, `rid`, `nonce`). Your backend runs its own MFA for that
+  account, then signs an ES256 compact JWS: header `{"alg": "ES256", "kid": ...}`, payload = the
+  claims plus `iat` and `exp` at most 600 seconds apart, optionally `amr` (recorded) and `iss`
+  (required if you set `UPGRADE_ASSERTION_ISSUER`). The app sends
+  `{"route": "assertion", "request_id": ..., "assertion": "<JWS>"}`; each request works once. Put your
+  P-256 public keys in a JWKS file named by **`UPGRADE_ASSERTION_JWKS_FILE`** (a key without `kid` is
+  addressed by its thumbprint); it is read at start, so restart after a rotation. `/health/ready` lists
+  the key IDs and reports an unusable file as `upgrade_assertion_keys_invalid`.
+
+| Route | Default | Proves | Caveats |
 |---|---|---|---|
-| 1. Step-up on the same phone (device passcode or biometric) | off | possession of the phone and its screen lock | It is the same phone the soft risk came from, and it proves nothing about who the user is. On Android 9 and 10 the key unlocks for a 30-second window rather than per use. Even when enabled, it only upgrades an integrity-elevated session, never relationship risk (accounts per device, devices per account). |
-| 2. Approval from another of the user's devices | on | that someone holding another installation already signed in to the account, with its own step-up, approved | Works only for users with a second phone or tablet that has your app enrolled and fully signed in — not a laptop or a browser. The approving device must show what it approves (which device, when), or users will approve prompts they did not cause; the server budgets the prompts. The second device sees the request when your app opens; waking it with a push notification is yours to build. One approval upgrades one limited session once. |
-| 3. A signed MFA assertion from your identity backend | off | whatever your MFA proves (SMS, e-mail, authenticator app) | Its strength is your MFA's: SMS codes inherit SIM-swap risk. You hold the signing key; this server verifies with your public key, configured next to its other secrets, and you rotate it. The assertion is short-lived, single-use, and names the account, installation and limited session. |
+| 1. Step-up on the same phone (device passcode or biometric) | off | possession of the phone and its screen lock | It is the same phone the soft risk came from, and it proves nothing about who the user is. On Android 9 and 10 the key unlocks for a 30-second window rather than per use. It never clears relationship risk. |
+| 2. Approval from another of the user's devices | on | that someone holding another installation already signed in to the account, with its own step-up, approved | Works only for users with a second phone or tablet that has your app enrolled and fully signed in — not a laptop or a browser. The approving device must show what it approves (the listing gives platform, first seen, how it joined its device), or users will approve prompts they did not cause; the server budgets the prompts. The second device sees the request when your app opens; waking it with a push notification is yours to build. |
+| 3. A signed MFA assertion from your identity backend | off | whatever your MFA proves (SMS, e-mail, authenticator app) | Its strength is your MFA's: SMS codes inherit SIM-swap risk. You hold the signing key and rotate it. Short-lived and single-use. |
 
-**Users with one device, and laptops.** With the proposed defaults, route 2 is the only route on, and
-it needs a second enrolled phone or tablet. A user with one phone stays limited until the cause clears
-(a new clean scan, or your review for a relationship review) — unless you turn on **route 3**, the only
-route that covers every user. Route 3 is also how your support team restores a user it has verified by
-its own means: your backend signs the assertion for that one limited session. A laptop cannot approve
-through route 2 — only Android and iOS installations can enrol here, and this server never sees your
-website's sessions — but it can through route 3: the user approves on your website, and your backend
-signs. That is as strong as your website's own login.
+**Users with one device, and laptops.** With the defaults, route 2 is the only route on, and it needs a
+second enrolled phone or tablet. A user with one phone stays limited until the cause clears — unless
+you turn on **route 3**, the only route that covers every user. Route 3 is also how your support team
+restores a user it has verified by its own means: your backend signs the assertion for that one
+limited session. A laptop cannot approve through route 2 — only Android and iOS installations can
+enrol here, and this server never sees your website's sessions — but it can through route 3: the user
+approves on your website, and your backend signs. That is as strong as your website's own login.
 
 **How it is enforced.** Entirely on the server; a modified app gains nothing. The limited mark is inside
-the token the server signs, and every request's access proof ties the token to the phone's key, so it
-can be neither edited nor used elsewhere. Every request's path is checked against your DBA's list, and
-a refresh keeps the mark. An approval (route 2) is accepted only from a *different* installation,
-linked to the *same account*, holding a *full* session, that passes the integrity and risk checks
-itself and signs with its own step-up key; it is single-use and expires within minutes. An assertion
-(route 3) must carry your key's signature over the account, installation, limited session and a
-one-time code this server issued, and each code is accepted once. After any upgrade the server re-runs
-the integrity and risk checks: an upgrade never overrides a block.
+the tokens the server signs and in the refresh-session row, and every request's access proof ties the
+token to the phone's key. An approval is accepted only from a *different* installation, linked to the
+*same account*, holding a *current full* session by its refresh row, that passes the integrity checks
+(no step-up allowance) and the risk checks itself and signs with its own step-up key; the requester
+cannot approve or deny itself. Approvals and assertions are bound to the requesting account,
+installation and refresh family, expire, and are consumed exactly once inside the upgrade.
 
-**Before you rely on it** (once available): list only low-value paths for limited sessions; decide per
-route whether its proof is enough for your users; **turn on route 3 if users with one phone must be
-able to recover**; make your app handle `session_limited`, show the routes the server lists and send
-users with none to support — the Flutter and .NET SDKs do not yet; and measure in observe mode how many
-sign-ins would have been limited.
+**Database.** Migration 011 adds `session_upgrade_requests`: every approval request and assertion
+nonce and what became of it. It is audit evidence — grant the application principal `SELECT, INSERT,
+UPDATE` on it, never `DELETE`.
 
+**Before you rely on it:** list only low-value paths in `limited_session_paths`; decide per route
+whether its proof is enough for your users; **turn on route 3 if users with one phone must be able to
+recover**; make your app handle `scope`, `session_limited`, `upgrade_routes` and the upgrade flows —
+**the Flutter and .NET SDKs do not handle them yet**; and measure in observe mode, from the stored
+decisions, how many sign-ins would have been limited.

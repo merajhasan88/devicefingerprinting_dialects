@@ -216,3 +216,33 @@ DESIGN.md §69, `c966ffb`, **schema 10** (migration 010 seeds three settings).
 - The reference suite has 65 checks: the W^X check now asserts points and reads the live percentage;
   new: developer settings advisory, and an eligibility check that runs when a rule is set.
 
+## 11. Added 2026-10-07 — limited sessions (server; SDK work needed before enforce mode)
+
+DESIGN.md §70 (design §67), **schema 11**. Nothing changes in observe mode. In enforce mode:
+
+- **Responses.** Login, registration and refresh carry `scope` (`full` or `limited`); a limited one also
+  `limited_causes` and `upgrade_routes` (`stepup`, `approval`, `assertion` — whichever are open to this
+  user now; empty means send the user to support). Both tokens carry a `scope` claim; refreshing never
+  widens it.
+- **New refusal: 403 `session_limited`** (`details.limited_causes`, `details.upgrade_routes`) for a
+  limited token anywhere except `/v1/auth/upgrade`, `/v1/auth/upgrade/request`, `/v1/integrity/*` and
+  the DBA's `limited_session_paths`.
+- **Upgrade:** `POST /v1/auth/upgrade` `{"route": "recheck" | "stepup" | "approval" | "assertion", ...}`
+  returns a full token pair in the same family. `recheck` works once the cause is gone (e.g. after a
+  clean scan); `stepup` needs a step-up proof v2 over the upgrade request; `approval` and `assertion`
+  start with `POST /v1/auth/upgrade/request` `{"route": ...}` (→ `request_id`, and for an assertion the
+  `assertion_claims` the customer's backend signs). A second phone approves with
+  `GET /v1/auth/approvals` and `POST /v1/auth/approvals/<id>/approve` (step-up required; its newest
+  token) or `/deny`.
+- **Codes to handle:** `upgrade_proof_required`, `upgrade_route_unavailable`, `session_not_limited`,
+  `session_rotated` (upgrade with the newest token), `approval_not_granted` (`details.state`: pending,
+  denied, expired, used, unknown — poll no faster than every 5 s), `no_approving_device`,
+  `upgrade_budget_exhausted` (429), `full_session_required`, `approval_not_pending`,
+  `upgrade_assertion_invalid` (`details.field`).
+- **Behaviour you may hit in tests:** an elevated verdict at login now gives a limited session instead
+  of 403 `integrity_elevated` (unless the DBA empties `limited_session_integrity_verdicts`); a new
+  account, or a first sign-in onto a device other accounts use, under relationship risk is still
+  refused.
+- The reference suite has 71 checks: limited login and clean-scan recheck, refresh, registration, and
+  one check per route (route 3 with a deterministic key whose public JWK the suite prints).
+

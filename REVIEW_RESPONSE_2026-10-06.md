@@ -24,7 +24,7 @@ device-level counts key on keys and hints a farm can regenerate.
 
 | ID | Disposition | Commit |
 |---|---|---|
-| R1 runtime growth | **Fixed 2026-10-07, your recipe with one owner-approved amendment** (§69): growth above the pinned full-session envelope is advisory (0 points) up to a DBA percentage, default 200 %; beyond it +40 stands alone, because an injector that copies the runtime's allocation sizes produces no corroborating signal and would otherwise grow without limit. Developer options and ADB are advisory; a deployment that wants them off sets an eligibility rule (403 `integrity_device_ineligible` with a remedy). The warm .NET session on a developer phone now reads 0 / trusted; the 11 stored reports with that false positive would all be trusted. Login on soft risk: the limited session (§67), not yet built. | `c966ffb` |
+| R1 runtime growth | **Fixed 2026-10-07, your recipe with one owner-approved amendment** (§69): growth above the pinned full-session envelope is advisory (0 points) up to a DBA percentage, default 200 %; beyond it +40 stands alone, because an injector that copies the runtime's allocation sizes produces no corroborating signal and would otherwise grow without limit. Developer options and ADB are advisory; a deployment that wants them off sets an eligibility rule (403 `integrity_device_ineligible` with a remedy). The warm .NET session on a developer phone now reads 0 / trusted; the 11 stored reports with that false positive would all be trusted. Login on soft risk: a limited session with three upgrade routes, built 2026-10-07 (§70). | `c966ffb`, limited sessions `acd1b7c`…`f6de5fd` |
 | R2 .NET scanner coverage | .NET SDK; passed on. | handoff §8 |
 | R3 empty scans | **Fixed.** `checked=true` with zero bytes compared in a bucket that always holds code (Android core/ext/app; iOS app only) is incomplete (+30). Your two zero-coverage observations now score 30 / elevated. Stored reports: none affected. | `fad5c20` |
 | R4 hint propagation | **Fixed 2026-10-07, your direction** (§68): a block spreads only from the device's established installations — the original, or a hint-linked one confirmed when an account first linked through an established installation signs in on it. Evidence and links are all kept; account counts unchanged by the owner's decision, with a support-team procedure in the guide. Never stricter than before for any installation; on every stored installation the pick is unchanged. | `ba63ecd` (guide), `1b7d3c5` |
@@ -50,4 +50,17 @@ in enforce. SQL Server: the new statements are translation-checked only.
 allowance and its validation, the eligibility gate; five deliberately broken servers each failed it).
 Suite (65 checks) on PostgreSQL 16.15: 59 passed, 0 failed, 6 skipped in observe; with both eligibility
 rules set, 10/10 targeted checks in enforce.
+
+**Added 2026-10-07 (limited sessions, your R1 recommendation 5 and R3's "explicit limited-access
+flow").** In enforce mode a soft outcome at login, registration or refresh issues a limited session —
+reaching only the upgrade endpoints, the integrity scan and DBA-listed paths — instead of a refusal;
+hard outcomes refuse as before, and at login before the password. It upgrades in the same refresh
+family by itself once the cause clears, or through a route the DBA enabled: a step-up on the same phone
+(off, integrity causes only), an approval from another installation of the account with a current
+full session and its own step-up (on), or an ES256 assertion from the customer's identity backend after
+its MFA (off until keys are configured). Testing with relationship enforcement on found that admitting
+a new account, or a first sign-in onto a device other accounts use, would raise those accounts' counts
+for good; both still refuse. Gate 53/53; suite (71 checks) 59/0/12 in observe and 68/0/3 with
+integrity enforcement and all three routes on; 14/14 targeted with both modes enforcing. Not yet: SQL
+Server execution, and the Flutter and .NET clients' handling of the new responses.
 
