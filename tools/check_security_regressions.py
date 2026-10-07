@@ -109,6 +109,8 @@ class Rows(object):
             self.result = self.refresh_row
         elif q.startswith("INSERT INTO refresh_sessions"):
             self.writes.append((q, params))
+        elif q.startswith("SELECT stepup_key_account_id, stepup_public_key_jwk"):
+            self.result = (None, self.step_jwk)
         elif q.startswith("SELECT account_id, password_hash FROM demo_accounts"):
             self.result = None
         elif q.startswith("SELECT i.status, d.status FROM app_installations i"):
@@ -131,7 +133,8 @@ class Rows(object):
         elif q.startswith("INSERT INTO integrity_reports"):
             self.writes.append((q, params))
         elif q.startswith(("DELETE FROM access_proof_nonces", "UPDATE app_installations",
-                           "UPDATE recognized_devices", "UPDATE integrity_challenges")):
+                           "UPDATE recognized_devices", "UPDATE integrity_challenges",
+                           "UPDATE refresh_sessions")):
             self.writes.append((q, params))
         else:
             raise AssertionError("Unmodeled SQL: " + q)
@@ -1638,6 +1641,72 @@ def a_limited_token_reaches_only_its_paths():
         except ValueError:
             accepted = False
         expect(accepted == valid, "%s=%r: accepted=%s" % (key, value, accepted))
+
+
+def _limited_session(*causes):
+    """A limited access token and its refresh-session row in the fixture."""
+    family, session = str(uuid.uuid4()), str(uuid.uuid4())
+    with s.app.app_context():
+        bearer = s.create_access_token(identity=account, additional_claims={
+            "role": "account", "iid": inst.installation_id, "did": inst.device_id,
+            "sid": session, "family": family, "scope": "limited", "limited": list(causes)})
+    db.refresh_row = (family, account, inst.device_id, inst.installation_id,
+                      s._utc_now() + s.REFRESH_TOKEN_LIFETIME, None, "limited", ",".join(causes))
+    return bearer
+
+
+def _upgrade(bearer, body, stepup=False):
+    raw = encode(body)
+    path = "/v1/auth/upgrade"
+    nonce = fresh_nonce()
+    head = access_headers("POST", path, raw, bearer=bearer, nonce=nonce)
+    if stepup:
+        head.update(stepup_headers("POST", path, raw, nonce, bearer=bearer))
+    return client.post(path, data=raw, headers=head)
+
+
+@check
+def a_limited_session_upgrades_only_through_an_open_route():
+    """Recheck needs no proof once the cause is gone; while it remains, route 1
+    (same-phone step-up) works only where the DBA enabled it, only for
+    integrity causes, and only with a valid step-up proof for this request."""
+    db.writes = []
+    try:
+        with elevated_integrity(), policy():
+            s._latest_integrity_state = _verdict_state("trusted")
+            reply = _upgrade(_limited_session("integrity_elevated"), {})
+            payload = reply.get_json() or {}
+            expect(reply.status_code == 200 and payload.get("scope") == "full"
+                   and payload.get("upgraded_by") == "recheck",
+                   "with the cause cleared the upgrade must need no proof: %s %s"
+                   % (reply.status_code, payload))
+            s._latest_integrity_state = _verdict_state("elevated")
+            for body, code in (({}, "upgrade_proof_required"),
+                               ({"route": "stepup"}, "upgrade_route_unavailable")):
+                reply = _upgrade(_limited_session("integrity_elevated"), body)
+                expect(reply.status_code == 403 and error_code(reply) == code,
+                       "route 1 off: %s must answer %s, got %s %s"
+                       % (body, code, reply.status_code, error_code(reply)))
+        with elevated_integrity(), policy(upgrade_stepup_same_device=1):
+            s._latest_integrity_state = _verdict_state("elevated")
+            reply = _upgrade(_limited_session("integrity_elevated"), {"route": "stepup"})
+            expect(reply.status_code == 403 and error_code(reply) == "stepup_required",
+                   "route 1 without a step-up proof must be refused, got %s %s"
+                   % (reply.status_code, error_code(reply)))
+            reply = _upgrade(_limited_session("integrity_elevated"), {"route": "stepup"}, stepup=True)
+            payload = reply.get_json() or {}
+            expect(reply.status_code == 200 and payload.get("upgraded_by") == "stepup"
+                   and payload.get("scope") == "full",
+                   "route 1 with a valid step-up proof must upgrade, got %s %s"
+                   % (reply.status_code, payload))
+            s._evaluate_risk_policy = lambda *a, **k: {"effective_action": "review"}
+            reply = _upgrade(_limited_session("integrity_elevated", "risk_review"),
+                             {"route": "stepup"}, stepup=True)
+            expect(reply.status_code == 403 and error_code(reply) == "upgrade_route_unavailable",
+                   "route 1 must never clear relationship risk, got %s %s"
+                   % (reply.status_code, error_code(reply)))
+    finally:
+        db.refresh_row = None
 
 
 def main():

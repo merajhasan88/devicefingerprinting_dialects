@@ -1817,6 +1817,43 @@ def check_limited_session_registration(api, ctx):
            "registration on soft risk must give a limited session, got %s %s" % (st, pl))
 
 
+@check("limited session: route 1, a step-up on the same phone, upgrades where the DBA enabled it")
+def check_upgrade_route_stepup(api, ctx):
+    """DESIGN.md 70. Off by default; when on, it upgrades only a session whose
+    causes are all integrity-related, with a step-up proof v2 over the upgrade
+    request itself."""
+    settings = live_settings(api)
+    if not _setting_on(settings, "upgrade_stepup_same_device"):
+        raise Skip("upgrade_stepup_same_device is off (the owner's default); set it to 1 "
+                   "to run this check")
+    if ctx["mode"] != "enforce":
+        raise Skip("server is in observe mode; limited sessions exist only in enforce mode")
+    integrity_context(ctx)
+    factor = settings.get("stepup_factor", "passcode")
+    inst = Installation()
+    stepup_priv, stepup_jwk = stepup_jwk_pair()
+    st, pl = enrol(api, inst, fresh_hint(), stepup_public_key=stepup_jwk,
+                   stepup_key_auth={"factor": factor, "mode": "per_use", "window_seconds": 0})
+    expect(st in (200, 201), "enrol failed: %s %s" % (st, pl))
+    token = device_token(api, inst)
+    submit_report(api, inst, token)
+    handle = "r1-%s" % secrets.token_hex(4)
+    st, pl = open_account(api, inst, token, handle)
+    expect(st in (200, 201), "setup: account open: %s %s" % (st, pl))
+    submit_report(api, inst, token, _elevate)
+    st, pl = sign_in(api, inst, token, handle)
+    expect(st == 200 and pl.get("scope") == "limited" and "stepup" in (pl.get("upgrade_routes") or []),
+           "the limited login must offer route 1, got %s %s" % (st, pl))
+    limited = pl["access_token"]
+    st, up = protected(api, inst, "POST", "/v1/auth/upgrade", limited, {"route": "stepup"})
+    expect(st == 403 and error_code(up) == "stepup_required",
+           "route 1 without a step-up proof must be refused, got %s %s" % (st, error_code(up)))
+    st, up = stepup_call(api, inst, stepup_priv, "POST", "/v1/auth/upgrade", limited,
+                         {"route": "stepup"}, factor)
+    expect(st == 200 and up.get("scope") == "full" and up.get("upgraded_by") == "stepup",
+           "route 1 with a valid step-up proof must upgrade, got %s %s" % (st, up))
+
+
 @check("enforcement: a step-up proof satisfies an elevated integrity verdict")
 def check_elevated_step_up(api, ctx):
     """Review F11 (DESIGN.md 63). An elevated verdict used to answer

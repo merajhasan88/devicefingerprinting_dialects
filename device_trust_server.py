@@ -4198,8 +4198,29 @@ def _require_limited_session_path(claims):
 
 
 def _upgrade_routes(cursor, account_id, installation_id, causes):
-    """The upgrade routes the DBA enabled AND that are open to this user."""
-    return []
+    """The upgrade routes the DBA enabled AND that are open to this user.
+
+    stepup (route 1): a step-up proof from this same phone -- off by default,
+    and only when every cause is integrity-related: it proves the screen lock
+    of the phone the risk came from, nothing about relationship risk.
+    """
+    routes = []
+    if (
+        _risk_setting_bool("upgrade_stepup_same_device", False)
+        and causes
+        and all(cause.startswith("integrity_") for cause in causes)
+    ):
+        cursor.execute(
+            "SELECT stepup_key_account_id, stepup_public_key_jwk "
+            "FROM app_installations WHERE installation_id = %s",
+            (installation_id,),
+        )
+        row = cursor.fetchone()
+        if row is not None and row[1] is not None and (
+            row[0] is None or str(row[0]) == str(account_id)
+        ):
+            routes.append("stepup")
+    return routes
 
 
 def _issue_device_token(installation_id, device_id, key_thumbprint):
@@ -5801,6 +5822,10 @@ def _verify_upgrade_proof(route, body, claims, account_id, installation_id, caus
             "upgrade_proof_required" if route == "recheck" else "upgrade_route_unavailable",
             details={"limited_causes": causes, "upgrade_routes": routes},
         )
+    if route == "stepup":
+        # Bound to this very upgrade request, like any step-up proof v2; the
+        # access proof's nonce, claimed once, makes it single-use.
+        _verify_step_up(installation_id, account_id)
 
 
 def _consume_upgrade_proof(route, body, cursor, session):
