@@ -71,6 +71,11 @@ or re-run `GRANT ... ON ALL TABLES` after each migration. On **SQL Server**, `db
 `risk_policy_settings` is **read-only** for the application (the DBA writes it), so `SELECT` alone
 suffices there.
 
+**Migration 011 adds `session_upgrade_requests`.** Without default privileges it needs its own grant
+(the test database did): `GRANT SELECT, INSERT, UPDATE ON session_upgrade_requests TO app_user;`. It
+is audit evidence — every approval request and assertion nonce and what became of it — and the server
+never deletes from it, so it needs no `DELETE`.
+
 ## Version contract
 
 `schema_migrations(version, applied_at, description)` holds one row per applied

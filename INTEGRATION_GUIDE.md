@@ -319,7 +319,8 @@ token stays limited, and a second upgrade of the same session answers 401 `sessi
   requests with `GET /v1/auth/approvals` and calls `POST /v1/auth/approvals/<request_id>/approve` with a
   step-up proof — or `/deny`. The limited session then sends `{"route": "approval", "request_id": ...}`;
   until the approval exists it answers 403 `approval_not_granted` with `details.state` (`pending`,
-  `denied`, `expired`, `used`), so poll no faster than every five seconds. Requests expire after
+  `denied`, `expired`, `used`), so poll no faster than every five seconds (with rate limiting on, a
+  faster poller gets 429 `rate_limited`). Requests expire after
   `upgrade_request_ttl_seconds` (300) and are budgeted per account, `upgrade_approvals_per_hour` (3,
   then 429 `upgrade_budget_exhausted`); with no other full session to approve from, the request answers
   409 `no_approving_device`.

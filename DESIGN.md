@@ -5689,8 +5689,9 @@ whether a password is right (inherent to the design).
 **The scope.** Both tokens carry `scope` (and `limited`, the causes); `refresh_sessions.scope` and
 `limited_causes` keep it. `_require_access_proof` refuses a limited account token with 403
 `session_limited` (`limited_causes`, `upgrade_routes`) everywhere except the upgrade endpoints, the
-integrity scan (the clients scan with the device token, but `/v1/integrity/*` accepts the account token
-too, and a new clean scan is how an elevated verdict clears) and `limited_session_paths`. A refresh
+integrity scan (the Dart client scans with the device token, the .NET client with whichever bearer
+token its caller passes; `/v1/integrity/*` accepts the account token, and a new clean scan is how an
+elevated verdict clears) and `limited_session_paths`. A refresh
 keeps a limited session limited and narrows a full one when it finds soft risk.
 
 **The upgrade.** `POST /v1/auth/upgrade` re-runs both gates; with no soft cause left it issues a full
