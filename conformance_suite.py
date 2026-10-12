@@ -1921,8 +1921,19 @@ def check_upgrade_route_approval(api, ctx):
     expect(st == 200 and pl.get("approved") is True, "approving with step-up failed: %s %s" % (st, pl))
     st, up = protected(api, phone, "POST", "/v1/auth/upgrade", limited,
                        {"route": "approval", "request_id": rid})
-    expect(st == 200 and up.get("scope") == "full" and up.get("upgraded_by") == "approval",
-           "an approved request must upgrade, got %s %s" % (st, up))
+    expect(st == 200 and up.get("scope") == "full" and up.get("upgraded_by") == "approval"
+           and "integrity_elevated" in (up.get("accepted_causes") or []),
+           "an approved request must upgrade and record what it accepted, got %s %s" % (st, up))
+    # DESIGN.md 72: the acceptance sticks -- protected requests need no
+    # step-up for the accepted cause, and a refresh keeps the session full.
+    st, me = protected(api, phone, "GET", "/v1/account/me", up["access_token"])
+    expect(st == 200 and (me.get("integrity") or {}).get("accepted_by_upgrade") is True,
+           "the upgraded session must reach protected paths, got %s %s" % (st, error_code(me) or me))
+    st, kept = _refresh(api, phone, up["refresh_token"])
+    expect(st == 200 and kept.get("scope") == "full"
+           and kept.get("accepted_causes") == up.get("accepted_causes"),
+           "a refresh must keep an accepted session full, got %s %s" % (st, kept))
+    accepted_access = kept["access_token"]
 
     second = limited_login()
     st, up = protected(api, phone, "POST", "/v1/auth/upgrade", second,
@@ -1945,6 +1956,12 @@ def check_upgrade_route_approval(api, ctx):
     expect(st == 429 and error_code(pl) == "upgrade_budget_exhausted",
            "request %d in an hour must exceed the budget of %d, got %s %s"
            % (budget + 1, budget, st, error_code(pl)))
+    blocked = submit_report(api, phone, phone_token,
+                            lambda probes: probes["runtime_maps"].update({"suspicious_tokens": ["frida"]}))
+    expect(blocked["verdict"] == "block", "setup: expected block, got %s" % blocked)
+    st, me = protected(api, phone, "GET", "/v1/account/me", accepted_access)
+    expect(st == 403 and error_code(me) == "integrity_blocked",
+           "a block after the acceptance must refuse, got %s %s" % (st, error_code(me)))
 
 
 # The suite's deterministic route-3 signing key: a server configured with its
@@ -2630,9 +2647,11 @@ def check_account_device_bands(api, ctx):
                    "device %d must be held for review, got %s %s %s"
                    % (n, st, pol.get("recommended_action"), sorted(_reason_codes(pol))))
             if enforce:
-                expect(st != 200 or pl.get("scope") == "limited",
-                       "enforce: device %d must not get a full session, got %s %s"
-                       % (n, st, pl.get("scope")))
+                # DESIGN.md 72: refused, never limited -- its permanent link
+                # would hold every device of the account in review.
+                expect(st == 403 and error_code(pl) in ("risk_review_required", "risk_policy_blocked"),
+                       "enforce: device %d must be refused, got %s %s %s"
+                       % (n, st, error_code(pl), pl.get("scope")))
 
 
 def jwk_thumbprint(jwk):

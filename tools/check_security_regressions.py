@@ -107,7 +107,7 @@ class Rows(object):
                            s._parse_public_key(inst.jwk)["thumbprint"])
         elif q.startswith("SELECT installation_id, device_id, registration_method"):
             self.result = self.reenrol_row
-        elif q.startswith("SELECT family_id, account_id, device_id, installation_id, expires_at, revoked_at, scope, limited_causes FROM refresh_sessions"):
+        elif q.startswith("SELECT family_id, account_id, device_id, installation_id, expires_at, revoked_at, scope, limited_causes, accepted_causes, accepted_until FROM refresh_sessions"):
             self.result = self.refresh_row
         elif q.startswith("INSERT INTO refresh_sessions"):
             self.writes.append((q, params))
@@ -1007,7 +1007,7 @@ def a_keyless_reuse_cannot_revoke_the_family():
             "role": "account", "iid": inst.installation_id, "did": inst.device_id,
             "sid": session, "family": family})
     db.refresh_row = (family, account, inst.device_id, inst.installation_id,
-                      s._utc_now() + s.REFRESH_TOKEN_LIFETIME, s._utc_now(), "full", None)
+                      s._utc_now() + s.REFRESH_TOKEN_LIFETIME, s._utc_now(), "full", None, None, None)
     db.writes = []
     try:
         reply = client.post("/v1/auth/refresh/challenge", headers={"Authorization": "Bearer " + old})
@@ -1598,7 +1598,7 @@ def a_limited_session_is_written_into_both_tokens_and_its_row():
            and tokens.get("upgrade_routes") == [],
            "a limited session must say so in both tokens and the response: %s %s" % (tokens, access))
     rows = [params for q, params in db.writes if q.startswith("INSERT INTO refresh_sessions")]
-    expect(rows[0][6:] == ("limited", "integrity_elevated,risk_review") and rows[1][6:] == ("full", None),
+    expect(rows[0][6:8] == ("limited", "integrity_elevated,risk_review") and rows[1][6:8] == ("full", None),
            "the refresh session row must carry the scope and causes: %s" % rows)
     expect(full["scope"] == "full" and full_access.get("scope") == "full"
            and "limited_causes" not in full and "limited" not in full_access,
@@ -1659,7 +1659,8 @@ def _limited_session(*causes):
             "role": "account", "iid": inst.installation_id, "did": inst.device_id,
             "sid": session, "family": family, "scope": "limited", "limited": list(causes)})
     db.refresh_row = (family, account, inst.device_id, inst.installation_id,
-                      s._utc_now() + s.REFRESH_TOKEN_LIFETIME, None, "limited", ",".join(causes))
+                      s._utc_now() + s.REFRESH_TOKEN_LIFETIME, None, "limited", ",".join(causes),
+                      None, None)
     return bearer
 
 
@@ -1838,12 +1839,13 @@ def approving_needs_a_current_full_session_and_a_step_up():
             expect(reply.status_code == 403 and error_code(reply) == "session_limited",
                    "a limited session must not approve, got %s %s" % (reply.status_code, error_code(reply)))
             db.refresh_row = (family, account, inst.device_id, inst.installation_id,
-                              s._utc_now() + s.REFRESH_TOKEN_LIFETIME, s._utc_now(), "full", None)
+                              s._utc_now() + s.REFRESH_TOKEN_LIFETIME, s._utc_now(), "full", None,
+                              None, None)
             reply = approve(full, stepup=True)
             expect(reply.status_code == 403 and error_code(reply) == "full_session_required",
                    "a rotated or revoked session must not approve, got %s %s"
                    % (reply.status_code, error_code(reply)))
-            db.refresh_row = db.refresh_row[:5] + (None, "full", None)
+            db.refresh_row = db.refresh_row[:5] + (None, "full", None, None, None)
             reply = approve(full)
             expect(reply.status_code == 403 and error_code(reply) == "stepup_required",
                    "approving must need a step-up proof, got %s %s" % (reply.status_code, error_code(reply)))
@@ -2027,13 +2029,13 @@ def a_limited_session_upgrades_with_an_assertion_only_where_enabled():
 
 
 @check
-def relationship_risk_never_admits_a_link_to_a_shared_device():
-    """DESIGN.md 70. A first login or a new account on a device writes a
-    permanent link; admitting it under relationship risk, even limited, would
-    raise the device's counts for every account already on it. It is refused
-    as before; an account already linked to the device, or a first login on a
-    device no other account uses, gets the limited session. A new account under
-    relationship risk is always refused."""
+def relationship_risk_admits_a_first_sign_in_only_within_the_counts():
+    """DESIGN.md 72 (owner decision): a first sign-in writes a permanent link, so
+    under relationship risk it is refused if that link would make the phone's
+    third account or the account's third device (the DBA's review counts; the
+    elevated counts where elevated_risk_refuses is set) -- anyone holding only a
+    password could otherwise do it from a fresh phone. Within the counts it gets
+    a limited session; a new account under relationship risk is always refused."""
     import bcrypt as _bcrypt
     login = encode({"handle": "someone", "password": "Passw0rd123"})
     signup = encode({"handle": "newcomer", "password": "Passw0rd123"})
@@ -2041,39 +2043,47 @@ def relationship_risk_never_admits_a_link_to_a_shared_device():
     def post(path, raw):
         return client.post(path, data=raw, headers=access_headers("POST", path, raw, device_token))
 
-    def review(linked, others=1):
+    def review(linked=False, accounts=2, devices=2):
         return lambda *a, **k: {"effective_action": "review", "recommended_action": "review",
                                 "context": {"account_already_linked_to_device": linked,
-                                            "device_account_count": others}}
+                                            "projected_device_account_count": accounts,
+                                            "projected_account_device_count": devices}}
+
+    def outcome():
+        reply = post("/v1/accounts/login", login)
+        payload = reply.get_json() or {}
+        if reply.status_code == 200:
+            return payload.get("scope")
+        return error_code(reply)
+
     db.account_row = (account, _bcrypt.hashpw(b"Passw0rd123", _bcrypt.gensalt(4)))
     db.writes = []
     try:
         with elevated_integrity(), policy():
             s._latest_integrity_state = _verdict_state("trusted")
-            s._evaluate_risk_policy = review(False)
-            reply = post("/v1/accounts/login", login)
-            expect(reply.status_code == 403 and error_code(reply) == "risk_review_required",
-                   "a first login under relationship review must be refused, got %s %s"
-                   % (reply.status_code, error_code(reply)))
+            for kwargs, expected, why in (
+                    ({"accounts": 2, "devices": 2}, "limited", "two people sharing / a second phone"),
+                    ({"linked": True, "accounts": 3, "devices": 3}, "limited", "an already-linked account"),
+                    ({"accounts": 3, "devices": 2}, "risk_review_required", "the phone's third account"),
+                    ({"accounts": 1, "devices": 3}, "risk_review_required", "the account's third device")):
+                s._evaluate_risk_policy = review(**kwargs)
+                got = outcome()
+                expect(got == expected, "%s: expected %s, got %s" % (why, expected, got))
+            s._evaluate_risk_policy = review(accounts=1, devices=1)
             reply = post("/v1/accounts/register", signup)
             expect(reply.status_code == 403 and error_code(reply) == "risk_review_required"
                    and not [q for q, _ in db.writes if q.startswith("INSERT INTO demo_accounts")],
                    "a new account under relationship review must be refused and not created, got %s %s"
                    % (reply.status_code, error_code(reply)))
-            s._evaluate_risk_policy = review(False, others=0)
-            reply = post("/v1/accounts/register", signup)
-            expect(reply.status_code == 403 and error_code(reply) == "risk_review_required",
-                   "a new account under relationship review must be refused even on an empty "
-                   "device, got %s %s" % (reply.status_code, error_code(reply)))
-            for linked, others, why in ((True, 2, "an already-linked account"),
-                                        (False, 0, "a first login on a device no one else uses")):
-                s._evaluate_risk_policy = review(linked, others)
-                reply = post("/v1/accounts/login", login)
-                payload = reply.get_json() or {}
-                expect(reply.status_code == 200 and payload.get("scope") == "limited"
-                       and payload.get("limited_causes") == ["risk_review"],
-                       "%s under review must get a limited session, got %s %s"
-                       % (why, reply.status_code, payload))
+        with elevated_integrity(), policy(device_accounts_review_count=4, account_devices_review_count=4):
+            s._latest_integrity_state = _verdict_state("trusted")
+            s._evaluate_risk_policy = review(accounts=3, devices=3)
+            expect(outcome() == "limited", "raised counts must let a third account or device in")
+        with elevated_integrity(), policy(elevated_risk_refuses=1):
+            s._latest_integrity_state = _verdict_state("trusted")
+            s._evaluate_risk_policy = review(accounts=2, devices=1)
+            expect(outcome() == "risk_review_required",
+                   "where elevated refuses, the elevated counts are the limits")
     finally:
         db.account_row = None
 
@@ -2131,6 +2141,133 @@ def devices_per_account_follow_the_dba_settings():
     with policy(account_devices_elevated_count=0, account_devices_review_count=0,
                 account_devices_block_count=0):
         expect(score(9) == (0, False, []), "0 switches each count off")
+
+
+
+# ---------------------------------------------------------------------------
+# An upgrade's acceptance (DESIGN.md 72)
+# ---------------------------------------------------------------------------
+
+
+def _full_token(accepted=(), until=None, scope="full"):
+    claims = {"role": "account", "iid": inst.installation_id, "did": inst.device_id,
+              "sid": str(uuid.uuid4()), "family": str(uuid.uuid4()), "scope": scope}
+    if accepted:
+        claims["accepted"] = sorted(accepted)
+        claims["accepted_until"] = int(until if until is not None else time.time() + 3600)
+    with s.app.app_context():
+        return s.create_access_token(identity=account, additional_claims=claims)
+
+
+@check
+def an_upgrade_acceptance_covers_its_causes_and_nothing_else():
+    me = "/v1/account/me"
+
+    def get(bearer):
+        reply = client.get(me, headers=access_headers("GET", me, bearer=bearer))
+        return reply.status_code, (error_code(reply) if reply.status_code != 200 else reply.get_json())
+
+    both = ("integrity_elevated", "risk_review")
+    with elevated_integrity(), policy():
+        s._latest_integrity_state = _verdict_state("elevated")
+        s._evaluate_risk_policy = lambda *a, **k: {"effective_action": "review", "context": {}}
+        for token, expected, why in (
+                (_full_token(), "integrity_step_up_required", "no acceptance"),
+                (_full_token(["integrity_elevated"]), "risk_review_required",
+                 "integrity accepted, relationship not"),
+                (_full_token(both, until=time.time() - 1), "integrity_step_up_required",
+                 "an acceptance past its time"),
+                (_full_token(both, scope="limited"), "session_limited", "a limited token")):
+            status, got = get(token)
+            expect(status == 403 and got == expected, "%s: expected %s, got %s %s"
+                   % (why, expected, status, got))
+        status, payload = get(_full_token(both))
+        expect(status == 200 and payload["integrity"].get("accepted_by_upgrade") is True
+               and payload["trust_policy"].get("accepted_by_upgrade") is True,
+               "both causes accepted must pass, marked: %s %s" % (status, payload))
+        for verdict, action, expected in (("block", "review", "integrity_blocked"),
+                                          ("review", "review", "integrity_review_required"),
+                                          ("elevated", "block", "risk_policy_blocked")):
+            s._latest_integrity_state = _verdict_state(verdict)
+            s._evaluate_risk_policy = (lambda a: lambda *x, **k: {"effective_action": a, "context": {}})(action)
+            status, got = get(_full_token(both))
+            expect(status == 403 and got == expected,
+                   "a worse outcome (%s / %s) must refuse with %s, got %s %s"
+                   % (verdict, action, expected, status, got))
+
+
+@check
+def an_upgrade_records_its_acceptance():
+    from flask_jwt_extended import decode_token
+    db.writes = []
+    try:
+        with elevated_integrity(), policy(upgrade_stepup_same_device=1):
+            s._latest_integrity_state = _verdict_state("elevated")
+            reply = _upgrade(_limited_session("integrity_elevated"), {"route": "stepup"}, stepup=True)
+            payload = reply.get_json() or {}
+            with s.app.app_context():
+                claims = decode_token(payload.get("access_token", ""))
+            row = [p for q, p in db.writes if q.startswith("INSERT INTO refresh_sessions")][-1]
+            expect(reply.status_code == 200 and payload.get("accepted_causes") == ["integrity_elevated"]
+                   and claims.get("accepted") == ["integrity_elevated"]
+                   and claims.get("accepted_until", 0) > time.time() + 29 * 86400
+                   and row[8] == "integrity_elevated" and row[9] is not None,
+                   "a proof upgrade must record what it accepted: %s %s %s" % (payload, claims, row[6:]))
+        with elevated_integrity(), policy(upgrade_stepup_same_device=1, upgrade_acceptance_hours=0):
+            s._latest_integrity_state = _verdict_state("elevated")
+            reply = _upgrade(_limited_session("integrity_elevated"), {"route": "stepup"}, stepup=True)
+            expect(reply.status_code == 200 and "accepted_causes" not in (reply.get_json() or {}),
+                   "upgrade_acceptance_hours=0 must record no acceptance")
+        with elevated_integrity(), policy():
+            s._latest_integrity_state = _verdict_state("trusted")
+            reply = _upgrade(_limited_session("integrity_elevated"), {})
+            expect(reply.status_code == 200 and "accepted_causes" not in (reply.get_json() or {}),
+                   "a recheck needs no proof and accepts nothing")
+    finally:
+        db.refresh_row = None
+
+
+@check
+def a_refresh_keeps_an_accepted_session_full_only_while_covered():
+    def refresh(stored_scope, accepted, until, verdict, action):
+        family, session = str(uuid.uuid4()), str(uuid.uuid4())
+        with s.app.app_context():
+            token = s.create_refresh_token(identity=account, additional_claims={
+                "role": "account", "iid": inst.installation_id, "did": inst.device_id,
+                "sid": session, "family": family, "scope": stored_scope})
+        db.refresh_row = (family, account, inst.device_id, inst.installation_id,
+                          s._utc_now() + s.REFRESH_TOKEN_LIFETIME, None, stored_scope, None,
+                          ",".join(accepted) or None, until)
+        s._latest_integrity_state = _verdict_state(verdict)
+        s._evaluate_risk_policy = lambda *a, **k: {"effective_action": action, "context": {}}
+        challenge = client.post("/v1/auth/refresh/challenge",
+                                headers={"Authorization": "Bearer " + token}).get_json()
+        reply = client.post("/v1/auth/refresh", json={
+            "challenge_id": challenge["challenge_id"], "payload": challenge["payload"],
+            "signature": inst.sign_b64(challenge["payload"])},
+            headers={"Authorization": "Bearer " + token})
+        payload = reply.get_json() or {}
+        expect(reply.status_code == 200, "refresh failed: %s %s" % (reply.status_code, payload))
+        return payload.get("scope"), payload.get("accepted_causes")
+
+    later, earlier = s._utc_now() + timedelta(days=5), s._utc_now() - timedelta(seconds=1)
+    try:
+        with elevated_integrity(), policy():
+            for args, expected, why in (
+                    (("full", ["integrity_elevated"], later, "elevated", "allow"),
+                     ("full", ["integrity_elevated"]), "a covered cause keeps the session full"),
+                    (("full", ["integrity_elevated"], later, "elevated", "review"),
+                     ("limited", None), "a cause beyond the acceptance narrows it and drops it"),
+                    (("full", ["integrity_elevated"], earlier, "elevated", "allow"),
+                     ("limited", None), "an expired acceptance narrows"),
+                    (("full", [], None, "elevated", "allow"), ("limited", None),
+                     "without acceptance a soft cause narrows"),
+                    (("full", ["integrity_elevated"], later, "trusted", "allow"),
+                     ("full", ["integrity_elevated"]), "with no cause left it stays full")):
+                got = refresh(*args)
+                expect(got == expected, "%s: expected %s, got %s" % (why, expected, got))
+    finally:
+        db.refresh_row = None
 
 
 def main():

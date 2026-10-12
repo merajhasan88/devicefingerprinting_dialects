@@ -42,6 +42,7 @@ Apply migrations **in ascending version order**; each one records its own row in
 | 10 | `010_runtime_growth_and_eligibility.sql` | seeds `wx_far_above_baseline_percent` (200), `developer_options_refuses` (0), `adb_enabled_refuses` (0): W^X growth up to the percentage is advisory, developer options and ADB become optional eligibility rules (joint review R1) |
 | 11 | `011_limited_sessions.sql` | `refresh_sessions.scope` / `limited_causes`, the `session_upgrade_requests` table (audit evidence: grant SELECT, INSERT, UPDATE — never DELETE), and the eight limited-session settings at the owner's defaults |
 | 12 | `012_policy_bands_and_devices_per_account.sql` | seeds the relationship-risk bands (`policy_step_up_score` 30, `policy_review_score` 60, `policy_block_score` 90) and the devices-per-account policy (`account_devices_*`: 2 elevated, 3 review, 5 block) at the owner's defaults |
+| 13 | `013_upgrade_acceptance.sql` | `refresh_sessions.accepted_causes` / `accepted_until`: the soft causes an upgrade's proof accepted, kept with the session; seeds `upgrade_acceptance_hours` (720) |
 
 All scripts are guarded and safe to re-run.
 

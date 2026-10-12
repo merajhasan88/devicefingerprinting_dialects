@@ -1156,7 +1156,7 @@ def _get_backend_identity():
 # against a schema it does not understand. /health/* still answers so operators
 # can see why.
 
-REQUIRED_SCHEMA_VERSION = 12
+REQUIRED_SCHEMA_VERSION = 13
 
 _schema_state = None
 _schema_lock = threading.Lock()
@@ -1304,6 +1304,7 @@ _RISK_SETTING_KINDS = {
     "account_devices_review_count": "int",
     "account_devices_review_points": "int",
     "account_devices_block_count": "int",
+    "upgrade_acceptance_hours": "int",
 }
 # Lower bounds a value must also meet. Below 100 the "far above the baseline"
 # rule would fire for memory inside the build's own measured envelope.
@@ -2781,7 +2782,12 @@ def _eligibility_failures(state):
 
 
 def _enforce_integrity_gate(
-    device_id, installation_id, step_up=None, step_up_accepted=False, limited_ok=False
+    device_id,
+    installation_id,
+    step_up=None,
+    step_up_accepted=False,
+    limited_ok=False,
+    accepted=(),
 ):
     """Refuse the request unless the latest integrity verdict allows it.
 
@@ -2798,6 +2804,11 @@ def _enforce_integrity_gate(
     limited_cause and the caller issues a limited session. Everything else --
     block, an unlisted review, an eligibility rule, a device-memory block --
     still refuses here, before any password is compared.
+
+    accepted (a full session's upgrade acceptance, DESIGN.md 72): a verdict
+    whose cause the upgrade accepted passes, marked accepted_by_upgrade. Only
+    that cause: a worse verdict, an eligibility rule or a device-memory block
+    refuses as ever.
     """
     state = _latest_integrity_state(installation_id)
     ineligible = _eligibility_failures(state)
@@ -2825,7 +2836,9 @@ def _enforce_integrity_gate(
         if limited_ok
         else set()
     )
-    if verdict == "review" and "review" in soft:
+    if verdict == "review" and "integrity_review" in accepted:
+        state = dict(state, accepted_by_upgrade=True)
+    elif verdict == "review" and "review" in soft:
         state = dict(state, limited_cause="integrity_review")
     elif verdict == "review":
         raise ApiProblem(
@@ -2844,6 +2857,8 @@ def _enforce_integrity_gate(
         )
     if verdict == "elevated" and step_up:
         state = dict(state, satisfied_by_step_up=True)
+    elif verdict == "elevated" and "integrity_elevated" in accepted:
+        state = dict(state, accepted_by_upgrade=True)
     elif verdict == "elevated" and step_up_accepted:
         raise ApiProblem(
             "The latest device-integrity verdict requires step-up verification: "
@@ -3364,7 +3379,7 @@ def _evaluate_risk_policy(
     return decision
 
 
-def _enforce_risk_policy(decision, limited_ok=False):
+def _enforce_risk_policy(decision, limited_ok=False, accepted=()):
     """Refuse review and block; refuse elevated (step_up) only if a DBA opts in.
 
     By default an elevated decision is recorded and returned but does not
@@ -3378,11 +3393,18 @@ def _enforce_risk_policy(decision, limited_ok=False):
     lists in limited_session_policy_actions (owner default: step_up,review)
     returns its cause instead -- risk_step_up or risk_review -- and the caller
     issues a limited session. A block always refuses. Returns None otherwise.
+
+    accepted (DESIGN.md 72): an outcome whose cause a full session's upgrade
+    accepted passes, marked accepted_by_upgrade in the returned decision (the
+    stored decision row is written before this and does not carry the mark).
     """
     action = decision.get("effective_action")
     if action == "allow":
         return None
     if action == "step_up" and not _risk_setting_bool("elevated_risk_refuses", False):
+        return None
+    if action in ("step_up", "review") and "risk_%s" % action in accepted:
+        decision["accepted_by_upgrade"] = True
         return None
     if (
         limited_ok
@@ -3689,9 +3711,14 @@ def _require_trusted_account_request(event_type="protected_request"):
     server-side device/account policy and enforce its effective action.
     """
     claims = _require_access_proof("account")
+    accepted = _session_acceptance(claims)
     step_up = _enforce_step_up(claims.get("iid"), get_jwt_identity())
     integrity = _enforce_integrity_gate(
-        claims.get("did"), claims.get("iid"), step_up=step_up, step_up_accepted=True
+        claims.get("did"),
+        claims.get("iid"),
+        step_up=step_up,
+        step_up_accepted=True,
+        accepted=accepted,
     )
     policy = _evaluate_risk_policy(
         event_type,
@@ -3701,8 +3728,21 @@ def _require_trusted_account_request(event_type="protected_request"):
         account_link_pending=False,
         persist=True,
     )
-    _enforce_risk_policy(policy)
+    _enforce_risk_policy(policy, accepted=accepted)
     return claims, policy, integrity
+
+
+def _session_acceptance(claims):
+    """The soft causes this full session's upgrade accepted, while still valid."""
+    until = claims.get("accepted_until")
+    if (
+        claims.get("scope") != "full"
+        or isinstance(until, bool)
+        or not isinstance(until, int)
+        or until <= int(_utc_now().timestamp())
+    ):
+        return frozenset()
+    return frozenset(c for c in claims.get("accepted") or [] if isinstance(c, str))
 
 
 # ---------------------------------------------------------------------------
@@ -4431,12 +4471,18 @@ def _issue_account_tokens(
     family_id=None,
     policy=None,
     limited_causes=(),
+    accepted_causes=(),
+    accepted_until=None,
 ):
     """Issue an access and refresh token pair and record the refresh session.
 
     With limited_causes the session is LIMITED (DESIGN.md 70): the scope rides
     in both server-signed tokens and in refresh_sessions, so neither the client
     nor a refresh can widen it; only /v1/auth/upgrade issues a full session.
+
+    With accepted_causes (a full session only) the soft causes an upgrade's
+    proof accepted ride along until accepted_until (DESIGN.md 72): protected
+    requests and refreshes honour exactly those causes, and nothing else.
     """
     family_id = family_id or str(uuid.uuid4())
     session_id = str(uuid.uuid4())
@@ -4452,6 +4498,12 @@ def _issue_account_tokens(
     }
     if limited:
         claims["limited"] = limited
+    accepted = [] if limited else sorted(set(accepted_causes))
+    if accepted and accepted_until is not None and accepted_until > _utc_now():
+        claims["accepted"] = accepted
+        claims["accepted_until"] = int(accepted_until.timestamp())
+    else:
+        accepted, accepted_until = [], None
     access_token = create_access_token(
         identity=account_id,
         additional_claims=claims,
@@ -4466,8 +4518,8 @@ def _issue_account_tokens(
         """
         INSERT INTO refresh_sessions
             (session_id, family_id, account_id, device_id, installation_id,
-             expires_at, scope, limited_causes)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+             expires_at, scope, limited_causes, accepted_causes, accepted_until)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """,
         (
             session_id,
@@ -4478,6 +4530,8 @@ def _issue_account_tokens(
             _utc_now() + REFRESH_TOKEN_LIFETIME,
             scope,
             ",".join(limited) or None,
+            ",".join(accepted) or None,
+            accepted_until,
         ),
     )
     tokens = {
@@ -4495,6 +4549,9 @@ def _issue_account_tokens(
         tokens["upgrade_routes"] = _upgrade_routes(
             cursor, account_id, installation_id, limited
         )
+    if accepted:
+        tokens["accepted_causes"] = accepted
+        tokens["accepted_until"] = _iso_z(accepted_until)
     return tokens
 
 
@@ -4516,7 +4573,8 @@ def _refresh_session(cursor, claims, lock=False):
     cursor.execute(
         """
         SELECT family_id, account_id, device_id, installation_id,
-               expires_at, revoked_at, scope, limited_causes
+               expires_at, revoked_at, scope, limited_causes,
+               accepted_causes, accepted_until
         FROM refresh_sessions""" + hint + """
         WHERE session_id = %s
         """
@@ -4538,6 +4596,8 @@ def _refresh_session(cursor, claims, lock=False):
         revoked_at,
         stored_scope,
         stored_causes,
+        stored_accepted,
+        stored_accepted_until,
     ) = row
     if (
         str(stored_family) != family_id
@@ -4563,6 +4623,8 @@ def _refresh_session(cursor, claims, lock=False):
         "installation_id": installation_id,
         "scope": stored_scope or "full",
         "limited_causes": [c for c in (stored_causes or "").split(",") if c],
+        "accepted_causes": [c for c in (stored_accepted or "").split(",") if c],
+        "accepted_until": stored_accepted_until,
     }
 
 
@@ -5483,7 +5545,7 @@ def account_login():
     )
     limited = _limited_causes(
         integrity,
-        _enforce_risk_policy(policy, limited_ok=_links_no_shared_device(policy)),
+        _enforce_risk_policy(policy, limited_ok=_first_link_within_counts(policy)),
     )
 
     with _cursor(commit=True) as cursor:
@@ -5522,7 +5584,9 @@ def account_me():
 @jwt_required()
 def policy_me():
     claims = _require_access_proof("account")
-    _enforce_integrity_gate(claims.get("did"), claims.get("iid"))
+    _enforce_integrity_gate(
+        claims.get("did"), claims.get("iid"), accepted=_session_acceptance(claims)
+    )
     decision = _evaluate_risk_policy(
         "policy_check",
         claims.get("did"),
@@ -5802,7 +5866,20 @@ def refresh_account_tokens():
             # A refresh never widens a session: a limited one stays limited
             # (with its causes) unless soft risk is found now, and a full one
             # becomes limited when it is (DESIGN.md 70). Only the upgrade
-            # endpoint issues a full session from a limited one.
+            # endpoint issues a full session from a limited one. A full session
+            # whose upgrade accepted every cause found now stays full, with its
+            # acceptance, until accepted_until; anything beyond what was
+            # accepted narrows it and drops the acceptance (DESIGN.md 72).
+            accepted, accepted_until = (), None
+            if (
+                session["scope"] == "full"
+                and session["accepted_causes"]
+                and session["accepted_until"] is not None
+                and session["accepted_until"] > _utc_now()
+                and set(limited) <= set(session["accepted_causes"])
+            ):
+                accepted, accepted_until = session["accepted_causes"], session["accepted_until"]
+                limited = []
             if not limited and session["scope"] == "limited":
                 limited = session["limited_causes"] or ["session_limited"]
             tokens = _issue_account_tokens(
@@ -5813,6 +5890,8 @@ def refresh_account_tokens():
                 family_id=session["family_id"],
                 policy=policy,
                 limited_causes=limited,
+                accepted_causes=accepted,
+                accepted_until=accepted_until,
             )
             cursor.execute(
                 """
@@ -5837,23 +5916,35 @@ def refresh_account_tokens():
 # ---------------------------------------------------------------------------
 
 
-def _links_no_shared_device(policy):
-    """Relationship risk may limit a login only if no OTHER account pays for it.
+def _first_link_within_counts(policy):
+    """Relationship risk may limit a first sign-in only within the DBA's counts.
 
-    A first login of an account on a device writes a device-account link, and
-    links are permanent: admitting it, even limited, raises that device's
-    account count for every account already on it -- a phone shared by two
-    people would put both into review because a third person was let in. So a
-    limited session under relationship risk is given only to an account already
-    linked to the device, or to a first login on a device no other account
-    uses (a user's own new phone): there the new link weighs on this account
-    alone, which the limited session and its upgrade already govern. Anything
-    else is refused as before.
+    A first sign-in of an account on a device writes a device-account link, and
+    links are permanent. If that link made the phone's third account or the
+    account's third device (the owner's defaults: the review counts), every
+    account on that phone, or every device of that account, would be refused
+    from then on -- and anyone holding only a password could do it from a
+    fresh phone, since a phone cannot prove it is new. Such a sign-in is
+    refused as before (owner decision, DESIGN.md 72). Within the counts -- two
+    people sharing a phone, a user's own second phone -- it gets a limited
+    session. Where elevated_risk_refuses is set, the elevated counts are the
+    ones that refuse, so they are the limits. An account already linked to the
+    device adds no link and may always be limited.
     """
     context = (policy or {}).get("context") or {}
     if context.get("account_already_linked_to_device") is True:
         return True
-    return context.get("device_account_count") == 0
+    accounts = context.get("projected_device_account_count")
+    devices = context.get("projected_account_device_count")
+    if not isinstance(accounts, int) or not isinstance(devices, int):
+        return False
+    level = "elevated" if _risk_setting_bool("elevated_risk_refuses", False) else "review"
+    defaults = {"elevated": 2, "review": 3}
+    for key, count in (("device_accounts_%s_count", accounts), ("account_devices_%s_count", devices)):
+        limit = _risk_setting_int(key % level, defaults[level])
+        if limit > 0 and count >= limit:
+            return False
+    return True
 
 
 def _limited_causes(integrity, risk_cause):
@@ -5932,6 +6023,12 @@ def upgrade_session():
             """,
             (session["session_id"],),
         )
+        # The proof accepts the soft causes found now, for this sign-in, until
+        # the DBA's upgrade_acceptance_hours (owner default 720: the refresh
+        # lifetime) -- not any other cause, and never past the refresh lifetime
+        # (DESIGN.md 72). A recheck needed no proof and accepts nothing.
+        hours = _risk_setting_int("upgrade_acceptance_hours", 720)
+        accepted_until = _utc_now() + min(timedelta(hours=hours), REFRESH_TOKEN_LIFETIME)
         tokens = _issue_account_tokens(
             cursor,
             account_id,
@@ -5939,6 +6036,8 @@ def upgrade_session():
             installation_id,
             family_id=session["family_id"],
             policy=policy,
+            accepted_causes=causes if hours > 0 else (),
+            accepted_until=accepted_until,
         )
         cursor.execute(
             """
@@ -6383,6 +6482,8 @@ def approve_upgrade(request_id):
     account_id = str(get_jwt_identity())
     installation_id = claims.get("iid")
     _require_full_session(claims)
+    # Strict on purpose: no step-up allowance and no upgrade acceptance. A
+    # device whose own risk was only accepted must not vouch for another.
     _enforce_integrity_gate(claims.get("did"), installation_id)
     policy = _evaluate_risk_policy(
         "approval_grant",
