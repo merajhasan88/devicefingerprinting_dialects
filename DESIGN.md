@@ -5781,7 +5781,68 @@ device for good. The proposal before the owner: a limited session writes no new 
 **Results (2026-10-12).** `tools/check_security_regressions.py` **55 / 55** (new: the bands follow the
 settings and must rise; devices per account follow the settings, a business may let a third device
 through, `0` switches a count off); three mutations each failed it. SQL Server translation, module
-order, 3.9 syntax, iOS scoring rules: OK. **Not run on the test stack**: the dev machine's address had
-changed, and adding it to the instance's SSH rule needs the owner; the instance was started and stopped
-again without a deploy. The suite gained a live devices-per-account check (72).
+order, 3.9 syntax, iOS scoring rules: OK. The suite gained a live devices-per-account check (72). The
+first attempt to deploy failed on the instance's SSH rule (the dev machine's address had changed; the
+owner added it); migration 012 was applied and tested on 2026-10-12 with §72's change — results there.
+
+## 72. First sign-ins within the counts, and an upgrade's acceptance (2026-10-12)
+
+**Owner decisions (2026-10-12).** The score of a person on two phones is a DBA setting (already true:
+`account_devices_elevated_points`, and `device_accounts_elevated_points` for two accounts on one phone,
+§71 and migration 006). "By default I agree with what we have right now for 2a." "I agree with 'one
+rule fixes both'" — refuse a first sign-in only if it would make the phone's third account or the
+account's third device, limit the rest. The fix for an upgrade that does not stick: yes, kept until the
+user signs out, at most the 30-day refresh lifetime, DBA-configurable. The integrity verdict bands
+stay fixed.
+
+**One case the two 2a statements disagree on**, resolved in favour of the newer rule and flagged to
+the owner: a second person signing in on a phone another account uses, who already uses their own
+phone (two accounts +35, a second device +35 = 70, review). It was refused; it now gets a limited
+session. A DBA who wants it to pass outright lowers either +35; one who wants it refused can say so and
+the rule's limits move to the elevated counts.
+
+**The rule** (`abeac06`). `_first_link_within_counts`: an account already linked to the device may
+always be limited; otherwise the projected accounts on the phone and devices of the account must both
+stay below the DBA's review counts (`device_accounts_review_count`, `account_devices_review_count`;
+the elevated counts where `elevated_risk_refuses` is set; a `0` count is off). Beyond them the sign-in
+is refused as before: its permanent link would hold every account on the phone, or every device of the
+account, in review — and a fresh phone costs an attacker nothing, so a password alone could do it.
+A new account under relationship risk stays refused (§70).
+
+**The acceptance** (`abeac06`, migration 013). A proof upgrade (routes 1–3) while soft causes remain
+records exactly those causes and an expiry — now + `upgrade_acceptance_hours` (720), capped at the
+refresh lifetime; `0` records nothing — in both server-signed tokens (`accepted`, `accepted_until`)
+and `refresh_sessions.accepted_causes` / `accepted_until`. A recheck accepts nothing.
+
+- Protected requests (`_require_trusted_account_request`, `/v1/policy/me`) pass the accepted causes:
+  `_enforce_integrity_gate(accepted=...)` lets an accepted `integrity_elevated` (or a DBA-listed
+  `integrity_review`) through, and `_enforce_risk_policy(accepted=...)` an accepted `risk_review` /
+  `risk_step_up`; both mark the outcome `accepted_by_upgrade` in what they return (the stored decision
+  row is written before and does not carry the mark).
+- Anything worse is judged afresh: a cause outside the accepted set refuses; a block, an eligibility
+  rule and a device-memory block refuse as ever.
+- A refresh keeps the session full, with its acceptance, while every cause found is accepted and the
+  expiry has not passed; otherwise it narrows the session and drops the acceptance.
+- **The F11 trade-off:** for that sign-in an accepted elevated verdict no longer needs a step-up proof
+  per ordinary request. The DBA's `stepup_required_paths` still require one per request — which is
+  where per-request step-up matters.
+- Approvers stay strict: approving another installation's upgrade takes a clean integrity verdict with
+  no step-up allowance and no acceptance, so an accepted device cannot vouch for another.
+
+**Results (2026-10-12).**
+
+| Check | Result |
+|---|---|
+| `tools/check_security_regressions.py` | **58 / 58** — new: an acceptance covers its causes and nothing else (no acceptance, a partial one, an expired one, a limited token, block / worse verdict / relationship block); an upgrade records its acceptance (and none with `0`, none on recheck); a refresh keeps an accepted session full only while covered. The sign-in rule check was rewritten for the counts |
+| Mutation runs | six deliberately broken servers, each failing the gate |
+| Migrations 012 and 013, PostgreSQL 16.15 | applied; nine settings rows at the owner's defaults |
+| Conformance suite, observe, **72 checks** | **60 passed, 0 failed, 12 skipped** |
+| Integrity enforce, routes 1–3 on | **69 passed, 0 failed, 3 skipped** |
+| Both modes enforcing, targeted | **15 / 15** — among them: the third account and the third device refused; route 2 upgrades a session at review (relationship and integrity causes), which then reaches protected paths and refreshes full; a block afterwards refuses |
+| Server journal | no errors |
+| Not done | SQL Server execution (translation-checked); the Flutter and .NET clients; handsets |
+
+**State.** EC2 stopped. Server `/opt/device_trust_server.py` = `abeac06` (md5 `d7e7ed4f…`, backup
+`.bak-20261012-140928`); schema 13; observe/observe; routes 1 and 3 off, route 2 on; no assertion
+keys; `stepup_required_paths` `''`.
 

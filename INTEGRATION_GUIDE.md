@@ -127,7 +127,7 @@ statement timeout `DB_QUERY_TIMEOUT` (15 s).
   cleartext; require the same of every client build you ship.
 
 **Database.** PostgreSQL 13+ or SQL Server 2017+ (`DB_ENGINE`). Your DBA applies
-`migrations/<engine>/001…012` in order; the server only reads `schema_migrations` and refuses to serve
+`migrations/<engine>/001…013` in order; the server only reads `schema_migrations` and refuses to serve
 on any other version (`/health/ready` says why). Use verified TLS: PostgreSQL `DB_SSLMODE=verify-full`
 with `DB_SSLROOTCERT`; SQL Server always connects with `Encrypt=yes` and `TrustServerCertificate=no`.
 
@@ -300,11 +300,13 @@ are permanent:
 
 - **A new account under relationship risk is refused**, as before. Under a soft *integrity* verdict
   the account is created — and linked — with a limited session.
-- **A first sign-in under relationship risk on a device that other accounts use is refused**, as
-  before: its link would raise their account count, and a phone shared by two people would put both
-  into review because a third person was let in. An account already linked to the device, or a first
-  sign-in on a device no other account uses (a user's own new phone), gets the limited session; that
-  first sign-in still writes its link, which counts toward the account's devices.
+- **A first sign-in under relationship risk is refused if its link would make the phone's third
+  account or the account's third device** — your review counts in section 5, or the elevated counts
+  where `elevated_risk_refuses` is 1. Such a link is permanent: every account on that phone, or every
+  device of that account, would be refused from then on, and anyone holding only a password could
+  cause it from a fresh phone, since a phone cannot prove it is new. Within the counts — two people
+  sharing a phone, a user's own second phone — the sign-in gets a limited session, and its link is
+  written. Raising the counts raises these limits with them.
 
 **What your app sees.** Login, registration and refresh responses carry `scope` (`full` or `limited`);
 a limited one also carries `limited_causes` (`integrity_elevated`, `integrity_review`, `risk_step_up`,
@@ -318,6 +320,18 @@ refreshed under soft risk becomes limited.
 `{"route": ...}`. The server re-runs the integrity and relationship checks first — an upgrade never
 overrides a hard outcome — and issues a full session in the same refresh family; the old limited
 token stays limited, and a second upgrade of the same session answers 401 `session_rotated`.
+
+**What an upgrade accepts.** An upgrade made with a proof (routes 1–3) while soft causes remain
+accepts exactly those causes for that sign-in: the response carries `accepted_causes` and
+`accepted_until`, and both tokens carry them. Until then — `upgrade_acceptance_hours` (default 720,
+the refresh lifetime, never longer; `0` keeps nothing) or until the user signs out — protected
+requests pass those causes (the outcome is marked `accepted_by_upgrade`) and a refresh keeps the
+session full. Anything worse is judged afresh: a cause the proof did not cover refuses the request and
+narrows the session at its next refresh (dropping the acceptance), and a block, an eligibility rule or
+a device-memory block refuses as always. Two consequences to know: an accepted `elevated` integrity
+verdict no longer needs a step-up proof on every ordinary request (your `stepup_required_paths`
+still do), and a phone approving someone else's upgrade gets no acceptance of its own — it must be
+clean.
 
 - **`recheck`** (no proof): succeeds once no soft cause remains — for example after a new clean
   integrity scan. A relationship review does not clear by itself (links are permanent): once your own

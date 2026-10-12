@@ -253,3 +253,16 @@ devices-per-account counts (2 elevated, 3 review, 5 block) are now `risk_policy_
 decision's `thresholds` reports the live bands. Nothing changes at the defaults. The reference suite
 has 72 checks (new: devices per account, expectations from the live settings).
 
+## 13. Added 2026-10-12 — an upgrade's acceptance; first sign-ins within the counts
+
+DESIGN.md §72, **schema 13** (migration 013). Server only; nothing changes in observe mode.
+
+- After an upgrade made with a proof, the response carries `accepted_causes` and `accepted_until`, and
+  the session keeps them (both tokens, and across refreshes) for `upgrade_acceptance_hours` (720).
+  Protected requests then pass those causes — an accepted `integrity_elevated` no longer needs a
+  step-up proof per ordinary request — and a refresh stays `full`. Anything worse refuses or narrows
+  the session again. No client change is needed; a client that attaches step-up proofs pre-emptively
+  may stop doing so while an elevated verdict is accepted.
+- A first sign-in under relationship risk that would make the phone's third account or the account's
+  third device is refused (403 `risk_review_required` / `risk_policy_blocked`), never limited.
+

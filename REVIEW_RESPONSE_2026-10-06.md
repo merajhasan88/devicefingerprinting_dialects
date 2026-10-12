@@ -64,3 +64,12 @@ for good; both still refuse. Gate 53/53; suite (71 checks) 59/0/12 in observe an
 integrity enforcement and all three routes on; 14/14 targeted with both modes enforcing. Not yet: SQL
 Server execution, and the Flutter and .NET clients' handling of the new responses.
 
+**Added 2026-10-12.** Testing the limited sessions with relationship enforcement on found two more
+things, both now fixed (DESIGN.md §72): a limited first sign-in could link an account's third device —
+with only a password, from a fresh phone — and so hold the real owner in review everywhere for good;
+such sign-ins are now refused at the owner's counts. And an upgrade over a soft cause did not stick —
+protected requests judged it again and refused; the upgrade now records exactly the causes its proof
+accepted, which protected requests and refreshes honour until the DBA's limit, and anything worse is
+judged afresh. Gate 58/58; suite (72 checks) 60/0/12 in observe, 69/0/3 with integrity enforcement and
+all routes on, 15/15 targeted with both modes enforcing.
+
