@@ -3688,6 +3688,18 @@ class _DeviceRecognitionPageState extends State<DeviceRecognitionPage> {
   final TextEditingController _passwordController = TextEditingController();
   final TextEditingController _stolenRefreshController =
       TextEditingController(text: injectedStolenRefreshToken);
+  /// Owner request (2026-10-12): a mistyped test password is otherwise
+  /// invisible; both password fields can be shown while typing.
+  bool _showPasswords = false;
+
+  Widget _showPasswordToggle() {
+    return IconButton(
+      tooltip: _showPasswords ? 'Hide password' : 'Show password',
+      icon: Icon(_showPasswords ? Icons.visibility_off : Icons.visibility),
+      onPressed: () => setState(() => _showPasswords = !_showPasswords),
+    );
+  }
+
   final TextEditingController _stepUpPasswordController =
       TextEditingController();
   final TextEditingController _stolenAccessController =
@@ -4117,10 +4129,13 @@ class _DeviceRecognitionPageState extends State<DeviceRecognitionPage> {
             TextField(
               controller: _passwordController,
               enabled: !_controller.busy,
-              obscureText: true,
-              decoration: const InputDecoration(
+              obscureText: !_showPasswords,
+              autocorrect: false,
+              enableSuggestions: false,
+              decoration: InputDecoration(
                 labelText: 'Password (10–72 UTF-8 bytes)',
-                border: OutlineInputBorder(),
+                border: const OutlineInputBorder(),
+                suffixIcon: _showPasswordToggle(),
               ),
             ),
             const SizedBox(height: 12),
@@ -4346,11 +4361,14 @@ class _DeviceRecognitionPageState extends State<DeviceRecognitionPage> {
               TextField(
                 controller: _stepUpPasswordController,
                 enabled: !_controller.busy,
-                obscureText: true,
+                obscureText: !_showPasswords,
+                autocorrect: false,
+                enableSuggestions: false,
                 onChanged: (_) => setState(() {}),
-                decoration: const InputDecoration(
+                decoration: InputDecoration(
                   labelText: 'Account password (to re-enrol step-up)',
-                  border: OutlineInputBorder(),
+                  border: const OutlineInputBorder(),
+                  suffixIcon: _showPasswordToggle(),
                 ),
               ),
               const SizedBox(height: 8),
