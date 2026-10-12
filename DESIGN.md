@@ -5971,6 +5971,87 @@ without renewing it; after ten minutes idle it answered 401 `expired_token`, and
 had lapsed meanwhile. (3) The owner mistyped a password on account creation (`hs-a-1012` is unusable);
 the password fields now have a show/hide toggle and no autocorrect (`0644eaf`).
 
-**State.** RDS `devicetrust-mssql-1012` at db.t3.small with the owner's default settings, to be deleted
-(no final snapshot, no automated backups) before the session ends; EC2 still on SQL Server, both modes
-enforcing. Test accounts `hs-b-1012` and `hs-c-1012` exist only on that database.
+**State at the end of this round.** RDS `devicetrust-mssql-1012` at db.t3.small with the owner's default
+settings; EC2 still on SQL Server, both modes enforcing. Test accounts `hs-b-1012` and `hs-c-1012`
+existed only on that database. The database was deleted the same night (§75).
+
+## 75. Duplicate approval requests, the harness fixes, the Vivo, and a false positive after an update (2026-10-13)
+
+**The Vivo against SQL Server** — V2118, Android 12, the first 32-bit ARM phone tested (armeabi-v7a),
+locked bootloader, verified boot green; the release build from `0644eaf`; RDS at db.t3.small, both modes
+enforcing. The Vivo writes no app lines to logcat, so its results were read from the server.
+
+| Step | Result |
+|---|---|
+| First scan | **0 / trusted** (developer options and ADB at 0 points) |
+| At start the risk card showed a score of 33 | the decision saved with its last session, from the PostgreSQL round of §53.4b; the SQL Server database had none. The stale-session bug below |
+| Signs in limited to an account a scripted phone opened; protected access | limited; refused 403 — **PASS** |
+| Scripted approval; the Vivo waits | approved 00:07:00, the Vivo upgraded by itself 00:07:04 — **PASS** |
+| Protected access; bound refresh | **PASS** |
+| The Vivo approves, owner defaults | refused **`risk_review_required`**: the approver itself scored 80 at `approval_grant` — a phone first seen today +10, two accounts on it +35, and the account's second device +35, a link the requester's own sign-in had just made. Correct under the defaults; an established phone with one account scores 35 and approves. Recorded, not changed |
+| The Vivo approves under the shared-phone settings (§73) | **PASS**; the scripted phone upgraded with both causes accepted |
+| The Vivo denies | **PASS** (`state: denied` on the scripted phone) |
+| The app kept a lapsed request on screen; approving it | PIN asked, then 404 — correct server answer; the harness gap fixed below |
+
+**A newer approval request replaces the same phone's pending ones** (`c6a79c2`, owner request). The
+Vivo's approver saw two requests from one scripted phone, one per sign-in. Now, when an installation
+asks for approval again for the same account, its requests still pending are marked superseded
+(migration 014: `session_upgrade_requests.superseded_at`; schema version 14). Only the caller's own
+installation and account are touched — never another phone's, another account's, an assertion's, or an
+answered request; the rows stay as evidence and still count toward `upgrade_approvals_per_hour`. The
+approver lists one request per phone; approving or denying a replaced one answers **409
+`approval_superseded`** (scoped to the account's other installations, so it reveals nothing else); the
+requester reads its state as `superseded`. An approval granted before the phone asked again stays usable,
+once.
+
+| Check | Result |
+|---|---|
+| Gate | **59 / 59** with a new SQLite check; three mutations (supersede other phones, grant ignores it, state ignores it) each fail it |
+| Suite | new `check_upgrade_request_supersedes` (73 checks); with the approval check, **PASS** on SQL Server and on PostgreSQL |
+| Huawei approver, SQL Server: two requests from one scripted phone | the Huawei listed **one**, approved it, and its list emptied by itself; the database shows the first superseded at 19:48:50 UTC, the second approved and used — **PASS** |
+
+**Harness fixes** (Dart only, in the iOS build).
+- `ab04822` — after approve or deny, whatever the answer, the approvals list is fetched again; a request
+  that lapsed on screen is dropped, and pressing Approve on one no longer asks for the PIN first. An
+  access token about to expire is renewed with a bound refresh before anything asks for the screen lock,
+  and a call refused with `expired_token` is renewed and tried once (the Huawei had answered
+  `expired_token` after ten idle minutes).
+- `ea00d0d` — at start a saved session is refreshed once before anything from it is shown. A 401
+  discards it and its old decision; any other answer keeps it. Every app start now costs one refresh and
+  one risk evaluation — read later request-rate figures with that in mind.
+
+| Start-up check on the Huawei | Result |
+|---|---|
+| Owner defaults: the Huawei held three accounts | the refresh answered 403 `risk_policy_blocked`; the session was **kept**, as designed |
+| Shared-phone settings | **`SESSION: start: Session: full`** — confirmed |
+| Against PostgreSQL with a saved SQL Server session | **`unknown_refresh_session`; discarded** |
+
+**A false positive after an update, fixed** (`4a6f75e`, owner approved). About a minute after `adb
+install -r`, the Huawei recompiled the app in the background and replaced its own
+`/data/app/…/oat/arm64/base.odex` under the running process. The next scan found an executable mapping
+of a deleted file — `android_deleted_code_mapping` **+55**, elevated — and a new account was refused
+(65, review) until the app restarted. Real users would hit this after updates. The collector now counts
+deleted executable mappings of its own install folder's `oat/` files (`.odex .vdex .art .oat`) apart, as
+`deleted_exec_own_code`; the server records them as `android_app_code_recompiled` at **0 points**.
+Writing there takes installd, system or root, so the exemption gives an attacker nothing. Any other
+deleted executable mapping still costs 55, and so does an older collector's report, which cannot tell
+them apart. Gate 60 / 60; a server that exempts other deletions fails it. On the Huawei, `cmd package
+compile -m speed -f` under the running app (pid unchanged), then a scan: **0 / trusted** with the
+advisory — **PASS**. Android only; iOS has no such probe.
+
+**Teardown and checks.**
+
+| Item | Result |
+|---|---|
+| EC2 back on PostgreSQL 16.15, migration 014 applied, observe / observe | full suite **59 passed, 0 failed, 14 skipped** (73 checks). Against the previous run: the new check skips in observe mode, and the step-up path check skipped because `stepup_required_paths` is empty here |
+| RDS `devicetrust-mssql-1012` | deleted, no final snapshot, no automated backups. Resized to db.t3.small at the owner's choice for the last hour (USD 0.044/h against 0.022/h for db.t3.micro, SQL Server Express, Oregon) |
+| Removed | the SQL Server and assertion drop-ins, the JWKS file, the RDS password files (EC2 and local), the sqlcmd helper, the SQL Server migrations copy and tonight's query files |
+| Left, not created tonight | `~/.mssql_pw` on EC2 (2026-09-06) and the database security group's port-1433 rule (app server's group only) — owner to decide |
+| Billing | EC2 stopped; no RDS, no snapshots, no Elastic IPs, no NAT |
+
+**State.** EC2 `i-0559685f02c4013b1` stopped. Server `/opt/device_trust_server.py` = `4a6f75e` (md5
+`e41be8d7…`; backups `.bak-20261012-193947`, `.bak-20261012-195334`); schema 14; observe / observe; owner
+defaults on PostgreSQL. The Huawei carries the `4a6f75e` release build and no saved session; the Vivo
+the `0644eaf` build. Open: rotate the `dtadmin` test password (it was printed once on 2026-10-12); the
+iPhone round (the Codemagic build was cancelled); the .NET handoff note (the `superseded` state, 409
+`approval_superseded`, migration 014, `deleted_exec_own_code`, the `nvarchar`-vs-`char(36)` finding).
