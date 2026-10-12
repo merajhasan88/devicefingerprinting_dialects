@@ -127,7 +127,7 @@ statement timeout `DB_QUERY_TIMEOUT` (15 s).
   cleartext; require the same of every client build you ship.
 
 **Database.** PostgreSQL 13+ or SQL Server 2017+ (`DB_ENGINE`). Your DBA applies
-`migrations/<engine>/001…011` in order; the server only reads `schema_migrations` and refuses to serve
+`migrations/<engine>/001…012` in order; the server only reads `schema_migrations` and refuses to serve
 on any other version (`/health/ready` says why). Use verified TLS: PostgreSQL `DB_SSLMODE=verify-full`
 with `DB_SSLROOTCERT`; SQL Server always connects with `Encrypt=yes` and `TrustServerCertificate=no`.
 
@@ -165,15 +165,26 @@ defaults and changed by your DBA, never by the server. Notable keys:
 
 | setting | default | meaning |
 |---|---|---|
+| `policy_step_up_score` / `policy_review_score` / `policy_block_score` | 30 / 60 / 90 | the relationship-risk bands: below 30 allow; 30–59 step-up (recorded, allowed unless `elevated_risk_refuses` is 1); 60–89 review (refused in enforce mode); 90 and above block. They must rise |
 | `device_accounts_elevated_count` / `_points` | 2 / 35 | a phone shared by two people: scored, never refused by itself |
-| `device_accounts_review_count` / `_points` | 3 / 60 | held for review |
+| `device_accounts_review_count` / `_points` | 3 / 60 | a third account on one phone: held for review, so refused in enforce mode |
 | `device_accounts_block_count` | 4 | blocked |
+| `account_devices_elevated_count` / `_points` | 2 / 35 | one account on a second device: scored, never refused by itself |
+| `account_devices_review_count` / `_points` | 3 / 60 | a third device: held for review, so refused in enforce mode |
+| `account_devices_block_count` | 5 | blocked |
 | `elevated_risk_refuses` | 0 | 1 makes an elevated decision refuse in enforce mode |
 | `stepup_required_paths` | empty | comma-separated request paths that require a step-up proof |
 | `stepup_factor` / `stepup_mode` / `stepup_window_seconds` | passcode / per_use / 0 | the step-up policy |
 | `wx_far_above_baseline_percent` | 200 | W^X growth above a build's pin is advisory up to this percentage of it and +40 beyond (section 3); minimum 100 |
 | `developer_options_refuses` / `adb_enabled_refuses` | 0 / 0 | eligibility rules: 1 refuses a device whose latest scan reports the setting on (below) |
 | `rate_anomaly_*`, `population_baseline_*` | off | advisory signals |
+
+**Shared phones and several devices are a business decision.** By default a third account on one
+phone, or one account on a third device, is held for review and refused in enforce mode. A business
+whose users legitimately share phones (a kiosk, a field team) or carry several devices raises the
+counts, or the bands, for its own deployment; a `0` count switches that rule off. The
+`POLICY_*_SCORE` and `POLICY_ACCOUNT_DEVICE_BLOCK_COUNT` environment variables are only fallbacks for
+a missing row.
 
 **Developer options and USB debugging (ADB)** are measured on every Android scan and recorded
 (`android_developer_options`, `android_adb_enabled`), but cost no points: they are common on legitimate

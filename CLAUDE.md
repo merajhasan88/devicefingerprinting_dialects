@@ -90,8 +90,8 @@ processes** from the systemd drop-in, with a per-process connection pool (`DB_PO
 `DB_POOL_RECHECK_SECONDS`) and, on SQL Server, a 15 s statement timeout (`DB_QUERY_TIMEOUT`) —
 DESIGN.md 55 and 60. Serve SQL Server with processes, never threads.
 
-**Schema is migrations, DBA-applied.** `migrations/<dialect>/001…011`, applied in order; the server
-refuses to serve unless `schema_migrations` holds the version it requires (currently **11**). A new
+**Schema is migrations, DBA-applied.** `migrations/<dialect>/001…012`, applied in order; the server
+refuses to serve unless `schema_migrations` holds the version it requires (currently **12**). A new
 table needs its grant (`GRANT`/`ALTER DEFAULT PRIVILEGES` on PostgreSQL). Risk and step-up policy
 values live in `risk_policy_settings`, seeded by the migrations with the owner's defaults, which a DBA
 may change — never hard-code a policy value.
@@ -99,7 +99,7 @@ may change — never hard-code a policy value.
 ## Commands
 
 ```bash
-# Conformance suite — the gate. 71 checks; needs `cryptography` (harness only).
+# Conformance suite — the gate. 72 checks; needs `cryptography` (harness only).
 python3 conformance_suite.py --base-url https://<endpoint>
 #   Scoring checks need the server started with INTEGRITY_ANDROID_CERT_SHA256 set to the
 #   certificate the suite prints, or empty to disable the allow-list.
@@ -136,9 +136,9 @@ not jailbroken). The emulator AVD `integrity_root_lab` is the disposable root la
 
 ## Current point of work
 
-See the end of DESIGN.md: sections 66–70 record the 2026-10-05 joint review, the declined attestation
-proposal, the limited-session design (67) and its implementation (70), R4 (68) and R1 (69), each with
-its state;
+See the end of DESIGN.md: sections 66–71 record the 2026-10-05 joint review, the declined attestation
+proposal, the limited-session design (67) and its implementation (70), R4 (68), R1 (69) and the
+DBA-tunable bands (71), each with its state;
 section 64 is an open question for the reviewer (the .NET W^X allowance); section 63 records the
 2026-09-29 external review, what was repaired and the owner's decisions; sections 51–62 cover the step-up
 key, dead-key recovery, the account policy, SQL Server concurrency, the serving model and W^X

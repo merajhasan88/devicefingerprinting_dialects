@@ -5753,3 +5753,35 @@ are unaffected.
 `.bak-20261007-094044`); schema 11; observe/observe; routes 1 and 3 off, route 2 on; no assertion keys
 configured; `stepup_required_paths` `''`; eligibility rules 0; `wx_far_above_baseline_percent` 200.
 
+## 71. DBA-tunable relationship bands and devices-per-account policy (2026-10-12)
+
+**Owner decisions (2026-10-12).** "Put 30-59 and 60-89 DBA-configurable. By default third or more
+should be refused so yes a third account cannot be created. But allow DBAs to override that for
+business use." And §70's first departure stands: a new account under relationship risk is refused,
+not limited. The second departure (§70, first sign-in under relationship risk) awaits the owner, after
+the flaw found on 2026-10-12: a limited first sign-in writes a permanent link, so someone holding only a
+password could push an account to three or four devices and hold its real owner in review on every
+device for good. The proposal before the owner: a limited session writes no new link; the upgrade does.
+
+**Changes** (`0e64f44`, migration 012).
+
+- The relationship bands are `policy_step_up_score` / `policy_review_score` / `policy_block_score`
+  (30 / 60 / 90); they must rise, or the policy snapshot is refused. `_policy_action` and every
+  decision's `thresholds` read them. The `POLICY_*_SCORE` environment variables are only fallbacks.
+- Devices per account follow `account_devices_elevated_count` / `_points` (2 / 35),
+  `account_devices_review_count` / `_points` (3 / 60) and `account_devices_block_count` (5; the
+  `POLICY_ACCOUNT_DEVICE_BLOCK_COUNT` variable is its fallback); `0` switches a count off. Accounts per
+  device were already settings (migration 006): by default the third account on a phone is review,
+  the fourth blocked.
+- With the defaults, a third account on a phone and an account's third device reach the review band
+  and are refused in enforce mode (or, for a first sign-in on a device no other account uses, limited
+  — §70, pending the owner's decision).
+- The integrity verdict bands (30 / 60 / 90 in `_integrity_verdict`) are unchanged and not settings.
+
+**Results (2026-10-12).** `tools/check_security_regressions.py` **55 / 55** (new: the bands follow the
+settings and must rise; devices per account follow the settings, a business may let a third device
+through, `0` switches a count off); three mutations each failed it. SQL Server translation, module
+order, 3.9 syntax, iOS scoring rules: OK. **Not run on the test stack**: the dev machine's address had
+changed, and adding it to the instance's SSH rule needs the owner; the instance was started and stopped
+again without a deploy. The suite gained a live devices-per-account check (72).
+

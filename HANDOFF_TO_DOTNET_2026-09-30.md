@@ -246,3 +246,10 @@ DESIGN.md §70 (design §67), **schema 11**. Nothing changes in observe mode. In
 - The reference suite has 71 checks: limited login and clean-scan recheck, refresh, registration, and
   one check per route (route 3 with a deterministic key whose public JWK the suite prints).
 
+## 12. Added 2026-10-12 — DBA-tunable bands (server only, no client change)
+
+DESIGN.md §71, **schema 12** (migration 012). The relationship bands (30 / 60 / 90) and the
+devices-per-account counts (2 elevated, 3 review, 5 block) are now `risk_policy_settings` rows; every
+decision's `thresholds` reports the live bands. Nothing changes at the defaults. The reference suite
+has 72 checks (new: devices per account, expectations from the live settings).
+
