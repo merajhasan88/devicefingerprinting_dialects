@@ -530,6 +530,15 @@ class IntegrityProbeManager(private val context: Context) {
         var wx = 0
         var deletedExec = 0
         var deletedExecJit = 0
+        var deletedExecOwnCode = 0
+        // The app's own compiled code: Android recompiles an app in the
+        // background after an install or update and replaces these files
+        // under the running process (the Huawei did, about a minute after an
+        // install, 2026-10-13). Writing here takes installd, system or root --
+        // an attacker who can plant code here already owns the device -- so
+        // they are counted apart and the server treats them as advisory.
+        // Nothing outside oat/ is exempt, not even base.apk.
+        val ownCodeDir = File(context.applicationInfo.sourceDir).parentFile?.path?.let { "$it/oat/" }
         var anonExecLabeled = 0
         var anonExecUnlabeled = 0
         val samples = mutableListOf<String>()
@@ -558,8 +567,15 @@ class IntegrityProbeManager(private val context: Context) {
                         lower.contains("dalvik-") ||
                         lower.contains("/art") ||
                         lower.contains("jit-zygote")
+                    val mapped = path.removeSuffix("(deleted)").trim()
+                    val isOwnCode = ownCodeDir != null && mapped.startsWith(ownCodeDir) &&
+                        (mapped.endsWith(".odex") || mapped.endsWith(".vdex") ||
+                            mapped.endsWith(".art") || mapped.endsWith(".oat"))
                     if (isJit) {
                         deletedExecJit++
+                    } else if (isOwnCode) {
+                        deletedExecOwnCode++
+                        if (samples.size < 8) samples.add(line.trim().take(160))
                     } else {
                         deletedExec++
                         if (samples.size < 8) samples.add(line.trim().take(160))
@@ -576,6 +592,7 @@ class IntegrityProbeManager(private val context: Context) {
             "wx_mappings" to wx,
             "deleted_exec_mappings" to deletedExec,
             "deleted_exec_jit" to deletedExecJit,
+            "deleted_exec_own_code" to deletedExecOwnCode,
             "anon_exec_labeled" to anonExecLabeled,
             "anon_exec_unlabeled" to anonExecUnlabeled,
             "samples" to samples

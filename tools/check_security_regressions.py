@@ -383,6 +383,30 @@ def ios_code_integrity_is_required_when_scored():
 
 
 @check
+def the_apps_own_recompiled_code_is_advisory_and_nothing_else_is():
+    """DESIGN.md 75. Android recompiles an app after an install or update and
+    replaces its oat files under the running process (the Huawei, 2026-10-13).
+    The collector counts those deleted mappings apart and they are advisory;
+    any other deleted executable mapping still costs 55, and so does an older
+    collector's report, which cannot tell them apart."""
+    def decision(**shape):
+        probes = clean("android")
+        probes["exec_mappings"].update(shape)
+        status, payload = send_report("android", probes)
+        expect(status == 200, "report failed: %s %s" % (status, payload))
+        return payload["integrity"]
+
+    own = decision(deleted_exec_mappings=0, deleted_exec_own_code=1)
+    expect(own["score"] == 0 and points_of(own).get("android_app_code_recompiled") == 0,
+           "the app's own recompiled code must be advisory, got %s" % own)
+    both = decision(deleted_exec_mappings=1, deleted_exec_own_code=1)
+    expect(both["score"] == 55 and points_of(both).get("android_deleted_code_mapping") == 55,
+           "any other deleted executable mapping must still cost 55, got %s" % both)
+    old = decision(deleted_exec_mappings=1)
+    expect(old["score"] == 55, "an older collector's deleted mapping must still cost 55, got %s" % old)
+
+
+@check
 def inconsistent_wx_shape_earns_no_baseline_allowance():
     probes = clean("android")
     apk = probes["app_identity"]["apk_sha256"]

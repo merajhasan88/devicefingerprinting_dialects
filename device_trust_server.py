@@ -2474,6 +2474,18 @@ def _score_android_integrity(probes):
         _integrity_reason(reasons, "android_deleted_code_mapping", 55,
                           "Executable memory backed by a deleted file is mapped into the process.")
         score += 55
+    # The app's own compiled code -- the oat/ files in its own install folder --
+    # replaced on disk while it ran: Android recompiles an app in the background
+    # after an install or update (the Huawei did, about a minute after an
+    # install, 2026-10-13, and scored 55 until the app restarted). The collector
+    # counts these apart; writing there takes installd, system or root, so it is
+    # not an injection shape and stays advisory (DESIGN.md 75). An older
+    # collector cannot tell them apart and counts them in deleted_exec_mappings,
+    # which still costs 55.
+    if _as_int(exec_maps.get("deleted_exec_own_code")) > 0:
+        _integrity_reason(reasons, "android_app_code_recompiled", 0,
+                          "The app's own compiled code was replaced on disk while it ran "
+                          "(a system recompilation after an install or update; advisory).")
 
     emulator = _probe(probes, "emulator")
     if _as_bool(emulator.get("suspected")) and not INTEGRITY_ALLOW_EMULATOR:
