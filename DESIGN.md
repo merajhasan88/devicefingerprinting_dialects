@@ -5795,8 +5795,8 @@ account's third device, limit the rest. The fix for an upgrade that does not sti
 user signs out, at most the 30-day refresh lifetime, DBA-configurable. The integrity verdict bands
 stay fixed.
 
-**One case the two 2a statements disagree on**, resolved in favour of the newer rule and flagged to
-the owner: a second person signing in on a phone another account uses, who already uses their own
+**One case the two 2a statements disagree on**, resolved in favour of the newer rule and **confirmed
+by the owner the same day** ("Go with the rule as you have done"): a second person signing in on a phone another account uses, who already uses their own
 phone (two accounts +35, a second device +35 = 70, review). It was refused; it now gets a limited
 session. A DBA who wants it to pass outright lowers either +35; one who wants it refused can say so and
 the rule's limits move to the elevated counts.
