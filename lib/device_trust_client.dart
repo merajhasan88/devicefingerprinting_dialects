@@ -744,12 +744,37 @@ class AccountSession {
     required this.accessToken,
     required this.refreshToken,
     this.policy,
+    this.scope = 'full',
+    this.limitedCauses = const <String>[],
+    this.upgradeRoutes = const <String>[],
+    this.acceptedCauses = const <String>[],
+    this.acceptedUntil,
   });
 
   final String accountId;
   final String accessToken;
   final String refreshToken;
   final RiskPolicyDecision? policy;
+
+  /// `full` or `limited` (DESIGN.md 70). A limited session reaches only the
+  /// upgrade endpoints, the integrity scan and the paths a DBA lists.
+  final String scope;
+  final List<String> limitedCauses;
+
+  /// The upgrade routes the server says are open to this user right now;
+  /// empty means none is, and the user should contact support.
+  final List<String> upgradeRoutes;
+
+  /// The soft causes an upgrade's proof accepted, kept until [acceptedUntil]
+  /// (DESIGN.md 72).
+  final List<String> acceptedCauses;
+  final String? acceptedUntil;
+
+  bool get isLimited => scope == 'limited';
+
+  static List<String> _strings(Object? value) => value is List
+      ? value.map((Object? item) => item.toString()).toList(growable: false)
+      : const <String>[];
 
   factory AccountSession.fromApi(Map<String, dynamic> value) {
     return AccountSession(
@@ -761,20 +786,16 @@ class AccountSession {
               Map<String, dynamic>.from(value['policy'] as Map),
             )
           : null,
+      scope: value['scope'] as String? ?? 'full',
+      limitedCauses: _strings(value['limited_causes']),
+      upgradeRoutes: _strings(value['upgrade_routes']),
+      acceptedCauses: _strings(value['accepted_causes']),
+      acceptedUntil: value['accepted_until'] as String?,
     );
   }
 
   factory AccountSession.fromStoredJson(Map<String, dynamic> value) {
-    return AccountSession(
-      accountId: value['account_id'] as String,
-      accessToken: value['access_token'] as String,
-      refreshToken: value['refresh_token'] as String,
-      policy: value['policy'] is Map
-          ? RiskPolicyDecision.fromJson(
-              Map<String, dynamic>.from(value['policy'] as Map),
-            )
-          : null,
-    );
+    return AccountSession.fromApi(value);
   }
 
   Map<String, dynamic> toJson() => <String, dynamic>{
@@ -782,6 +803,11 @@ class AccountSession {
         'access_token': accessToken,
         'refresh_token': refreshToken,
         'policy': policy?.toJson(),
+        'scope': scope,
+        'limited_causes': limitedCauses,
+        'upgrade_routes': upgradeRoutes,
+        'accepted_causes': acceptedCauses,
+        'accepted_until': acceptedUntil,
       };
 }
 
@@ -1485,8 +1511,28 @@ class DeviceApi {
     required Map<String, dynamic> body,
     String? stepUpFactor,
     Future<String> Function(String payload)? signStepUp,
+  }) {
+    return _postWithStepUp(
+      path: '/v1/account/sensitive-echo',
+      accessToken: accessToken,
+      signingIdentity: signingIdentity,
+      body: body,
+      stepUpFactor: stepUpFactor,
+      signStepUp: signStepUp,
+    );
+  }
+
+  /// A protected POST that may also carry a step-up proof v2 over exactly
+  /// this request -- the sensitive path, a session upgrade, or approving
+  /// another phone's upgrade.
+  Future<Map<String, dynamic>> _postWithStepUp({
+    required String path,
+    required String accessToken,
+    required InstallationIdentity signingIdentity,
+    required Map<String, dynamic> body,
+    String? stepUpFactor,
+    Future<String> Function(String payload)? signStepUp,
   }) async {
-    const String path = '/v1/account/sensitive-echo';
     final List<int> nonceBytes = _freshNonce();
     final String encodedBody = jsonEncode(body);
     final Map<String, String> stepUp = <String, String>{};
@@ -1592,6 +1638,99 @@ class DeviceApi {
     );
   }
 
+  /// Upgrades a limited session to a full one (DESIGN.md 70, 72). [route] is
+  /// `recheck` (no proof: works once no soft cause remains), `stepup` (needs
+  /// [signStepUp]) or `approval` (needs the [requestId] another phone approved).
+  Future<AccountSession> upgradeSession({
+    required String accessToken,
+    required InstallationIdentity signingIdentity,
+    required String route,
+    String? requestId,
+    String? stepUpFactor,
+    Future<String> Function(String payload)? signStepUp,
+  }) async {
+    final Map<String, dynamic> value = await _postWithStepUp(
+      path: '/v1/auth/upgrade',
+      accessToken: accessToken,
+      signingIdentity: signingIdentity,
+      body: <String, dynamic>{
+        'route': route,
+        'request_id': ?requestId,
+      },
+      stepUpFactor: stepUpFactor,
+      signStepUp: signStepUp,
+    );
+    return AccountSession.fromApi(value);
+  }
+
+  /// Starts an upgrade another party must confirm: `approval` (route 2).
+  Future<Map<String, dynamic>> requestUpgrade({
+    required String accessToken,
+    required InstallationIdentity signingIdentity,
+    required String route,
+  }) {
+    return _protectedRequest(
+      'POST',
+      '/v1/auth/upgrade/request',
+      bearerToken: accessToken,
+      signingIdentity: signingIdentity,
+      body: <String, dynamic>{'route': route},
+    );
+  }
+
+  /// Pending approval requests from this account's OTHER installations.
+  Future<List<Map<String, dynamic>>> pendingApprovals({
+    required String accessToken,
+    required InstallationIdentity signingIdentity,
+  }) async {
+    final Map<String, dynamic> value = await _protectedRequest(
+      'GET',
+      '/v1/auth/approvals',
+      bearerToken: accessToken,
+      signingIdentity: signingIdentity,
+    );
+    final Object? approvals = value['approvals'];
+    return approvals is List
+        ? approvals
+            .whereType<Map>()
+            .map((Map item) => Map<String, dynamic>.from(item))
+            .toList(growable: false)
+        : <Map<String, dynamic>>[];
+  }
+
+  /// Approves another installation's upgrade; the server requires a step-up
+  /// proof over this very request.
+  Future<Map<String, dynamic>> approveUpgrade({
+    required String accessToken,
+    required InstallationIdentity signingIdentity,
+    required String requestId,
+    required String? stepUpFactor,
+    required Future<String> Function(String payload) signStepUp,
+  }) {
+    return _postWithStepUp(
+      path: '/v1/auth/approvals/$requestId/approve',
+      accessToken: accessToken,
+      signingIdentity: signingIdentity,
+      body: <String, dynamic>{},
+      stepUpFactor: stepUpFactor,
+      signStepUp: signStepUp,
+    );
+  }
+
+  Future<Map<String, dynamic>> denyUpgrade({
+    required String accessToken,
+    required InstallationIdentity signingIdentity,
+    required String requestId,
+  }) {
+    return _protectedRequest(
+      'POST',
+      '/v1/auth/approvals/$requestId/deny',
+      bearerToken: accessToken,
+      signingIdentity: signingIdentity,
+      body: <String, dynamic>{},
+    );
+  }
+
   Future<Map<String, dynamic>> refreshChallenge(String refreshToken) {
     return _request(
       'POST',
@@ -1664,6 +1803,9 @@ class DeviceRecognitionController extends ChangeNotifier {
   StepUpKeyMetadata? stepUpKey;
   String? stepUpUnavailable;
   String? stepUpTestResult;
+  String? limitedSessionResult;
+  String? pendingUpgradeRequestId;
+  List<Map<String, dynamic>> approvalRequests = <Map<String, dynamic>>[];
   String status = 'Not started';
   bool busy = false;
 
@@ -2223,6 +2365,7 @@ class DeviceRecognitionController extends ChangeNotifier {
       );
       await _store.saveAccountSession(accountSession!);
       latestPolicy = accountSession?.policy;
+      _logSession('account created');
       summary = await _api.deviceSummary(token, identity!);
       status = 'Account created and linked to the recognized device';
     });
@@ -2241,8 +2384,11 @@ class DeviceRecognitionController extends ChangeNotifier {
       );
       await _store.saveAccountSession(accountSession!);
       latestPolicy = accountSession?.policy;
+      _logSession('login');
       summary = await _api.deviceSummary(token, identity!);
-      status = 'Account authenticated on the recognized device';
+      status = accountSession!.isLimited
+          ? 'Signed in with a LIMITED session'
+          : 'Account authenticated on the recognized device';
     });
   }
 
@@ -2367,6 +2513,7 @@ class DeviceRecognitionController extends ChangeNotifier {
       accountSession = rotatedSession;
       latestPolicy = rotatedSession.policy;
       await _store.saveAccountSession(rotatedSession);
+      _logSession('refresh');
 
       // Also prove the newly issued access token is usable.
       await _api.accountMe(
@@ -3100,6 +3247,276 @@ class DeviceRecognitionController extends ChangeNotifier {
         _recordStepUp(<String>[
           'FAIL: the server refused the step-up proof',
           'POST /v1/account/sensitive-echo: ${error.statusCode} ${error.code}',
+        ]);
+      }
+    });
+  }
+
+  String get sessionScopeLine {
+    final AccountSession? session = accountSession;
+    if (session == null) {
+      return 'Session: not signed in';
+    }
+    if (session.isLimited) {
+      final String routes = session.upgradeRoutes.isEmpty
+          ? 'none - contact support'
+          : session.upgradeRoutes.join(', ');
+      return 'Session: LIMITED (${session.limitedCauses.join(', ')}); '
+          'upgrade routes open: $routes';
+    }
+    if (session.acceptedCauses.isNotEmpty) {
+      return 'Session: full; the upgrade accepted '
+          '${session.acceptedCauses.join(', ')} until ${session.acceptedUntil}';
+    }
+    return 'Session: full';
+  }
+
+  void _logSession(String event) {
+    debugPrint('SESSION: $event: $sessionScopeLine');
+  }
+
+  void _recordLimited(List<String> lines) {
+    limitedSessionResult = lines.join('\n');
+    status = lines.first;
+    for (final String line in lines) {
+      debugPrint('LIMITED: $line');
+    }
+  }
+
+  /// Upgrade without a proof: the server re-checks and succeeds once no soft
+  /// cause remains, for example after a new clean integrity scan.
+  Future<void> upgradeByRecheck() => _upgrade('recheck');
+
+  /// Route 1: a step-up on this same phone (only where the DBA enabled it,
+  /// and only for integrity causes).
+  Future<void> upgradeWithStepUp() => _upgrade('stepup', withStepUp: true);
+
+  /// Route 2, last step: the request another phone approved.
+  Future<void> completeApprovedUpgrade() =>
+      _upgrade('approval', requestId: pendingUpgradeRequestId);
+
+  Future<void> _upgrade(
+    String route, {
+    bool withStepUp = false,
+    String? requestId,
+  }) {
+    limitedSessionResult = null;
+    return _run('Upgrading the session ($route)…', () async {
+      final AccountSession? session = accountSession;
+      final InstallationIdentity? currentIdentity = identity;
+      final StepUpKeyMetadata? key = stepUpKey;
+      if (session == null || currentIdentity == null) {
+        throw ApiException('Log in first.');
+      }
+      if (withStepUp && (key == null || !stepUpUsable)) {
+        throw ApiException(
+          'No bound step-up key on this phone: '
+          '${stepUpUnavailable ?? 're-enrol it first'}',
+        );
+      }
+      // A fresh scan first, so the server judges the phone as it is now.
+      final String deviceProofToken = await _freshDeviceToken();
+      deviceToken = deviceProofToken;
+      await _collectIntegrityWithToken(deviceProofToken, currentIdentity);
+      try {
+        final AccountSession upgraded = await _api.upgradeSession(
+          accessToken: session.accessToken,
+          signingIdentity: currentIdentity,
+          route: route,
+          requestId: requestId,
+          stepUpFactor: withStepUp ? key!.factor : null,
+          signStepUp: withStepUp
+              ? (String payload) => _stepUpKeyProvider.sign(
+                    payload,
+                    reason: 'Upgrade this limited session',
+                  )
+              : null,
+        );
+        accountSession = upgraded;
+        latestPolicy = upgraded.policy ?? latestPolicy;
+        await _store.saveAccountSession(upgraded);
+        if (route == 'approval') {
+          pendingUpgradeRequestId = null;
+        }
+        _recordLimited(<String>[
+          'PASS: session upgraded ($route)',
+          'POST /v1/auth/upgrade: 200 scope=${upgraded.scope}',
+          upgraded.acceptedCauses.isEmpty
+              ? 'Accepted: nothing (no soft cause remained)'
+              : 'Accepted: ${upgraded.acceptedCauses.join(', ')} '
+                  'until ${upgraded.acceptedUntil}',
+        ]);
+        _logSession('upgrade');
+      } on NativeKeyException catch (error) {
+        _recordLimited(<String>[
+          error.code == 'STEPUP_CANCELLED'
+              ? 'CANCELLED: no step-up signature was produced; nothing was sent'
+              : 'FAIL: the step-up key could not sign',
+          '${error.message} [${error.code}]',
+        ]);
+      } on ApiException catch (error) {
+        final Object? state = error.details?['state'];
+        final Object? causes = error.details?['limited_causes'];
+        final Object? routes = error.details?['upgrade_routes'];
+        _recordLimited(<String>[
+          'NOT UPGRADED: ${error.code}',
+          'POST /v1/auth/upgrade: ${error.statusCode} ${error.code}'
+              '${state == null ? '' : ' state=$state'}',
+          if (causes != null) 'Still limited by: $causes',
+          if (routes != null) 'Routes open: $routes',
+        ]);
+      }
+    });
+  }
+
+  /// Route 2, first step: ask another phone of this account to approve.
+  Future<void> requestApproval() {
+    limitedSessionResult = null;
+    return _run('Asking another phone to approve…', () async {
+      final AccountSession? session = accountSession;
+      final InstallationIdentity? currentIdentity = identity;
+      if (session == null || currentIdentity == null) {
+        throw ApiException('Log in first.');
+      }
+      try {
+        final Map<String, dynamic> value = await _api.requestUpgrade(
+          accessToken: session.accessToken,
+          signingIdentity: currentIdentity,
+          route: 'approval',
+        );
+        pendingUpgradeRequestId = value['request_id'] as String?;
+        _recordLimited(<String>[
+          'Approval requested: $pendingUpgradeRequestId',
+          'Approve it on another phone signed in to this account, then press '
+              '"Complete approved upgrade".',
+          'Expires: ${value['expires_at']}',
+        ]);
+      } on ApiException catch (error) {
+        _recordLimited(<String>[
+          'NOT REQUESTED: ${error.code}',
+          'POST /v1/auth/upgrade/request: ${error.statusCode} ${error.code}',
+        ]);
+      }
+    });
+  }
+
+  /// Approver side: pending requests from this account's other phones.
+  Future<void> loadApprovalRequests() {
+    limitedSessionResult = null;
+    return _run('Loading approval requests…', () async {
+      final AccountSession? session = accountSession;
+      final InstallationIdentity? currentIdentity = identity;
+      if (session == null || currentIdentity == null) {
+        throw ApiException('Log in first.');
+      }
+      try {
+        approvalRequests = await _api.pendingApprovals(
+          accessToken: session.accessToken,
+          signingIdentity: currentIdentity,
+        );
+        _recordLimited(<String>[
+          'Approval requests waiting: ${approvalRequests.length}',
+          for (final Map<String, dynamic> request in approvalRequests)
+            _describeApprovalRequest(request),
+        ]);
+      } on ApiException catch (error) {
+        approvalRequests = <Map<String, dynamic>>[];
+        _recordLimited(<String>[
+          'NOT LISTED: ${error.code}',
+          'GET /v1/auth/approvals: ${error.statusCode} ${error.code}',
+        ]);
+      }
+    });
+  }
+
+  String _describeApprovalRequest(Map<String, dynamic> request) {
+    final Map<String, dynamic> from = request['requesting_installation'] is Map
+        ? Map<String, dynamic>.from(request['requesting_installation'] as Map)
+        : <String, dynamic>{};
+    return '${request['request_id']}: ${from['platform']}, first seen '
+        '${from['first_seen_at']}, joined by ${from['registration_method']}';
+  }
+
+  Future<void> approveRequest(String requestId) {
+    limitedSessionResult = null;
+    return _run('Approving with step-up…', () async {
+      final AccountSession? session = accountSession;
+      final InstallationIdentity? currentIdentity = identity;
+      final StepUpKeyMetadata? key = stepUpKey;
+      if (session == null || currentIdentity == null) {
+        throw ApiException('Log in first.');
+      }
+      if (key == null || !stepUpUsable) {
+        throw ApiException(
+          'Approving needs this phone\'s bound step-up key: '
+          '${stepUpUnavailable ?? 're-enrol it first'}',
+        );
+      }
+      // The approver must itself be clean: a fresh scan first.
+      final String deviceProofToken = await _freshDeviceToken();
+      deviceToken = deviceProofToken;
+      await _collectIntegrityWithToken(deviceProofToken, currentIdentity);
+      try {
+        await _api.approveUpgrade(
+          accessToken: session.accessToken,
+          signingIdentity: currentIdentity,
+          requestId: requestId,
+          stepUpFactor: key.factor,
+          signStepUp: (String payload) => _stepUpKeyProvider.sign(
+            payload,
+            reason: 'Approve a sign-in on another phone',
+          ),
+        );
+        approvalRequests = approvalRequests
+            .where((Map<String, dynamic> r) => r['request_id'] != requestId)
+            .toList(growable: false);
+        _recordLimited(<String>[
+          'PASS: request approved',
+          'POST /v1/auth/approvals/$requestId/approve: 200',
+        ]);
+      } on NativeKeyException catch (error) {
+        _recordLimited(<String>[
+          error.code == 'STEPUP_CANCELLED'
+              ? 'CANCELLED: no step-up signature was produced; nothing was sent'
+              : 'FAIL: the step-up key could not sign',
+          '${error.message} [${error.code}]',
+        ]);
+      } on ApiException catch (error) {
+        _recordLimited(<String>[
+          'NOT APPROVED: ${error.code}',
+          'POST /v1/auth/approvals/$requestId/approve: '
+              '${error.statusCode} ${error.code}',
+        ]);
+      }
+    });
+  }
+
+  Future<void> denyRequest(String requestId) {
+    limitedSessionResult = null;
+    return _run('Denying the request…', () async {
+      final AccountSession? session = accountSession;
+      final InstallationIdentity? currentIdentity = identity;
+      if (session == null || currentIdentity == null) {
+        throw ApiException('Log in first.');
+      }
+      try {
+        await _api.denyUpgrade(
+          accessToken: session.accessToken,
+          signingIdentity: currentIdentity,
+          requestId: requestId,
+        );
+        approvalRequests = approvalRequests
+            .where((Map<String, dynamic> r) => r['request_id'] != requestId)
+            .toList(growable: false);
+        _recordLimited(<String>[
+          'Request denied',
+          'POST /v1/auth/approvals/$requestId/deny: 200',
+        ]);
+      } on ApiException catch (error) {
+        _recordLimited(<String>[
+          'NOT DENIED: ${error.code}',
+          'POST /v1/auth/approvals/$requestId/deny: '
+              '${error.statusCode} ${error.code}',
         ]);
       }
     });
@@ -3918,6 +4335,127 @@ class _DeviceRecognitionPageState extends State<DeviceRecognitionPage> {
     );
   }
 
+  Widget _limitedSessionCard() {
+    final bool signedIn = _controller.accountSession != null;
+    final bool busy = _controller.busy;
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: <Widget>[
+            Text(
+              'Limited session and upgrade',
+              style: Theme.of(context).textTheme.titleLarge,
+            ),
+            const SizedBox(height: 8),
+            const Text(
+              'In enforce mode, soft risk at sign-in gives a limited session '
+              'instead of a refusal. It upgrades by itself once the cause '
+              'clears, or with a proof: a step-up on this phone (if the DBA '
+              'allows it) or an approval from another phone of the account.',
+            ),
+            const SizedBox(height: 8),
+            Text(_controller.sessionScopeLine),
+            const SizedBox(height: 12),
+            Wrap(
+              spacing: 10,
+              runSpacing: 10,
+              children: <Widget>[
+                OutlinedButton(
+                  onPressed:
+                      busy || !signedIn ? null : _controller.upgradeByRecheck,
+                  child: const Text('Upgrade after a clean scan'),
+                ),
+                FilledButton.tonal(
+                  onPressed: busy || !signedIn || !_controller.stepUpUsable
+                      ? null
+                      : _controller.upgradeWithStepUp,
+                  child: const Text('Upgrade with step-up on this phone'),
+                ),
+                OutlinedButton(
+                  onPressed:
+                      busy || !signedIn ? null : _controller.requestApproval,
+                  child: const Text('Ask another phone to approve'),
+                ),
+                FilledButton(
+                  onPressed: busy ||
+                          !signedIn ||
+                          _controller.pendingUpgradeRequestId == null
+                      ? null
+                      : _controller.completeApprovedUpgrade,
+                  child: const Text('Complete approved upgrade'),
+                ),
+              ],
+            ),
+            const Divider(height: 32),
+            Text(
+              'Approve another phone',
+              style: Theme.of(context).textTheme.titleMedium,
+            ),
+            const SizedBox(height: 8),
+            const Text(
+              'On a phone with a full session for the same account: list the '
+              'requests, check where each comes from, and approve with your '
+              'screen lock - or deny it if you did not just sign in.',
+            ),
+            const SizedBox(height: 12),
+            OutlinedButton(
+              onPressed:
+                  busy || !signedIn ? null : _controller.loadApprovalRequests,
+              child: const Text('Show approval requests'),
+            ),
+            for (final Map<String, dynamic> request
+                in _controller.approvalRequests) ...<Widget>[
+              const SizedBox(height: 12),
+              Text(_requestLabel(request)),
+              const SizedBox(height: 6),
+              Wrap(
+                spacing: 10,
+                runSpacing: 10,
+                children: <Widget>[
+                  FilledButton.tonal(
+                    onPressed: busy || !_controller.stepUpUsable
+                        ? null
+                        : () => _controller.approveRequest(
+                              request['request_id'] as String,
+                            ),
+                    child: const Text('Approve (screen lock)'),
+                  ),
+                  TextButton(
+                    onPressed: busy
+                        ? null
+                        : () => _controller.denyRequest(
+                              request['request_id'] as String,
+                            ),
+                    child: const Text('Deny'),
+                  ),
+                ],
+              ),
+            ],
+            if (_controller.limitedSessionResult != null) ...<Widget>[
+              const SizedBox(height: 12),
+              _testResultPanel(
+                'Limited session result',
+                _controller.limitedSessionResult!,
+              ),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+
+  String _requestLabel(Map<String, dynamic> request) {
+    final Map<String, dynamic> from = request['requesting_installation'] is Map
+        ? Map<String, dynamic>.from(request['requesting_installation'] as Map)
+        : <String, dynamic>{};
+    final String id = request['request_id'] as String? ?? '';
+    return 'Request ${id.length > 8 ? id.substring(0, 8) : id}: '
+        '${from['platform']} phone first seen ${from['first_seen_at']}, '
+        'joined by ${from['registration_method']}';
+  }
+
   Widget _explanationCard() {
     return const Card(
       child: Padding(
@@ -4037,6 +4575,7 @@ class _DeviceRecognitionPageState extends State<DeviceRecognitionPage> {
               _integrityCard(),
               _riskPolicyCard(),
               _accountCard(),
+              _limitedSessionCard(),
               _explanationCard(),
               const SizedBox(height: 8),
               Wrap(
