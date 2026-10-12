@@ -1872,11 +1872,48 @@ class DeviceRecognitionController extends ChangeNotifier {
       identity = await _store.loadOrCreateIdentity();
       registration = await _store.loadRegistration();
       accountSession = await _store.loadAccountSession();
-      latestPolicy = accountSession?.policy;
+      // Nothing from a saved session is shown until the server confirms it
+      // (_checkSavedSession): its risk decision may come from another server.
+      latestPolicy = null;
       reinstallHint = await _hintReader.read();
       await _registerAndProve();
+      await _checkSavedSession();
       status = 'Installation identity verified';
     });
+  }
+
+  /// A saved session is confirmed with the server at start, by one bound
+  /// refresh, before anything from it is shown. A server that does not know
+  /// it -- expired, revoked, or another database -- answers 401, and the
+  /// session and its old risk decision are discarded. Any other failure keeps
+  /// it: a network blip must not sign the user out. Found on the Huawei,
+  /// 2026-10-12: after a switch to another database the app showed the old
+  /// server's decision (four accounts on the phone) as current. Costs one
+  /// refresh and one risk evaluation per start (DESIGN.md 75).
+  Future<void> _checkSavedSession() async {
+    final InstallationIdentity? currentIdentity = identity;
+    if (accountSession == null || currentIdentity == null) {
+      return;
+    }
+    try {
+      // _registerAndProve has just scanned, as a refresh requires.
+      await _rotateSession(currentIdentity);
+      _logSession('start');
+    } on ApiException catch (error) {
+      if (error.statusCode != 401) {
+        debugPrint('SESSION: start: saved session not checked: ${error.code}');
+        return;
+      }
+      await _store.clearAccountSession();
+      accountSession = null;
+      latestPolicy = summary?.policy;
+      debugPrint(
+        'SESSION: start: the server does not know the saved session '
+        '(${error.code}); discarded',
+      );
+    } catch (error) {
+      debugPrint('SESSION: start: saved session not checked: $error');
+    }
   }
 
   Future<void> reauthenticate() {
