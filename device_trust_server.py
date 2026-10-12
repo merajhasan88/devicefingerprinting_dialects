@@ -1156,7 +1156,7 @@ def _get_backend_identity():
 # against a schema it does not understand. /health/* still answers so operators
 # can see why.
 
-REQUIRED_SCHEMA_VERSION = 13
+REQUIRED_SCHEMA_VERSION = 14
 
 _schema_state = None
 _schema_lock = threading.Lock()
@@ -6234,7 +6234,7 @@ def _approval_state(cursor, body, claims, account_id, installation_id, required=
     request_id = _uuid_text(body.get("request_id"), "request_id")
     cursor.execute(
         """
-        SELECT approved_at, denied_at, consumed_at, expires_at
+        SELECT approved_at, denied_at, consumed_at, expires_at, superseded_at
         FROM session_upgrade_requests
         WHERE request_id = %s AND route = 'approval' AND account_id = %s
           AND installation_id = %s AND family_id = %s
@@ -6248,6 +6248,10 @@ def _approval_state(cursor, body, claims, account_id, installation_id, required=
         state = "used"
     elif row[1] is not None:
         state = "denied"
+    elif row[4] is not None:
+        # This phone asked again for the same account; the newer request
+        # replaced this one (DESIGN.md 75).
+        state = "superseded"
     elif row[3] <= _utc_now():
         state = "expired"
     elif row[0] is None:
@@ -6273,7 +6277,7 @@ def _consume_approval(cursor, request_id, session):
         WHERE request_id = %s AND route = 'approval' AND account_id = %s
           AND installation_id = %s AND family_id = %s
           AND approved_at IS NOT NULL AND denied_at IS NULL
-          AND consumed_at IS NULL AND expires_at > %s
+          AND consumed_at IS NULL AND superseded_at IS NULL AND expires_at > %s
         """,
         (
             _uuid_text(request_id, "request_id"),
@@ -6295,7 +6299,7 @@ def _grant_approval(cursor, request_id, account_id, approver_installation_id):
         WHERE request_id = %s AND route = 'approval' AND account_id = %s
           AND installation_id <> %s
           AND approved_at IS NULL AND denied_at IS NULL
-          AND consumed_at IS NULL AND expires_at > %s
+          AND consumed_at IS NULL AND superseded_at IS NULL AND expires_at > %s
         """,
         (approver_installation_id, request_id, account_id, approver_installation_id,
          _utc_now()),
@@ -6311,11 +6315,67 @@ def _deny_approval(cursor, request_id, account_id, installation_id):
         WHERE request_id = %s AND route = 'approval' AND account_id = %s
           AND installation_id <> %s
           AND approved_at IS NULL AND denied_at IS NULL
-          AND consumed_at IS NULL AND expires_at > %s
+          AND consumed_at IS NULL AND superseded_at IS NULL AND expires_at > %s
         """,
         (request_id, account_id, installation_id, _utc_now()),
     )
     return cursor.rowcount
+
+
+def _supersede_pending_requests(cursor, account_id, installation_id):
+    """Mark this installation's pending approval requests for the account as
+    superseded, before it raises a new one (DESIGN.md 75).
+
+    An approver then sees one request per phone, not duplicates from repeated
+    sign-ins. Only the caller's own installation is touched -- one phone must
+    never cancel another's prompt -- and only requests still open: approved,
+    denied, used or already superseded rows keep their state. The rows stay as
+    evidence and still count toward upgrade_approvals_per_hour.
+    """
+    cursor.execute(
+        """
+        UPDATE session_upgrade_requests
+        SET superseded_at = NOW()
+        WHERE account_id = %s AND installation_id = %s AND route = 'approval'
+          AND approved_at IS NULL AND denied_at IS NULL
+          AND consumed_at IS NULL AND superseded_at IS NULL
+        """,
+        (account_id, installation_id),
+    )
+    return cursor.rowcount
+
+
+def _approval_superseded(cursor, request_id, account_id, installation_id):
+    """Whether a request an approver could have acted on was superseded.
+
+    Scoped like approving itself -- the same account, another installation --
+    so the answer reveals nothing about requests the caller could not see.
+    """
+    cursor.execute(
+        """
+        SELECT superseded_at FROM session_upgrade_requests
+        WHERE request_id = %s AND route = 'approval' AND account_id = %s
+          AND installation_id <> %s
+        """,
+        (request_id, account_id, installation_id),
+    )
+    row = cursor.fetchone()
+    return row is not None and row[0] is not None
+
+
+def _refuse_unchangeable_request(cursor, request_id, account_id, installation_id, verb):
+    if _approval_superseded(cursor, request_id, account_id, installation_id):
+        raise ApiProblem(
+            "That request was replaced by a newer one from the same phone; "
+            "refresh the list.",
+            409,
+            "approval_superseded",
+        )
+    raise ApiProblem(
+        "There is no pending request with that ID that this installation can %s." % verb,
+        404,
+        "approval_not_pending",
+    )
 
 
 def _require_full_session(claims):
@@ -6388,6 +6448,9 @@ def upgrade_request():
                     429,
                     "upgrade_budget_exhausted",
                 )
+            replaced = _supersede_pending_requests(cursor, account_id, installation_id)
+            if replaced:
+                response["superseded"] = replaced
         nonce_sha256 = None
         if route == "assertion":
             # What the customer's identity backend must sign once its MFA has
@@ -6442,7 +6505,8 @@ def list_approvals():
             WHERE r.account_id = %s AND r.route = 'approval'
               AND r.installation_id <> %s
               AND r.approved_at IS NULL AND r.denied_at IS NULL
-              AND r.consumed_at IS NULL AND r.expires_at > %s
+              AND r.consumed_at IS NULL AND r.superseded_at IS NULL
+              AND r.expires_at > %s
             ORDER BY r.created_at DESC
             """,
             (str(get_jwt_identity()), claims.get("iid"), _utc_now()),
@@ -6497,12 +6561,10 @@ def approve_upgrade(request_id):
     _verify_step_up(installation_id, account_id)
     with _cursor(commit=True) as cursor:
         changed = _grant_approval(cursor, request_id, account_id, installation_id)
-    if changed != 1:
-        raise ApiProblem(
-            "There is no pending request with that ID that this installation can approve.",
-            404,
-            "approval_not_pending",
-        )
+        if changed != 1:
+            _refuse_unchangeable_request(
+                cursor, request_id, account_id, installation_id, "approve"
+            )
     logger.info("Upgrade approved: request=%s approver=%s", request_id, installation_id)
     return jsonify({"request_id": request_id, "approved": True})
 
@@ -6517,12 +6579,10 @@ def deny_upgrade(request_id):
     _require_full_session(claims)
     with _cursor(commit=True) as cursor:
         changed = _deny_approval(cursor, request_id, str(get_jwt_identity()), claims.get("iid"))
-    if changed != 1:
-        raise ApiProblem(
-            "There is no pending request with that ID that this installation can deny.",
-            404,
-            "approval_not_pending",
-        )
+        if changed != 1:
+            _refuse_unchangeable_request(
+                cursor, request_id, str(get_jwt_identity()), claims.get("iid"), "deny"
+            )
     logger.warning("Upgrade denied: request=%s by=%s", request_id, claims.get("iid"))
     return jsonify({"request_id": request_id, "denied": True})
 

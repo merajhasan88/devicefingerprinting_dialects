@@ -1744,6 +1744,7 @@ CREATE TABLE session_upgrade_requests (
     approved_at              TSZ,
     denied_at                TSZ,
     consumed_at              TSZ,
+    superseded_at            TSZ,
     nonce_sha256             TEXT,
     assertion_method         TEXT
 );
@@ -1810,6 +1811,56 @@ def approvals_come_from_another_installation_of_the_account_and_are_single_use()
            and s._consume_approval(cur, denied, mine) == 0 and state(denied) == "denied",
            "a denied request stays denied")
     expect(s._deny_approval(cur, request(), acct, phone) == 0, "the requester must not deny its own request")
+    connection.close()
+
+
+@check
+def a_new_approval_request_supersedes_only_the_same_phones_pending_ones():
+    """DESIGN.md 75. Asking again replaces the phone's own pending requests for
+    the account -- never another phone's, another account's, an assertion's or
+    one already answered -- and a replaced request can be neither approved,
+    denied nor used; only the account's approvers learn it was replaced."""
+    connection = sqlite3.connect(":memory:", detect_types=sqlite3.PARSE_DECLTYPES)
+    connection.executescript(UPGRADE_LITE_SCHEMA)
+    cur = LiteCursor(connection)
+    now = s._utc_now()
+    acct, stranger = str(uuid.uuid4()), str(uuid.uuid4())
+    phone, other, approver = (str(uuid.uuid4()) for _ in range(3))
+    family = str(uuid.uuid4())
+
+    def request(iid=phone, who=acct, route="approval"):
+        rid = str(uuid.uuid4())
+        connection.execute("INSERT INTO session_upgrade_requests (request_id, route, account_id, "
+                           "installation_id, family_id, expires_at) VALUES (?, ?, ?, ?, ?, ?)",
+                           (rid, route, who, iid, family, now + timedelta(minutes=5)))
+        return rid
+
+    def state(rid, iid=phone, who=acct):
+        return s._approval_state(cur, {"request_id": rid}, {"family": family}, who, iid)
+
+    old, answered = request(), request()
+    others, foreign, assertion = request(iid=other), request(who=stranger), request(route="assertion")
+    expect(s._grant_approval(cur, answered, acct, approver) == 1, "setup: one request approved")
+    expect(s._supersede_pending_requests(cur, acct, phone) == 1,
+           "exactly the phone's one pending approval request is superseded")
+    expect(state(old) == "superseded", "the replaced request reads as superseded")
+    expect(state(others, iid=other) == "pending" and state(foreign, who=stranger) == "pending",
+           "another phone's or another account's request is untouched")
+    expect(state(answered) == "approved", "an answered request keeps its state")
+    expect(connection.execute("SELECT superseded_at FROM session_upgrade_requests WHERE request_id = ?",
+                              (assertion,)).fetchone()[0] is None,
+           "an assertion request is untouched")
+    expect(s._grant_approval(cur, old, acct, approver) == 0 and s._deny_approval(cur, old, acct, approver) == 0,
+           "a superseded request can be neither approved nor denied")
+    expect(s._approval_superseded(cur, old, acct, approver)
+           and not s._approval_superseded(cur, old, stranger, approver)
+           and not s._approval_superseded(cur, old, acct, phone)
+           and not s._approval_superseded(cur, others, acct, approver),
+           "only the account's approvers learn that a request was superseded")
+    mine = {"account_id": acct, "installation_id": phone, "family_id": family}
+    expect(s._consume_approval(cur, answered, mine) == 1,
+           "an approval granted before the phone asked again still upgrades, once")
+    expect(s._supersede_pending_requests(cur, acct, phone) == 0, "nothing is left to supersede")
     connection.close()
 
 

@@ -1964,6 +1964,69 @@ def check_upgrade_route_approval(api, ctx):
            "a block after the acceptance must refuse, got %s %s" % (st, error_code(me)))
 
 
+@check("limited session: asking again replaces the phone's pending request")
+def check_upgrade_request_supersedes(api, ctx):
+    """DESIGN.md 75. A phone that asks for approval again replaces its own
+    pending request: the approver lists only the newest, the older one can be
+    neither approved nor used, and the newest upgrades as usual."""
+    settings = live_settings(api)
+    if not _setting_on(settings, "upgrade_other_device_approval") and \
+            "upgrade_other_device_approval" in settings:
+        raise Skip("upgrade_other_device_approval is off on this server")
+    if ctx["mode"] != "enforce":
+        raise Skip("server is in observe mode; limited sessions exist only in enforce mode")
+    if int(settings.get("upgrade_approvals_per_hour", "3")) < 2:
+        raise Skip("upgrade_approvals_per_hour is below 2; this check raises two requests")
+    integrity_context(ctx)
+    factor = settings.get("stepup_factor", "passcode")
+    approver = Installation()
+    stepup_priv, stepup_jwk = stepup_jwk_pair()
+    st, pl = enrol(api, approver, fresh_hint(), stepup_public_key=stepup_jwk,
+                   stepup_key_auth={"factor": factor, "mode": "per_use", "window_seconds": 0})
+    expect(st in (200, 201), "enrol failed: %s %s" % (st, pl))
+    approver_token = device_token(api, approver)
+    submit_report(api, approver, approver_token)
+    handle = "r2s-%s" % secrets.token_hex(4)
+    st, pl = open_account(api, approver, approver_token, handle)
+    expect(st in (200, 201) and pl.get("scope") == "full", "setup: approver account: %s %s" % (st, pl))
+    approver_access = pl["access_token"]
+
+    phone = Installation()
+    st, pl = enrol(api, phone, fresh_hint())
+    expect(st in (200, 201), "enrol failed: %s %s" % (st, pl))
+    phone_token = device_token(api, phone)
+    submit_report(api, phone, phone_token, _elevate)
+    st, pl = sign_in(api, phone, phone_token, handle)
+    expect(st == 200 and pl.get("scope") == "limited", "setup: limited session: %s %s" % (st, pl))
+    limited = pl["access_token"]
+    raised = []
+    for _ in range(2):
+        st, req = protected(api, phone, "POST", "/v1/auth/upgrade/request", limited, {"route": "approval"})
+        expect(st == 201 and req.get("request_id"), "approval request failed: %s %s" % (st, req))
+        raised.append(req)
+    old, new = raised[0]["request_id"], raised[1]["request_id"]
+    expect(raised[1].get("superseded") == 1,
+           "the second request must report one superseded, got %s" % raised[1])
+    st, listed = protected(api, approver, "GET", "/v1/auth/approvals", approver_access)
+    ids = [a.get("request_id") for a in (listed.get("approvals") or [])] if st == 200 else []
+    expect(ids == [new], "the approver must see only the newest request, got %s %s" % (st, ids))
+    st, pl = stepup_call(api, approver, stepup_priv, "POST", "/v1/auth/approvals/%s/approve" % old,
+                         approver_access, {}, factor)
+    expect(st == 409 and error_code(pl) == "approval_superseded",
+           "approving a replaced request must answer approval_superseded, got %s %s" % (st, error_code(pl)))
+    st, up = protected(api, phone, "POST", "/v1/auth/upgrade", limited,
+                       {"route": "approval", "request_id": old})
+    expect(st == 403 and _details(up).get("state") == "superseded",
+           "a replaced request must read as superseded, got %s %s" % (st, up))
+    st, pl = stepup_call(api, approver, stepup_priv, "POST", "/v1/auth/approvals/%s/approve" % new,
+                         approver_access, {}, factor)
+    expect(st == 200 and pl.get("approved") is True, "approving the newest request failed: %s %s" % (st, pl))
+    st, up = protected(api, phone, "POST", "/v1/auth/upgrade", limited,
+                       {"route": "approval", "request_id": new})
+    expect(st == 200 and up.get("scope") == "full",
+           "the newest request must upgrade, got %s %s" % (st, up))
+
+
 # The suite's deterministic route-3 signing key: a server configured with its
 # public JWK (printed when the check skips) can run the assertion check.
 P256_ORDER = 0xFFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551
