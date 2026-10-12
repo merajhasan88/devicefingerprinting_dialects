@@ -3312,9 +3312,99 @@ class DeviceRecognitionController extends ChangeNotifier {
   /// and only for integrity causes).
   Future<void> upgradeWithStepUp() => _upgrade('stepup', withStepUp: true);
 
-  /// Route 2, last step: the request another phone approved.
-  Future<void> completeApprovedUpgrade() =>
-      _upgrade('approval', requestId: pendingUpgradeRequestId);
+  /// True while this phone waits for its approval request to be answered.
+  bool waitingForApproval = false;
+  DateTime? approvalExpiresAt;
+
+  /// Stops waiting; the request stays on the server until it expires.
+  void stopWaitingForApproval() {
+    pendingUpgradeRequestId = null;
+    waitingForApproval = false;
+    _recordLimited(<String>['Stopped waiting for the approval']);
+    notifyListeners();
+  }
+
+  /// Route 2, last step, done by the app itself: it asks the server every
+  /// five seconds -- never faster (INTEGRATION_GUIDE.md section 7) -- until the
+  /// other phone approves (the upgrade completes at once), denies, or the
+  /// request expires. Before an approval exists each check is a cheap read on
+  /// the server that stores no risk decision. A real app could be woken by a
+  /// push notification from the customer's servers instead.
+  Future<void> _waitForApproval(String requestId) async {
+    waitingForApproval = true;
+    notifyListeners();
+    try {
+      while (pendingUpgradeRequestId == requestId) {
+        await Future<void>.delayed(const Duration(seconds: 5));
+        if (pendingUpgradeRequestId != requestId) {
+          return;
+        }
+        final DateTime? expires = approvalExpiresAt;
+        if (expires != null && DateTime.now().toUtc().isAfter(expires)) {
+          pendingUpgradeRequestId = null;
+          _recordLimited(<String>[
+            'EXPIRED: nobody approved in time; ask again if you still need it',
+          ]);
+          return;
+        }
+        final AccountSession? session = accountSession;
+        final InstallationIdentity? currentIdentity = identity;
+        if (session == null || currentIdentity == null) {
+          pendingUpgradeRequestId = null;
+          return;
+        }
+        try {
+          final AccountSession upgraded = await _api.upgradeSession(
+            accessToken: session.accessToken,
+            signingIdentity: currentIdentity,
+            route: 'approval',
+            requestId: requestId,
+          );
+          accountSession = upgraded;
+          latestPolicy = upgraded.policy ?? latestPolicy;
+          await _store.saveAccountSession(upgraded);
+          pendingUpgradeRequestId = null;
+          _recordLimited(<String>[
+            'PASS: session upgraded (approval)',
+            'POST /v1/auth/upgrade: 200 scope=${upgraded.scope}',
+            upgraded.acceptedCauses.isEmpty
+                ? 'Accepted: nothing (no soft cause remained)'
+                : 'Accepted: ${upgraded.acceptedCauses.join(', ')} '
+                    'until ${upgraded.acceptedUntil}',
+          ]);
+          _logSession('upgrade');
+          return;
+        } on ApiException catch (error) {
+          final Object? state = error.details?['state'];
+          if (error.code == 'approval_not_granted' && state == 'pending') {
+            continue;
+          }
+          if (error.code == 'integrity_scan_required') {
+            // The scan from sign-in has aged out; take a fresh one and go on.
+            final String token = await _freshDeviceToken();
+            deviceToken = token;
+            await _collectIntegrityWithToken(token, currentIdentity);
+            continue;
+          }
+          pendingUpgradeRequestId = null;
+          _recordLimited(<String>[
+            state == 'denied'
+                ? 'DENIED: the other phone refused this sign-in'
+                : 'NOT UPGRADED: ${error.code}',
+            'POST /v1/auth/upgrade: ${error.statusCode} ${error.code}'
+                '${state == null ? '' : ' state=$state'}',
+          ]);
+          return;
+        }
+      }
+    } catch (error) {
+      pendingUpgradeRequestId = null;
+      _recordLimited(<String>['Stopped waiting: $error']);
+    } finally {
+      waitingForApproval = false;
+      notifyListeners();
+    }
+  }
 
   Future<void> _upgrade(
     String route, {
@@ -3392,9 +3482,9 @@ class DeviceRecognitionController extends ChangeNotifier {
   }
 
   /// Route 2, first step: ask another phone of this account to approve.
-  Future<void> requestApproval() {
+  Future<void> requestApproval() async {
     limitedSessionResult = null;
-    return _run('Asking another phone to approve…', () async {
+    await _run('Asking another phone to approve…', () async {
       final AccountSession? session = accountSession;
       final InstallationIdentity? currentIdentity = identity;
       if (session == null || currentIdentity == null) {
@@ -3407,10 +3497,12 @@ class DeviceRecognitionController extends ChangeNotifier {
           route: 'approval',
         );
         pendingUpgradeRequestId = value['request_id'] as String?;
+        approvalExpiresAt =
+            DateTime.tryParse(value['expires_at'] as String? ?? '')?.toUtc();
         _recordLimited(<String>[
           'Approval requested: $pendingUpgradeRequestId',
-          'Approve it on another phone signed in to this account, then press '
-              '"Complete approved upgrade".',
+          'Approve it on another phone signed in to this account; this phone '
+              'completes the upgrade by itself as soon as it is approved.',
           'Expires: ${value['expires_at']}',
         ]);
       } on ApiException catch (error) {
@@ -3420,6 +3512,10 @@ class DeviceRecognitionController extends ChangeNotifier {
         ]);
       }
     });
+    final String? requestId = pendingUpgradeRequestId;
+    if (requestId != null && !waitingForApproval) {
+      unawaited(_waitForApproval(requestId));
+    }
   }
 
   /// Approver side: pending requests from this account's other phones.
@@ -4400,20 +4496,35 @@ class _DeviceRecognitionPageState extends State<DeviceRecognitionPage> {
                   child: const Text('Upgrade with step-up on this phone'),
                 ),
                 OutlinedButton(
-                  onPressed:
-                      busy || !signedIn ? null : _controller.requestApproval,
-                  child: const Text('Ask another phone to approve'),
-                ),
-                FilledButton(
-                  onPressed: busy ||
-                          !signedIn ||
-                          _controller.pendingUpgradeRequestId == null
+                  onPressed: busy || !signedIn || _controller.waitingForApproval
                       ? null
-                      : _controller.completeApprovedUpgrade,
-                  child: const Text('Complete approved upgrade'),
+                      : _controller.requestApproval,
+                  child: const Text('Ask another phone to approve'),
                 ),
               ],
             ),
+            if (_controller.waitingForApproval) ...<Widget>[
+              const SizedBox(height: 12),
+              Row(
+                children: <Widget>[
+                  const SizedBox.square(
+                    dimension: 18,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  ),
+                  const SizedBox(width: 10),
+                  const Expanded(
+                    child: Text(
+                      'Waiting for your other phone to approve. This phone '
+                      'checks every 5 seconds and finishes by itself.',
+                    ),
+                  ),
+                  TextButton(
+                    onPressed: _controller.stopWaitingForApproval,
+                    child: const Text('Stop'),
+                  ),
+                ],
+              ),
+            ],
             const Divider(height: 32),
             Text(
               'Approve another phone',
