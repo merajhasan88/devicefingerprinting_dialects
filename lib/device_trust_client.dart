@@ -1806,6 +1806,19 @@ class DeviceRecognitionController extends ChangeNotifier {
   String? limitedSessionResult;
   String? pendingUpgradeRequestId;
   List<Map<String, dynamic>> approvalRequests = <Map<String, dynamic>>[];
+
+  /// The requests still open by their own expiry. The server leaves out lapsed
+  /// and replaced requests (DESIGN.md 75); this hides one that lapsed since the
+  /// list was loaded. Found on the Vivo, 2026-10-13: a lapsed request stayed on
+  /// screen, and approving it asked for the PIN only to get a 404.
+  List<Map<String, dynamic>> get openApprovalRequests {
+    final DateTime now = DateTime.now().toUtc();
+    return approvalRequests.where((Map<String, dynamic> request) {
+      final DateTime? expires =
+          DateTime.tryParse(request['expires_at'] as String? ?? '');
+      return expires == null || expires.isAfter(now);
+    }).toList(growable: false);
+  }
   String status = 'Not started';
   bool busy = false;
 
@@ -3522,15 +3535,16 @@ class DeviceRecognitionController extends ChangeNotifier {
   Future<void> loadApprovalRequests() {
     limitedSessionResult = null;
     return _run('Loading approval requests…', () async {
-      final AccountSession? session = accountSession;
       final InstallationIdentity? currentIdentity = identity;
-      if (session == null || currentIdentity == null) {
+      if (accountSession == null || currentIdentity == null) {
         throw ApiException('Log in first.');
       }
       try {
-        approvalRequests = await _api.pendingApprovals(
-          accessToken: session.accessToken,
-          signingIdentity: currentIdentity,
+        approvalRequests = await _withAccessToken(
+          (String accessToken) => _api.pendingApprovals(
+            accessToken: accessToken,
+            signingIdentity: currentIdentity,
+          ),
         );
         _recordLimited(<String>[
           'Approval requests waiting: ${approvalRequests.length}',
@@ -3547,6 +3561,116 @@ class DeviceRecognitionController extends ChangeNotifier {
     });
   }
 
+  /// The server's list again after an approve or deny -- whatever the answer --
+  /// so a request that was used, lapsed or replaced does not linger on screen.
+  Future<void> _reloadApprovalRequests(
+    InstallationIdentity currentIdentity,
+  ) async {
+    try {
+      approvalRequests = await _withAccessToken(
+        (String accessToken) => _api.pendingApprovals(
+          accessToken: accessToken,
+          signingIdentity: currentIdentity,
+        ),
+      );
+    } on ApiException catch (error) {
+      debugPrint('LIMITED: list not reloaded: ${error.code}');
+    }
+  }
+
+  /// Runs [call] with an access token that has not expired. Access tokens
+  /// live ten minutes; one that is about to expire is renewed first with a
+  /// bound refresh -- before anything asks for the screen lock -- and a call
+  /// refused with expired_token is renewed and tried once more. Found on the
+  /// Huawei, 2026-10-12: the approvals list answered expired_token after ten
+  /// idle minutes.
+  Future<T> _withAccessToken<T>(
+    Future<T> Function(String accessToken) call,
+  ) async {
+    final AccountSession? session = accountSession;
+    if (session == null) {
+      throw ApiException('Log in first.');
+    }
+    if (!_accessTokenExpiring(session.accessToken)) {
+      try {
+        return await call(session.accessToken);
+      } on ApiException catch (error) {
+        if (error.code != 'expired_token') {
+          rethrow;
+        }
+      }
+    }
+    final AccountSession renewed = await _renewSession();
+    return call(renewed.accessToken);
+  }
+
+  /// Whether the access token's own expiry is within 30 seconds. Read from
+  /// the token for timing only; the server alone decides validity.
+  bool _accessTokenExpiring(String accessToken) {
+    final List<String> parts = accessToken.split('.');
+    if (parts.length != 3) {
+      return false;
+    }
+    try {
+      final Object? claims = jsonDecode(
+        utf8.decode(base64Url.decode(base64Url.normalize(parts[1]))),
+      );
+      final Object? exp = claims is Map ? claims['exp'] : null;
+      if (exp is! num) {
+        return false;
+      }
+      final DateTime expires =
+          DateTime.fromMillisecondsSinceEpoch(exp.toInt() * 1000, isUtc: true);
+      return DateTime.now()
+          .toUtc()
+          .add(const Duration(seconds: 30))
+          .isAfter(expires);
+    } on FormatException {
+      return false;
+    }
+  }
+
+  /// A fresh scan, then one bound refresh of the stored session; the rotated
+  /// session is saved and its risk decision becomes the current one.
+  Future<AccountSession> _renewSession() async {
+    final InstallationIdentity? currentIdentity = identity;
+    if (accountSession == null || currentIdentity == null) {
+      throw ApiException('Log in first.');
+    }
+    final String token = await _freshDeviceToken();
+    deviceToken = token;
+    await _collectIntegrityWithToken(token, currentIdentity);
+    final AccountSession renewed = await _rotateSession(currentIdentity);
+    _logSession('renewed');
+    return renewed;
+  }
+
+  /// The refresh itself: the server's challenge for the stored refresh token,
+  /// signed by the installation key, then the rotation. The caller has just
+  /// scanned. Saves the rotated session and its decision.
+  Future<AccountSession> _rotateSession(
+    InstallationIdentity currentIdentity,
+  ) async {
+    final AccountSession? session = accountSession;
+    if (session == null) {
+      throw ApiException('Log in first.');
+    }
+    final Map<String, dynamic> challenge =
+        await _api.refreshChallenge(session.refreshToken);
+    final String payload = challenge['payload'] as String;
+    final String signature = await currentIdentity.signPayload(payload);
+    final AccountSession rotated = await _api.refreshAccount(
+      refreshToken: session.refreshToken,
+      challengeId: challenge['challenge_id'] as String,
+      payload: payload,
+      signature: signature,
+    );
+    accountSession = rotated;
+    latestPolicy = rotated.policy;
+    await _store.saveAccountSession(rotated);
+    return rotated;
+  }
+
   String _describeApprovalRequest(Map<String, dynamic> request) {
     final Map<String, dynamic> from = request['requesting_installation'] is Map
         ? Map<String, dynamic>.from(request['requesting_installation'] as Map)
@@ -3558,11 +3682,20 @@ class DeviceRecognitionController extends ChangeNotifier {
   Future<void> approveRequest(String requestId) {
     limitedSessionResult = null;
     return _run('Approving with step-up…', () async {
-      final AccountSession? session = accountSession;
       final InstallationIdentity? currentIdentity = identity;
       final StepUpKeyMetadata? key = stepUpKey;
-      if (session == null || currentIdentity == null) {
+      if (accountSession == null || currentIdentity == null) {
         throw ApiException('Log in first.');
+      }
+      if (!openApprovalRequests.any(
+        (Map<String, dynamic> r) => r['request_id'] == requestId,
+      )) {
+        await _reloadApprovalRequests(currentIdentity);
+        _recordLimited(<String>[
+          'NOT OPEN: that request lapsed, was replaced or was answered; '
+              'nothing was signed. The list is current again.',
+        ]);
+        return;
       }
       if (key == null || !stepUpUsable) {
         throw ApiException(
@@ -3575,19 +3708,19 @@ class DeviceRecognitionController extends ChangeNotifier {
       deviceToken = deviceProofToken;
       await _collectIntegrityWithToken(deviceProofToken, currentIdentity);
       try {
-        await _api.approveUpgrade(
-          accessToken: session.accessToken,
-          signingIdentity: currentIdentity,
-          requestId: requestId,
-          stepUpFactor: key.factor,
-          signStepUp: (String payload) => _stepUpKeyProvider.sign(
-            payload,
-            reason: 'Approve a sign-in on another phone',
+        await _withAccessToken(
+          (String accessToken) => _api.approveUpgrade(
+            accessToken: accessToken,
+            signingIdentity: currentIdentity,
+            requestId: requestId,
+            stepUpFactor: key.factor,
+            signStepUp: (String payload) => _stepUpKeyProvider.sign(
+              payload,
+              reason: 'Approve a sign-in on another phone',
+            ),
           ),
         );
-        approvalRequests = approvalRequests
-            .where((Map<String, dynamic> r) => r['request_id'] != requestId)
-            .toList(growable: false);
+        await _reloadApprovalRequests(currentIdentity);
         _recordLimited(<String>[
           'PASS: request approved',
           'POST /v1/auth/approvals/$requestId/approve: 200',
@@ -3601,11 +3734,14 @@ class DeviceRecognitionController extends ChangeNotifier {
         ]);
       } on ApiException catch (error) {
         _noteStepUpRefusal(error);
+        await _reloadApprovalRequests(currentIdentity);
         _recordLimited(<String>[
           'NOT APPROVED: ${error.code}',
           if (error.code == 'stepup_key_other_account')
             "Re-enrol the step-up key with this account's password "
                 '(Step-up section), then approve again.',
+          if (error.code == 'approval_superseded')
+            'The same phone asked again; approve its newer request.',
           'POST /v1/auth/approvals/$requestId/approve: '
               '${error.statusCode} ${error.code}',
         ]);
@@ -3616,25 +3752,25 @@ class DeviceRecognitionController extends ChangeNotifier {
   Future<void> denyRequest(String requestId) {
     limitedSessionResult = null;
     return _run('Denying the request…', () async {
-      final AccountSession? session = accountSession;
       final InstallationIdentity? currentIdentity = identity;
-      if (session == null || currentIdentity == null) {
+      if (accountSession == null || currentIdentity == null) {
         throw ApiException('Log in first.');
       }
       try {
-        await _api.denyUpgrade(
-          accessToken: session.accessToken,
-          signingIdentity: currentIdentity,
-          requestId: requestId,
+        await _withAccessToken(
+          (String accessToken) => _api.denyUpgrade(
+            accessToken: accessToken,
+            signingIdentity: currentIdentity,
+            requestId: requestId,
+          ),
         );
-        approvalRequests = approvalRequests
-            .where((Map<String, dynamic> r) => r['request_id'] != requestId)
-            .toList(growable: false);
+        await _reloadApprovalRequests(currentIdentity);
         _recordLimited(<String>[
           'Request denied',
           'POST /v1/auth/approvals/$requestId/deny: 200',
         ]);
       } on ApiException catch (error) {
+        await _reloadApprovalRequests(currentIdentity);
         _recordLimited(<String>[
           'NOT DENIED: ${error.code}',
           'POST /v1/auth/approvals/$requestId/deny: '
@@ -4561,7 +4697,7 @@ class _DeviceRecognitionPageState extends State<DeviceRecognitionPage> {
               child: const Text('Show approval requests'),
             ),
             for (final Map<String, dynamic> request
-                in _controller.approvalRequests) ...<Widget>[
+                in _controller.openApprovalRequests) ...<Widget>[
               const SizedBox(height: 12),
               Text(_requestLabel(request)),
               const SizedBox(height: 6),
