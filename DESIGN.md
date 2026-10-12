@@ -5878,3 +5878,21 @@ at a time: the new statements have run only on PostgreSQL.
 **State.** EC2 stopped; stack back to observe/observe at defaults. The Huawei keeps the harness build
 and the PIN the owner set; test accounts `hw-a-1012` and `hw-b-1012` exist on the test database.
 
+**Second round, same day** (the owner asked for another go). With the first round's links in place,
+the Huawei held two accounts, so under the defaults:
+
+| Step | Result |
+|---|---|
+| A third new account on the Huawei | **refused** (403; review 70: a phone first seen today +10, a third account +60) — the owner's default, on a real phone |
+| DBA business settings for shared phones (`device_accounts_review_count` 10, `_block_count` 11, `device_accounts_elevated_points` 0), then the same account again | created |
+| Scripted phone signs in with an elevated scan of its own (75: account's second device +35, new phone +10, integrity +30) | limited (`integrity_elevated`, `risk_review`) |
+| The Huawei approves | **403 `stepup_key_other_account`**: its step-up key had been re-enrolled by the first account and serves only it (§58). Correct server behaviour; the harness kept showing the key as usable and hid the re-enrolment box — fixed (`8a85ea9`), then re-enrolment for this account and the approval **PASS**; the scripted phone upgraded with both causes accepted, protected request 200 |
+| The Huawei denies the next request | **PASS** (the scripted phone then saw `state: denied`) |
+| `device_accounts_elevated_points` back to 35; the Huawei signs in to an account a scripted phone opened (80) | limited — **PASS**; protected access refused — **PASS**; pressing "Complete approved upgrade" before the approval answered `pending` twice, as designed |
+| Scripted approval; the Huawei completes; protected access; bound refresh | **PASS**, `risk_review` accepted |
+| Owner request: the app should finish by itself | the harness now checks every 5 s after "Ask another phone to approve" and completes, or reports denied / expired (`f264b36`); the manual button is gone. Tried: approved by the scripted phone at 21:04:37, the Huawei finished at 21:04:41 — **PASS** |
+| Server journal | no errors |
+
+Settings were returned to the defaults and the stack to observe/observe; EC2 stopped. Test accounts
+`hw-c-1012` and `hw-d-1012` were added; the Huawei's step-up key now belongs to `hw-c-1012`.
+
