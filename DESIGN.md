@@ -5846,3 +5846,35 @@ and `refresh_sessions.accepted_causes` / `accepted_until`. A recheck accepts not
 `.bak-20261012-140928`); schema 13; observe/observe; routes 1 and 3 off, route 2 on; no assertion
 keys; `stepup_required_paths` `''`.
 
+## 73. Limited sessions on a handset: the Huawei, the Dart client and the harness (2026-10-12)
+
+**Built** (`1900ecd`). The Dart client reads `scope`, `limited_causes`, `upgrade_routes`,
+`accepted_causes` and `accepted_until` and keeps them in the stored session; `DeviceApi` gains
+`upgradeSession` (recheck, stepup with a step-up proof v2 over the upgrade request, approval),
+`requestUpgrade`, `pendingApprovals`, `approveUpgrade` (step-up over the approve request) and
+`denyUpgrade`; the sensitive path's step-up signing moved into one shared helper unchanged. The harness
+has a "Limited session and upgrade" card, and logs `SESSION:` / `LIMITED:` lines. Route 3 needs the
+customer's identity backend and is not in the harness. `flutter analyze`: the existing two issues,
+nothing new.
+
+**Handset round** — Huawei AQM-LX1 (Android 10), release build, EC2 + PostgreSQL 16.15 at schema 13,
+`INTEGRITY_MODE=enforce` and `DEVICE_POLICY_MODE=enforce`, every setting at the owner's defaults.
+The other side of each approval was a scripted second phone (the conformance suite's software keys),
+so one handset exercised both roles. The engine choice (PostgreSQL, not SQL Server) kept one unknown
+at a time: the new statements have run only on PostgreSQL.
+
+| Step | Result |
+|---|---|
+| Huawei first scan | **0 / trusted**; developer options and ADB recorded at 0 points (§69) on a real phone |
+| Huawei had no screen lock | step-up unavailable (`STEPUP_NO_DEVICE_CREDENTIAL`); after the owner set a PIN, re-enrolment **PASS** (windowed 30 s key, Android 10, `policy_downgrade` recorded) |
+| Huawei approves: a scripted phone holding its own account signs in to the Huawei's account (two accounts on it +35, the account's second device +35, a new phone +10 = 80, review, within the counts) | limited (`risk_review`), route `approval`; the Huawei listed the request (platform, first seen, `new_device`) and approved it with the PIN — **PASS**; the scripted phone upgraded to full with `risk_review` accepted and its protected request succeeded — **PASS** |
+| Huawei denies a second request | denied — **PASS**; the scripted phone's upgrade then answered 403 `approval_not_granted`, `state: denied` |
+| Huawei is the limited phone: it signs in to an account a scripted phone opened (80, review) | limited (`risk_review`), route `approval` — **PASS**; `/v1/account/me` refused 403 — **PASS** |
+| The scripted phone approves; the Huawei completes the upgrade | full, `risk_review` accepted until 2026-11-11 — **PASS** |
+| After the upgrade | protected access (`/v1/account/me`, protected echo) 200 — **PASS**; bound refresh stays full with the acceptance — **PASS** |
+| Server journal | no errors |
+| Not covered on the handset | route 1 and a recheck need a soft integrity cause, which a clean phone does not produce; route 3 needs a customer backend. All three are covered by the suite |
+
+**State.** EC2 stopped; stack back to observe/observe at defaults. The Huawei keeps the harness build
+and the PIN the owner set; test accounts `hw-a-1012` and `hw-b-1012` exist on the test database.
+
