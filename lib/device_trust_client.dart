@@ -1913,7 +1913,21 @@ class DeviceRecognitionController extends ChangeNotifier {
   /// confirmed as bound to this installation.
   bool get stepUpUsable {
     final StepUpKeyMetadata? key = stepUpKey;
-    return key != null && key.thumbprint == _boundStepUpThumbprint;
+    return key != null &&
+        key.thumbprint == _boundStepUpThumbprint &&
+        !_stepUpKeyOtherAccount;
+  }
+
+  /// The server answered stepup_key_other_account: this phone's step-up key
+  /// was re-enrolled by another account on it (DESIGN.md 58), so it cannot
+  /// approve for the account signed in now. Found on the Huawei, 2026-10-12.
+  /// Cleared by a re-enrolment, or when another account signs in.
+  bool _stepUpKeyOtherAccount = false;
+
+  void _noteStepUpRefusal(ApiException error) {
+    if (error.code == 'stepup_key_other_account') {
+      _stepUpKeyOtherAccount = true;
+    }
   }
 
   /// Recovery when this installation's step-up key is lost or replaced
@@ -1965,6 +1979,7 @@ class DeviceRecognitionController extends ChangeNotifier {
           },
         );
         // Re-register so the server's view (bound, matching) is what shows.
+        _stepUpKeyOtherAccount = false;
         await _registerAndProve();
         _recordStepUp(<String>[
           'PASS: step-up key re-enrolled',
@@ -2006,6 +2021,9 @@ class DeviceRecognitionController extends ChangeNotifier {
     } else if (current.stepupKeyMatches == false) {
       server = 'the server holds a different step-up key: re-enrol it with '
           'your password below';
+    } else if (_stepUpKeyOtherAccount) {
+      server = 'bound to another account on this phone: re-enrol it with '
+          "this account's password below";
     } else if (key.thumbprint != _boundStepUpThumbprint) {
       server = 'not confirmed as the bound key: re-enrol it with your '
           'password below';
@@ -2365,6 +2383,7 @@ class DeviceRecognitionController extends ChangeNotifier {
       );
       await _store.saveAccountSession(accountSession!);
       latestPolicy = accountSession?.policy;
+      _stepUpKeyOtherAccount = false;
       _logSession('account created');
       summary = await _api.deviceSummary(token, identity!);
       status = 'Account created and linked to the recognized device';
@@ -2384,6 +2403,7 @@ class DeviceRecognitionController extends ChangeNotifier {
       );
       await _store.saveAccountSession(accountSession!);
       latestPolicy = accountSession?.policy;
+      _stepUpKeyOtherAccount = false;
       _logSession('login');
       summary = await _api.deviceSummary(token, identity!);
       status = accountSession!.isLimited
@@ -3244,6 +3264,7 @@ class DeviceRecognitionController extends ChangeNotifier {
           '${error.message} [${error.code}]',
         ]);
       } on ApiException catch (error) {
+        _noteStepUpRefusal(error);
         _recordStepUp(<String>[
           'FAIL: the server refused the step-up proof',
           'POST /v1/account/sensitive-echo: ${error.statusCode} ${error.code}',
@@ -3355,6 +3376,7 @@ class DeviceRecognitionController extends ChangeNotifier {
           '${error.message} [${error.code}]',
         ]);
       } on ApiException catch (error) {
+        _noteStepUpRefusal(error);
         final Object? state = error.details?['state'];
         final Object? causes = error.details?['limited_causes'];
         final Object? routes = error.details?['upgrade_routes'];
@@ -3482,8 +3504,12 @@ class DeviceRecognitionController extends ChangeNotifier {
           '${error.message} [${error.code}]',
         ]);
       } on ApiException catch (error) {
+        _noteStepUpRefusal(error);
         _recordLimited(<String>[
           'NOT APPROVED: ${error.code}',
+          if (error.code == 'stepup_key_other_account')
+            "Re-enrol the step-up key with this account's password "
+                '(Step-up section), then approve again.',
           'POST /v1/auth/approvals/$requestId/approve: '
               '${error.statusCode} ${error.code}',
         ]);
