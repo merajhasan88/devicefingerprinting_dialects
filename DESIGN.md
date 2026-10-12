@@ -5896,3 +5896,81 @@ the Huawei held two accounts, so under the defaults:
 Settings were returned to the defaults and the stack to observe/observe; EC2 stopped. Test accounts
 `hw-c-1012` and `hw-d-1012` were added; the Huawei's step-up key now belongs to `hw-c-1012`.
 
+
+## 74. SQL Server 2022 on RDS, the OPPO, and the Huawei against SQL Server (2026-10-12)
+
+**OPPO round** — CPH2083 (Android 9), release build, EC2 + PostgreSQL at schema 13, both modes
+enforcing. The OPPO already held five accounts, so the DBA's shared-phone settings from §73 were used.
+
+| Step | Result |
+|---|---|
+| The OPPO approves a scripted phone's request | **PASS**, after the step-up key was re-enrolled for the account (the Approve button stays grey until then, as designed in §73) |
+| The OPPO denies the next request | **PASS** |
+| The OPPO signs in limited and waits; scripted approval | finished by itself — **PASS** |
+| Protected access and bound refresh after that | **not verified**: the two presses never reached the server. The Huawei covers both (§73 and below) |
+| Route 1 and a recheck on a handset | **not done**: a debug build scores 95 (debuggable +35, W^X +60) rather than a soft cause, and it crashed on relaunch (`dart.cc: 799: unreachable code`). Nothing was committed. The suite covers both routes |
+
+**SQL Server** — RDS `sqlserver-ex` 16.00.4295.3 (SQL Server 2022 Express), db.t3.micro, single-AZ,
+backups off, no snapshots. Database `devicetrustdb`; migrations 001–013 applied (schema 13). The EC2
+server was switched to it with a systemd drop-in (`DB_ENGINE=sqlserver`).
+
+| Run on SQL Server | Result |
+|---|---|
+| Conformance suite, observe, 72 checks | **60 passed, 0 failed, 12 skipped** — the same as PostgreSQL, including the parallel-clients check |
+| Integrity enforce, routes 1–3 on (assertion keys installed) | **69 passed, 0 failed, 3 skipped** — the same as PostgreSQL |
+| Both modes enforcing, eligibility rules on, targeted | **18 / 18** |
+| Server journal | no errors |
+
+So the code since §65 (one-use challenges, R4, limited sessions with all three routes, the upgrade
+acceptance, eligibility, the new settings) has run on SQL Server, not only through the translation check.
+
+**The Huawei against SQL Server** — AQM-LX1 (Android 10), the same release build. It registered as a
+new phone (0 / trusted); its step-up key was bound at registration, so it served every account.
+
+| Step | Result |
+|---|---|
+| Defaults. The Huawei signs in to an account a scripted phone opened | limited (`risk_review`), route `approval` — **PASS** |
+| Scripted approval; the Huawei waits | approved 22:56:39, the Huawei finished by itself 22:56:42 — **PASS** |
+| Protected access; bound refresh | **PASS**; the refresh stays full with `risk_review` accepted until 2026-11-11 |
+| Shared-phone settings (§73). The Huawei creates `hs-c-1012`; a scripted phone with an elevated scan signs in to it (75: new phone +10, the account's second device +35, integrity +30) | limited (`integrity_elevated`, `risk_review`) |
+| The Huawei approves with its screen lock | **PASS** (23:45:17); the scripted phone upgraded to full with both causes accepted; protected request 200 |
+| The Huawei denies the next request | **PASS** (23:47:28); the scripted phone's upgrade then answered 403 `approval_not_granted`, `state: denied` |
+| Server journal after the resize below | no errors |
+
+**Five 500s on db.t3.micro, and what they exposed.** Before the approve step, five requests (two account
+creations, two sign-ins, one approvals list) failed with `HYT00 Query timeout expired` after the 15 s
+`DB_QUERY_TIMEOUT`. They were not locks and not a code fault; each failed at its first read and was
+rolled back, so nothing was half-written.
+
+- On db.t3.micro (1 GB), SQL Server's target memory was 127 MB and its query workspace **3 MB**; the
+  small-query semaphore was off (target 0), so every memory grant used the one queue.
+- Amazon's `RdsAdminService` was running consistency checks (`DBCC CHECKDB` internals) database by
+  database, each asking for a 22–24 MB grant, plus 1 MB task-list queries. At the head of the queue they
+  held everyone behind them: `master`'s check from 23:02 to 23:15 local, then `rdsadmin`'s. The first
+  three failures (23:00–23:01) came before the queue was inspected; the wait statistics point to the
+  same cause: RESOURCE_SEMAPHORE 58 waits, longest 99 s; lock waits at most 1.6 s.
+- A retry in an 8-second gap between two checks failed the same way. The owner chose to resize to
+  **db.t3.small** (2 GB): workspace 253 MB, no waiters, and every step above then passed.
+
+**Finding, not yet fixed.** Our lookups needed a memory grant at all only because the driver sends a
+Python `str` as `nvarchar`, while every ID column is `char(36) COLLATE Latin1_General_BIN2`. The
+comparison converts the column side (`CONVERT_IMPLICIT`), so the integrity-state lookup
+(`WHERE installation_id = ? ORDER BY created_at DESC`, top 1) becomes a dynamic seek plus a **Sort**
+with a 32 KB grant. With a `char(36)` parameter the same statement is a plain index seek under a Top,
+with no sort and no grant (estimated plans, 2026-10-12). The fix belongs in the SQL Server dialect —
+bind ID parameters as `varchar(36)` (pyodbc `setinputsizes`) — and needs the suite rerun on both
+engines. The .NET SDK has the same exposure: SqlClient sends `string` as `nvarchar` unless the
+parameter is declared `SqlDbType.Char`/`VarChar` with size 36. Also: a production SQL Server needs
+more than 1 GB; on that size Amazon's own housekeeping can stall it.
+
+**Harness gaps seen, not yet fixed.** (1) At start the app showed the risk decision saved with its last
+session without checking that the session still exists; after the switch to SQL Server it showed the
+PostgreSQL decision (four accounts on the phone) for a phone the new database had never seen. Display
+only: the server never relies on the app's copy. (2) The approvals list uses the stored access token
+without renewing it; after ten minutes idle it answered 401 `expired_token`, and the five-minute request
+had lapsed meanwhile. (3) The owner mistyped a password on account creation (`hs-a-1012` is unusable);
+the password fields now have a show/hide toggle and no autocorrect (`0644eaf`).
+
+**State.** RDS `devicetrust-mssql-1012` at db.t3.small with the owner's default settings, to be deleted
+(no final snapshot, no automated backups) before the session ends; EC2 still on SQL Server, both modes
+enforcing. Test accounts `hs-b-1012` and `hs-c-1012` exist only on that database.
