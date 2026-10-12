@@ -130,6 +130,9 @@ DEVICE_POLICY_MODE = os.environ.get("DEVICE_POLICY_MODE", "observe").strip().low
 if DEVICE_POLICY_MODE not in ("observe", "enforce"):
     raise RuntimeError("DEVICE_POLICY_MODE must be 'observe' or 'enforce'.")
 
+# Fallbacks only: the live bands are risk_policy_settings.policy_step_up_score,
+# policy_review_score and policy_block_score (DBA-tunable, seeded by migration
+# 012 with the owner's defaults 30 / 60 / 90).
 POLICY_STEP_UP_SCORE = int(os.environ.get("POLICY_STEP_UP_SCORE", "30"))
 POLICY_REVIEW_SCORE = int(os.environ.get("POLICY_REVIEW_SCORE", "60"))
 POLICY_BLOCK_SCORE = int(os.environ.get("POLICY_BLOCK_SCORE", "90"))
@@ -141,6 +144,8 @@ POLICY_REINSTALL_WINDOW_HOURS = int(
 POLICY_DEVICE_ACCOUNT_BLOCK_COUNT = int(
     os.environ.get("POLICY_DEVICE_ACCOUNT_BLOCK_COUNT", "4")
 )
+# Fallback only: the live value is risk_policy_settings.account_devices_block_count
+# (DBA-tunable, seeded by migration 012 with the owner's default of 5).
 POLICY_ACCOUNT_DEVICE_BLOCK_COUNT = int(
     os.environ.get("POLICY_ACCOUNT_DEVICE_BLOCK_COUNT", "5")
 )
@@ -1151,7 +1156,7 @@ def _get_backend_identity():
 # against a schema it does not understand. /health/* still answers so operators
 # can see why.
 
-REQUIRED_SCHEMA_VERSION = 11
+REQUIRED_SCHEMA_VERSION = 12
 
 _schema_state = None
 _schema_lock = threading.Lock()
@@ -1291,12 +1296,21 @@ _RISK_SETTING_KINDS = {
     "upgrade_mfa_assertion": "bool",
     "upgrade_request_ttl_seconds": "int",
     "upgrade_approvals_per_hour": "int",
+    "policy_step_up_score": "int",
+    "policy_review_score": "int",
+    "policy_block_score": "int",
+    "account_devices_elevated_count": "int",
+    "account_devices_elevated_points": "int",
+    "account_devices_review_count": "int",
+    "account_devices_review_points": "int",
+    "account_devices_block_count": "int",
 }
 # Lower bounds a value must also meet. Below 100 the "far above the baseline"
 # rule would fire for memory inside the build's own measured envelope.
 _RISK_SETTING_MINIMUMS = {
     "wx_far_above_baseline_percent": 100,
     "upgrade_request_ttl_seconds": 30,
+    "policy_step_up_score": 1,
 }
 _RISK_SETTING_BOOL_WORDS = ("0", "1", "true", "false", "yes", "no", "on", "off")
 # Rows whose absence would silently weaken a gate instead of restoring the
@@ -1338,6 +1352,21 @@ def _validate_risk_settings(values):
             valid = int(value) >= _RISK_SETTING_MINIMUMS[key]
         if not valid:
             raise ValueError("risk_policy_settings.%s has an invalid value" % key)
+    # The relationship bands must rise: step-up < review < block. A missing
+    # row means its fallback, so a lone retuned row is checked against those.
+    bands = [
+        int(values.get(key, "").strip() or default)
+        for key, default in (
+            ("policy_step_up_score", POLICY_STEP_UP_SCORE),
+            ("policy_review_score", POLICY_REVIEW_SCORE),
+            ("policy_block_score", POLICY_BLOCK_SCORE),
+        )
+    ]
+    if not bands[0] < bands[1] < bands[2]:
+        raise ValueError(
+            "risk_policy_settings bands must rise: policy_step_up_score < "
+            "policy_review_score < policy_block_score"
+        )
 
 
 def _risk_policy_settings():
@@ -2855,6 +2884,44 @@ def _enforce_integrity_gate(
 # ---------------------------------------------------------------------------
 
 
+def _account_device_points(reasons, projected_count):
+    """Score devices per account against the DBA's counts; (points, hard)."""
+    devices_block = _risk_setting_int(
+        "account_devices_block_count", POLICY_ACCOUNT_DEVICE_BLOCK_COUNT
+    )
+    devices_review = _risk_setting_int("account_devices_review_count", 3)
+    devices_elevated = _risk_setting_int("account_devices_elevated_count", 2)
+    if devices_block > 0 and projected_count >= devices_block:
+        _policy_reason(
+            reasons,
+            "account_device_count_block_threshold",
+            100,
+            "This account is linked to %d recognized devices; the configured policy "
+            "blocks at %d." % (projected_count, devices_block),
+        )
+        return 0, True
+    if devices_review > 0 and projected_count >= devices_review:
+        points = _risk_setting_int("account_devices_review_points", 60)
+        _policy_reason(
+            reasons,
+            "account_has_many_devices",
+            points,
+            "This account is linked to %d recognized devices; the configured policy "
+            "reviews at %d." % (projected_count, devices_review),
+        )
+        return points, False
+    if devices_elevated > 0 and projected_count >= devices_elevated:
+        points = _risk_setting_int("account_devices_elevated_points", 35)
+        _policy_reason(
+            reasons,
+            "account_has_multiple_devices",
+            points,
+            "This account is linked to %d recognized devices." % projected_count,
+        )
+        return points, False
+    return 0, False
+
+
 def _policy_reason(reasons, code, points, message):
     reasons.append(
         {
@@ -2865,12 +2932,27 @@ def _policy_reason(reasons, code, points, message):
     )
 
 
+def _policy_bands():
+    """The relationship-risk bands (DBA-tunable; owner defaults 30 / 60 / 90).
+
+    Below step-up: allow. Step-up to review: step_up, recorded and allowed
+    unless elevated_risk_refuses is set. Review to block: review, refused in
+    enforce mode. Block and above, or any hard reason: block.
+    """
+    return {
+        "step_up": _risk_setting_int("policy_step_up_score", POLICY_STEP_UP_SCORE),
+        "review": _risk_setting_int("policy_review_score", POLICY_REVIEW_SCORE),
+        "block": _risk_setting_int("policy_block_score", POLICY_BLOCK_SCORE),
+    }
+
+
 def _policy_action(score, hard_block=False):
-    if hard_block or score >= POLICY_BLOCK_SCORE:
+    bands = _policy_bands()
+    if hard_block or score >= bands["block"]:
         return "block"
-    if score >= POLICY_REVIEW_SCORE:
+    if score >= bands["review"]:
         return "review"
-    if score >= POLICY_STEP_UP_SCORE:
+    if score >= bands["step_up"]:
         return "step_up"
     return "allow"
 
@@ -3075,32 +3157,15 @@ def _evaluate_risk_policy(
         )
         score += elevated_points
 
-    # One account appearing on several recognized physical devices.
+    # One account appearing on several recognized physical devices. DBA-tunable
+    # (migration 012); the owner's defaults: a second device is elevated and
+    # allowed, a third or more is held for review -- refused in enforce mode --
+    # and a fifth is blocked. A business whose users legitimately carry more
+    # devices raises the counts.
     if account_id is not None:
-        if projected_account_device_count >= POLICY_ACCOUNT_DEVICE_BLOCK_COUNT:
-            _policy_reason(
-                reasons,
-                "account_device_count_block_threshold",
-                100,
-                "This account is linked to too many recognized devices for the configured policy.",
-            )
-            hard_block = True
-        elif projected_account_device_count >= 3:
-            _policy_reason(
-                reasons,
-                "account_has_many_devices",
-                60,
-                "This account is linked to three or more recognized devices.",
-            )
-            score += 60
-        elif projected_account_device_count == 2:
-            _policy_reason(
-                reasons,
-                "account_has_multiple_devices",
-                35,
-                "This account is being used on a second recognized device.",
-            )
-            score += 35
+        points, blocked = _account_device_points(reasons, projected_account_device_count)
+        score += points
+        hard_block = hard_block or blocked
 
     # Reinstall velocity on one server-recognized device.
     if recent_reinstall_count >= POLICY_REINSTALL_BLOCK_COUNT:
@@ -3267,11 +3332,7 @@ def _evaluate_risk_policy(
         "enforced": DEVICE_POLICY_MODE == "enforce" and recommended_action != "allow",
         "reasons": reasons,
         "context": context,
-        "thresholds": {
-            "step_up": POLICY_STEP_UP_SCORE,
-            "review": POLICY_REVIEW_SCORE,
-            "block": POLICY_BLOCK_SCORE,
-        },
+        "thresholds": _policy_bands(),
         "created_at": _iso_z(_utc_now()),
     }
 

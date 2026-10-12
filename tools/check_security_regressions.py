@@ -2078,6 +2078,61 @@ def relationship_risk_never_admits_a_link_to_a_shared_device():
         db.account_row = None
 
 
+
+# ---------------------------------------------------------------------------
+# Relationship bands and devices per account are the DBA's (migration 012)
+# ---------------------------------------------------------------------------
+
+
+@check
+def relationship_bands_follow_the_dba_settings():
+    with policy():
+        actions = [s._policy_action(score) for score in (29, 30, 59, 60, 89, 90)]
+        expect(actions == ["allow", "step_up", "step_up", "review", "review", "block"],
+               "the owner's default bands are 30 / 60 / 90, got %s" % actions)
+        expect(s._policy_action(0, hard_block=True) == "block", "a hard reason always blocks")
+    with policy(policy_step_up_score=40, policy_review_score=70, policy_block_score=95):
+        actions = [s._policy_action(score) for score in (39, 40, 69, 70, 94, 95)]
+        expect(actions == ["allow", "step_up", "step_up", "review", "review", "block"],
+               "retuned bands must apply, got %s" % actions)
+    for values, valid in (({"policy_review_score": "65"}, True),
+                          ({"policy_review_score": "95"}, False),
+                          ({"policy_step_up_score": "60"}, False),
+                          ({"policy_step_up_score": "0"}, False),
+                          ({"policy_block_score": "eighty"}, False)):
+        try:
+            s._validate_risk_settings(dict(SETTINGS, **values))
+            accepted = True
+        except ValueError:
+            accepted = False
+        expect(accepted == valid, "bands %s: accepted=%s" % (values, accepted))
+
+
+@check
+def devices_per_account_follow_the_dba_settings():
+    def score(count):
+        reasons = []
+        points, hard = s._account_device_points(reasons, count)
+        return points, hard, [r["code"] for r in reasons]
+
+    with policy():
+        expect(score(1) == (0, False, []), "one device scores nothing")
+        expect(score(2) == (35, False, ["account_has_multiple_devices"]), "a second device: +35")
+        expect(score(3)[:2] == (60, False) and score(4)[:2] == (60, False),
+               "a third or fourth device: +60, review")
+        expect(score(5) == (0, True, ["account_device_count_block_threshold"]), "a fifth device blocks")
+        expect(s._policy_action(score(3)[0]) == "review",
+               "by default a third device must reach the review band (refused in enforce mode)")
+    with policy(account_devices_review_count=4, account_devices_review_points=60,
+                account_devices_block_count=6):
+        expect(score(3)[:2] == (35, False) and s._policy_action(score(3)[0]) == "step_up",
+               "a business may let a third device through: %s" % (score(3),))
+        expect(score(6)[1] is True, "and still block at its own count")
+    with policy(account_devices_elevated_count=0, account_devices_review_count=0,
+                account_devices_block_count=0):
+        expect(score(9) == (0, False, []), "0 switches each count off")
+
+
 def main():
     passed = failed = 0
     for function in CHECKS:

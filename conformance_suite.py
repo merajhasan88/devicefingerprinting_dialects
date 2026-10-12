@@ -2590,6 +2590,51 @@ def check_device_account_bands(api, ctx):
 
 
 
+@check("risk: devices per account follow the DBA policy (defaults 2 elevated, 3 review)")
+def check_account_device_bands(api, ctx):
+    """Migration 012. One account signing in on more and more devices: the
+    elevated count raises the score, the review count holds the decision for
+    review (by default a third device), and in enforce mode that sign-in never
+    gets a full session. Expectations come from the live settings."""
+    settings = live_settings(api)
+    _, health = api.call("GET", "/health/ready")
+    enforce = (health if isinstance(health, dict) else {}).get("device_policy_mode") == "enforce"
+    elevated = int(settings.get("account_devices_elevated_count", "2"))
+    review = int(settings.get("account_devices_review_count", "3"))
+    if not 1 < elevated < review <= 6:
+        raise Skip("devices-per-account counts %s/%s are not ordered within 6" % (elevated, review))
+
+    def device():
+        inst = Installation()
+        st, pl = enrol(api, inst, fresh_hint())
+        expect(st in (200, 201), "enrol failed: %s %s" % (st, pl))
+        token = device_token(api, inst)
+        submit_report(api, inst, token)
+        return inst, token
+
+    first, token = device()
+    handle = "devs-%s" % secrets.token_hex(4)
+    st, pl = open_account(api, first, token, handle)
+    expect(st in (200, 201), "account open failed: %s %s" % (st, pl))
+    for n in range(2, review + 1):
+        inst, token = device()
+        st, pl = sign_in(api, inst, token, handle)
+        pol = _policy_of(pl)
+        if n == elevated:
+            expect("account_has_multiple_devices" in _reason_codes(pol),
+                   "device %d must be scored account_has_multiple_devices, got %s %s"
+                   % (n, st, sorted(_reason_codes(pol))))
+        if n == review:
+            expect("account_has_many_devices" in _reason_codes(pol)
+                   and pol.get("recommended_action") in ("review", "block"),
+                   "device %d must be held for review, got %s %s %s"
+                   % (n, st, pol.get("recommended_action"), sorted(_reason_codes(pol))))
+            if enforce:
+                expect(st != 200 or pl.get("scope") == "limited",
+                       "enforce: device %d must not get a full session, got %s %s"
+                       % (n, st, pl.get("scope")))
+
+
 def jwk_thumbprint(jwk):
     """The server's key thumbprint: SHA-256 hex of the sorted canonical JWK."""
     canonical = json.dumps({"crv": jwk["crv"], "kty": "EC", "x": jwk["x"], "y": jwk["y"]},
