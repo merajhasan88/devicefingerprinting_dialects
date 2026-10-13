@@ -1711,6 +1711,65 @@ def _elevate(probes):
     probes["mounts"] = {"status": "error", "error": "permission denied"}  # one failed probe, +30
 
 
+@check("relationship: sign-ins at the same moment cannot exceed the devices-per-account limit",
+       db_sensitive=True)
+def check_parallel_first_sign_ins(api, ctx):
+    """Review R2 (DESIGN.md 76). An account on one phone; four new phones sign in
+    to it at the same moment. Each decision sees one device, so without a
+    recheck all four would link -- five devices, which no decision allowed.
+    With the recheck under locks at most one more device links (the second,
+    within the counts); the others are refused, with risk_review_required (the
+    third device) or 409 relationship_changed (decided on counts that changed).
+    Runs when DEVICE_POLICY_MODE=enforce with the owner's review count of 3."""
+    _, health = api.call("GET", "/health/ready")
+    health = health if isinstance(health, dict) else {}
+    settings = (health.get("scoring_flags") or {}).get("risk_policy_settings") or {}
+    if health.get("device_policy_mode") != "enforce":
+        raise Skip("DEVICE_POLICY_MODE is not enforce; nothing is refused to race against")
+    if str(settings.get("account_devices_review_count", "3")) != "3":
+        raise Skip("account_devices_review_count is not the owner's 3 on this server")
+    owner = Installation()
+    st, pl = enrol(api, owner, fresh_hint())
+    expect(st in (200, 201), "enrol failed: %s %s" % (st, pl))
+    token = device_token(api, owner)
+    submit_report(api, owner, token)
+    handle = "race-%s" % secrets.token_hex(4)
+    st, pl = open_account(api, owner, token, handle)
+    expect(st in (200, 201), "open account failed: %s %s" % (st, pl))
+    phones = []
+    for _ in range(4):
+        inst = Installation()
+        st, pl = enrol(api, inst, fresh_hint())
+        expect(st in (200, 201), "enrol failed: %s %s" % (st, pl))
+        phone_token = device_token(api, inst)
+        submit_report(api, inst, phone_token)
+        phones.append((inst, phone_token))
+    barrier, lock, results = threading.Barrier(len(phones)), threading.Lock(), []
+
+    def go(inst, phone_token):
+        client = Api(api.base_url)
+        try:
+            barrier.wait(timeout=30)
+            st, pl = sign_in(client, inst, phone_token, handle)
+            outcome = (st, pl.get("scope") if st == 200 else error_code(pl))
+        except BaseException as error:  # a thread must report, never vanish
+            outcome = (0, str(error)[:80])
+        with lock:
+            results.append(outcome)
+
+    threads = [threading.Thread(target=go, args=phone) for phone in phones]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    linked = [r for r in results if r[0] == 200]
+    refused = [r for r in results
+               if r in ((403, "risk_review_required"), (409, "relationship_changed"))]
+    expect(len(linked) <= 1 and len(linked) + len(refused) == len(phones),
+           "at most one of four simultaneous sign-ins may link, the rest refused; got %s"
+           % sorted(results))
+
+
 @check("session: sign-out revokes the family at once; a routine refresh does not")
 def check_logout_revokes_the_family(api, ctx):
     """Review R6 (DESIGN.md 76). After a refresh the previous access token still

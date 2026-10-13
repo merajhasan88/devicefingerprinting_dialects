@@ -86,6 +86,8 @@ class Rows(object):
         self.other_full_session = None
         self.account_row = None
         self.revoked_families = set()
+        self.link_exists = False
+        self.link_counts = (0, 0)
 
     def execute(self, sql, params=None):
         q = " ".join(sql.split())
@@ -116,6 +118,15 @@ class Rows(object):
             self.result = self.other_full_session
         elif q.startswith("SELECT COUNT(*) FROM refresh_sessions WHERE family_id"):
             self.result = (0 if params[0] in self.revoked_families else 1,)
+        elif q.startswith(("SELECT account_id FROM demo_accounts",
+                           "SELECT device_id FROM recognized_devices")):
+            self.result = (params[0],)  # the anchor row; locking is the engine's job
+        elif q.startswith("SELECT 1 FROM device_account_links WHERE device_id"):
+            self.result = (1,) if self.link_exists else None
+        elif q.startswith("SELECT COUNT(*) FROM device_account_links WHERE device_id"):
+            self.result = (self.link_counts[0],)
+        elif q.startswith("SELECT COUNT(DISTINCT device_id) FROM device_account_links"):
+            self.result = (self.link_counts[1],)
         elif q.startswith("UPDATE session_upgrade_requests"):
             self.writes.append((q, params))
         elif q.startswith("SELECT stepup_key_account_id, stepup_public_key_jwk"):
@@ -1311,6 +1322,8 @@ class LiteCursor(object):
         self.rowcount = 0
 
     def execute(self, sql, params=()):
+        # SQLite has one writer at a time and no row locks to request.
+        sql = sql.replace(" FOR UPDATE", "")
         self.cursor.execute(sql.replace("%s", "?").replace("NOW()", "CURRENT_TIMESTAMP"),
                             tuple(params or ()))
         self.rowcount = self.cursor.rowcount
@@ -2122,8 +2135,11 @@ def relationship_risk_admits_a_first_sign_in_only_within_the_counts():
         return client.post(path, data=raw, headers=access_headers("POST", path, raw, device_token))
 
     def review(linked=False, accounts=2, devices=2):
+        new = 0 if linked else 1
         return lambda *a, **k: {"effective_action": "review", "recommended_action": "review",
                                 "context": {"account_already_linked_to_device": linked,
+                                            "device_account_count": accounts - new,
+                                            "account_device_count": devices - new,
                                             "projected_device_account_count": accounts,
                                             "projected_account_device_count": devices}}
 
@@ -2391,6 +2407,94 @@ def a_signed_out_or_revoked_family_reaches_nothing():
         expect(reply.status_code == 200 and revoked and revoked[-1][0] == family,
                "a %s session's logout must revoke its family, got %s %s %s"
                % (scope, reply.status_code, reply.get_json(), revoked))
+
+
+ADMISSION_LITE_SCHEMA = """
+CREATE TABLE demo_accounts (account_id TEXT PRIMARY KEY);
+CREATE TABLE recognized_devices (device_id TEXT PRIMARY KEY);
+CREATE TABLE device_account_links (
+    device_id             TEXT NOT NULL,
+    account_id            TEXT NOT NULL,
+    first_installation_id TEXT NOT NULL,
+    first_seen_at         TSZ DEFAULT CURRENT_TIMESTAMP,
+    last_seen_at          TSZ DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (device_id, account_id)
+);
+"""
+
+
+@check
+def sign_ins_decided_together_cannot_exceed_the_counts_they_saw():
+    """Review R2 (DESIGN.md 76), the server's own SQL on SQLite. Four sign-ins of
+    one account from four new phones are all decided before any link is
+    written, each seeing one device on the account. Without the recheck all
+    four link (five devices). With it the first links and the other three get
+    relationship_changed; the same holds for accounts on one phone. A pair
+    already linked is always admitted; a decision without counts is refused."""
+    connection = sqlite3.connect(":memory:", detect_types=sqlite3.PARSE_DECLTYPES)
+    connection.executescript(ADMISSION_LITE_SCHEMA)
+    cur = LiteCursor(connection)
+    acct, first = str(uuid.uuid4()), str(uuid.uuid4())
+    phones = [str(uuid.uuid4()) for _ in range(4)]
+    others = [str(uuid.uuid4()) for _ in range(2)]
+    for account_id in [acct] + others:
+        connection.execute("INSERT INTO demo_accounts VALUES (?)", (account_id,))
+    for device_id in [first] + phones:
+        connection.execute("INSERT INTO recognized_devices VALUES (?)", (device_id,))
+    s._link_device_account(cur, first, acct, str(uuid.uuid4()))
+
+    def attempt(device_id, account_id, accounts_seen, devices_seen):
+        decided = {"context": {"device_account_count": accounts_seen,
+                               "account_device_count": devices_seen}}
+        try:
+            s._admit_link(cur, device_id, account_id, decided)
+        except s.ApiProblem as problem:
+            return problem.code
+        s._link_device_account(cur, device_id, account_id, str(uuid.uuid4()))
+        return "linked"
+
+    outcomes = [attempt(phone, acct, 0, 1) for phone in phones]
+    links = connection.execute("SELECT COUNT(*) FROM device_account_links WHERE account_id = ?",
+                               (acct,)).fetchone()[0]
+    expect(outcomes == ["linked"] + ["relationship_changed"] * 3 and links == 2,
+           "four sign-ins decided on one device must link one more, got %s, %d links"
+           % (outcomes, links))
+    # The phone side: two other accounts decided against the phone that now holds one.
+    outcomes = [attempt(first, account_id, 1, 0) for account_id in others]
+    expect(outcomes == ["linked", "relationship_changed"],
+           "two accounts decided on one account per phone must add one, got %s" % outcomes)
+    expect(attempt(phones[0], acct, 0, 1) == "linked",
+           "an already-linked pair adds nothing and must be admitted")
+    expect(_refused(lambda: s._admit_link(cur, phones[1], acct, {"context": {}}))
+           == "admission_unverifiable", "a decision without its counts must be refused")
+    connection.close()
+
+
+@check
+def login_and_registration_recheck_the_counts_before_linking():
+    """Review R2 at the endpoints: when the links counted now exceed what the
+    decision saw, login and registration answer 409 relationship_changed."""
+    import bcrypt as _bcrypt
+    allow = lambda *a, **k: {"effective_action": "allow", "recommended_action": "allow",
+                             "context": {"device_account_count": 0, "account_device_count": 1}}
+    db.account_row = (account, _bcrypt.hashpw(b"Passw0rd123", _bcrypt.gensalt(4)))
+    try:
+        with elevated_integrity(), policy():
+            s._latest_integrity_state = _verdict_state("trusted")
+            s._evaluate_risk_policy = allow
+            for path, handle in (("/v1/accounts/login", "someone"), ("/v1/accounts/register", "fresh")):
+                raw = encode({"handle": handle, "password": "Passw0rd123"})
+                for counts, expected in (((0, 1), (200, 201)), ((0, 2), (409,)), ((1, 1), (409,))):
+                    db.link_counts = counts
+                    reply = client.post(path, data=raw,
+                                        headers=access_headers("POST", path, raw, device_token))
+                    expect(reply.status_code in expected
+                           and (reply.status_code != 409
+                                or error_code(reply) == "relationship_changed"),
+                           "%s with links now %s against decided (0, 1): expected %s, got %s %s"
+                           % (path, counts, expected, reply.status_code, error_code(reply)))
+    finally:
+        db.account_row, db.link_counts = None, (0, 0)
 
 
 def main():

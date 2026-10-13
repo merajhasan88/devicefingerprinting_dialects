@@ -4462,6 +4462,67 @@ def _confirm_hint_installation(cursor, device_id, account_id, installation_id):
     )
 
 
+def _admit_link(cursor, device_id, account_id, policy):
+    """Recheck, inside the transaction that creates the link, the relationship
+    counts the risk decision was made on (review R2, DESIGN.md 76).
+
+    The decision reads the counts in its own transaction; the link and the
+    session are written in a later one. Four sign-ins of one account from four
+    new phones could all read "one device" and all be admitted, ending with
+    five links, which no single decision allowed. Here the account row and then
+    the device row are locked -- always in that order, so concurrent sign-ins
+    cannot deadlock -- and the counts are read again. If another sign-in has
+    linked the account or the device since this decision was made, the link is
+    refused with 409 relationship_changed and nothing is written; signing in
+    again gets a decision on the new counts. A pair already linked adds
+    nothing, so it is always admitted.
+    """
+    context = (policy or {}).get("context") or {}
+    decided = (context.get("device_account_count"), context.get("account_device_count"))
+    if any(isinstance(n, bool) or not isinstance(n, int) for n in decided):
+        raise ApiProblem(
+            "The sign-in decision did not record the relationship counts.",
+            500,
+            "admission_unverifiable",
+        )
+    hint, suffix = DIALECT.row_lock_hint(), DIALECT.row_lock_suffix()
+    cursor.execute(
+        "SELECT account_id FROM demo_accounts" + hint + " WHERE account_id = %s" + suffix,
+        (account_id,),
+    )
+    cursor.execute(
+        "SELECT device_id FROM recognized_devices" + hint + " WHERE device_id = %s" + suffix,
+        (device_id,),
+    )
+    cursor.execute(
+        "SELECT 1 FROM device_account_links WHERE device_id = %s AND account_id = %s",
+        (device_id, account_id),
+    )
+    if cursor.fetchone() is not None:
+        return
+    cursor.execute(
+        "SELECT COUNT(*) FROM device_account_links WHERE device_id = %s",
+        (device_id,),
+    )
+    device_accounts = int(cursor.fetchone()[0])
+    cursor.execute(
+        "SELECT COUNT(DISTINCT device_id) FROM device_account_links WHERE account_id = %s",
+        (account_id,),
+    )
+    account_devices = int(cursor.fetchone()[0])
+    if device_accounts > decided[0] or account_devices > decided[1]:
+        raise ApiProblem(
+            "Another sign-in changed this phone's or this account's links while this "
+            "one was being decided; sign in again.",
+            409,
+            "relationship_changed",
+            details={
+                "decided": {"device_accounts": decided[0], "account_devices": decided[1]},
+                "now": {"device_accounts": device_accounts, "account_devices": account_devices},
+            },
+        )
+
+
 def _link_device_account(cursor, device_id, account_id, installation_id):
     # Portable upsert: update first, insert only if nothing was updated. Two
     # first logins racing both see no row, and the loser's INSERT hits the
@@ -5506,6 +5567,7 @@ def account_register():
                 """,
                 (account_id, lookup, password_hash),
             )
+            _admit_link(cursor, device_id, account_id, policy)
             _link_device_account(cursor, device_id, account_id, installation_id)
             tokens = _issue_account_tokens(
                 cursor,
@@ -5586,6 +5648,7 @@ def account_login():
     )
 
     with _cursor(commit=True) as cursor:
+        _admit_link(cursor, device_id, account_id, policy)
         _confirm_hint_installation(cursor, device_id, account_id, installation_id)
         _link_device_account(cursor, device_id, account_id, installation_id)
         tokens = _issue_account_tokens(
@@ -6493,6 +6556,13 @@ def upgrade_request():
     request_id = str(uuid.uuid4())
     response = {"request_id": request_id, "route": route, "expires_at": _iso_z(now + ttl)}
     with _cursor(commit=True) as cursor:
+        # Count and insert under the account row's lock, so parallel requests
+        # cannot all pass the budget count before any is inserted (review R2).
+        cursor.execute(
+            "SELECT account_id FROM demo_accounts" + DIALECT.row_lock_hint()
+            + " WHERE account_id = %s" + DIALECT.row_lock_suffix(),
+            (account_id,),
+        )
         if route == "approval":
             if not _has_other_full_session(cursor, account_id, installation_id):
                 raise ApiProblem(
