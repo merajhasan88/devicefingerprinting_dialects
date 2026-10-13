@@ -6096,7 +6096,8 @@ business decisions for them."*
 | Android collector 3: unreadable maps / no threads report an error; `maps_lines` | `7f0bcb9` | release build compiles; **not yet on a phone** |
 | R1 + migration 016: acceptance records, reason/points/count coverage, lapses, auto-cover setting, request scope (409 `upgrade_scope_changed`), `complete_scan_required`, decisions name their acceptance, sign-out revokes acceptances | `e3cc70e` | gate (reproduction by the review's case; five mutations) |
 | R1, app: the approver sees what approving accepts | `251a330` | analyze |
-| Business API + migration 017: events, graph, lapse feed, decision-context counts; nothing scored | `cb241b2`, `b9687c1` | gate (four mutations); suite `check_business_api`; the suite found a PostgreSQL-only bug (empty string as uuid), fixed in `b9687c1` |
+| Business API + migration 017: events, graph, lapse feed, decision-context counts; nothing scored | `cb241b2`, `b9687c1`, `2c14c91` | gate (four mutations); suite `check_business_api`; the suite found a PostgreSQL-only bug (empty string as uuid), fixed in `b9687c1`; the lapse feed pages with a cursor that keeps rows sharing an instant (`2c14c91`, a tie case in the gate) |
+| Suite route 1 proves reason-level coverage live: approved reasons covered, a later reason (`android_backup_enabled`) not, and the lapse readable through the business API | `3a15f18` | PASS on PostgreSQL |
 
 **Live runs, EC2 PostgreSQL 16.15, schema 17.**
 
@@ -6143,7 +6144,8 @@ away if the business wants the server to apply them.
 both engines). Android builds with collector 3 for the Huawei, OPPO and Vivo. The iPhone round (a new
 iOS build: GitHub Actions or Codemagic). The Python dialect's ID parameter types (§74).
 
-**State.** EC2 `i-0559685f02c4013b1` on PostgreSQL 16.15, schema 17; server `b9687c1` (md5 `f48621b2…`);
-business API configured with a test token (`business.conf`); assertion keys and routes 1–3 on for the
-suite; both modes enforcing — to be returned to observe/observe and the owner's defaults when the
-session ends.
+**State.** EC2 `i-0559685f02c4013b1` stopped; PostgreSQL 16.15 at schema 17 (the three new tables
+granted to `dtadmin` as the migrations document); server `2c14c91` (md5 `3472bd6f…`); observe /
+observe, every setting at the owner's defaults, the assertion keys and the business-token drop-in
+removed (the business API answers 404); no server error since 10:40 UTC. The Huawei, OPPO and Vivo
+still run collector 2 and will read `legacy` until they get a build from `7f0bcb9` or later.
