@@ -2440,11 +2440,13 @@ class DeviceRecognitionController extends ChangeNotifier {
       final String token = await _freshDeviceToken();
       deviceToken = token;
       await _collectIntegrityWithToken(token, identity!);
-      accountSession = await _api.registerAccount(
-        deviceToken: token,
-        signingIdentity: identity!,
-        handle: handle,
-        password: password,
+      accountSession = await _onceMoreIfRelationshipChanged(
+        () => _api.registerAccount(
+          deviceToken: token,
+          signingIdentity: identity!,
+          handle: handle,
+          password: password,
+        ),
       );
       await _store.saveAccountSession(accountSession!);
       latestPolicy = accountSession?.policy;
@@ -2460,11 +2462,13 @@ class DeviceRecognitionController extends ChangeNotifier {
       final String token = await _freshDeviceToken();
       deviceToken = token;
       await _collectIntegrityWithToken(token, identity!);
-      accountSession = await _api.loginAccount(
-        deviceToken: token,
-        signingIdentity: identity!,
-        handle: handle,
-        password: password,
+      accountSession = await _onceMoreIfRelationshipChanged(
+        () => _api.loginAccount(
+          deviceToken: token,
+          signingIdentity: identity!,
+          handle: handle,
+          password: password,
+        ),
       );
       await _store.saveAccountSession(accountSession!);
       latestPolicy = accountSession?.policy;
@@ -2475,6 +2479,24 @@ class DeviceRecognitionController extends ChangeNotifier {
           ? 'Signed in with a LIMITED session'
           : 'Account authenticated on the recognized device';
     });
+  }
+
+  /// A sign-in decided while another sign-in linked the same phone or account
+  /// answers 409 relationship_changed and writes nothing (DESIGN.md 76). The
+  /// app asks once more, and the server decides on the new counts; a second
+  /// conflict is reported.
+  Future<AccountSession> _onceMoreIfRelationshipChanged(
+    Future<AccountSession> Function() signIn,
+  ) async {
+    try {
+      return await signIn();
+    } on ApiException catch (error) {
+      if (error.code != 'relationship_changed') {
+        rethrow;
+      }
+      debugPrint('SESSION: relationship changed during sign-in; asking again');
+      return signIn();
+    }
   }
 
   Future<void> refreshPolicy() {
