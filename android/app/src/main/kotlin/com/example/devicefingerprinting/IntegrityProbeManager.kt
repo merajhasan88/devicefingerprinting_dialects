@@ -32,7 +32,7 @@ class IntegrityProbeManager(private val context: Context) {
         //     exec_mappings, and the native code_integrity buckets. Every
         //     report carries this, so a stored report says which probe set
         //     produced it - see DESIGN.md 29.
-        private const val COLLECTOR_VERSION = 2
+        private const val COLLECTOR_VERSION = 3
         private const val MAX_TEXT = 8192
         // Every shell command is bounded (review, DESIGN.md 63): one hung
         // child used to block its probe, and the whole scan, indefinitely.
@@ -204,6 +204,14 @@ class IntegrityProbeManager(private val context: Context) {
         }
         return result
     }
+
+    // A probe that could not make its measurement says so, rather than
+    // reporting "ok" with nothing in it: unknown is not clean (review R4,
+    // DESIGN.md 76; evidence contract 3).
+    private fun unavailable(reason: String): Map<String, Any> = linkedMapOf(
+        "status" to "error",
+        "error" to reason
+    )
 
     private fun resultUnsupported(reason: String): Map<String, Any> = linkedMapOf(
         "status" to "unsupported",
@@ -380,9 +388,12 @@ class IntegrityProbeManager(private val context: Context) {
     private fun probeRuntimeMaps(): Map<String, Any> {
         val found = linkedSetOf<String>()
         var suspiciousLines = 0
+        var mapsLines = 0
         val file = File("/proc/self/maps")
-        if (file.canRead()) {
+        if (!file.canRead()) return unavailable("/proc/self/maps is not readable")
+        run {
             file.forEachLine { original ->
+                mapsLines++
                 val line = original.lowercase(Locale.US)
                 var lineMatched = false
                 for (token in suspiciousRuntimeTokens) {
@@ -394,9 +405,11 @@ class IntegrityProbeManager(private val context: Context) {
                 if (lineMatched) suspiciousLines++
             }
         }
+        if (mapsLines == 0) return unavailable("/proc/self/maps returned no lines")
         return ok(
             "suspicious_tokens" to found.toList(),
-            "suspicious_line_count" to suspiciousLines
+            "suspicious_line_count" to suspiciousLines,
+            "maps_lines" to mapsLines
         )
     }
 
@@ -506,6 +519,9 @@ class IntegrityProbeManager(private val context: Context) {
                 for (t in suspiciousRuntimeTokens) if (lower.contains(t)) tokenHits.add(t)
             }
         }
+        // A running process always has threads; none enumerated means the
+        // probe saw nothing, not that nothing is there.
+        if (count == 0) return unavailable("no thread of this process could be enumerated")
         return ok(
             "frida_threads" to fridaHits.toList(),
             "glib_threads" to glibHits.toList(),
@@ -542,9 +558,12 @@ class IntegrityProbeManager(private val context: Context) {
         var anonExecLabeled = 0
         var anonExecUnlabeled = 0
         val samples = mutableListOf<String>()
+        var mapsLines = 0
         val file = File("/proc/self/maps")
-        if (file.canRead()) {
+        if (!file.canRead()) return unavailable("/proc/self/maps is not readable")
+        run {
             file.forEachLine { line ->
+                mapsLines++
                 val parts = line.trim().split(Regex("\\s+"), limit = 6)
                 if (parts.size < 5) return@forEachLine
                 val perms = parts[1]
@@ -588,8 +607,10 @@ class IntegrityProbeManager(private val context: Context) {
                 }
             }
         }
+        if (mapsLines == 0) return unavailable("/proc/self/maps returned no lines")
         return ok(
             "wx_mappings" to wx,
+            "maps_lines" to mapsLines,
             "deleted_exec_mappings" to deletedExec,
             "deleted_exec_jit" to deletedExecJit,
             "deleted_exec_own_code" to deletedExecOwnCode,
