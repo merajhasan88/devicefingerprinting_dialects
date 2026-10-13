@@ -1731,6 +1731,21 @@ class DeviceApi {
     );
   }
 
+  /// Signs the session's refresh family out on the server (DESIGN.md 76): its
+  /// refresh token and every access token of the family stop working at once.
+  Future<Map<String, dynamic>> logout({
+    required String accessToken,
+    required InstallationIdentity signingIdentity,
+  }) {
+    return _protectedRequest(
+      'POST',
+      '/v1/auth/logout',
+      bearerToken: accessToken,
+      signingIdentity: signingIdentity,
+      body: <String, dynamic>{},
+    );
+  }
+
   Future<Map<String, dynamic>> refreshChallenge(String refreshToken) {
     return _request(
       'POST',
@@ -3817,12 +3832,38 @@ class DeviceRecognitionController extends ChangeNotifier {
     });
   }
 
+  /// Signs out on the server first, then drops the tokens on this phone.
+  /// Dropping them locally alone left a copied token, used with this phone's
+  /// key, valid until it expired (review R6, DESIGN.md 76). A server that
+  /// already does not know the session is fine; one that cannot be reached
+  /// is reported, and the tokens are dropped here anyway.
   Future<void> clearAccountSession() {
-    return _run('Clearing local account tokens…', () async {
+    return _run('Signing out…', () async {
+      final InstallationIdentity? currentIdentity = identity;
+      String outcome = 'Signed out';
+      if (accountSession != null && currentIdentity != null) {
+        try {
+          await _withAccessToken(
+            (String accessToken) => _api.logout(
+              accessToken: accessToken,
+              signingIdentity: currentIdentity,
+            ),
+          );
+        } on ApiException catch (error) {
+          if (error.statusCode != 401) {
+            outcome = 'Signed out on this phone; the server answered '
+                '${error.code ?? error.statusCode}';
+          }
+        } catch (error) {
+          outcome = 'Signed out on this phone; the server could not be '
+              'reached: $error';
+        }
+      }
       await _store.clearAccountSession();
       accountSession = null;
       latestPolicy = summary?.policy;
-      status = 'Local account tokens cleared';
+      status = outcome;
+      debugPrint('SESSION: sign-out: $outcome');
     });
   }
 
@@ -4346,7 +4387,7 @@ class _DeviceRecognitionPageState extends State<DeviceRecognitionPage> {
                           _controller.accountSession == null
                       ? null
                       : _controller.clearAccountSession,
-                  child: const Text('Clear local account tokens'),
+                  child: const Text('Sign out'),
                 ),
               ],
             ),
