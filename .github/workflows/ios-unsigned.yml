@@ -1,0 +1,71 @@
+# GitHub Actions - iOS unsigned build for the Device Trust client.
+#
+# A second route next to codemagic.yaml, added 2026-10-13 when Codemagic's
+# macOS queue stalled during an incident on their side. Same recipe, same
+# reasons (see codemagic.yaml):
+#
+#   * UNSIGNED. `flutter build ios --no-codesign`; the .ipa is pre-signed
+#     locally with tools/presign_trollstore_ipa.sh and installed through
+#     TrollStore, so no Apple account or certificate is involved.
+#   * MANUAL .ipa PACKAGING. `flutter build ipa` requires signing; an .ipa is
+#     a zip with the bundle under Payload/, so it is assembled here.
+#   * MANUAL TRIGGER ONLY (workflow_dispatch): Actions tab -> "iOS unsigned
+#     build" -> Run workflow. Pushes start nothing.
+#   * API_BASE_URL is the stable DuckDNS name, pinned in the repo so the commit
+#     history records which server a build talks to.
+#
+# The repository is public, so GitHub-hosted runners, macOS included, cost
+# nothing. Flutter comes from its own git repository rather than a
+# third-party setup action, and the workflow token is read-only.
+
+name: iOS unsigned build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ios-unsigned:
+    runs-on: macos-15
+    timeout-minutes: 45
+    env:
+      API_BASE_URL: "https://devicefingerprinting.duckdns.org"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Flutter (stable)
+        run: |
+          git clone --depth 1 --branch stable https://github.com/flutter/flutter.git "$HOME/flutter"
+          echo "$HOME/flutter/bin" >> "$GITHUB_PATH"
+
+      - name: Flutter version in use
+        run: flutter --version
+
+      - name: Fetch packages
+        run: flutter pub get
+
+      - name: Build iOS without code signing
+        run: |
+          flutter build ios --release --no-codesign \
+            --dart-define=API_BASE_URL="$API_BASE_URL"
+
+      - name: Package Runner.app into an unsigned .ipa
+        run: |
+          set -e
+          APP="build/ios/iphoneos/Runner.app"
+          test -d "$APP" || { echo "Runner.app not found at $APP"; exit 1; }
+          rm -rf build/ipa && mkdir -p build/ipa/Payload
+          cp -R "$APP" build/ipa/Payload/
+          cd build/ipa
+          zip -qry ../../devicetrust-unsigned.ipa Payload
+          cd ../..
+          ls -lh devicetrust-unsigned.ipa
+          shasum -a 256 devicetrust-unsigned.ipa
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: devicetrust-unsigned-ipa
+          path: devicetrust-unsigned.ipa
+          retention-days: 7
