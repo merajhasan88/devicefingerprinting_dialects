@@ -2014,8 +2014,33 @@ def check_upgrade_route_stepup(api, ctx):
            "route 1 without a step-up proof must be refused, got %s %s" % (st, error_code(up)))
     st, up = stepup_call(api, inst, stepup_priv, "POST", "/v1/auth/upgrade", limited,
                          {"route": "stepup"}, factor)
-    expect(st == 200 and up.get("scope") == "full" and up.get("upgraded_by") == "stepup",
-           "route 1 with a valid step-up proof must upgrade, got %s %s" % (st, up))
+    expect(st == 200 and up.get("scope") == "full" and up.get("upgraded_by") == "stepup"
+           and up.get("acceptance_id"),
+           "route 1 with a valid step-up proof must upgrade and name its acceptance, got %s %s"
+           % (st, up))
+    # DESIGN.md 76: the acceptance covers the reasons approved, nothing more.
+    acceptance, full = up["acceptance_id"], up["access_token"]
+    submit_report(api, inst, token, _elevate)
+    st, me = protected(api, inst, "GET", "/v1/account/me", full)
+    expect(st == 200 and (me.get("integrity") or {}).get("acceptance_id") == acceptance,
+           "the approved reasons must stay covered, got %s %s" % (st, error_code(me) or me))
+
+    def one_more_reason(probes):
+        _elevate(probes)
+        probes["app_identity"]["allow_backup"] = True  # android_backup_enabled +5: never approved
+
+    submit_report(api, inst, token, one_more_reason)
+    st, me = protected(api, inst, "GET", "/v1/account/me", full)
+    expect(st == 403 and error_code(me) == "integrity_step_up_required",
+           "a reason found after the approval must not be covered, got %s %s" % (st, error_code(me)))
+    business = os.environ.get("DEVICE_TRUST_BUSINESS_TOKEN", "")
+    if business:
+        st, feed = api.call("GET", "/v1/business/acceptance-lapses?limit=1000",
+                            headers={"Authorization": "Bearer " + business})
+        expect(st == 200 and any(l["acceptance_id"] == acceptance
+                                 and l["reason_code"] == "android_backup_enabled"
+                                 for l in feed.get("lapses", [])),
+               "the new reason must be recorded as a lapse: %s %s" % (st, feed))
 
 
 @check("limited session: route 2, approval from another installation of the account", db_sensitive=True)
