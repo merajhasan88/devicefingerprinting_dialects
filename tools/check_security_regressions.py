@@ -224,7 +224,9 @@ def stepup_headers(method, route, body, nonce, factor="passcode", signer=None,
     return {"X-Step-Up-Proof": raw, "X-Step-Up-Signature": (signer or step).sign_b64(raw)}
 
 
-def send_report(platform, probes, collector_version=2):
+def send_report(platform, probes, collector_version=None):
+    if collector_version is None:
+        collector_version = s._EVIDENCE_CONTRACT_VERSION.get(platform, 1)
     required = s._integrity_probe_plan(platform)
     nonce = os.urandom(32)
     db.report_row = (inst.installation_id, inst.device_id, platform, c.sha256_hex(nonce),
@@ -509,6 +511,8 @@ def one_changed_byte_is_detected():
                                                      "app_compared_bytes": 4096})
                 probes["code_integrity"].update({"checked": True, "app_diff_bytes": count,
                                                  "app_compared_bytes": 4096})
+                if "app_expected_bytes" in probes["code_integrity"]:  # contract-3 coverage
+                    probes["code_integrity"]["app_expected_bytes"] = 4096
                 status, payload = send_report(platform, probes)
                 expect(status == 200, "%s report failed: %s %s" % (platform, status, payload))
                 scores.append(payload["integrity"]["score"])
@@ -545,8 +549,8 @@ def code_coverage_is_reported_and_checked():
     probes = coverage(clean("android"))
     probes["code_integrity"]["app_expected_bytes"] = 8388608   # does not add up
     status, payload = send_report("android", probes)
-    expect(status == 200 and "integrity_probe_incomplete:code_integrity" in codes(payload),
-           "coverage that does not add up must be incomplete evidence, got %s" % payload)
+    expect(status == 200 and "integrity_evidence_invalid:code_integrity" in codes(payload),
+           "coverage that does not add up must be invalid evidence, got %s" % payload)
     probes = coverage(clean("android"))
     probes["code_integrity"]["protect_restore_failures"] = 1
     status, payload = send_report("android", probes)
@@ -2553,6 +2557,65 @@ def collection_problems_count_once_and_never_follow_the_device():
         lite_report(db_, tampered, found, 0, finding_score=0)
         refused, _, _ = memory_outcome(found, tampered)
         expect(refused, "a real finding must still follow the device after a clean scan")
+
+
+def v3(probes):
+    """A report under the Android evidence contract 3 (DESIGN.md 76)."""
+    for name in ("runtime_maps", "exec_mappings"):
+        if name in probes:
+            probes[name].setdefault("maps_lines", 412)
+    if "exec_mappings" in probes:
+        probes["exec_mappings"].setdefault("deleted_exec_own_code", 0)
+    if "code_integrity" in probes and "core_expected_bytes" not in probes["code_integrity"]:
+        coverage(probes)
+    return probes
+
+
+@check
+def weak_or_contradictory_evidence_is_never_complete():
+    """Review R4 (DESIGN.md 76, owner decision 2026-10-13). Evidence that cannot
+    all be true is invalid (+30, labelled invalid), not clean; a measurement
+    the collector could not make is incomplete; a wrongly typed field is a
+    malformed report (400); a collector below its platform's evidence
+    contract is labelled legacy, never complete."""
+    def send(probes, version=3):
+        status, payload = send_report("android", probes, collector_version=version)
+        return status, (payload or {}).get("integrity") or (payload or {}).get("error") or {}
+
+    status, decision = send(v3(clean("android")))
+    expect(status == 200 and decision.get("evidence_quality") == "complete"
+           and decision.get("score") == 0, "control: a v3 clean scan is complete: %s" % decision)
+    status, decision = send(clean("android"), version=2)
+    expect(status == 200 and decision.get("evidence_quality") == "legacy"
+           and decision.get("score") == 0, "a v2 clean scan is legacy, not complete: %s" % decision)
+    for label, mutate, quality in (
+            ("zero W+X mappings with a size listed",
+             lambda p: p["exec_mappings"].update(wx_mappings=0, wx_bytes=0, wx_size_classes="4096:1"),
+             "invalid"),
+            ("coverage figures that do not add up",
+             lambda p: p["code_integrity"].update(app_expected_bytes=8388608), "invalid"),
+            ("no thread enumerated", lambda p: p["instrumentation_threads"].update(thread_count=0),
+             "incomplete"),
+            ("an unreadable process map", lambda p: p["runtime_maps"].update(maps_lines=0),
+             "incomplete"),
+            ("coverage totals omitted under contract 3",
+             lambda p: [p["code_integrity"].pop("%s_expected_bytes" % b) for b in ("core", "ext", "app")],
+             "incomplete")):
+        probes = v3(clean("android"))
+        probes.setdefault("instrumentation_threads",
+                          c.clean_probes(["instrumentation_threads"])["instrumentation_threads"])
+        probes.setdefault("exec_mappings", v3(c.clean_probes(["exec_mappings"]))["exec_mappings"])
+        mutate(probes)
+        status, decision = send(probes)
+        expect(status == 200 and decision.get("evidence_quality") == quality
+               and decision.get("verdict") != "trusted" and decision.get("finding_score") == 0,
+               "%s must be %s, never trusted: %s %s" % (label, quality, status, decision))
+    probes = v3(clean("android"))
+    probes.setdefault("exec_mappings", v3(c.clean_probes(["exec_mappings"]))["exec_mappings"])
+    probes["exec_mappings"]["deleted_exec_own_code"] = "1"
+    status, error = send(probes)
+    expect(status == 400 and error.get("code") == "invalid_integrity_probe",
+           "a wrongly typed own-code count must be malformed, not ignored: %s %s" % (status, error))
 
 
 def main():

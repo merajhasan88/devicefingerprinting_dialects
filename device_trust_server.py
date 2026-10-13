@@ -1961,7 +1961,12 @@ _PROBE_REQUIRED_FIELDS = {
 _PROBE_OPTIONAL_FIELDS = {
     "android": {
         "exec_mappings": {"wx_bytes": int, "wx_size_classes": str,
-                          "wx_smallest_bytes": int, "wx_largest_bytes": int},
+                          "wx_smallest_bytes": int, "wx_largest_bytes": int,
+                          "deleted_exec_own_code": int, "deleted_exec_jit": int,
+                          "anon_exec_labeled": int, "anon_exec_unlabeled": int,
+                          "maps_lines": int, "samples": list},
+        "runtime_maps": {"maps_lines": int, "suspicious_line_count": int},
+        "instrumentation_threads": {"thread_count": int},
         # Coverage, reported by the native scanner since DESIGN.md 63.
         "code_integrity": dict(
             [("%s_%s" % (bucket, field), int)
@@ -2058,12 +2063,64 @@ def _check_probe_evidence(platform, probes, required_probes):
                 for bucket in _MUST_MEASURE_BUCKETS.get(platform, ())
                 if value.get("%s_compared_bytes" % bucket) == 0
             ]
-        if (name == "code_integrity" and platform == "android" and not missing
-                and not _code_coverage_consistent(value)):
-            missing = ["coverage figures that add up"]
         if missing:
             incomplete.append((name, missing))
     return incomplete
+
+
+# The evidence contract each platform's current collector meets (DESIGN.md 76,
+# review R4). A report from an older collector is scored as before but
+# labelled legacy, never complete; a report at or above the contract must
+# carry these fields wherever the probe answered ok.
+_EVIDENCE_CONTRACT_VERSION = {"android": 3, "ios": 2}
+_CONTRACT_FIELDS = {
+    "android": {
+        "runtime_maps": ("maps_lines",),
+        "exec_mappings": ("maps_lines", "deleted_exec_own_code"),
+        "instrumentation_threads": ("thread_count",),
+    },
+}
+
+
+def _check_probe_consistency(platform, probes, required_probes, collector_version):
+    """Find evidence that cannot be true, and measurements that were not made.
+
+    Returns (invalid, incomplete): [(probe, detail)] and [(probe, [missing])].
+    Run before scoring, because the scorers take fast paths on zeros -- zero
+    writable-executable mappings returned clean before the sizes listed for
+    them were ever read (review R4). Unknown or unreadable data must stay
+    distinguishable from a measured negative: a collector that could not read
+    the process map, or enumerated no thread of a running process, measured
+    nothing, whatever "ok" it reported.
+    """
+    invalid, incomplete = [], []
+    current = collector_version >= _EVIDENCE_CONTRACT_VERSION.get(platform, 0)
+    contract = _CONTRACT_FIELDS.get(platform, {}) if current else {}
+    for name in required_probes:
+        value = probes.get(name)
+        if not isinstance(value, dict) or value.get("status") != "ok":
+            continue
+        missing = [f for f in contract.get(name, ()) if value.get(f) is None]
+        if (name == "code_integrity" and platform == "android" and current
+                and value.get("checked") is True):
+            missing += ["%s_expected_bytes" % bucket for bucket in _CODE_BUCKETS
+                        if value.get("%s_expected_bytes" % bucket) is None]
+        if name in ("runtime_maps", "exec_mappings") and value.get("maps_lines") == 0:
+            missing.append("a readable process map (maps_lines 0)")
+        if name == "instrumentation_threads" and value.get("thread_count") == 0:
+            missing.append("an enumerated thread (thread_count 0)")
+        if missing:
+            incomplete.append((name, missing))
+        if name == "exec_mappings":
+            listed = _wx_size_classes(value)
+            extremes = _as_int(value.get("wx_smallest_bytes")) or _as_int(value.get("wx_largest_bytes"))
+            if (_as_int(value.get("wx_mappings")) == 0 and not _as_int(value.get("wx_bytes"))
+                    and (listed or extremes)):
+                invalid.append((name, "zero writable-executable mappings, but their sizes listed"))
+        if (name == "code_integrity" and platform == "android"
+                and not _code_coverage_consistent(value)):
+            invalid.append((name, "coverage figures that do not add up"))
+    return invalid, incomplete
 
 
 def _integrity_verdict(score, hard_block=False):
@@ -2094,7 +2151,7 @@ def _is_quality_reason(reason):
     return str(reason.get("code", "")).startswith(_QUALITY_REASON_PREFIXES)
 
 
-def _apply_collection_problems(scored, failed_required, incomplete, invalid=()):
+def _apply_collection_problems(scored, failed_required, incomplete, invalid=(), legacy=False):
     """Score what the scan could not measure apart from what it found.
 
     A probe that failed, answered "ok" without its measurements, or reported
@@ -2107,6 +2164,11 @@ def _apply_collection_problems(scored, failed_required, incomplete, invalid=()):
     what the device memory remembers; a complete scan clears the rest. Owner
     decision of 2026-10-13. collection_problems_block = 1 restores the earlier
     rule in one place: each problem +30, counted as a finding.
+
+    evidence_quality, worst first: invalid (figures that contradict each
+    other), incomplete (failed or unmeasured), legacy (a collector below its
+    platform's evidence contract), partial (code compared only in part, an
+    advisory the owner kept), complete.
 
     Sets score, verdict, evidence_quality and finding_score on scored.
     """
@@ -2146,6 +2208,8 @@ def _apply_collection_problems(scored, failed_required, incomplete, invalid=()):
         quality = "invalid"
     elif problems:
         quality = "incomplete"
+    elif legacy:
+        quality = "legacy"
     elif codes & set(_PARTIAL_EVIDENCE_REASONS):
         quality = "partial"
     else:
@@ -5522,6 +5586,12 @@ def integrity_report():
         if report.get("challenge_nonce") != challenge_nonce_text:
             raise ApiProblem("Integrity nonce encoding mismatch.", 400, "integrity_nonce_mismatch")
         incomplete = _check_probe_evidence(platform, probes, required_probes)
+        invalid, unmeasured = _check_probe_consistency(
+            platform, probes, required_probes, collector_version
+        )
+        incomplete = incomplete + [
+            item for item in unmeasured if item[0] not in {n for n, _ in incomplete}
+        ]
 
         _verify_installation_signature(
             key_algorithm,
@@ -5538,7 +5608,13 @@ def integrity_report():
                 failed_required.append(probe_name)
 
         _apply_hardware_backing_policy(cursor, installation_id, scored)
-        _apply_collection_problems(scored, failed_required, incomplete)
+        _apply_collection_problems(
+            scored,
+            failed_required,
+            incomplete,
+            invalid,
+            legacy=collector_version < _EVIDENCE_CONTRACT_VERSION.get(platform, 0),
+        )
         cursor.execute(
             "UPDATE integrity_challenges SET used_at = NOW() WHERE challenge_id = %s",
             (challenge_id,),

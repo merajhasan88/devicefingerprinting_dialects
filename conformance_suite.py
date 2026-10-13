@@ -801,7 +801,8 @@ def clean_probes(required, cert=None, platform="android"):
                 "ro.boot.veritymode": "enforcing",
             },
         },
-        "runtime_maps": {"status": "ok", "suspicious_tokens": [], "suspicious_line_count": 0},
+        "runtime_maps": {"status": "ok", "suspicious_tokens": [], "suspicious_line_count": 0,
+                         "maps_lines": 412},
         "tracer": {"status": "ok", "tracer_pid": 0, "seccomp": 2, "no_new_privs": 1},
         "root_shell": {"status": "ok", "su_path": "", "su_found": False},
         "selinux": {
@@ -826,6 +827,8 @@ def clean_probes(required, cert=None, platform="android"):
             "deleted_exec_jit": 1,
             "anon_exec_labeled": 1,
             "anon_exec_unlabeled": 0,
+            "deleted_exec_own_code": 0,
+            "maps_lines": 412,
             "samples": [],
         },
         "code_integrity": {
@@ -841,6 +844,20 @@ def clean_probes(required, cert=None, platform="android"):
             "app_diff_bytes": 0,
             "app_libs_diff": 0,
             "diffed_libs": "",
+            # Coverage, required by the Android evidence contract 3 (DESIGN.md 76).
+            "core_expected_bytes": 614400,
+            "core_skipped_bytes": 0,
+            "core_unreadable_bytes": 0,
+            "core_complete": True,
+            "ext_expected_bytes": 2097152,
+            "ext_skipped_bytes": 0,
+            "ext_unreadable_bytes": 0,
+            "ext_complete": True,
+            "app_expected_bytes": 4194304,
+            "app_skipped_bytes": 0,
+            "app_unreadable_bytes": 0,
+            "app_complete": True,
+            "protect_restore_failures": 0,
         },
         "emulator": {"status": "ok", "suspected": False},
         "developer_settings": {
@@ -869,7 +886,9 @@ def submit_report(api, installation, token, mutate=None, cert=None):
         "challenge_nonce": challenge["nonce"],
         "installation_id": installation.installation_id,
         "platform": challenge["platform"],
-        "collector_version": 1,
+        # The current collectors: Android meets evidence contract 3, iOS 2
+        # (DESIGN.md 76); an older version is scored but labelled legacy.
+        "collector_version": {"android": 3, "ios": 2}.get(challenge["platform"], 1),
         "collected_at": int(time.time()),
         "probe_results": probes,
         "version": 1,
