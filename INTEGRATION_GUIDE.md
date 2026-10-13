@@ -526,8 +526,9 @@ and the component its 30-day totals per type.
 
 **`GET /v1/business/acceptance-lapses?since=<ISO time>&limit=<n>`**: when an approved session met a
 reason its approval did not cover, oldest first — `acceptance_id`, `account_id`, `installation_id`,
-`reason_code`, `source`, `points`, `event_type`, `occurred_at`. Page with `next_since`; the key is
-`(acceptance_id, reason_code)`.
+`reason_code`, `source`, `points`, `event_type`, `occurred_at`. `since` is exclusive; then page with
+`?cursor=<next_cursor>`, which carries the last row's time and key, so rows sharing one instant at a
+page edge are never skipped. Each `(acceptance_id, reason_code)` appears once.
 
 **In every decision.** With the business API configured, each risk decision's `context` carries
 `business_events_30d`: this account's counts by type, and those of every account on this phone.
@@ -538,4 +539,5 @@ across a phone's accounts adds points" — are yours to run, in your engine, fro
 decision context; the server can apply such rules too, but only if you decide it should.
 
 **Database.** Migration 017 adds `business_events`: grant `SELECT, INSERT`, never `UPDATE` or
-`DELETE`.
+`DELETE`. The server serves only at its schema version (17): a database without 017 answers 503
+`schema_version_mismatch` everywhere but `/health`, so no decision ever reads a missing table.

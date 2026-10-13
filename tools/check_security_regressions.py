@@ -3045,22 +3045,37 @@ def the_business_graph_combines_links_and_events():
 @check
 def acceptance_lapses_are_read_in_order():
     """DESIGN.md 76: the business reads when an approved session met a new
-    reason, oldest first, paging with next_since."""
+    reason, oldest first, paging with next_cursor -- which carries the last
+    row's time and key, so rows sharing one instant at a page edge are never
+    skipped; since= is exclusive."""
     with business_store() as conn:
         base = s._utc_now() - timedelta(hours=3)
-        for minutes, code in ((10, "android_process_traced"), (20, "request_rate_anomaly"),
-                              (30, "android_root_artifact")):
+        tie = base + timedelta(minutes=20)
+        acc_a, acc_b = "11111111-1111-1111-1111-111111111111", "22222222-2222-2222-2222-222222222222"
+        for when, acc, code in ((base + timedelta(minutes=10), acc_a, "android_process_traced"),
+                                (tie, acc_a, "request_rate_anomaly"),
+                                (tie, acc_b, "android_root_artifact"),
+                                (base + timedelta(minutes=30), acc_b, "new_device")):
             conn.execute("INSERT INTO acceptance_lapses VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                         ("acc-1", code, "integrity", 50, "acct", "inst", "refresh",
-                          base + timedelta(minutes=minutes)))
-        status, page = business_call("GET", "/v1/business/acceptance-lapses", query={"limit": "2"})
-        codes_ = [l["reason_code"] for l in page.get("lapses", [])]
-        expect(status == 200 and codes_ == ["android_process_traced", "request_rate_anomaly"],
-               "the first page, oldest first: %s %s" % (status, page))
+                         (acc, code, "integrity", 50, "acct", "inst", "refresh", when))
+        seen, cursor_ = [], None
+        for _ in range(5):
+            query = {"limit": "2"}
+            if cursor_:
+                query["cursor"] = cursor_
+            status, page = business_call("GET", "/v1/business/acceptance-lapses", query=query)
+            expect(status == 200, "lapse page failed: %s %s" % (status, page))
+            if not page["lapses"]:
+                break
+            seen += [l["reason_code"] for l in page["lapses"]]
+            cursor_ = page["next_cursor"]
+        expect(seen == ["android_process_traced", "request_rate_anomaly", "android_root_artifact",
+                        "new_device"],
+               "every lapse once, oldest first, ties kept across the page edge: %s" % seen)
         status, page = business_call("GET", "/v1/business/acceptance-lapses",
-                                     query={"since": page["next_since"]})
-        expect([l["reason_code"] for l in page["lapses"]] == ["android_root_artifact"],
-               "the next page continues after next_since: %s" % page)
+                                     query={"since": s._iso_z(tie)})
+        expect([l["reason_code"] for l in page["lapses"]] == ["new_device"],
+               "since= is exclusive: %s" % page)
 
 
 def main():

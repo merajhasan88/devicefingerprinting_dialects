@@ -7730,15 +7730,26 @@ def business_graph():
 @app.get("/v1/business/acceptance-lapses")
 def business_acceptance_lapses():
     """When an approved session met a reason its approval did not cover, and
-    which (DESIGN.md 76) -- oldest first, after ?since=<ISO time>. A row
-    appears once per acceptance and reason; page with next_since and keep
-    (acceptance_id, reason_code) as the key."""
+    which (DESIGN.md 76) -- oldest first, after ?since=<ISO time>, then page
+    with ?cursor=<next_cursor>. A row appears once per acceptance and reason;
+    (acceptance_id, reason_code) is its key. The cursor carries the last row's
+    time and key, so rows sharing a timestamp at a page edge are not skipped."""
     _require_business_caller()
-    since_text = request.args.get("since")
-    since = (
-        _parse_business_time(since_text, 0, "since") if since_text
-        else datetime(1970, 1, 1, tzinfo=timezone.utc)
-    )
+    # Without a cursor nothing at the "since" instant itself is returned: the
+    # highest possible key makes the tie branch empty, on both engines.
+    after_acceptance, after_reason = "ffffffff-ffff-ffff-ffff-ffffffffffff", ""
+    cursor_text = request.args.get("cursor")
+    if cursor_text:
+        parts = cursor_text.split("|")
+        if len(parts) != 3:
+            raise ApiProblem("cursor is not one this server issued.", 400, "invalid_cursor")
+        since = _parse_business_time(parts[0], 0, "cursor")
+        after_acceptance = _uuid_text(parts[1], "cursor")
+        after_reason = parts[2][:96]
+    elif request.args.get("since"):
+        since = _parse_business_time(request.args.get("since"), 0, "since")
+    else:
+        since = datetime(1970, 1, 1, tzinfo=timezone.utc)
     try:
         limit = min(1000, max(1, int(request.args.get("limit", "100"))))
     except ValueError:
@@ -7750,9 +7761,12 @@ def business_acceptance_lapses():
                    installation_id, event_type, occurred_at
             FROM acceptance_lapses
             WHERE occurred_at > %s
+               OR (occurred_at = %s
+                   AND (acceptance_id > %s
+                        OR (acceptance_id = %s AND reason_code > %s)))
             ORDER BY occurred_at, acceptance_id, reason_code
             LIMIT """ + str(limit),
-            (since,),
+            (since, since, after_acceptance, after_acceptance, after_reason),
         )
         rows = cursor.fetchall() or []
     lapses = [
@@ -7761,8 +7775,12 @@ def business_acceptance_lapses():
          "occurred_at": _iso_z(r[7])}
         for r in rows
     ]
-    return jsonify({"lapses": lapses,
-                    "next_since": lapses[-1]["occurred_at"] if lapses else since_text})
+    last = lapses[-1] if lapses else None
+    return jsonify({
+        "lapses": lapses,
+        "next_cursor": ("%s|%s|%s" % (last["occurred_at"], last["acceptance_id"],
+                                      last["reason_code"])) if last else cursor_text,
+    })
 
 
 if __name__ == "__main__":
