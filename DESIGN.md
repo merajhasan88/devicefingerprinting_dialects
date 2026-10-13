@@ -6052,6 +6052,11 @@ advisory — **PASS**. Android only; iOS has no such probe.
 **State.** EC2 `i-0559685f02c4013b1` stopped. Server `/opt/device_trust_server.py` = `4a6f75e` (md5
 `e41be8d7…`; backups `.bak-20261012-193947`, `.bak-20261012-195334`); schema 14; observe / observe; owner
 defaults on PostgreSQL. The Huawei carries the `4a6f75e` release build and no saved session; the Vivo
-the `0644eaf` build. Open: rotate the `dtadmin` test password (it was printed once on 2026-10-12); the
-iPhone round (the Codemagic build was cancelled); the .NET handoff note (the `superseded` state, 409
-`approval_superseded`, migration 014, `deleted_exec_own_code`, the `nvarchar`-vs-`char(36)` finding).
+the `0644eaf` build.
+
+**Afterwards, the same night.** The `dtadmin` test password was rotated (the old one had been printed
+once in a session). It now lives only in the root-only `/etc/devicetrust.env`: the inline copy in the
+`test.conf` drop-in, visible to any local user through `systemctl show`, was removed, and every
+`test.conf.bak-*` was scrubbed; `/health/ready` answered `ready` on the new password; EC2 stopped again.
+The .NET handoff gained §14–§17. Open: the iPhone round (Codemagic's macOS queue was stalled by an
+incident on their side; the build was cancelled); the Python dialect's ID parameter types (§74).

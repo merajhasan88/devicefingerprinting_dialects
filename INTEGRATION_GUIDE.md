@@ -344,8 +344,11 @@ clean.
   requests with `GET /v1/auth/approvals` and calls `POST /v1/auth/approvals/<request_id>/approve` with a
   step-up proof — or `/deny`. The limited session then sends `{"route": "approval", "request_id": ...}`;
   until the approval exists it answers 403 `approval_not_granted` with `details.state` (`pending`,
-  `denied`, `expired`, `used`), so poll no faster than every five seconds (with rate limiting on, a
-  faster poller gets 429 `rate_limited`). Requests expire after
+  `denied`, `expired`, `used`, `superseded`), so poll no faster than every five seconds (with rate
+  limiting on, a faster poller gets 429 `rate_limited`). When the same installation asks again for the
+  same account, its earlier pending requests are superseded: the approving phone lists one request per
+  phone, approving or denying a superseded one answers 409 `approval_superseded`, and the old request
+  reads `superseded` (stop waiting on it). Requests expire after
   `upgrade_request_ttl_seconds` (300) and are budgeted per account, `upgrade_approvals_per_hour` (3,
   then 429 `upgrade_budget_exhausted`); with no other full session to approve from, the request answers
   409 `no_approving_device`.

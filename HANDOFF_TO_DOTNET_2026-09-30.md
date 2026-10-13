@@ -266,3 +266,85 @@ DESIGN.md §72, **schema 13** (migration 013). Server only; nothing changes in o
 - A first sign-in under relationship risk that would make the phone's third account or the account's
   third device is refused (403 `risk_review_required` / `risk_policy_blocked`), never limited.
 
+## 14. Added 2026-10-13 — limited sessions on a phone: what the reference client does
+
+The Dart reference client now implements §11 and has been run on the Huawei (Android 10), the OPPO
+(Android 9) and the Vivo (Android 12), against PostgreSQL and SQL Server (DESIGN.md §73–§75). These are
+the client behaviours your SDK needs before a customer turns enforce mode on:
+
+- **Wait for an approval by itself** (`f264b36`). After `POST /v1/auth/upgrade/request`
+  `{"route": "approval"}`, send `POST /v1/auth/upgrade` `{"route": "approval", "request_id": ...}` every
+  5 s — never faster — until it returns the full token pair, or `approval_not_granted` with a terminal
+  `details.state` (`denied`, `expired`, `used`, `unknown`, `superseded`); stop at the request's
+  `expires_at`. On `integrity_scan_required`, scan again and carry on.
+- **`stepup_key_other_account`** (`8a85ea9`). On approve, this means the phone's step-up key was
+  re-enrolled by another account on the phone (DESIGN.md §58) and cannot sign for the signed-in one: stop
+  offering Approve and offer re-enrolment with this account's password. A key bound at registration
+  (no account) serves every account on the phone.
+- **The approvals list** (`ab04822`). After approve or deny — whatever the answer — fetch the list again;
+  drop a request locally once its `expires_at` has passed; never ask for the screen lock for a request
+  that is no longer open. (The Vivo asked for its PIN for a lapsed request and then got 404.)
+- **Access-token renewal** (`ab04822`). Access tokens live ten minutes. Before a call that will ask for
+  the screen lock, renew with a bound refresh if the token expires within 30 s (read `exp` for timing
+  only); on 401 `expired_token`, renew once and retry. (The Huawei's approvals list answered
+  `expired_token` after ten idle minutes.)
+- **A saved session at start** (`ea00d0d`). Refresh it once before showing anything from it. On a 401
+  (`unknown_refresh_session`, `refresh_session_expired`, `refresh_binding_mismatch`, `invalid_token`,
+  `expired_token`) discard it and the risk decision stored with it; on anything else (network, 5xx, 403
+  `risk_policy_blocked`) keep it. After a server-side reset the app had shown the old server's decision
+  as current. Each app start then costs one refresh and one risk evaluation.
+- **The approver is judged too.** Approving runs a relationship evaluation (`approval_grant`) on the
+  approving phone. Under the owner's defaults, a phone first seen today with two accounts, approving the
+  account's second device, scores 80 and gets 403 `risk_review_required` (seen on the Vivo). Show the
+  code; it is policy, not a fault.
+
+Still open from earlier sections: §10's full-session profiling in the `baseline` command, and §11's
+client work, which the points above complete.
+
+## 15. Added 2026-10-13 — a newer approval request replaces the same phone's pending ones
+
+DESIGN.md §75, `c6a79c2`, **schema 14** (migration 014, `session_upgrade_requests.superseded_at`). Server,
+with a small client change:
+
+- `POST /v1/auth/upgrade/request` may return `"superseded": <n>`, the number of this installation's
+  pending requests for the account that it replaced.
+- The approving phone's `GET /v1/auth/approvals` lists one request per requesting phone. Approving or
+  denying a replaced request answers **409 `approval_superseded`**: refresh the list and offer the newer
+  one.
+- `approval_not_granted` gains `details.state` = **`superseded`**, a terminal state: stop waiting; the
+  newer request is the live one.
+- Unchanged: the per-account budget counts every request raised; another phone's or another account's
+  requests are never touched; an approval granted before the phone asked again stays usable once.
+- The reference suite has 73 checks (new: `check_upgrade_request_supersedes`).
+
+## 16. Added 2026-10-13 — the app's own recompiled code (one collector change requested)
+
+DESIGN.md §75, `4a6f75e`. A false positive found on the Huawei: Android recompiles an app in the
+background after an install or update, and the running process keeps the replaced
+`…/oat/<isa>/base.odex` mapped as executable and `(deleted)`. That scored `android_deleted_code_mapping`
++55 (elevated) until the app restarted, and a new account was refused.
+
+- **Requested** in `AndroidIntegrityCollector.ProbeExecMappings`: count a deleted, non-JIT executable
+  mapping as **`deleted_exec_own_code`** (a new field) when its path, without ` (deleted)`, starts with
+  `<parent folder of ApplicationInfo.SourceDir>/oat/` and ends in `.odex`, `.vdex`, `.art` or `.oat`.
+  Everything else stays in `deleted_exec_mappings`. Do not exempt `base.apk` or anything outside `oat/`.
+  The method is static today, so it needs the source folder passed in.
+- The server records `deleted_exec_own_code` as `android_app_code_recompiled` at 0 points. Until your
+  collector sends the field, the same event keeps scoring +55. The server cannot classify from
+  `samples`: they are cut at 160 characters, which drops the ` (deleted)` suffix and can cut the path.
+- To reproduce: `adb shell cmd package compile -m speed -f <package>` while the app is running, then
+  scan.
+
+## 17. Added 2026-10-13 — SQL Server notes (no protocol change)
+
+- The server code since §8 has run on SQL Server 2022 Express on RDS, with the same suite results as on
+  PostgreSQL (DESIGN.md §74).
+- **Finding, not yet fixed in the Python dialect.** The schema's IDs are `char(36) COLLATE
+  Latin1_General_BIN2`. A Unicode parameter (pyodbc `str`; SqlClient `string` with `AddWithValue`) makes
+  SQL Server convert the column side, so an index lookup becomes a dynamic seek plus a sort that needs a
+  memory grant. If you ever write a .NET data layer for this schema, declare ID parameters as
+  `SqlDbType.Char` or `VarChar` with length 36 (Dapper: `DbString { IsAnsi = true, Length = 36 }`; EF
+  Core: `IsUnicode(false)` and `HasColumnType("char(36)")`).
+- Test-stack sizing: on db.t3.micro SQL Server got 3 MB of query workspace; Amazon's own consistency
+  checks held the grant queue and statements timed out (`HYT00` after `DB_QUERY_TIMEOUT`, 15 s). Use
+  db.t3.small (2 GB) or larger for SQL Server tests.
