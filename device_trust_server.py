@@ -7707,7 +7707,8 @@ def business_graph():
         devices = [_business_device_node(cursor, node_id)
                    for kind, node_id in seen if kind == "device"]
     for device in devices:
-        memory = _device_integrity_memory(device["device_id"], "")
+        # No calling installation: only the device's established ones count.
+        memory = _device_integrity_memory(device["device_id"], None)
         device["integrity_memory_block"] = bool(memory and memory.get("finding_verdict") == "block")
     component = {}
     for account in accounts:
