@@ -348,3 +348,43 @@ background after an install or update, and the running process keeps the replace
 - Test-stack sizing: on db.t3.micro SQL Server got 3 MB of query workspace; Amazon's own consistency
   checks held the grant queue and statements timed out (`HYT00` after `DB_QUERY_TIMEOUT`, 15 s). Use
   db.t3.small (2 GB) or larger for SQL Server tests.
+
+## 18. Added 2026-10-13 — the critical review: what the SDK must do
+
+DESIGN.md §76, schema **17** (migrations 015–017). The server side is done and green on PostgreSQL
+(suite 72/0/4 with integrity enforce and routes 1–3; 61/0/15 observe); SQL Server pending. For the SDK:
+
+- **Sign out on the server.** `POST /v1/auth/logout` (access token + access proof, body `{}`) before
+  dropping tokens; it revokes the family and its acceptances. Afterwards every access token of the
+  family answers **401 `session_revoked`** — treat it like an unknown session (discard, sign in).
+- **409 `relationship_changed`** at login or registration: another sign-in linked the same phone or
+  account meanwhile and nothing was written; ask once more.
+- **Approvals accept exactly what was approved.** The upgrade response adds `acceptance_id`. Handle
+  **403 `complete_scan_required`** (at request or upgrade: the cause is collection problems only —
+  scan again, and the session upgrades by itself) and **409 `upgrade_scope_changed`** (something new
+  since the request — ask again). The approvals listing adds `limited_causes` and `reasons`
+  (`code`, `points`, `message`, `source`): show them to the approving user; approving accepts exactly
+  those. A route-3 request returns the same `reasons` for your backend to show.
+- **Evidence contract 3 for your Android collector** (the server labels lower versions `legacy`:
+  scored as before, never `complete`, refused on `complete_evidence_paths`):
+  - send `collector_version` 3 once the following hold;
+  - `runtime_maps` and `exec_mappings` carry `maps_lines` (lines read) and answer `status: error`
+    when `/proc/self/maps` cannot be read or returns nothing — never `ok` with empty lists;
+  - `instrumentation_threads` answers `status: error` when no thread could be enumerated;
+  - `exec_mappings` carries `deleted_exec_own_code` (§16 above) as an integer — the field is typed
+    now: a string makes the report malformed (400);
+  - `code_integrity` with `checked: true` carries `<bucket>_expected_bytes` for core, ext and app;
+  - figures must agree: zero `wx_mappings` with sizes listed, or coverage that does not add up, is
+    `invalid` (+30).
+- **Evidence quality** is in every report response and integrity state: `complete`, `partial`,
+  `legacy`, `incomplete`, `invalid`; `finding_score` is the score without collection problems.
+  Collection problems now add +30 once (`integrity_evidence_incomplete`), never per probe.
+- **Sensitive operations.** On the DBA's `complete_evidence_paths` the server answers **403
+  `integrity_complete_evidence_required`** unless the latest scan is `complete` and fresh: scan right
+  before such an operation.
+- **The business API is not the SDK's.** `/v1/business/*` is server to server, called by the
+  customer's backend with its own bearer token.
+
+The reference suite has **76** checks (new: logout, parallel sign-ins, business API, the contract-3
+fixture — its "elevated" fixture is now test-keys + no boot state, since a failed probe can no longer be
+approved); the offline gate **72**.

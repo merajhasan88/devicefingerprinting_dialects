@@ -99,7 +99,7 @@ may change — never hard-code a policy value.
 ## Commands
 
 ```bash
-# Conformance suite — the gate. 72 checks; needs `cryptography` (harness only).
+# Conformance suite — the gate. 76 checks; needs `cryptography` (harness only).
 python3 conformance_suite.py --base-url https://<endpoint>
 #   Scoring checks need the server started with INTEGRITY_ANDROID_CERT_SHA256 set to the
 #   certificate the suite prints, or empty to disable the allow-list.
@@ -110,13 +110,14 @@ python3 conformance_suite.py --base-url https://<endpoint>
 #   check_parallel_clients (4 concurrent flows) must pass on any new backend BEFORE handset
 #   or paid-database time is spent on it.
 
-# Offline security regression gate (review F1-F10, DESIGN.md 63): no database needed
+# Offline security regression gate (72 checks; DESIGN.md 63, 76): no database needed
 python3 tools/check_security_regressions.py
 # Native scanner on the host (from a scratch dir; clang++ or g++)
 clang++ -std=c++17 -O1 -Wall -Wextra -Itools/native -Iandroid/app/src/main/cpp \
     tools/native/check_code_integrity.cpp -o check_code_integrity && ./check_code_integrity
-# Live first-link race on a real engine (server env; --compare an older server file)
+# Live races on a real engine (server env; --compare an older server file)
 python3 tools/race_first_link.py
+python3 tools/race_admission.py   # review R2: parallel sign-ins cannot exceed the counts
 
 # Server syntax gate
 python3 -c "import ast,io; ast.parse(io.open('device_trust_server.py',encoding='utf-8').read(), feature_version=(3,9)); print('3.9 OK')"
@@ -136,7 +137,9 @@ not jailbroken). The emulator AVD `integrity_root_lab` is the disposable root la
 
 ## Current point of work
 
-See the end of DESIGN.md: sections 66–72 record the 2026-10-05 joint review, the declined attestation
+See the end of DESIGN.md: section 76 records the critical review of 2026-10-13 and what was built from
+it (sign-out and family checks, admission under locks, evidence quality, scoped acceptances, the
+business API; schema 17); sections 73–75 the handset rounds and SQL Server; sections 66–72 record the 2026-10-05 joint review, the declined attestation
 proposal, the limited-session design (67) and its implementation (70, 72), R4 (68), R1 (69) and
 the DBA-tunable bands (71), each with its state;
 section 64 is an open question for the reviewer (the .NET W^X allowance); section 63 records the
