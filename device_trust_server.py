@@ -4012,6 +4012,20 @@ def _bearer_token_from_request():
     return token
 
 
+def _family_active(cursor, family_id):
+    """Whether this refresh family still holds a current session."""
+    if not isinstance(family_id, str) or not family_id:
+        return False
+    cursor.execute(
+        """
+        SELECT COUNT(*) FROM refresh_sessions
+        WHERE family_id = %s AND revoked_at IS NULL AND expires_at > %s
+        """,
+        (family_id, _utc_now()),
+    )
+    return int(cursor.fetchone()[0]) > 0
+
+
 def _require_access_proof(required_role="account"):
     """Verify a one-request proof of possession for the current access token.
 
@@ -4229,6 +4243,16 @@ def _require_access_proof(required_role="account"):
         _claim_nonce_redis(nonce_hash, installation_id)
 
     with _cursor(commit=True) as cursor:
+        # An access token outlives its refresh family by up to its lifetime.
+        # A signed-out or reuse-revoked family stops here at once (review R6,
+        # DESIGN.md 76); a routine rotation leaves the newest session current,
+        # so requests in flight with the previous access token still pass.
+        if required_role == "account" and not _family_active(cursor, claims.get("family")):
+            raise ApiProblem(
+                "This session was signed out or revoked; sign in again.",
+                401,
+                "session_revoked",
+            )
         if NONCE_BACKEND == "database":
             if _maintenance_due("access_proof_nonces"):
                 cursor.execute(
@@ -4294,6 +4318,7 @@ def _require_access_proof(required_role="account"):
 # otherwise only the paths a DBA lists in limited_session_paths.
 _LIMITED_SESSION_ALWAYS_PATHS = frozenset(
     (
+        "/v1/auth/logout",
         "/v1/auth/upgrade",
         "/v1/auth/upgrade/request",
         "/v1/integrity/challenge",
@@ -5969,6 +5994,35 @@ def _limited_causes(integrity, risk_cause):
 
 
 _UPGRADE_ROUTES = ("recheck", "stepup", "approval", "assertion")
+
+
+@app.post("/v1/auth/logout")
+@jwt_required()
+def logout():
+    """Sign this session out on the server (review R6, DESIGN.md 76).
+
+    Revokes every current session of the caller's refresh family: its refresh
+    token stops working, and so do its access tokens, at once -- account
+    requests check the family. Clearing tokens on the phone alone leaves a
+    copied token, with the phone's key, usable until it expires. A limited
+    session may sign out too.
+    """
+    _enforce_rate_limit("auth_logout", get_jwt().get("iid") or request.remote_addr)
+    claims = _require_access_proof("account")
+    with _cursor(commit=True) as cursor:
+        cursor.execute(
+            """
+            UPDATE refresh_sessions SET revoked_at = NOW()
+            WHERE family_id = %s AND revoked_at IS NULL
+            """,
+            (claims.get("family"),),
+        )
+        revoked = cursor.rowcount
+    logger.info(
+        "Signed out: installation=%s family=%s sessions=%s",
+        claims.get("iid"), claims.get("family"), revoked,
+    )
+    return jsonify({"signed_out": True, "sessions_revoked": revoked})
 
 
 @app.post("/v1/auth/upgrade")

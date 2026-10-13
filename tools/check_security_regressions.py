@@ -85,6 +85,7 @@ class Rows(object):
         self.refresh_row = None
         self.other_full_session = None
         self.account_row = None
+        self.revoked_families = set()
 
     def execute(self, sql, params=None):
         q = " ".join(sql.split())
@@ -113,6 +114,8 @@ class Rows(object):
             self.writes.append((q, params))
         elif q.startswith("SELECT r.session_id FROM refresh_sessions r"):
             self.result = self.other_full_session
+        elif q.startswith("SELECT COUNT(*) FROM refresh_sessions WHERE family_id"):
+            self.result = (0 if params[0] in self.revoked_families else 1,)
         elif q.startswith("UPDATE session_upgrade_requests"):
             self.writes.append((q, params))
         elif q.startswith("SELECT stepup_key_account_id, stepup_public_key_jwk"):
@@ -2343,6 +2346,51 @@ def a_refresh_keeps_an_accepted_session_full_only_while_covered():
                 expect(got == expected, "%s: expected %s, got %s" % (why, expected, got))
     finally:
         db.refresh_row = None
+
+
+@check
+def a_signed_out_or_revoked_family_reaches_nothing():
+    """Review R6 (DESIGN.md 76). An access token outlives its refresh family by
+    up to ten minutes; account requests now check that the family still has a
+    current session, so a sign-out or a reuse revocation takes effect at once.
+    A routine rotation leaves the newest session current, so in-flight tokens
+    survive it. /v1/auth/logout revokes the family, and a limited session may
+    call it."""
+    me, out = "/v1/account/me", "/v1/auth/logout"
+    family = str(uuid.uuid4())
+
+    def bearer(scope="full"):
+        claims = {"role": "account", "iid": inst.installation_id, "did": inst.device_id,
+                  "sid": str(uuid.uuid4()), "family": family, "scope": scope}
+        if scope == "limited":
+            claims["limited"] = ["integrity_elevated"]
+        with s.app.app_context():
+            return s.create_access_token(identity=account, additional_claims=claims)
+
+    def get(token):
+        reply = client.get(me, headers=access_headers("GET", me, bearer=token))
+        return reply.status_code, error_code(reply)
+
+    with elevated_integrity():
+        s._latest_integrity_state = _verdict_state("trusted")
+        status, code = get(bearer())
+        expect(status == 200, "a current family must pass, got %s %s" % (status, code))
+        db.revoked_families.add(family)
+        try:
+            status, code = get(bearer())
+            expect(status == 401 and code == "session_revoked",
+                   "a revoked family must not reach a protected path, got %s %s" % (status, code))
+        finally:
+            db.revoked_families.discard(family)
+    for scope in ("full", "limited"):
+        db.writes = []
+        body = encode({})
+        token = bearer(scope)
+        reply = client.post(out, data=body, headers=access_headers("POST", out, body, bearer=token))
+        revoked = [p for q, p in db.writes if q.startswith("UPDATE refresh_sessions SET revoked_at")]
+        expect(reply.status_code == 200 and revoked and revoked[-1][0] == family,
+               "a %s session's logout must revoke its family, got %s %s %s"
+               % (scope, reply.status_code, reply.get_json(), revoked))
 
 
 def main():

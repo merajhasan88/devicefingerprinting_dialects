@@ -1711,6 +1711,41 @@ def _elevate(probes):
     probes["mounts"] = {"status": "error", "error": "permission denied"}  # one failed probe, +30
 
 
+@check("session: sign-out revokes the family at once; a routine refresh does not")
+def check_logout_revokes_the_family(api, ctx):
+    """Review R6 (DESIGN.md 76). After a refresh the previous access token still
+    works (requests in flight survive a rotation); after /v1/auth/logout every
+    access token of the family is refused with session_revoked at once, and its
+    refresh token no longer refreshes."""
+    inst = Installation()
+    st, pl = enrol(api, inst, fresh_hint())
+    expect(st in (200, 201), "enrol failed: %s %s" % (st, pl))
+    token = device_token(api, inst)
+    submit_report(api, inst, token)
+    st, pl = open_account(api, inst, token, "lo-%s" % secrets.token_hex(4))
+    expect(st in (200, 201), "open account failed: %s %s" % (st, pl))
+    first_access = pl["access_token"]
+    st, rotated = _refresh(api, inst, pl["refresh_token"])
+    expect(st == 200, "refresh failed: %s %s" % (st, rotated))
+    st, me = protected(api, inst, "GET", "/v1/account/me", first_access)
+    expect(st == 200, "an access token from before a routine refresh must still work, got %s %s"
+           % (st, error_code(me)))
+    st, out = protected(api, inst, "POST", "/v1/auth/logout", rotated["access_token"], {})
+    expect(st == 200 and out.get("signed_out") is True, "logout failed: %s %s" % (st, out))
+    for label, access in (("the current", rotated["access_token"]), ("the previous", first_access)):
+        st, me = protected(api, inst, "GET", "/v1/account/me", access)
+        expect(st == 401 and error_code(me) == "session_revoked",
+               "%s access token must be refused after logout, got %s %s" % (label, st, error_code(me)))
+    # The challenge itself changes nothing (DESIGN.md 66.2); the refresh must fail.
+    refresh = rotated["refresh_token"]
+    st, got = api.call("POST", "/v1/auth/refresh/challenge", bearer=refresh)
+    if st == 200:
+        body = {"challenge_id": got["challenge_id"], "payload": got["payload"],
+                "signature": inst.sign_b64(got["payload"])}
+        st, got = api.call("POST", "/v1/auth/refresh", body_text=json.dumps(body), bearer=refresh)
+    expect(st == 401, "a signed-out refresh token must not refresh, got %s %s" % (st, got))
+
+
 def _limited_setup(api, ctx):
     """An installation with an account, whose latest scan is elevated (+30)."""
     if ctx["mode"] != "enforce":
