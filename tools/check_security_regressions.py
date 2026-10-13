@@ -1364,6 +1364,9 @@ class LiteCursor(object):
     def fetchone(self):
         return self.cursor.fetchone()
 
+    def fetchall(self):
+        return self.cursor.fetchall()
+
 
 @contextmanager
 def lite_store():
@@ -2832,6 +2835,232 @@ def an_approval_accepts_what_its_request_showed():
                  "a third device")):
             expect(within(integrity, policy_now) == "upgrade_scope_changed",
                    "%s after the request must change its scope" % why)
+
+
+BUSINESS_LITE_SCHEMA = """
+CREATE TABLE demo_accounts (account_id TEXT PRIMARY KEY, handle_lookup TEXT, created_at TSZ);
+CREATE TABLE recognized_devices (device_id TEXT PRIMARY KEY, platform TEXT, status TEXT,
+                                 created_at TSZ, last_seen_at TSZ);
+CREATE TABLE app_installations (installation_id TEXT PRIMARY KEY, device_id TEXT,
+                                registration_method TEXT, created_at TSZ, device_confirmed_at TSZ);
+CREATE TABLE device_account_links (device_id TEXT, account_id TEXT, first_installation_id TEXT,
+                                   first_seen_at TSZ, last_seen_at TSZ,
+                                   PRIMARY KEY (device_id, account_id));
+CREATE TABLE integrity_reports (report_id TEXT PRIMARY KEY, installation_id TEXT, device_id TEXT,
+                                score INTEGER, verdict TEXT, hard_block BOOLEAN, created_at TSZ,
+                                evidence_quality TEXT, finding_score INTEGER);
+CREATE TABLE business_events (event_id TEXT PRIMARY KEY,
+                              account_id TEXT NOT NULL REFERENCES demo_accounts(account_id),
+                              event_type TEXT NOT NULL, occurred_at TSZ NOT NULL,
+                              received_at TSZ DEFAULT CURRENT_TIMESTAMP, amount_minor INTEGER,
+                              currency TEXT, outcome TEXT, subject_hash TEXT);
+CREATE TABLE acceptance_lapses (acceptance_id TEXT, reason_code TEXT, source TEXT, points INTEGER,
+                                account_id TEXT, installation_id TEXT, event_type TEXT,
+                                occurred_at TSZ, PRIMARY KEY (acceptance_id, reason_code));
+"""
+BUSINESS_TOKEN = "business-token-for-the-gate"
+
+
+@contextmanager
+def business_store(configured=True):
+    """The business API over the server's own SQL on SQLite (DESIGN.md 76)."""
+    connection = sqlite3.connect(":memory:", detect_types=sqlite3.PARSE_DECLTYPES)
+    connection.executescript(BUSINESS_LITE_SCHEMA)
+
+    @contextmanager
+    def lite_cursor(commit=False):
+        yield LiteCursor(connection)
+        connection.commit()
+
+    saved = (s._cursor, s.BUSINESS_API_TOKEN_SHA256)
+    s._risk_settings_cache.update(values=dict(db.settings), at=time.monotonic(),
+                                  failed_at=None, error=None)
+    s._cursor = lite_cursor
+    s.BUSINESS_API_TOKEN_SHA256 = (
+        (c.sha256_hex(BUSINESS_TOKEN.encode()),) if configured else ())
+    real_unique = s.DIALECT.is_unique_violation
+    s.DIALECT.is_unique_violation = lambda error: (isinstance(error, sqlite3.IntegrityError)
+                                                   or real_unique(error))
+    try:
+        yield connection
+    finally:
+        s._cursor, s.BUSINESS_API_TOKEN_SHA256 = saved
+        del s.DIALECT.is_unique_violation
+        connection.close()
+
+
+@contextmanager
+def business_policy(**values):
+    """Settings for a business check: the snapshot is primed, never read from
+    SQLite, which has no settings table."""
+    saved = dict(db.settings)
+    db.settings.update({key: str(value) for key, value in values.items()})
+    s._risk_settings_cache.update(values=dict(db.settings), at=time.monotonic(),
+                                  failed_at=None, error=None)
+    try:
+        yield
+    finally:
+        db.settings.clear()
+        db.settings.update(saved)
+        s._risk_settings_cache.update(values=dict(db.settings), at=time.monotonic(),
+                                      failed_at=None, error=None)
+
+
+def business_call(method, path, body=None, token=BUSINESS_TOKEN, query=None):
+    headers = {"Authorization": "Bearer " + token} if token else {}
+    if method == "POST":
+        reply = client.post(path, json=body, headers=headers)
+    else:
+        reply = client.get(path, query_string=query or {}, headers=headers)
+    return reply.status_code, reply.get_json() or {}
+
+
+def business_account(connection, handle):
+    account_id = str(uuid.uuid4())
+    connection.execute("INSERT INTO demo_accounts VALUES (?, ?, ?)",
+                       (account_id, s._handle_lookup(handle), s._utc_now()))
+    return account_id
+
+
+def business_link(connection, device_id, account_id):
+    now = s._utc_now()
+    connection.execute("INSERT OR IGNORE INTO recognized_devices VALUES (?, 'android', 'active', ?, ?)",
+                       (device_id, now, now))
+    connection.execute("INSERT INTO device_account_links VALUES (?, ?, ?, ?, ?)",
+                       (device_id, account_id, str(uuid.uuid4()), now, now))
+
+
+@check
+def the_business_api_is_off_until_configured_and_needs_its_token():
+    """DESIGN.md 76: server to server only. Unconfigured, the business API does
+    not exist (404); configured, it needs one of the configured tokens."""
+    event = {"events": [{"event_id": "e1", "account_id": str(uuid.uuid4()), "type": "advance",
+                         "occurred_at": "2026-10-01T00:00:00Z"}]}
+    with business_store(configured=False):
+        status, payload = business_call("POST", "/v1/business/events", event)
+        expect(status == 404, "an unconfigured business API must not exist, got %s" % status)
+    with business_store():
+        for token in ("", "wrong-token", device_token):
+            status, payload = business_call("POST", "/v1/business/events", event, token=token)
+            expect(status == 401 and payload["error"]["code"] == "business_token_invalid",
+                   "token %r must be refused, got %s %s" % (token[:12], status, payload))
+        status, payload = business_call("POST", "/v1/business/events", event)
+        expect(status == 200, "the configured token must be accepted, got %s %s" % (status, payload))
+
+
+@check
+def business_events_are_minimal_validated_and_recorded_once():
+    """DESIGN.md 76. An event names an account by its opaque ID or a handle
+    (resolved, never stored), carries short codes and an optional amount; a
+    subject reference is stored only as a keyed hash; any other field, free
+    text, an amount without its currency or a future time is refused; an
+    event_id is recorded once; an unknown account is rejected, never created."""
+    with business_store() as conn:
+        alice = business_account(conn, "alice")
+        good = {"event_id": "adv-1", "account_id": alice, "type": "advance_disbursed",
+                "occurred_at": "2026-10-12T10:00:00+05:00", "amount_minor": 5000,
+                "currency": "USD", "outcome": "ok", "subject_ref": "IBAN DE00 1234"}
+        by_handle = {"event_id": "adv-2", "handle": "Alice", "type": "repayment_failed",
+                     "occurred_at": "2026-10-12T11:00:00Z"}
+        stranger = {"event_id": "adv-3", "handle": "nobody", "type": "advance_disbursed",
+                    "occurred_at": "2026-10-12T11:00:00Z"}
+        status, payload = business_call("POST", "/v1/business/events",
+                                        {"events": [good, by_handle, stranger, good]})
+        statuses = [r["status"] for r in payload.get("results", [])]
+        expect(status == 200 and statuses == ["accepted", "accepted", "rejected", "duplicate"],
+               "expected accepted, accepted, rejected, duplicate; got %s %s" % (status, payload))
+        rows = conn.execute("SELECT event_id, account_id, subject_hash FROM business_events "
+                            "ORDER BY event_id").fetchall()
+        expect([r[1] for r in rows] == [alice, alice] and rows[0][2]
+               and len(rows[0][2]) == 64 and "1234" not in rows[0][2],
+               "events must land on the account, the subject only as a keyed hash: %s" % rows)
+        for change, field in (({"note": "free text"}, "note"),
+                              ({"outcome": "Paid in full"}, "outcome"),
+                              ({"type": "Advance"}, "type"),
+                              ({"currency": None}, "currency"),
+                              ({"occurred_at": "2099-01-01T00:00:00Z"}, "occurred_at"),
+                              ({"occurred_at": "2026-10-12T10:00:00"}, "occurred_at"),
+                              ({"handle": "alice"}, "account_id")):
+            event = dict(good, event_id="bad", **change)
+            if change.get("currency", 1) is None:
+                event.pop("currency")
+            status, payload = business_call("POST", "/v1/business/events", {"events": [event]})
+            expect(status == 400 and payload["error"]["details"]["field"] == field,
+                   "%s must be refused on %s, got %s %s" % (change, field, status, payload))
+        with business_policy(business_event_types="advance_disbursed"):
+            status, payload = business_call("POST", "/v1/business/events", {"events": [
+                dict(by_handle, event_id="adv-4")]})
+            expect(status == 400, "a type outside the DBA's list must be refused, got %s" % status)
+
+
+@check
+def the_business_graph_combines_links_and_events():
+    """DESIGN.md 76. From one account the graph walks to its phones and the
+    accounts on them, to the DBA's depth and node cap, with each account's
+    events by window and amount, how many other accounts share a subject,
+    each phone's latest integrity, and component totals."""
+    with business_store() as conn:
+        alice, bob, carol = (business_account(conn, name) for name in ("alice", "bob", "carol"))
+        phone = str(uuid.uuid4())
+        business_link(conn, phone, alice)
+        business_link(conn, phone, bob)
+        now = s._utc_now()
+        events = [{"event_id": "a1", "account_id": alice, "type": "repayment_failed",
+                   "occurred_at": s._iso_z(now - timedelta(hours=2)), "subject_ref": "payee-9"},
+                  {"event_id": "a2", "account_id": alice, "type": "repayment_failed",
+                   "occurred_at": s._iso_z(now - timedelta(days=3)), "amount_minor": 700,
+                   "currency": "USD"},
+                  {"event_id": "b1", "account_id": bob, "type": "repayment_failed",
+                   "occurred_at": s._iso_z(now - timedelta(days=10))},
+                  {"event_id": "c1", "account_id": carol, "type": "advance_disbursed",
+                   "occurred_at": s._iso_z(now - timedelta(days=1)), "subject_ref": "payee-9"}]
+        status, payload = business_call("POST", "/v1/business/events", {"events": events})
+        expect(status == 200 and payload["accepted"] == 4, "setup failed: %s %s" % (status, payload))
+        status, graph = business_call("GET", "/v1/business/graph", query={"account_id": alice})
+        accounts = {a["account_id"]: a for a in graph.get("accounts", [])}
+        alice_events = (accounts.get(alice) or {}).get("business_events", {}).get("repayment_failed", {})
+        expect(status == 200 and set(accounts) == {alice, bob}
+               and [d["device_id"] for d in graph["devices"]] == [phone]
+               and len(graph["links"]) == 2 and graph["truncated"] is False
+               and alice_events.get("1d") == 1 and alice_events.get("7d") == 2
+               and alice_events.get("30d") == 2 and alice_events.get("amount_30d") == {"USD": 700}
+               and accounts[alice]["accounts_sharing_a_subject_30d"] == 1
+               and graph["component_business_events_30d"]["repayment_failed"]
+               == {"events_30d": 3, "accounts_30d": 2},
+               "the graph must combine links and events: %s %s" % (status, graph))
+        with business_policy(business_graph_depth=1):
+            status, graph = business_call("GET", "/v1/business/graph", query={"handle": "alice"})
+            expect({a["account_id"] for a in graph["accounts"]} == {alice} and graph["devices"],
+                   "depth 1 stops at the account's phones: %s" % graph)
+        with business_policy(business_graph_max_nodes=2):
+            status, graph = business_call("GET", "/v1/business/graph", query={"device_id": phone})
+            expect(graph["truncated"] is True and len(graph["accounts"]) + len(graph["devices"]) == 2,
+                   "the node cap must cut and say so: %s" % graph)
+        counts = s._business_event_counts(phone, alice)
+        expect(counts == {"account": {"repayment_failed": 2},
+                          "device": {"repayment_failed": 3}},
+               "decision context counts by account and by phone: %s" % counts)
+
+
+@check
+def acceptance_lapses_are_read_in_order():
+    """DESIGN.md 76: the business reads when an approved session met a new
+    reason, oldest first, paging with next_since."""
+    with business_store() as conn:
+        base = s._utc_now() - timedelta(hours=3)
+        for minutes, code in ((10, "android_process_traced"), (20, "request_rate_anomaly"),
+                              (30, "android_root_artifact")):
+            conn.execute("INSERT INTO acceptance_lapses VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                         ("acc-1", code, "integrity", 50, "acct", "inst", "refresh",
+                          base + timedelta(minutes=minutes)))
+        status, page = business_call("GET", "/v1/business/acceptance-lapses", query={"limit": "2"})
+        codes_ = [l["reason_code"] for l in page.get("lapses", [])]
+        expect(status == 200 and codes_ == ["android_process_traced", "request_rate_anomaly"],
+               "the first page, oldest first: %s %s" % (status, page))
+        status, page = business_call("GET", "/v1/business/acceptance-lapses",
+                                     query={"since": page["next_since"]})
+        expect([l["reason_code"] for l in page["lapses"]] == ["android_root_artifact"],
+               "the next page continues after next_since: %s" % page)
 
 
 def main():

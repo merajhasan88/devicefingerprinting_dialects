@@ -103,6 +103,24 @@ _ACCOUNT_LOOKUP_PEPPER = hmac.new(
 _CHALLENGE_MAC_KEY = hmac.new(
     _ROOT_SECRET, b"installation-challenge-mac-v1", hashlib.sha256
 ).digest()
+_BUSINESS_SUBJECT_PEPPER = hmac.new(
+    _ROOT_SECRET, b"business-subject-v1", hashlib.sha256
+).digest()
+
+
+def _business_token_digests():
+    """SHA-256 digests (hex) of the bearer tokens the customer's backend may
+    use on /v1/business/* (DESIGN.md 76), comma-separated so a token can be
+    rotated with no gap. Unset: the business API answers 404."""
+    raw = os.environ.get("BUSINESS_API_TOKEN_SHA256", "")
+    digests = [d.strip().lower() for d in raw.replace(";", ",").split(",") if d.strip()]
+    for digest in digests:
+        if re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+            raise RuntimeError("BUSINESS_API_TOKEN_SHA256 must list 64-hex SHA-256 digests.")
+    return tuple(digests)
+
+
+BUSINESS_API_TOKEN_SHA256 = _business_token_digests()
 
 ACCESS_TOKEN_LIFETIME = timedelta(minutes=10)
 DEVICE_TOKEN_LIFETIME = timedelta(minutes=10)
@@ -1156,7 +1174,7 @@ def _get_backend_identity():
 # against a schema it does not understand. /health/* still answers so operators
 # can see why.
 
-REQUIRED_SCHEMA_VERSION = 16
+REQUIRED_SCHEMA_VERSION = 17
 
 _schema_state = None
 _schema_lock = threading.Lock()
@@ -1311,6 +1329,9 @@ _RISK_SETTING_KINDS = {
     "complete_evidence_max_age_seconds": "int",
     "incomplete_evidence_review_after": "int",
     "acceptance_auto_cover_reasons": "codes",
+    "business_event_types": "codes",
+    "business_graph_depth": "int",
+    "business_graph_max_nodes": "int",
 }
 # Lower bounds a value must also meet. Below 100 the "far above the baseline"
 # rule would fire for memory inside the build's own measured envelope.
@@ -1319,6 +1340,8 @@ _RISK_SETTING_MINIMUMS = {
     "upgrade_request_ttl_seconds": 30,
     "policy_step_up_score": 1,
     "complete_evidence_max_age_seconds": 30,
+    "business_graph_depth": 1,
+    "business_graph_max_nodes": 1,
 }
 _RISK_SETTING_BOOL_WORDS = ("0", "1", "true", "false", "yes", "no", "on", "off")
 # Rows whose absence would silently weaken a gate instead of restoring the
@@ -3579,8 +3602,13 @@ def _evaluate_risk_policy(
         "integrity_mode": INTEGRITY_MODE,
         "integrity_freshness_seconds": INTEGRITY_FRESHNESS_SECONDS,
         "device_integrity_memory": device_integrity_memory,
-        "device_integrity_memory_hours": INTEGRITY_DEVICE_MEMORY_HOURS,
+        "device_integrity_memory_hours": _risk_setting_int(
+            "integrity_device_memory_hours", INTEGRITY_DEVICE_MEMORY_HOURS
+        ),
     }
+    if BUSINESS_API_TOKEN_SHA256:
+        # Measurements only (DESIGN.md 76): the business decides what they mean.
+        context["business_events_30d"] = _business_event_counts(device_id, account_id)
     decision = {
         "decision_id": decision_id,
         "event_type": event_type,
@@ -7324,6 +7352,416 @@ def deny_upgrade(request_id):
             )
     logger.warning("Upgrade denied: request=%s by=%s", request_id, claims.get("iid"))
     return jsonify({"request_id": request_id, "denied": True})
+
+
+# ---------------------------------------------------------------------------
+# Routes: the business API -- server to server, never the app (DESIGN.md 76)
+# ---------------------------------------------------------------------------
+#
+# The customer's backend reports business events and reads the phone-account
+# graph combined with them, and the acceptance lapses. The server guarantees
+# the measurements; what they should refuse is the business's decision, so
+# nothing here is scored. No personal data: accounts are the server's opaque
+# IDs (or a handle, resolved through the same keyed lookup as sign-in and
+# never stored); a subject reference is kept only as a keyed hash; types and
+# outcomes are short codes; any other field is refused.
+
+_BUSINESS_EVENT_FIELDS = frozenset((
+    "event_id", "account_id", "handle", "type", "occurred_at", "amount_minor",
+    "currency", "outcome", "subject_ref",
+))
+_BUSINESS_WINDOWS = (("1d", 1), ("7d", 7), ("30d", 30))
+
+
+def _require_business_caller():
+    if not BUSINESS_API_TOKEN_SHA256:
+        raise ApiProblem("Not found.", 404, "not_found")
+    _enforce_rate_limit("business_api", request.remote_addr or "unknown")
+    header = request.headers.get("Authorization", "")
+    token = header[len("Bearer "):].strip() if header.startswith("Bearer ") else ""
+    digest = hashlib.sha256(token.encode("utf-8")).hexdigest() if token else "-"
+    if not any(hmac.compare_digest(digest, allowed) for allowed in BUSINESS_API_TOKEN_SHA256):
+        raise ApiProblem(
+            "A valid business API token is required.", 401, "business_token_invalid"
+        )
+
+
+def _business_problem(index, field, message):
+    return ApiProblem(
+        "Event %d: %s" % (index, message), 400, "invalid_business_event",
+        details={"index": index, "field": field},
+    )
+
+
+def _parse_business_time(value, index, field):
+    if not isinstance(value, str) or len(value) > 40:
+        raise _business_problem(index, field, "must be an ISO 8601 time with its offset.")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        raise _business_problem(index, field, "must be an ISO 8601 time with its offset.")
+    if parsed.tzinfo is None:
+        raise _business_problem(index, field, "must carry a UTC offset.")
+    return parsed.astimezone(timezone.utc)
+
+
+def _parse_business_event(event, index):
+    if not isinstance(event, dict):
+        raise _business_problem(index, "event", "must be an object.")
+    unknown = sorted(set(event) - _BUSINESS_EVENT_FIELDS)
+    if unknown:
+        raise _business_problem(index, unknown[0], "is not a known field; nothing else is stored.")
+    event_id = event.get("event_id")
+    if not isinstance(event_id, str) or re.fullmatch(r"[A-Za-z0-9._:-]{1,64}", event_id) is None:
+        raise _business_problem(index, "event_id", "must be 1-64 of A-Z a-z 0-9 . _ : -")
+    if ("account_id" in event) == ("handle" in event):
+        raise _business_problem(index, "account_id", "give exactly one of account_id or handle.")
+    account_id = (
+        _uuid_text(event["account_id"], "account_id") if "account_id" in event else None
+    )
+    lookup = _handle_lookup(event["handle"]) if "handle" in event else None
+    event_type = event.get("type")
+    if not isinstance(event_type, str) or re.fullmatch(r"[a-z][a-z0-9_]{1,47}", event_type) is None:
+        raise _business_problem(index, "type", "must be a short code: a-z, 0-9, _.")
+    allowed = _risk_setting_words("business_event_types", "")
+    if allowed and event_type not in allowed:
+        raise _business_problem(index, "type", "is not among the DBA's business_event_types.")
+    occurred_at = _parse_business_time(event.get("occurred_at"), index, "occurred_at")
+    if occurred_at > _utc_now() + timedelta(minutes=5):
+        raise _business_problem(index, "occurred_at", "is in the future.")
+    amount = event.get("amount_minor")
+    currency = event.get("currency")
+    if amount is not None:
+        if isinstance(amount, bool) or not isinstance(amount, int) or not 0 <= amount <= (1 << 53):
+            raise _business_problem(index, "amount_minor", "must be a whole number of minor units.")
+        if not isinstance(currency, str) or re.fullmatch(r"[A-Z]{3}", currency) is None:
+            raise _business_problem(index, "currency", "an amount needs its ISO 4217 currency.")
+    elif currency is not None:
+        raise _business_problem(index, "currency", "is only given with an amount.")
+    outcome = event.get("outcome")
+    if outcome is not None and (
+        not isinstance(outcome, str) or re.fullmatch(r"[a-z][a-z0-9_]{0,31}", outcome) is None
+    ):
+        raise _business_problem(index, "outcome", "must be a short code: a-z, 0-9, _.")
+    subject = event.get("subject_ref")
+    if subject is not None and (not isinstance(subject, str) or not 1 <= len(subject) <= 256):
+        raise _business_problem(index, "subject_ref", "must be 1-256 characters.")
+    return {
+        "event_id": event_id,
+        "account_id": account_id,
+        "lookup": lookup,
+        "type": event_type,
+        "occurred_at": occurred_at,
+        "amount_minor": amount,
+        "currency": currency,
+        "outcome": outcome,
+        # Only a keyed hash is kept: accounts that share a payee can be
+        # linked, and the payee itself is never stored.
+        "subject_hash": hmac.new(
+            _BUSINESS_SUBJECT_PEPPER, subject.encode("utf-8"), hashlib.sha256
+        ).hexdigest() if subject is not None else None,
+    }
+
+
+@app.post("/v1/business/events")
+def business_events():
+    """Record business events for accounts; each event once (its event_id)."""
+    _require_business_caller()
+    body = _json_body()
+    events = body.get("events")
+    if set(body) - {"events"} or not isinstance(events, list) or not 1 <= len(events) <= 100:
+        raise ApiProblem(
+            'Send {"events": [...]} with 1-100 events.', 400, "invalid_business_events"
+        )
+    parsed = [_parse_business_event(event, index) for index, event in enumerate(events)]
+    results = []
+    with _cursor(commit=True) as cursor:
+        for event in parsed:
+            if event["account_id"] is not None:
+                cursor.execute(
+                    "SELECT account_id FROM demo_accounts WHERE account_id = %s",
+                    (event["account_id"],),
+                )
+            else:
+                cursor.execute(
+                    "SELECT account_id FROM demo_accounts WHERE handle_lookup = %s",
+                    (event["lookup"],),
+                )
+            row = cursor.fetchone()
+            if row is None:
+                results.append({"event_id": event["event_id"], "status": "rejected",
+                                "code": "unknown_account"})
+                continue
+            savepoint = DIALECT.savepoint("business_event")
+            if savepoint:
+                cursor.execute(savepoint[0])
+            try:
+                cursor.execute(
+                    """
+                    INSERT INTO business_events
+                        (event_id, account_id, event_type, occurred_at, amount_minor,
+                         currency, outcome, subject_hash)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (event["event_id"], str(row[0]), event["type"], event["occurred_at"],
+                     event["amount_minor"], event["currency"], event["outcome"],
+                     event["subject_hash"]),
+                )
+            except Exception as error:
+                if not DIALECT.is_unique_violation(error):
+                    raise
+                if savepoint:
+                    cursor.execute(savepoint[1])
+                results.append({"event_id": event["event_id"], "status": "duplicate"})
+            else:
+                if savepoint:
+                    cursor.execute(savepoint[2])
+                results.append({"event_id": event["event_id"], "status": "accepted"})
+    counts = {state: sum(1 for r in results if r["status"] == state)
+              for state in ("accepted", "duplicate", "rejected")}
+    return jsonify(dict(counts, results=results))
+
+
+def _business_event_counts(device_id, account_id):
+    """Event counts by type in the last 30 days: this account's, and those of
+    every account linked to this phone."""
+    cutoff = _utc_now() - timedelta(days=30)
+    counts = {"account": {}, "device": {}}
+    with _cursor() as cursor:
+        if account_id is not None:
+            cursor.execute(
+                """
+                SELECT event_type, COUNT(*) FROM business_events
+                WHERE account_id = %s AND occurred_at >= %s
+                GROUP BY event_type
+                """,
+                (account_id, cutoff),
+            )
+            counts["account"] = {str(r[0]): int(r[1]) for r in cursor.fetchall() or []}
+        cursor.execute(
+            """
+            SELECT e.event_type, COUNT(*) FROM business_events e
+            JOIN device_account_links l ON l.account_id = e.account_id
+            WHERE l.device_id = %s AND e.occurred_at >= %s
+            GROUP BY e.event_type
+            """,
+            (device_id, cutoff),
+        )
+        counts["device"] = {str(r[0]): int(r[1]) for r in cursor.fetchall() or []}
+    return counts
+
+
+def _business_account_node(cursor, account_id):
+    now = _utc_now()
+    cutoffs = {label: now - timedelta(days=days) for label, days in _BUSINESS_WINDOWS}
+    cursor.execute("SELECT created_at FROM demo_accounts WHERE account_id = %s", (account_id,))
+    row = cursor.fetchone()
+    cursor.execute(
+        """
+        SELECT event_type, currency,
+               SUM(CASE WHEN occurred_at >= %s THEN 1 ELSE 0 END),
+               SUM(CASE WHEN occurred_at >= %s THEN 1 ELSE 0 END),
+               COUNT(*),
+               SUM(COALESCE(amount_minor, 0))
+        FROM business_events
+        WHERE account_id = %s AND occurred_at >= %s
+        GROUP BY event_type, currency
+        """,
+        (cutoffs["1d"], cutoffs["7d"], account_id, cutoffs["30d"]),
+    )
+    events = {}
+    for event_type, currency, day, week, month, amount in cursor.fetchall() or []:
+        entry = events.setdefault(str(event_type), {"1d": 0, "7d": 0, "30d": 0, "amount_30d": {}})
+        entry["1d"] += int(day or 0)
+        entry["7d"] += int(week or 0)
+        entry["30d"] += int(month or 0)
+        if currency:
+            entry["amount_30d"][str(currency)] = int(amount or 0)
+    cursor.execute(
+        """
+        SELECT COUNT(DISTINCT e2.account_id)
+        FROM business_events e1
+        JOIN business_events e2
+          ON e2.subject_hash = e1.subject_hash AND e2.account_id <> e1.account_id
+        WHERE e1.account_id = %s AND e1.subject_hash IS NOT NULL
+          AND e1.occurred_at >= %s AND e2.occurred_at >= %s
+        """,
+        (account_id, cutoffs["30d"], cutoffs["30d"]),
+    )
+    shared = cursor.fetchone()
+    return {
+        "account_id": account_id,
+        "created_at": _iso_z(row[0]) if row else None,
+        "business_events": events,
+        "accounts_sharing_a_subject_30d": int(shared[0]) if shared else 0,
+    }
+
+
+def _business_device_node(cursor, device_id):
+    cursor.execute(
+        """
+        SELECT platform, status, created_at, last_seen_at FROM recognized_devices
+        WHERE device_id = %s
+        """,
+        (device_id,),
+    )
+    row = cursor.fetchone()
+    cursor.execute(
+        "SELECT COUNT(*) FROM app_installations WHERE device_id = %s", (device_id,)
+    )
+    installations = int(cursor.fetchone()[0])
+    cursor.execute(
+        """
+        SELECT verdict, evidence_quality, created_at FROM integrity_reports
+        WHERE device_id = %s
+        ORDER BY created_at DESC
+        LIMIT 1
+        """,
+        (device_id,),
+    )
+    report = cursor.fetchone()
+    return {
+        "device_id": device_id,
+        "platform": row[0] if row else None,
+        "status": row[1] if row else None,
+        "first_seen_at": _iso_z(row[2]) if row else None,
+        "last_seen_at": _iso_z(row[3]) if row else None,
+        "installations": installations,
+        "latest_integrity": {
+            "verdict": report[0], "evidence_quality": report[1],
+            "created_at": _iso_z(report[2]),
+        } if report else None,
+    }
+
+
+@app.get("/v1/business/graph")
+def business_graph():
+    """The phone-account graph around one account or phone, with business
+    events per account and per component (DESIGN.md 76). Walked one
+    parameterised query per node -- no recursive SQL -- to the DBA's
+    business_graph_depth, cut at business_graph_max_nodes."""
+    _require_business_caller()
+    args = request.args
+    given = [key for key in ("account_id", "device_id", "handle") if args.get(key)]
+    if len(given) != 1:
+        raise ApiProblem(
+            "Give exactly one of account_id, device_id or handle.", 400, "invalid_graph_query"
+        )
+    depth = min(4, max(1, _risk_setting_int("business_graph_depth", 2)))
+    limit = max(1, _risk_setting_int("business_graph_max_nodes", 200))
+    with _cursor() as cursor:
+        if given[0] == "handle":
+            cursor.execute(
+                "SELECT account_id FROM demo_accounts WHERE handle_lookup = %s",
+                (_handle_lookup(args["handle"]),),
+            )
+            row = cursor.fetchone()
+            if row is None:
+                raise ApiProblem("No such account.", 404, "unknown_account")
+            start = ("account", str(row[0]))
+        else:
+            kind = given[0][: -len("_id")]
+            start = (kind, _uuid_text(args[given[0]], given[0]))
+        seen = {start: 0}
+        frontier = [start]
+        edges = {}
+        truncated = False
+        while frontier:
+            kind, node_id = frontier.pop(0)
+            hop = seen[(kind, node_id)]
+            if hop >= depth:
+                continue
+            if kind == "account":
+                cursor.execute(
+                    """
+                    SELECT device_id, first_seen_at, last_seen_at FROM device_account_links
+                    WHERE account_id = %s
+                    """,
+                    (node_id,),
+                )
+                found = [("device", str(r[0]), str(r[0]), node_id, r[1], r[2])
+                         for r in cursor.fetchall() or []]
+            else:
+                cursor.execute(
+                    """
+                    SELECT account_id, first_seen_at, last_seen_at FROM device_account_links
+                    WHERE device_id = %s
+                    """,
+                    (node_id,),
+                )
+                found = [("account", str(r[0]), node_id, str(r[0]), r[1], r[2])
+                         for r in cursor.fetchall() or []]
+            for other_kind, other_id, device_id, account_id, first, last in found:
+                if (other_kind, other_id) not in seen:
+                    if len(seen) >= limit:
+                        truncated = True
+                        continue
+                    seen[(other_kind, other_id)] = hop + 1
+                    frontier.append((other_kind, other_id))
+                edges[(device_id, account_id)] = {
+                    "device_id": device_id, "account_id": account_id,
+                    "first_seen_at": _iso_z(first), "last_seen_at": _iso_z(last),
+                }
+        accounts = [_business_account_node(cursor, node_id)
+                    for kind, node_id in seen if kind == "account"]
+        devices = [_business_device_node(cursor, node_id)
+                   for kind, node_id in seen if kind == "device"]
+    for device in devices:
+        memory = _device_integrity_memory(device["device_id"], "")
+        device["integrity_memory_block"] = bool(memory and memory.get("finding_verdict") == "block")
+    component = {}
+    for account in accounts:
+        for event_type, entry in account["business_events"].items():
+            total = component.setdefault(event_type, {"events_30d": 0, "accounts_30d": 0})
+            total["events_30d"] += entry["30d"]
+            total["accounts_30d"] += 1 if entry["30d"] else 0
+    return jsonify({
+        "start": {"kind": start[0], "id": start[1]},
+        "depth": depth,
+        "truncated": truncated,
+        "accounts": accounts,
+        "devices": devices,
+        "links": [edges[key] for key in sorted(edges)],
+        "component_business_events_30d": component,
+    })
+
+
+@app.get("/v1/business/acceptance-lapses")
+def business_acceptance_lapses():
+    """When an approved session met a reason its approval did not cover, and
+    which (DESIGN.md 76) -- oldest first, after ?since=<ISO time>. A row
+    appears once per acceptance and reason; page with next_since and keep
+    (acceptance_id, reason_code) as the key."""
+    _require_business_caller()
+    since_text = request.args.get("since")
+    since = (
+        _parse_business_time(since_text, 0, "since") if since_text
+        else datetime(1970, 1, 1, tzinfo=timezone.utc)
+    )
+    try:
+        limit = min(1000, max(1, int(request.args.get("limit", "100"))))
+    except ValueError:
+        raise ApiProblem("limit must be a whole number.", 400, "invalid_limit")
+    with _cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT acceptance_id, reason_code, source, points, account_id,
+                   installation_id, event_type, occurred_at
+            FROM acceptance_lapses
+            WHERE occurred_at > %s
+            ORDER BY occurred_at, acceptance_id, reason_code
+            LIMIT """ + str(limit),
+            (since,),
+        )
+        rows = cursor.fetchall() or []
+    lapses = [
+        {"acceptance_id": str(r[0]), "reason_code": r[1], "source": r[2], "points": int(r[3]),
+         "account_id": str(r[4]), "installation_id": str(r[5]), "event_type": r[6],
+         "occurred_at": _iso_z(r[7])}
+        for r in rows
+    ]
+    return jsonify({"lapses": lapses,
+                    "next_since": lapses[-1]["occurred_at"] if lapses else since_text})
 
 
 if __name__ == "__main__":

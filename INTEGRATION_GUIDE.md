@@ -127,7 +127,7 @@ statement timeout `DB_QUERY_TIMEOUT` (15 s).
   cleartext; require the same of every client build you ship.
 
 **Database.** PostgreSQL 13+ or SQL Server 2017+ (`DB_ENGINE`). Your DBA applies
-`migrations/<engine>/001…016` in order; the server only reads `schema_migrations` and refuses to serve
+`migrations/<engine>/001…017` in order; the server only reads `schema_migrations` and refuses to serve
 on any other version (`/health/ready` says why). Use verified TLS: PostgreSQL `DB_SSLMODE=verify-full`
 with `DB_SSLROOTCERT`; SQL Server always connects with `Encrypt=yes` and `TrustServerCertificate=no`.
 

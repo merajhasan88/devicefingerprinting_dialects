@@ -44,6 +44,7 @@ import base64
 import copy
 import hashlib
 import json
+import os
 import secrets
 import sys
 import threading
@@ -1793,6 +1794,50 @@ def check_parallel_first_sign_ins(api, ctx):
     expect(len(linked) <= 1 and len(linked) + len(refused) == len(phones),
            "at most one of four simultaneous sign-ins may link, the rest refused; got %s"
            % sorted(results))
+
+
+@check("business: events are recorded once and combined with the phone-account graph")
+def check_business_api(api, ctx):
+    """DESIGN.md 76. Server to server: needs the token whose SHA-256 the server
+    lists in BUSINESS_API_TOKEN_SHA256, given to the suite as
+    DEVICE_TRUST_BUSINESS_TOKEN; skips without it. A fresh account on a fresh
+    phone gets two events (one sent twice); the graph from the account shows
+    the phone, the link and the counts; the lapse feed answers."""
+    token = os.environ.get("DEVICE_TRUST_BUSINESS_TOKEN", "")
+    if not token:
+        raise Skip("set DEVICE_TRUST_BUSINESS_TOKEN to the business API token to run this")
+    inst = Installation()
+    st, pl = enrol(api, inst, fresh_hint())
+    expect(st in (200, 201), "enrol failed: %s %s" % (st, pl))
+    device = device_token(api, inst)
+    submit_report(api, inst, device)
+    st, pl = open_account(api, inst, device, "biz-%s" % secrets.token_hex(4))
+    expect(st in (200, 201), "open account failed: %s %s" % (st, pl))
+    account_id = pl["account_id"]
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    tag = secrets.token_hex(4)
+    events = [{"event_id": "suite-%s-1" % tag, "account_id": account_id, "type": "advance_disbursed",
+               "occurred_at": now, "amount_minor": 2500, "currency": "USD",
+               "subject_ref": "payee-%s" % tag},
+              {"event_id": "suite-%s-2" % tag, "account_id": account_id, "type": "repayment_failed",
+               "occurred_at": now}]
+    business = {"Authorization": "Bearer " + token}
+    st, pl = api.call("POST", "/v1/business/events", headers=business,
+                      body_text=json.dumps({"events": events + events[:1]}))
+    expect(st == 200 and [r["status"] for r in pl.get("results", [])]
+           == ["accepted", "accepted", "duplicate"], "events: %s %s" % (st, pl))
+    st, pl = api.call("POST", "/v1/business/events", headers={"Authorization": "Bearer wrong"},
+                      body_text=json.dumps({"events": events}))
+    expect(st == 401, "a wrong business token must be refused, got %s" % st)
+    st, graph = api.call("GET", "/v1/business/graph?account_id=%s" % account_id, headers=business)
+    node = ([a for a in graph.get("accounts", []) if a.get("account_id") == account_id] or [{}])[0]
+    expect(st == 200 and [d["device_id"] for d in graph.get("devices", [])] == [inst.device_id]
+           and node.get("business_events", {}).get("advance_disbursed", {}).get("30d") == 1
+           and node["business_events"]["advance_disbursed"].get("amount_30d") == {"USD": 2500}
+           and node["business_events"].get("repayment_failed", {}).get("1d") == 1,
+           "the graph must show the phone and the events: %s %s" % (st, graph))
+    st, feed = api.call("GET", "/v1/business/acceptance-lapses?limit=1", headers=business)
+    expect(st == 200 and isinstance(feed.get("lapses"), list), "lapse feed: %s %s" % (st, feed))
 
 
 @check("session: sign-out revokes the family at once; a routine refresh does not")
