@@ -388,3 +388,53 @@ DESIGN.md §76, schema **17** (migrations 015–017). The server side is done an
 The reference suite has **76** checks (new: logout, parallel sign-ins, business API, the contract-3
 fixture — its "elevated" fixture is now test-keys + no boot state, since a failed probe can no longer be
 approved); the offline gate **72**.
+
+## 19. Added 2026-10-13 (later) — after your catch-up to §75
+
+Read against your `1d212da` (DESIGN.md refreshed to §75; `docs/validation.md` §9, offline only). Your
+`f3604dc`, `2c72c18` and `08f52b1` already cover most of §10–§16: limited sessions with the automatic
+wait, supersede, lapsed requests dropped, token renewal before a prompt, the saved-session check at
+start, eligibility remedies, `deleted_exec_own_code`, read failures as probe errors, full coverage
+figures, and `baseline --session`. Today's reference work is DESIGN.md **§76** (pull it with §75) and
+schema **18** (migrations 015–018). What it needs from you, checked against your code:
+
+**Breaks your conformance port — fix first.** `LimitedSessionConformanceChecks.Elevate()` (and the
+step-up check's scenario) makes the `mounts` probe fail. A failed probe is now a collection problem,
+which can never be approved: requesting an approval, or a route-1 upgrade, for a cause made only of
+collection problems answers **403 `complete_scan_required`**. The reference suite's fixture is now two
+mild findings an approval can accept — `root_files.test_keys = true` (+25) and no
+`ro.boot.verifiedbootstate` / `ro.boot.flash.locked` / `ro.boot.vbmeta.device_state` in
+`system_properties` (+15): 40, elevated (`conformance_suite._elevate`). Your approver-view assertion
+(`requesting_installation` holds exactly three keys) still holds: the listing's new `limited_causes`
+and `reasons` sit beside it, not inside.
+
+**Still to do in the SDK** (none found in `src/`):
+- `POST /v1/auth/logout` before dropping a session; **401 `session_revoked`** afterwards → discard.
+- **409 `relationship_changed`** at login or registration → ask once more.
+- **403 `complete_scan_required`** (request or upgrade) → scan; the session then upgrades by recheck.
+  **409 `upgrade_scope_changed`** (something new since the request) → ask again.
+- The approvals listing's `limited_causes` and `reasons` (`code`, `points`, `message`, `source`): show
+  them to the approving user — approving accepts exactly those. The upgrade response adds
+  `acceptance_id`.
+- Android collector **3**: `maps_lines` in `runtime_maps` and `exec_mappings`; `status: error` when
+  `/proc/self/maps` returns no lines and when no thread could be enumerated (you already fail on an
+  unreadable file); then `CollectorVersion` 3. Until then your reports read **`legacy`**: scored as
+  before, never `complete`, refused only on a DBA's `complete_evidence_paths` (empty by default), never
+  counted by the escalation.
+- Read `evidence_quality` and `finding_score` from report responses and the integrity state, if your
+  harness shows them.
+
+**Server-only, nothing for you:**
+- Approvals granted before 016 are carried over at their first use (`legacy_acceptances`, migration
+  018, default `carry`); `drop` makes them cover nothing.
+- The business API (`/v1/business/*`) is server to server; its lapse feed now pages with
+  `next_cursor`.
+- Acceptance records, lapses, collection-problem grouping, evidence quality, the admission recheck
+  under locks.
+
+**What exists, and what was not run, on our side.** Offline gate **72/72**. Suite **76** checks: new
+since §18 are route 1 proving reason-level coverage and the lapse record live. On EC2 PostgreSQL 16.15
+at schema 17: observe 61/0/15; integrity enforce with routes 1–3 72/0/4; both modes 15/15 targeted;
+`tools/race_admission.py` 5 links before the fix, 2 after. **Not run:** migration 018 and the
+carry-over on any database (gate only); anything from 015 on against SQL Server; collector 3 on a
+handset; an iPhone round. Your `validation.md` §"Not covered" can point here for the server side.
