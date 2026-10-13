@@ -90,8 +90,8 @@ processes** from the systemd drop-in, with a per-process connection pool (`DB_PO
 `DB_POOL_RECHECK_SECONDS`) and, on SQL Server, a 15 s statement timeout (`DB_QUERY_TIMEOUT`) —
 DESIGN.md 55 and 60. Serve SQL Server with processes, never threads.
 
-**Schema is migrations, DBA-applied.** `migrations/<dialect>/001…014`, applied in order; the server
-refuses to serve unless `schema_migrations` holds the version it requires (currently **13**). A new
+**Schema is migrations, DBA-applied.** `migrations/<dialect>/001…015`, applied in order; the server
+refuses to serve unless `schema_migrations` holds the version it requires (currently **15**). A new
 table needs its grant (`GRANT`/`ALTER DEFAULT PRIVILEGES` on PostgreSQL). Risk and step-up policy
 values live in `risk_policy_settings`, seeded by the migrations with the owner's defaults, which a DBA
 may change — never hard-code a policy value.

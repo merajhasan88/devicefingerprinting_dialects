@@ -1282,13 +1282,15 @@ CREATE TABLE app_installations (
     device_confirmed_at TSZ
 );
 CREATE TABLE integrity_reports (
-    report_id       TEXT PRIMARY KEY,
-    installation_id TEXT NOT NULL REFERENCES app_installations(installation_id),
-    device_id       TEXT NOT NULL,
-    score           INTEGER NOT NULL,
-    verdict         TEXT NOT NULL,
-    hard_block      BOOLEAN NOT NULL,
-    created_at      TSZ NOT NULL
+    report_id        TEXT PRIMARY KEY,
+    installation_id  TEXT NOT NULL REFERENCES app_installations(installation_id),
+    device_id        TEXT NOT NULL,
+    score            INTEGER NOT NULL,
+    verdict          TEXT NOT NULL,
+    hard_block       BOOLEAN NOT NULL,
+    created_at       TSZ NOT NULL,
+    evidence_quality TEXT,
+    finding_score    INTEGER
 );
 CREATE TABLE device_account_links (
     device_id             TEXT NOT NULL,
@@ -1343,6 +1345,9 @@ def lite_store():
         connection.commit()
 
     saved = (s._cursor, s._latest_integrity_state)
+    # The settings snapshot comes from the fixture, not from SQLite.
+    s._risk_settings_cache.update(values=dict(db.settings), at=time.monotonic(),
+                                  failed_at=None, error=None)
     s._cursor = lite_cursor
     # Each installation's own latest scan is clean and fresh, so the gate
     # reaches the device memory -- the only thing these checks vary.
@@ -1362,12 +1367,15 @@ def lite_installation(connection, device_id, method, confirmed=False):
     return installation_id
 
 
-def lite_report(connection, installation_id, device_id, score, hard_block=False, age_hours=0.0):
+def lite_report(connection, installation_id, device_id, score, hard_block=False, age_hours=0.0,
+                finding_score=None):
+    """finding_score None: a report stored before migration 015."""
     connection.execute(
-        "INSERT INTO integrity_reports VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO integrity_reports (report_id, installation_id, device_id, score, verdict, "
+        "hard_block, created_at, finding_score) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         (str(uuid.uuid4()), installation_id, device_id, score,
          s._integrity_verdict(score, hard_block), hard_block,
-         s._utc_now() - timedelta(hours=age_hours)))
+         s._utc_now() - timedelta(hours=age_hours), finding_score))
 
 
 def memory_outcome(device_id, installation_id):
@@ -1382,7 +1390,7 @@ def memory_outcome(device_id, installation_id):
                "unexpected gate refusal %s" % problem.code)
         refused = True
     memory = s._device_integrity_memory(device_id, installation_id)
-    blocked = memory is not None and (memory["hard_block"] or memory["verdict"] == "block")
+    blocked = memory is not None and memory["finding_verdict"] == "block"
     expect(blocked == refused, "gate and memory disagree: %s %s" % (refused, memory))
     plus50 = blocked and memory["installation_id"] != installation_id
     return refused, plus50, memory and memory["report_id"]
@@ -1570,6 +1578,7 @@ def soft_outcomes_defer_only_where_the_dba_lists_them():
                 expect(_refused(gate) == code, "%s must refuse with %s by default" % (verdict, code))
             s._latest_integrity_state = _verdict_state("elevated")
             s._device_integrity_memory = lambda d, i: {"verdict": "block", "hard_block": True,
+                                                      "finding_verdict": "block",
                                                       "installation_id": str(uuid.uuid4())}
             expect(_refused(gate) == "integrity_device_blocked_recently",
                    "a device-memory block must refuse even when the verdict is soft")
@@ -2495,6 +2504,55 @@ def login_and_registration_recheck_the_counts_before_linking():
                            % (path, counts, expected, reply.status_code, error_code(reply)))
     finally:
         db.account_row, db.link_counts = None, (0, 0)
+
+
+@check
+def collection_problems_count_once_and_never_follow_the_device():
+    """Review R3 (DESIGN.md 76, owner decision 2026-10-13). One collection
+    problem can break three probes at once; that used to add 3 x 30 = 90, a
+    block, remembered for every account on the phone for a day. Now each
+    failed probe is listed at 0 points and together they add +30 once; the
+    findings score stays 0, so nothing enters the device memory. A DBA who
+    sets collection_problems_block = 1 gets the earlier rule back, memory
+    included. Reports from before migration 015 are judged by their score."""
+    probes = clean("android")
+    for name in ("runtime_maps", "tracer", "debug_state"):  # always requested on Android
+        probes[name] = {"status": "error", "error": "permission denied"}
+    status, payload = send_report("android", probes)
+    decision = (payload or {}).get("integrity") or {}
+    points = points_of(decision) if decision else {}
+    expect(status == 200 and decision.get("score") == 30 and decision.get("verdict") == "elevated"
+           and decision.get("finding_score") == 0
+           and decision.get("evidence_quality") == "incomplete"
+           and points.get("integrity_evidence_incomplete") == 30
+           and points.get("integrity_probe_failed:tracer") == 0,
+           "three failed probes must cost +30 once, with no finding: %s %s" % (status, decision))
+    with policy(collection_problems_block=1):
+        status, payload = send_report("android", probes)
+        decision = payload["integrity"]
+        expect(decision["score"] == 90 and decision["verdict"] == "block"
+               and decision["finding_score"] == 90,
+               "collection_problems_block=1 must restore +30 each, as a finding: %s" % decision)
+    status, payload = send_report("android", clean("android"))
+    expect(payload["integrity"].get("evidence_quality") == "complete"
+           and payload["integrity"]["score"] == 0, "a clean scan is complete: %s" % payload)
+    with lite_store() as db_:
+        device = str(uuid.uuid4())
+        phone = lite_installation(db_, device, "new_device")
+        lite_report(db_, phone, device, 90, finding_score=0, age_hours=1)
+        refused, _, _ = memory_outcome(device, phone)
+        expect(not refused, "a block made of collection problems must not follow the device")
+        old = str(uuid.uuid4())
+        legacy = lite_installation(db_, old, "new_device")
+        lite_report(db_, legacy, old, 90, age_hours=1)  # stored before migration 015
+        refused, _, _ = memory_outcome(old, legacy)
+        expect(refused, "a pre-015 block must keep its memory until it ages out")
+        found = str(uuid.uuid4())
+        tampered = lite_installation(db_, found, "new_device")
+        lite_report(db_, tampered, found, 95, finding_score=95, age_hours=1)
+        lite_report(db_, tampered, found, 0, finding_score=0)
+        refused, _, _ = memory_outcome(found, tampered)
+        expect(refused, "a real finding must still follow the device after a clean scan")
 
 
 def main():

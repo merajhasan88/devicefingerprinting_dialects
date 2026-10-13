@@ -1156,7 +1156,7 @@ def _get_backend_identity():
 # against a schema it does not understand. /health/* still answers so operators
 # can see why.
 
-REQUIRED_SCHEMA_VERSION = 14
+REQUIRED_SCHEMA_VERSION = 15
 
 _schema_state = None
 _schema_lock = threading.Lock()
@@ -1305,6 +1305,11 @@ _RISK_SETTING_KINDS = {
     "account_devices_review_points": "int",
     "account_devices_block_count": "int",
     "upgrade_acceptance_hours": "int",
+    "collection_problems_block": "bool",
+    "integrity_device_memory_hours": "int",
+    "complete_evidence_paths": "paths",
+    "complete_evidence_max_age_seconds": "int",
+    "incomplete_evidence_review_after": "int",
 }
 # Lower bounds a value must also meet. Below 100 the "far above the baseline"
 # rule would fire for memory inside the build's own measured envelope.
@@ -1312,6 +1317,7 @@ _RISK_SETTING_MINIMUMS = {
     "wx_far_above_baseline_percent": 100,
     "upgrade_request_ttl_seconds": 30,
     "policy_step_up_score": 1,
+    "complete_evidence_max_age_seconds": 30,
 }
 _RISK_SETTING_BOOL_WORDS = ("0", "1", "true", "false", "yes", "no", "on", "off")
 # Rows whose absence would silently weaken a gate instead of restoring the
@@ -2070,6 +2076,83 @@ def _integrity_verdict(score, hard_block=False):
     return "trusted"
 
 
+# Collection quality, kept apart from findings (review R3, DESIGN.md 76).
+_QUALITY_REASON_PREFIXES = (
+    "integrity_probe_failed:",
+    "integrity_probe_incomplete:",
+    "integrity_evidence_",
+)
+# Coverage reasons that mark a scan as measuring only part of its targets.
+_PARTIAL_EVIDENCE_REASONS = (
+    "android_code_integrity_partial",
+    "android_code_integrity_restore_failed",
+)
+EVIDENCE_QUALITIES = ("complete", "partial", "incomplete", "invalid", "legacy")
+
+
+def _is_quality_reason(reason):
+    return str(reason.get("code", "")).startswith(_QUALITY_REASON_PREFIXES)
+
+
+def _apply_collection_problems(scored, failed_required, incomplete, invalid=()):
+    """Score what the scan could not measure apart from what it found.
+
+    A probe that failed, answered "ok" without its measurements, or reported
+    figures that contradict each other measured nothing usable; it must never
+    read as clean. Each is listed (0 points, for investigation), and together
+    they add +30 once, as integrity_evidence_incomplete: one collection problem
+    -- an unreadable process map, say -- can break three probes at once, which
+    used to add +90, a block, remembered for every account on the phone for a
+    day. finding_score is the score of the positive findings alone, which is
+    what the device memory remembers; a complete scan clears the rest. Owner
+    decision of 2026-10-13. collection_problems_block = 1 restores the earlier
+    rule in one place: each problem +30, counted as a finding.
+
+    Sets score, verdict, evidence_quality and finding_score on scored.
+    """
+    per_probe = _risk_setting_bool("collection_problems_block", False)
+    problems = [
+        ("integrity_probe_failed:%s" % name,
+         "A server-requested native integrity probe did not complete successfully.")
+        for name in failed_required
+    ] + [
+        ("integrity_probe_incomplete:%s" % name,
+         "A server-requested probe answered ok without the measurements it must "
+         "carry (%s)." % ", ".join(missing[:6]))
+        for name, missing in incomplete
+    ] + [
+        ("integrity_evidence_invalid:%s" % name,
+         "A probe reported measurements that contradict each other (%s)." % detail)
+        for name, detail in invalid
+    ]
+    for code, message in problems:
+        _integrity_reason(scored["reasons"], code, 30 if per_probe else 0, message)
+    if problems and not per_probe:
+        _integrity_reason(
+            scored["reasons"],
+            "integrity_evidence_incomplete",
+            30,
+            "%d requested probe(s) measured nothing usable; a complete scan clears this."
+            % len(problems),
+        )
+    points = lambda reasons: min(100, sum(max(0, int(r.get("points", 0))) for r in reasons))
+    scored["score"] = points(scored["reasons"])
+    scored["finding_score"] = points(
+        [r for r in scored["reasons"] if per_probe or not _is_quality_reason(r)]
+    )
+    scored["verdict"] = _integrity_verdict(scored["score"], hard_block=scored["hard_block"])
+    codes = {r.get("code") for r in scored["reasons"]}
+    if invalid:
+        quality = "invalid"
+    elif problems:
+        quality = "incomplete"
+    elif codes & set(_PARTIAL_EVIDENCE_REASONS):
+        quality = "partial"
+    else:
+        quality = "complete"
+    scored["evidence_quality"] = quality
+
+
 def _apply_hardware_backing_policy(cursor, installation_id, scored):
     """Fold the per-deployment hardware-backing policy into an integrity result.
 
@@ -2692,7 +2775,8 @@ def _latest_integrity_state(installation_id):
     with _cursor() as cursor:
         cursor.execute(
             """
-            SELECT report_id, score, verdict, hard_block, reasons, created_at
+            SELECT report_id, score, verdict, hard_block, reasons, created_at,
+                   evidence_quality, finding_score
             FROM integrity_reports
             WHERE installation_id = %s
             ORDER BY created_at DESC
@@ -2713,6 +2797,9 @@ def _latest_integrity_state(installation_id):
         "created_at": _iso_z(row[5]),
         "age_seconds": age_seconds,
         "fresh": age_seconds <= INTEGRITY_FRESHNESS_SECONDS,
+        # Reports stored before migration 015 carry neither.
+        "evidence_quality": row[6],
+        "finding_score": int(row[7]) if row[7] is not None else None,
     }
 
 
@@ -2734,21 +2821,27 @@ def _device_integrity_memory(device_id, installation_id):
     device. The set is always a subset of what was considered before, so this
     can only lift refusals, never add one.
     """
-    if INTEGRITY_DEVICE_MEMORY_HOURS <= 0:
+    hours = _risk_setting_int("integrity_device_memory_hours", INTEGRITY_DEVICE_MEMORY_HOURS)
+    if hours <= 0:
         return None
-    cutoff = _utc_now() - timedelta(hours=INTEGRITY_DEVICE_MEMORY_HOURS)
+    cutoff = _utc_now() - timedelta(hours=hours)
+    # What is remembered is the FINDINGS score (DESIGN.md 76): a scan whose
+    # probes failed is not evidence of compromise, so it never follows the
+    # device. Reports from before migration 015 have no finding_score and are
+    # judged by their score until they age out of the window.
     with _cursor() as cursor:
         cursor.execute(
             """
             SELECT r.report_id, r.installation_id, r.score, r.verdict,
-                   r.hard_block, r.created_at
+                   r.hard_block, r.created_at, r.finding_score
             FROM integrity_reports r
             JOIN app_installations i ON i.installation_id = r.installation_id
             WHERE r.device_id = %s AND r.created_at >= %s
               AND (r.installation_id = %s
                    OR i.registration_method <> 'reinstall_hint'
                    OR i.device_confirmed_at IS NOT NULL)
-            ORDER BY r.hard_block DESC, r.score DESC, r.created_at DESC,
+            ORDER BY r.hard_block DESC, COALESCE(r.finding_score, r.score) DESC,
+                     r.created_at DESC,
                      CASE WHEN r.installation_id = %s THEN 0 ELSE 1 END
             LIMIT 1
             """,
@@ -2757,6 +2850,7 @@ def _device_integrity_memory(device_id, installation_id):
         row = cursor.fetchone()
     if row is None:
         return None
+    finding = int(row[6]) if row[6] is not None else int(row[2])
     return {
         "report_id": str(row[0]),
         "installation_id": str(row[1]),
@@ -2764,7 +2858,9 @@ def _device_integrity_memory(device_id, installation_id):
         "verdict": row[3],
         "hard_block": bool(row[4]),
         "created_at": _iso_z(row[5]),
-        "window_hours": INTEGRITY_DEVICE_MEMORY_HOURS,
+        "finding_score": finding,
+        "finding_verdict": _integrity_verdict(finding, hard_block=bool(row[4])),
+        "window_hours": hours,
     }
 
 
@@ -2893,9 +2989,7 @@ def _enforce_integrity_gate(
     # whether the physical device was blocked recently under any installation:
     # reinstalling must not clear a compromised device's record.
     memory = _device_integrity_memory(device_id, installation_id)
-    if memory is not None and (
-        memory.get("hard_block") or memory.get("verdict") == "block"
-    ):
+    if memory is not None and memory.get("finding_verdict") == "block":
         raise ApiProblem(
             "This device recorded a blocked integrity verdict recently; "
             "reinstalling the app does not clear it.",
@@ -3256,8 +3350,7 @@ def _evaluate_risk_policy(
     # reinstall, which is exactly the case the installation-scoped lookup above
     # cannot see.
     if device_integrity_memory is not None and (
-        device_integrity_memory.get("hard_block")
-        or device_integrity_memory.get("verdict") == "block"
+        device_integrity_memory.get("finding_verdict") == "block"
     ):
         if device_integrity_memory.get("installation_id") != str(installation_id):
             _policy_reason(
@@ -5443,33 +5536,9 @@ def integrity_report():
             probe_value = probes.get(probe_name)
             if not isinstance(probe_value, dict) or probe_value.get("status") != "ok":
                 failed_required.append(probe_name)
-        for probe_name in failed_required:
-            _integrity_reason(
-                scored["reasons"],
-                "integrity_probe_failed:%s" % probe_name,
-                30,
-                "A server-requested native integrity probe did not complete successfully.",
-            )
-        # Missing evidence weighs exactly what a failed probe does: a probe
-        # that answered "ok" without its measurements measured nothing.
-        for probe_name, missing in incomplete:
-            _integrity_reason(
-                scored["reasons"],
-                "integrity_probe_incomplete:%s" % probe_name,
-                30,
-                "A server-requested probe answered ok without the measurements it "
-                "must carry (%s)." % ", ".join(missing[:6]),
-            )
-        if failed_required or incomplete:
-            scored["score"] = min(
-                100, sum(max(0, int(r.get("points", 0))) for r in scored["reasons"])
-            )
-            scored["verdict"] = _integrity_verdict(
-                scored["score"],
-                hard_block=scored["hard_block"],
-            )
 
         _apply_hardware_backing_policy(cursor, installation_id, scored)
+        _apply_collection_problems(scored, failed_required, incomplete)
         cursor.execute(
             "UPDATE integrity_challenges SET used_at = NOW() WHERE challenge_id = %s",
             (challenge_id,),
@@ -5479,8 +5548,8 @@ def integrity_report():
             INSERT INTO integrity_reports
                 (report_id, challenge_id, installation_id, device_id, platform,
                  collector_version, score, verdict, hard_block, reasons,
-                 probe_results, report_sha256)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                 probe_results, report_sha256, evidence_quality, finding_score)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """,
             (
                 report_id,
@@ -5495,6 +5564,8 @@ def integrity_report():
                 DIALECT.json_param(scored["reasons"]),
                 DIALECT.json_param(probes),
                 hashlib.sha256(report_bytes).hexdigest(),
+                scored["evidence_quality"],
+                scored["finding_score"],
             ),
         )
 
@@ -5503,6 +5574,8 @@ def integrity_report():
         "score": scored["score"],
         "verdict": scored["verdict"],
         "hard_block": scored["hard_block"],
+        "evidence_quality": scored["evidence_quality"],
+        "finding_score": scored["finding_score"],
         "reasons": scored["reasons"],
         "mode": INTEGRITY_MODE,
         "fresh_for_seconds": INTEGRITY_FRESHNESS_SECONDS,
