@@ -1156,7 +1156,7 @@ def _get_backend_identity():
 # against a schema it does not understand. /health/* still answers so operators
 # can see why.
 
-REQUIRED_SCHEMA_VERSION = 15
+REQUIRED_SCHEMA_VERSION = 16
 
 _schema_state = None
 _schema_lock = threading.Lock()
@@ -1310,6 +1310,7 @@ _RISK_SETTING_KINDS = {
     "complete_evidence_paths": "paths",
     "complete_evidence_max_age_seconds": "int",
     "incomplete_evidence_review_after": "int",
+    "acceptance_auto_cover_reasons": "codes",
 }
 # Lower bounds a value must also meet. Below 100 the "far above the baseline"
 # rule would fire for memory inside the build's own measured envelope.
@@ -1343,6 +1344,13 @@ def _validate_risk_settings(values):
                 path.strip().startswith("/")
                 for path in value.replace(";", ",").split(",")
                 if path.strip()
+            )
+        elif kind == "codes":
+            # Reason codes, comma-separated; empty is a valid choice.
+            valid = all(
+                re.fullmatch(r"[a-z0-9_:]{1,96}", item.strip()) is not None
+                for item in value.replace(";", ",").split(",")
+                if item.strip()
             )
         elif isinstance(kind, str) and kind.startswith("list:"):
             # A comma-separated subset of fixed words; empty is a valid choice.
@@ -2999,7 +3007,7 @@ def _enforce_integrity_gate(
     step_up=None,
     step_up_accepted=False,
     limited_ok=False,
-    accepted=(),
+    accepted=None,
 ):
     """Refuse the request unless the latest integrity verdict allows it.
 
@@ -3048,8 +3056,8 @@ def _enforce_integrity_gate(
         if limited_ok
         else set()
     )
-    if verdict == "review" and "integrity_review" in accepted:
-        state = dict(state, accepted_by_upgrade=True)
+    if verdict == "review" and _accepted(accepted, "integrity_review", integrity=state):
+        state = dict(state, accepted_by_upgrade=True, acceptance_id=accepted.acceptance_id)
     elif verdict == "review" and "review" in soft:
         state = dict(state, limited_cause="integrity_review")
     elif verdict == "review":
@@ -3069,8 +3077,8 @@ def _enforce_integrity_gate(
         )
     if verdict == "elevated" and step_up:
         state = dict(state, satisfied_by_step_up=True)
-    elif verdict == "elevated" and "integrity_elevated" in accepted:
-        state = dict(state, accepted_by_upgrade=True)
+    elif verdict == "elevated" and _accepted(accepted, "integrity_elevated", integrity=state):
+        state = dict(state, accepted_by_upgrade=True, acceptance_id=accepted.acceptance_id)
     elif verdict == "elevated" and step_up_accepted:
         raise ApiProblem(
             "The latest device-integrity verdict requires step-up verification: "
@@ -3615,7 +3623,20 @@ def _evaluate_risk_policy(
     return decision
 
 
-def _enforce_risk_policy(decision, limited_ok=False, accepted=()):
+def _mark_decision_accepted(decision):
+    """The stored decision row names the acceptance that let it pass, so the
+    row alone explains why a request proceeded (review R1)."""
+    decision_id = decision.get("decision_id")
+    if not decision.get("acceptance_id") or not decision_id or decision_id == "not-persisted":
+        return
+    with _cursor(commit=True) as cursor:
+        cursor.execute(
+            "UPDATE risk_policy_decisions SET acceptance_id = %s WHERE decision_id = %s",
+            (decision["acceptance_id"], decision_id),
+        )
+
+
+def _enforce_risk_policy(decision, limited_ok=False, accepted=None):
     """Refuse review and block; refuse elevated (step_up) only if a DBA opts in.
 
     By default an elevated decision is recorded and returned but does not
@@ -3639,8 +3660,10 @@ def _enforce_risk_policy(decision, limited_ok=False, accepted=()):
         return None
     if action == "step_up" and not _risk_setting_bool("elevated_risk_refuses", False):
         return None
-    if action in ("step_up", "review") and "risk_%s" % action in accepted:
+    if action in ("step_up", "review") and _accepted(accepted, "risk_%s" % action, policy=decision):
         decision["accepted_by_upgrade"] = True
+        decision["acceptance_id"] = accepted.acceptance_id
+        _mark_decision_accepted(decision)
         return None
     if (
         limited_ok
@@ -3947,7 +3970,7 @@ def _require_trusted_account_request(event_type="protected_request"):
     server-side device/account policy and enforce its effective action.
     """
     claims = _require_access_proof("account")
-    accepted = _session_acceptance(claims)
+    accepted = _session_acceptance(claims, event_type)
     step_up = _enforce_step_up(claims.get("iid"), get_jwt_identity())
     integrity = _enforce_integrity_gate(
         claims.get("did"),
@@ -3968,8 +3991,204 @@ def _require_trusted_account_request(event_type="protected_request"):
     return claims, policy, integrity
 
 
-def _session_acceptance(claims):
-    """The soft causes this full session's upgrade accepted, while still valid."""
+# An upgrade accepts what was approved, reason by reason (review R1, DESIGN.md
+# 76). Relationship reasons whose points follow a count are covered up to the
+# counts seen at approval; every other reason by its code, up to its points.
+_DEVICE_COUNT_REASONS = ("device_has_multiple_accounts", "device_has_many_accounts")
+_ACCOUNT_COUNT_REASONS = ("account_has_multiple_devices", "account_has_many_devices")
+
+
+def _reason_entries(reasons, source):
+    """The reasons of one source that carry points, in the stored form."""
+    entries = []
+    for reason in _as_list(reasons):
+        if not isinstance(reason, dict) or not reason.get("code"):
+            continue
+        points = reason.get("points", 0)
+        points = points if isinstance(points, int) and not isinstance(points, bool) else 0
+        if points > 0:
+            entries.append({"code": str(reason["code"]), "points": points, "source": source,
+                            "message": str(reason.get("message", ""))[:240]})
+    return entries
+
+
+def _cause_reasons(cause, integrity=None, policy=None):
+    """The reasons behind one limited cause, now."""
+    if cause.startswith("integrity_"):
+        return _reason_entries((integrity or {}).get("reasons"), "integrity")
+    if cause.startswith("risk_"):
+        return _reason_entries((policy or {}).get("reasons"), "relationship")
+    return []
+
+
+def _acceptance_snapshot(causes, integrity, policy):
+    """What an upgrade over these causes may accept: their reasons now --
+    collection problems excepted, which only a complete scan clears -- and the
+    relationship counts seen now. An integrity cause made of collection
+    problems alone cannot be approved at all: 403 complete_scan_required."""
+    reasons = []
+    for cause in causes:
+        found = _cause_reasons(cause, integrity, policy)
+        kept = [r for r in found if not _is_quality_reason(r)]
+        if cause.startswith("integrity_") and found and not kept:
+            raise ApiProblem(
+                "The integrity scan could not measure everything requested; that cannot "
+                "be approved. Send a complete scan; the session then upgrades by itself.",
+                403,
+                "complete_scan_required",
+                details={"limited_causes": list(causes)},
+            )
+        reasons.extend(kept)
+    context = (policy or {}).get("context") or {}
+    return reasons, context.get("device_account_count"), context.get("account_device_count")
+
+
+def _acceptance_covers(record, cause, integrity=None, policy=None, ignore_quality=False):
+    """(covered, uncovered reasons) for one limited cause under an acceptance.
+
+    Covered means: the acceptance is current and unrevoked, it accepted this
+    cause, and every reason behind the cause now was approved -- the same code
+    with no more points, or for the two count-following relationship reasons
+    no more accounts on the phone or devices on the account than at approval.
+    The DBA's acceptance_auto_cover_reasons are covered as well (a business
+    decision). Collection problems never are.
+    """
+    current = _cause_reasons(cause, integrity, policy)
+    if (
+        record is None
+        or record["revoked_at"] is not None
+        or record["expires_at"] <= _utc_now()
+        or cause not in record["causes"]
+    ):
+        return False, current
+    approved = {(r.get("source"), r.get("code")): r.get("points", 0) for r in record["reasons"]}
+    auto = _risk_setting_words("acceptance_auto_cover_reasons", "")
+    context = (policy or {}).get("context") or {}
+    uncovered = []
+    for reason in current:
+        code, points = reason["code"], reason["points"]
+        if _is_quality_reason(reason):
+            if not ignore_quality:
+                uncovered.append(reason)
+        elif code in auto:
+            continue
+        elif reason["source"] == "relationship" and code in _DEVICE_COUNT_REASONS:
+            if record["device_accounts"] is None or _as_int(
+                    context.get("device_account_count")) > record["device_accounts"]:
+                uncovered.append(reason)
+        elif reason["source"] == "relationship" and code in _ACCOUNT_COUNT_REASONS:
+            if record["account_devices"] is None or _as_int(
+                    context.get("account_device_count")) > record["account_devices"]:
+                uncovered.append(reason)
+        elif approved.get((reason["source"], code), -1) < points:
+            uncovered.append(reason)
+    return not uncovered, uncovered
+
+
+def _load_acceptance(acceptance_id, family_id, account_id, installation_id):
+    """The acceptance record, if it belongs to this family, account and phone."""
+    if not isinstance(acceptance_id, str) or not acceptance_id:
+        return None
+    with _cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT acceptance_id, family_id, account_id, installation_id, causes,
+                   reasons, device_accounts, account_devices, expires_at, revoked_at
+            FROM session_acceptances
+            WHERE acceptance_id = %s
+            """,
+            (acceptance_id,),
+        )
+        row = cursor.fetchone()
+    if row is None or (str(row[1]), str(row[2]), str(row[3])) != (
+        str(family_id), str(account_id), str(installation_id)
+    ):
+        return None
+    return {
+        "acceptance_id": str(row[0]),
+        "family_id": str(row[1]),
+        "account_id": str(row[2]),
+        "installation_id": str(row[3]),
+        "causes": [c for c in (row[4] or "").split(",") if c],
+        "reasons": [r for r in _as_list(DIALECT.json_value(row[5])) if isinstance(r, dict)],
+        "device_accounts": row[6],
+        "account_devices": row[7],
+        "expires_at": row[8],
+        "revoked_at": row[9],
+    }
+
+
+def _record_lapses(record, uncovered, event_type):
+    """Write down, once per reason, that an approved session met a reason its
+    approval did not cover (DESIGN.md 76). This is the measurement the
+    business reads -- when an approved session was limited again, and by what
+    -- to decide which reasons, if any, to cover automatically."""
+    if record is None or not uncovered:
+        return
+    with _cursor(commit=True) as cursor:
+        for reason in uncovered:
+            cursor.execute(
+                """
+                SELECT 1 FROM acceptance_lapses
+                WHERE acceptance_id = %s AND reason_code = %s
+                """,
+                (record["acceptance_id"], reason["code"][:96]),
+            )
+            if cursor.fetchone() is not None:
+                continue
+            savepoint = DIALECT.savepoint("lapse_insert")
+            if savepoint:
+                cursor.execute(savepoint[0])
+            try:
+                cursor.execute(
+                    """
+                    INSERT INTO acceptance_lapses
+                        (acceptance_id, reason_code, source, points, account_id,
+                         installation_id, event_type)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (record["acceptance_id"], reason["code"][:96], reason["source"],
+                     int(reason["points"]), record["account_id"],
+                     record["installation_id"], event_type[:32]),
+                )
+            except Exception as error:
+                if not DIALECT.is_unique_violation(error):
+                    raise
+                if savepoint:
+                    cursor.execute(savepoint[1])
+            else:
+                if savepoint:
+                    cursor.execute(savepoint[2])
+
+
+class _Acceptance(object):
+    """A full session's acceptance, judged reason by reason on each use."""
+
+    def __init__(self, record, event_type):
+        self.record = record
+        self.event_type = event_type
+
+    def covers(self, cause, integrity=None, policy=None):
+        covered, uncovered = _acceptance_covers(self.record, cause, integrity, policy)
+        if not covered:
+            _record_lapses(self.record, uncovered, self.event_type)
+        return covered
+
+    @property
+    def acceptance_id(self):
+        return self.record["acceptance_id"] if self.record else None
+
+
+def _accepted(accepted, cause, integrity=None, policy=None):
+    if isinstance(accepted, _Acceptance):
+        return accepted.covers(cause, integrity, policy)
+    return False
+
+
+def _session_acceptance(claims, event_type="protected_request"):
+    """This full session's acceptance, while its time runs. A session whose
+    upgrade predates migration 016 carries causes but no record, and its
+    acceptance covers nothing: the next refresh narrows it."""
     until = claims.get("accepted_until")
     if (
         claims.get("scope") != "full"
@@ -3977,8 +4196,12 @@ def _session_acceptance(claims):
         or not isinstance(until, int)
         or until <= int(_utc_now().timestamp())
     ):
-        return frozenset()
-    return frozenset(c for c in claims.get("accepted") or [] if isinstance(c, str))
+        return _Acceptance(None, event_type)
+    return _Acceptance(
+        _load_acceptance(claims.get("acc"), claims.get("family"),
+                         str(get_jwt_identity()), claims.get("iid")),
+        event_type,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -4795,6 +5018,7 @@ def _issue_account_tokens(
     limited_causes=(),
     accepted_causes=(),
     accepted_until=None,
+    acceptance_id=None,
 ):
     """Issue an access and refresh token pair and record the refresh session.
 
@@ -4824,8 +5048,10 @@ def _issue_account_tokens(
     if accepted and accepted_until is not None and accepted_until > _utc_now():
         claims["accepted"] = accepted
         claims["accepted_until"] = int(accepted_until.timestamp())
+        if acceptance_id:
+            claims["acc"] = acceptance_id
     else:
-        accepted, accepted_until = [], None
+        accepted, accepted_until, acceptance_id = [], None, None
     access_token = create_access_token(
         identity=account_id,
         additional_claims=claims,
@@ -4840,8 +5066,9 @@ def _issue_account_tokens(
         """
         INSERT INTO refresh_sessions
             (session_id, family_id, account_id, device_id, installation_id,
-             expires_at, scope, limited_causes, accepted_causes, accepted_until)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+             expires_at, scope, limited_causes, accepted_causes, accepted_until,
+             acceptance_id)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """,
         (
             session_id,
@@ -4854,6 +5081,7 @@ def _issue_account_tokens(
             ",".join(limited) or None,
             ",".join(accepted) or None,
             accepted_until,
+            acceptance_id,
         ),
     )
     tokens = {
@@ -4874,6 +5102,8 @@ def _issue_account_tokens(
     if accepted:
         tokens["accepted_causes"] = accepted
         tokens["accepted_until"] = _iso_z(accepted_until)
+        if acceptance_id:
+            tokens["acceptance_id"] = acceptance_id
     return tokens
 
 
@@ -4896,7 +5126,7 @@ def _refresh_session(cursor, claims, lock=False):
         """
         SELECT family_id, account_id, device_id, installation_id,
                expires_at, revoked_at, scope, limited_causes,
-               accepted_causes, accepted_until
+               accepted_causes, accepted_until, acceptance_id
         FROM refresh_sessions""" + hint + """
         WHERE session_id = %s
         """
@@ -4920,6 +5150,7 @@ def _refresh_session(cursor, claims, lock=False):
         stored_causes,
         stored_accepted,
         stored_accepted_until,
+        stored_acceptance_id,
     ) = row
     if (
         str(stored_family) != family_id
@@ -4947,6 +5178,7 @@ def _refresh_session(cursor, claims, lock=False):
         "limited_causes": [c for c in (stored_causes or "").split(",") if c],
         "accepted_causes": [c for c in (stored_accepted or "").split(",") if c],
         "accepted_until": stored_accepted_until,
+        "acceptance_id": str(stored_acceptance_id) if stored_acceptance_id else None,
     }
 
 
@@ -5902,7 +6134,8 @@ def account_me():
 def policy_me():
     claims = _require_access_proof("account")
     _enforce_integrity_gate(
-        claims.get("did"), claims.get("iid"), accepted=_session_acceptance(claims)
+        claims.get("did"), claims.get("iid"),
+        accepted=_session_acceptance(claims, "policy_check"),
     )
     decision = _evaluate_risk_policy(
         "policy_check",
@@ -6187,16 +6420,27 @@ def refresh_account_tokens():
             # whose upgrade accepted every cause found now stays full, with its
             # acceptance, until accepted_until; anything beyond what was
             # accepted narrows it and drops the acceptance (DESIGN.md 72).
-            accepted, accepted_until = (), None
+            accepted, accepted_until, acceptance_id = (), None, None
             if (
                 session["scope"] == "full"
                 and session["accepted_causes"]
                 and session["accepted_until"] is not None
                 and session["accepted_until"] > _utc_now()
-                and set(limited) <= set(session["accepted_causes"])
             ):
-                accepted, accepted_until = session["accepted_causes"], session["accepted_until"]
-                limited = []
+                # Judged reason by reason (DESIGN.md 76): every cause found now
+                # must be covered by what was approved; each one that is not is
+                # recorded as a lapse, and the session narrows.
+                acceptance = _Acceptance(
+                    _load_acceptance(session["acceptance_id"], session["family_id"],
+                                     session["account_id"], session["installation_id"]),
+                    "refresh",
+                )
+                verdicts = [acceptance.covers(cause, integrity=integrity, policy=policy)
+                            for cause in limited]
+                if acceptance.record is not None and all(verdicts):
+                    accepted, accepted_until = session["accepted_causes"], session["accepted_until"]
+                    acceptance_id = acceptance.acceptance_id
+                    limited = []
             if not limited and session["scope"] == "limited":
                 limited = session["limited_causes"] or ["session_limited"]
             tokens = _issue_account_tokens(
@@ -6209,6 +6453,7 @@ def refresh_account_tokens():
                 limited_causes=limited,
                 accepted_causes=accepted,
                 accepted_until=accepted_until,
+                acceptance_id=acceptance_id,
             )
             cursor.execute(
                 """
@@ -6298,6 +6543,13 @@ def logout():
             (claims.get("family"),),
         )
         revoked = cursor.rowcount
+        cursor.execute(
+            """
+            UPDATE session_acceptances SET revoked_at = NOW()
+            WHERE family_id = %s AND revoked_at IS NULL
+            """,
+            (claims.get("family"),),
+        )
     logger.info(
         "Signed out: installation=%s family=%s sessions=%s",
         claims.get("iid"), claims.get("family"), revoked,
@@ -6348,7 +6600,16 @@ def upgrade_session():
         persist=True,
     )
     causes = _limited_causes(integrity, _enforce_risk_policy(policy, limited_ok=True))
+    snapshot = scope = None
     if causes:
+        snapshot = _acceptance_snapshot(causes, integrity, policy)
+        if route in ("approval", "assertion"):
+            # Accept what the approver or the identity backend was shown --
+            # the request's reasons -- provided nothing has been added since.
+            scope = _request_scope(body.get("request_id"), account_id, installation_id)
+            if scope is not None:
+                _require_within_scope(scope, causes, integrity, policy)
+                snapshot = (scope["reasons"], scope["device_accounts"], scope["account_devices"])
         _verify_upgrade_proof(route, body, claims, account_id, installation_id, causes)
 
     with _cursor(commit=True) as cursor:
@@ -6375,6 +6636,11 @@ def upgrade_session():
         # (DESIGN.md 72). A recheck needed no proof and accepts nothing.
         hours = _risk_setting_int("upgrade_acceptance_hours", 720)
         accepted_until = _utc_now() + min(timedelta(hours=hours), REFRESH_TOKEN_LIFETIME)
+        acceptance_id = None
+        if causes and hours > 0:
+            acceptance_id = _insert_acceptance(
+                cursor, session, route, scope, causes, snapshot, integrity, accepted_until
+            )
         tokens = _issue_account_tokens(
             cursor,
             account_id,
@@ -6384,6 +6650,7 @@ def upgrade_session():
             policy=policy,
             accepted_causes=causes if hours > 0 else (),
             accepted_until=accepted_until,
+            acceptance_id=acceptance_id,
         )
         cursor.execute(
             """
@@ -6401,6 +6668,95 @@ def upgrade_session():
         ",".join(causes) or "-",
     )
     return jsonify(tokens)
+
+
+def _request_scope(request_id, account_id, installation_id):
+    """What an approval or assertion request showed: its causes, reasons and
+    counts. None for a request from before migration 016."""
+    request_id = _uuid_text(request_id, "request_id")
+    with _cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT causes, reasons, device_accounts, account_devices, approved_by_installation
+            FROM session_upgrade_requests
+            WHERE request_id = %s AND account_id = %s AND installation_id = %s
+            """,
+            (request_id, account_id, installation_id),
+        )
+        row = cursor.fetchone()
+    if row is None or row[1] is None:
+        return None
+    return {
+        "request_id": request_id,
+        "causes": [c for c in (row[0] or "").split(",") if c],
+        "reasons": [r for r in _as_list(DIALECT.json_value(row[1])) if isinstance(r, dict)],
+        "device_accounts": row[2],
+        "account_devices": row[3],
+        "approved_by_installation": str(row[4]) if row[4] else None,
+    }
+
+
+def _require_within_scope(scope, causes, integrity, policy):
+    """Refuse an upgrade whose causes grew after the request was shown: the
+    approver approved those reasons, not these (DESIGN.md 76)."""
+    record = dict(scope, revoked_at=None, expires_at=_utc_now() + timedelta(days=1))
+    grown = []
+    for cause in causes:
+        covered, uncovered = _acceptance_covers(record, cause, integrity, policy,
+                                                ignore_quality=True)
+        if not covered:
+            grown.extend(uncovered or [{"code": cause}])
+    if grown:
+        raise ApiProblem(
+            "Something was found after the approval was requested; ask again, so the "
+            "approver sees it.",
+            409,
+            "upgrade_scope_changed",
+            details={"new_reasons": [r.get("code") for r in grown]},
+        )
+
+
+def _insert_acceptance(cursor, session, route, scope, causes, snapshot, integrity, until):
+    """Record what this upgrade accepted; returns its acceptance_id."""
+    reasons, device_accounts, account_devices = snapshot
+    report_id = (integrity or {}).get("report_id")
+    build = None
+    if report_id:
+        cursor.execute("SELECT probe_results FROM integrity_reports WHERE report_id = %s",
+                       (report_id,))
+        row = cursor.fetchone()
+        identity = (DIALECT.json_value(row[0]) or {}).get("app_identity") if row else None
+        if isinstance(identity, dict):
+            build = identity.get("apk_sha256") or identity.get("executable_sha256")
+    acceptance_id = str(uuid.uuid4())
+    cursor.execute(
+        """
+        INSERT INTO session_acceptances
+            (acceptance_id, family_id, account_id, device_id, installation_id, route,
+             request_id, approved_by_installation, causes, reasons, device_accounts,
+             account_devices, evidence_quality, integrity_report_id, apk_sha256, expires_at)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """,
+        (
+            acceptance_id,
+            session["family_id"],
+            session["account_id"],
+            session["device_id"],
+            session["installation_id"],
+            route,
+            scope["request_id"] if scope else None,
+            scope["approved_by_installation"] if scope else None,
+            ",".join(sorted(set(causes))),
+            DIALECT.json_param(list(reasons)),
+            device_accounts,
+            account_devices,
+            (integrity or {}).get("evidence_quality"),
+            report_id,
+            build if isinstance(build, str) and len(build) <= 64 else None,
+            until,
+        ),
+    )
+    return acceptance_id
 
 
 def _verify_upgrade_proof(route, body, claims, account_id, installation_id, causes):
@@ -6763,15 +7119,33 @@ def upgrade_request():
         raise ApiProblem("route must be approval or assertion.", 400, "invalid_route")
     # A hard outcome refuses here too: a blocked device gets no prompt sent.
     integrity = _enforce_integrity_gate(device_id, installation_id, limited_ok=True)
-    causes = _limited_causes(integrity, None) or list(claims.get("limited") or [])
+    policy = _evaluate_risk_policy(
+        "upgrade_request",
+        device_id,
+        installation_id,
+        account_id=account_id,
+        account_link_pending=False,
+        persist=False,
+    )
+    causes = (
+        _limited_causes(integrity, _enforce_risk_policy(policy, limited_ok=True))
+        or list(claims.get("limited") or [])
+    )
     if route not in _enabled_upgrade_routes(causes):
         raise ApiProblem(
             "That upgrade route is not enabled here.", 403, "upgrade_route_unavailable"
         )
+    # What the approver -- or the identity backend -- is shown, and all an
+    # approval will accept (DESIGN.md 76). Collection problems alone cannot be
+    # approved: complete_scan_required, before anyone is prompted.
+    reasons, device_accounts, account_devices = _acceptance_snapshot(causes, integrity, policy)
     now = _utc_now()
     ttl = timedelta(seconds=_risk_setting_int("upgrade_request_ttl_seconds", 300))
     request_id = str(uuid.uuid4())
-    response = {"request_id": request_id, "route": route, "expires_at": _iso_z(now + ttl)}
+    response = {"request_id": request_id, "route": route, "expires_at": _iso_z(now + ttl),
+                "limited_causes": causes,
+                "reasons": [{k: r[k] for k in ("code", "points", "message", "source")}
+                            for r in reasons]}
     with _cursor(commit=True) as cursor:
         # Count and insert under the account row's lock, so parallel requests
         # cannot all pass the budget count before any is inserted (review R2).
@@ -6822,11 +7196,14 @@ def upgrade_request():
             """
             INSERT INTO session_upgrade_requests
                 (request_id, route, account_id, device_id, installation_id,
-                 session_id, family_id, nonce_sha256, created_at, expires_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                 session_id, family_id, nonce_sha256, created_at, expires_at,
+                 causes, reasons, device_accounts, account_devices)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """,
             (request_id, route, account_id, device_id, installation_id,
-             claims.get("sid"), claims.get("family"), nonce_sha256, now, now + ttl),
+             claims.get("sid"), claims.get("family"), nonce_sha256, now, now + ttl,
+             ",".join(sorted(set(causes))), DIALECT.json_param(list(reasons)),
+             device_accounts, account_devices),
         )
     logger.info(
         "Upgrade requested: installation=%s route=%s request=%s",
@@ -6851,7 +7228,8 @@ def list_approvals():
         cursor.execute(
             """
             SELECT r.request_id, r.created_at, r.expires_at,
-                   d.platform, i.created_at, i.registration_method
+                   d.platform, i.created_at, i.registration_method,
+                   r.causes, r.reasons
             FROM session_upgrade_requests r
             JOIN app_installations i ON i.installation_id = r.installation_id
             JOIN recognized_devices d ON d.device_id = i.device_id
@@ -6877,6 +7255,14 @@ def list_approvals():
                         "first_seen_at": _iso_z(row[4]),
                         "registration_method": row[5],
                     },
+                    # What approving accepts (DESIGN.md 76): the causes and the
+                    # reasons behind them, as the server worded them.
+                    "limited_causes": [c for c in (row[6] or "").split(",") if c],
+                    "reasons": [
+                        {k: r.get(k) for k in ("code", "points", "message", "source")}
+                        for r in _as_list(DIALECT.json_value(row[7]) if row[7] else [])
+                        if isinstance(r, dict)
+                    ],
                 }
                 for row in rows
             ]

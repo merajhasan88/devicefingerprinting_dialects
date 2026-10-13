@@ -14,8 +14,9 @@ certificate, like the suite's scoring checks.
         that phone lists approval requests and approves the newest (step-up)
     tools/second_phone.py --base-url ... signin HANDLE PASSWORD [elevated]
         a NEW phone holding an account of its own signs in to HANDLE; if the
-        session is limited it asks for approval. "elevated": its scan has one
-        failed probe (+30), a soft integrity cause of its own
+        session is limited it asks for approval. "elevated": its scan has two
+        mild findings (test-keys, no boot state: +40), a soft integrity cause an
+        approval can accept (a failed probe cannot be approved, DESIGN.md 76)
     tools/second_phone.py --base-url ... relogin HANDLE PASSWORD [elevated]
         the same new phone signs in again (a new limited session and request)
     tools/second_phone.py --base-url ... complete
@@ -136,7 +137,7 @@ def main():
             print("approve %s: %s %s" % (rid, st, c.error_code(pl) or pl))
     elif command in ("signin", "relogin"):
         handle, password = argv[3], argv[4]
-        # "elevated": the scripted phone's scan has one failed probe (+30), a
+        # "elevated": the scripted phone's scan has two mild findings (+40), a
         # soft integrity cause of its own, so it is limited even where a DBA
         # gave extra accounts on a phone no points.
         elevated = len(argv) > 5 and argv[5] == "elevated"

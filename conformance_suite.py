@@ -1727,7 +1727,13 @@ def _refresh(api, installation, refresh_token):
 
 
 def _elevate(probes):
-    probes["mounts"] = {"status": "error", "error": "permission denied"}  # one failed probe, +30
+    """Two mild findings, 25 + 15 = 40: elevated. Since DESIGN.md 76 a failed
+    probe (collection problem) cannot be approved -- only a complete scan
+    clears it -- so the limited-session checks need a finding an approval can
+    accept: test-keys and no Verified Boot state reported."""
+    probes["root_files"]["test_keys"] = True  # android_test_keys +25
+    for key in ("ro.boot.verifiedbootstate", "ro.boot.flash.locked", "ro.boot.vbmeta.device_state"):
+        probes["system_properties"]["properties"].pop(key, None)  # android_boot_state_unavailable +15
 
 
 @check("relationship: sign-ins at the same moment cannot exceed the devices-per-account limit",
@@ -1825,7 +1831,7 @@ def check_logout_revokes_the_family(api, ctx):
 
 
 def _limited_setup(api, ctx):
-    """An installation with an account, whose latest scan is elevated (+30)."""
+    """An installation with an account, whose latest scan is elevated (+40)."""
     if ctx["mode"] != "enforce":
         raise Skip("server is in observe mode; limited sessions exist only in enforce mode")
     if "elevated" not in _setting_words(live_settings(api), "limited_session_integrity_verdicts",

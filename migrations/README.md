@@ -45,6 +45,7 @@ Apply migrations **in ascending version order**; each one records its own row in
 | 13 | `013_upgrade_acceptance.sql` | `refresh_sessions.accepted_causes` / `accepted_until`: the soft causes an upgrade's proof accepted, kept with the session; seeds `upgrade_acceptance_hours` (720) |
 | 14 | `014_superseded_requests.sql` | `session_upgrade_requests.superseded_at`: a newer approval request from the same installation for the same account supersedes its pending ones, so an approver sees one request per phone (rows kept as evidence) |
 | 15 | `015_evidence_quality.sql` | `integrity_reports.evidence_quality` / `finding_score`: what a scan measured, and the score of its findings alone (only findings enter the device memory); an index for the per-request family check; seeds `collection_problems_block` (0), `integrity_device_memory_hours` (24), `complete_evidence_paths` (''), `complete_evidence_max_age_seconds` (600), `incomplete_evidence_review_after` (3) |
+| 16 | `016_scoped_acceptances.sql` | `session_acceptances` (what each upgrade accepted: reasons, points, counts, approver, scan and build; revocable) and `acceptance_lapses` (when an approved session met a reason it did not cover — the business's measurement); `refresh_sessions.acceptance_id`; `session_upgrade_requests.causes` / `reasons` / counts (what the approver is shown); `risk_policy_decisions.acceptance_id`; seeds `acceptance_auto_cover_reasons` ('') |
 
 All scripts are guarded and safe to re-run.
 

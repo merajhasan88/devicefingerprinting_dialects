@@ -89,6 +89,9 @@ class Rows(object):
         self.link_exists = False
         self.link_counts = (0, 0)
         self.recent_qualities = []
+        self.acceptances = {}
+        self.lapses = set()
+        self.request_scope = None
 
     def execute(self, sql, params=None):
         q = " ".join(sql.split())
@@ -111,8 +114,9 @@ class Rows(object):
                            s._parse_public_key(inst.jwk)["thumbprint"])
         elif q.startswith("SELECT installation_id, device_id, registration_method"):
             self.result = self.reenrol_row
-        elif q.startswith("SELECT family_id, account_id, device_id, installation_id, expires_at, revoked_at, scope, limited_causes, accepted_causes, accepted_until FROM refresh_sessions"):
-            self.result = self.refresh_row
+        elif q.startswith("SELECT family_id, account_id, device_id, installation_id, expires_at, revoked_at, scope, limited_causes, accepted_causes, accepted_until, acceptance_id FROM refresh_sessions"):
+            row = self.refresh_row
+            self.result = row + (None,) if row is not None and len(row) == 10 else row
         elif q.startswith("INSERT INTO refresh_sessions"):
             self.writes.append((q, params))
         elif q.startswith("SELECT r.session_id FROM refresh_sessions r"):
@@ -122,6 +126,26 @@ class Rows(object):
         elif q.startswith(("SELECT account_id FROM demo_accounts",
                            "SELECT device_id FROM recognized_devices")):
             self.result = (params[0],)  # the anchor row; locking is the engine's job
+        elif q.startswith("SELECT acceptance_id, family_id, account_id, installation_id, causes"):
+            self.result = self.acceptances.get(params[0])
+        elif q.startswith("INSERT INTO session_acceptances"):
+            self.writes.append((q, params))
+            self.acceptances[params[0]] = (params[0], params[1], params[2], params[4], params[8],
+                                           getattr(params[9], "adapted", params[9]),
+                                           params[10], params[11], params[15], None)
+        elif q.startswith(("UPDATE session_acceptances", "UPDATE risk_policy_decisions")):
+            self.writes.append((q, params))
+        elif q.startswith(("SAVEPOINT ", "RELEASE SAVEPOINT ", "ROLLBACK TO SAVEPOINT ")):
+            pass
+        elif q.startswith("SELECT 1 FROM acceptance_lapses"):
+            self.result = (1,) if (params[0], params[1]) in self.lapses else None
+        elif q.startswith("INSERT INTO acceptance_lapses"):
+            self.writes.append((q, params))
+            self.lapses.add((params[0], params[1]))
+        elif q.startswith("SELECT causes, reasons, device_accounts, account_devices, approved_by_installation"):
+            self.result = self.request_scope
+        elif q.startswith("SELECT probe_results FROM integrity_reports WHERE report_id"):
+            self.result = None
         elif q.startswith("SELECT evidence_quality FROM integrity_reports WHERE installation_id"):
             self.result = [(quality,) for quality in self.recent_qualities]
         elif q.startswith("SELECT 1 FROM device_account_links WHERE device_id"):
@@ -2269,41 +2293,104 @@ def _full_token(accepted=(), until=None, scope="full"):
         return s.create_access_token(identity=account, additional_claims=claims)
 
 
+WX = {"code": "android_wx_far_above_baseline", "points": 40, "source": "integrity"}
+TRACER = {"code": "android_process_traced", "points": 55}
+MULTI = {"code": "account_has_multiple_devices", "points": 35, "source": "relationship"}
+
+
+def _accepted_token(causes, reasons, device_accounts=None, account_devices=None,
+                    revoked=None, with_record=True):
+    """A full access token whose upgrade accepted these reasons, and its record."""
+    family, acceptance_id = str(uuid.uuid4()), str(uuid.uuid4())
+    if with_record:
+        db.acceptances[acceptance_id] = (acceptance_id, family, account, inst.installation_id,
+                                         ",".join(causes), list(reasons), device_accounts,
+                                         account_devices, s._utc_now() + timedelta(days=5), revoked)
+    claims = {"role": "account", "iid": inst.installation_id, "did": inst.device_id,
+              "sid": str(uuid.uuid4()), "family": family, "scope": "full",
+              "accepted": sorted(causes), "accepted_until": int(time.time() + 3600)}
+    if with_record:
+        claims["acc"] = acceptance_id  # a token from before migration 016 has none
+    with s.app.app_context():
+        return s.create_access_token(identity=account, additional_claims=claims), acceptance_id
+
+
+def _integrity_now(verdict, *reasons):
+    score = {"trusted": 0, "elevated": 40, "review": 60}[verdict]
+    return lambda iid: {"score": score, "verdict": verdict, "fresh": True,
+                        "reasons": [dict(r, message="m") for r in reasons]}
+
+
+def _risk_now(action, *reasons, **context):
+    return lambda *a, **k: {"effective_action": action, "decision_id": "not-persisted",
+                            "reasons": [dict(r, message="m") for r in reasons],
+                            "context": dict({"device_account_count": 1,
+                                             "account_device_count": 2}, **context)}
+
+
 @check
-def an_upgrade_acceptance_covers_its_causes_and_nothing_else():
+def an_upgrade_acceptance_covers_what_was_approved_and_nothing_else():
+    """Review R1 (DESIGN.md 76, owner decision 2026-10-13). An approval for
+    runtime growth used to cover a later tracer, in the same band, for a
+    month. Now an acceptance covers the reasons it approved -- same code, no
+    more points; relationship counts up to those approved -- and the DBA's
+    auto-cover list (a business decision). Collection problems never; a
+    revoked record or a pre-016 acceptance covers nothing. Each new reason is
+    recorded once as a lapse."""
     me = "/v1/account/me"
 
     def get(bearer):
         reply = client.get(me, headers=access_headers("GET", me, bearer=bearer))
         return reply.status_code, (error_code(reply) if reply.status_code != 200 else reply.get_json())
 
-    both = ("integrity_elevated", "risk_review")
-    with elevated_integrity(), policy():
-        s._latest_integrity_state = _verdict_state("elevated")
-        s._evaluate_risk_policy = lambda *a, **k: {"effective_action": "review", "context": {}}
-        for token, expected, why in (
-                (_full_token(), "integrity_step_up_required", "no acceptance"),
-                (_full_token(["integrity_elevated"]), "risk_review_required",
-                 "integrity accepted, relationship not"),
-                (_full_token(both, until=time.time() - 1), "integrity_step_up_required",
-                 "an acceptance past its time"),
-                (_full_token(both, scope="limited"), "session_limited", "a limited token")):
-            status, got = get(token)
-            expect(status == 403 and got == expected, "%s: expected %s, got %s %s"
-                   % (why, expected, status, got))
-        status, payload = get(_full_token(both))
-        expect(status == 200 and payload["integrity"].get("accepted_by_upgrade") is True
-               and payload["trust_policy"].get("accepted_by_upgrade") is True,
-               "both causes accepted must pass, marked: %s %s" % (status, payload))
-        for verdict, action, expected in (("block", "review", "integrity_blocked"),
-                                          ("review", "review", "integrity_review_required"),
-                                          ("elevated", "block", "risk_policy_blocked")):
-            s._latest_integrity_state = _verdict_state(verdict)
-            s._evaluate_risk_policy = (lambda a: lambda *x, **k: {"effective_action": a, "context": {}})(action)
-            status, got = get(_full_token(both))
-            expect(status == 403 and got == expected,
-                   "a worse outcome (%s / %s) must refuse with %s, got %s %s"
-                   % (verdict, action, expected, status, got))
+    quality = {"code": "integrity_evidence_incomplete", "points": 30}
+    try:
+        with elevated_integrity(), policy():
+            s._evaluate_risk_policy = _risk_now("allow")
+            token, acc = _accepted_token(["integrity_elevated"], [WX])
+            s._latest_integrity_state = _integrity_now("elevated", WX)
+            status, payload = get(token)
+            expect(status == 200 and payload["integrity"].get("acceptance_id") == acc,
+                   "the approved reason must pass, marked with its acceptance: %s %s" % (status, payload))
+            for now, why in (((TRACER,), "a different finding in the same band"),
+                             ((WX, TRACER), "a new finding beside the approved one"),
+                             ((dict(WX, points=45),), "more points than approved"),
+                             ((WX, quality), "a collection problem")):
+                s._latest_integrity_state = _integrity_now("elevated", *now)
+                got = get(token)
+                expect(got == (403, "integrity_step_up_required"),
+                       "%s must not be covered, got %s" % (why, got))
+            expect((acc, "android_process_traced") in db.lapses
+                   and (acc, "integrity_evidence_incomplete") in db.lapses,
+                   "each new reason must be recorded once as a lapse: %s" % db.lapses)
+            with policy(acceptance_auto_cover_reasons="android_process_traced,integrity_evidence_incomplete"):
+                s._latest_integrity_state = _integrity_now("elevated", WX, TRACER)
+                expect(get(token)[0] == 200, "the DBA's auto-cover list covers a new reason")
+                s._latest_integrity_state = _integrity_now("elevated", WX, quality)
+                expect(get(token) == (403, "integrity_step_up_required"),
+                       "a collection problem is never auto-covered")
+            s._latest_integrity_state = _integrity_now("elevated", WX)
+            for token_, why in ((_accepted_token(["integrity_elevated"], [WX], revoked=s._utc_now())[0],
+                                 "a revoked acceptance"),
+                                (_accepted_token(["integrity_elevated"], [WX], with_record=False)[0],
+                                 "an acceptance from before migration 016"),
+                                (_full_token(["integrity_elevated"]), "causes without a record")):
+                expect(get(token_) == (403, "integrity_step_up_required"),
+                       "%s must cover nothing" % why)
+            s._latest_integrity_state = _verdict_state("trusted")
+            token, acc = _accepted_token(["risk_review"], [MULTI], device_accounts=1, account_devices=2)
+            s._evaluate_risk_policy = _risk_now("review", MULTI)
+            expect(get(token)[0] == 200, "the approved relationship reason and counts pass")
+            s._evaluate_risk_policy = _risk_now("review", dict(MULTI, code="account_has_many_devices",
+                                                               points=60), account_device_count=3)
+            expect(get(token) == (403, "risk_review_required"), "a third device is not covered")
+            s._evaluate_risk_policy = _risk_now("review", MULTI, {"code": "request_rate_anomaly",
+                                                                  "points": 25,
+                                                                  "source": "relationship"})
+            expect(get(token) == (403, "risk_review_required"), "a new relationship reason is not covered")
+    finally:
+        db.acceptances.clear()
+        db.lapses.clear()
 
 
 @check
@@ -2312,17 +2399,27 @@ def an_upgrade_records_its_acceptance():
     db.writes = []
     try:
         with elevated_integrity(), policy(upgrade_stepup_same_device=1):
-            s._latest_integrity_state = _verdict_state("elevated")
+            quality = {"code": "integrity_evidence_incomplete", "points": 30}
+            s._latest_integrity_state = _integrity_now("elevated", WX, quality)
             reply = _upgrade(_limited_session("integrity_elevated"), {"route": "stepup"}, stepup=True)
             payload = reply.get_json() or {}
             with s.app.app_context():
                 claims = decode_token(payload.get("access_token", ""))
             row = [p for q, p in db.writes if q.startswith("INSERT INTO refresh_sessions")][-1]
+            record = [p for q, p in db.writes if q.startswith("INSERT INTO session_acceptances")][-1]
+            reasons = getattr(record[9], "adapted", record[9])
             expect(reply.status_code == 200 and payload.get("accepted_causes") == ["integrity_elevated"]
                    and claims.get("accepted") == ["integrity_elevated"]
                    and claims.get("accepted_until", 0) > time.time() + 29 * 86400
-                   and row[8] == "integrity_elevated" and row[9] is not None,
-                   "a proof upgrade must record what it accepted: %s %s %s" % (payload, claims, row[6:]))
+                   and claims.get("acc") == record[0] == row[10]
+                   and [r["code"] for r in reasons] == [WX["code"]],
+                   "a proof upgrade must record what it accepted, collection problems "
+                   "excepted: %s %s %s" % (payload, claims, reasons))
+            s._latest_integrity_state = _integrity_now("elevated", quality)
+            reply = _upgrade(_limited_session("integrity_elevated"), {"route": "stepup"}, stepup=True)
+            expect(reply.status_code == 403 and error_code(reply) == "complete_scan_required",
+                   "collection problems alone cannot be approved: %s %s"
+                   % (reply.status_code, error_code(reply)))
         with elevated_integrity(), policy(upgrade_stepup_same_device=1, upgrade_acceptance_hours=0):
             s._latest_integrity_state = _verdict_state("elevated")
             reply = _upgrade(_limited_session("integrity_elevated"), {"route": "stepup"}, stepup=True)
@@ -2339,17 +2436,22 @@ def an_upgrade_records_its_acceptance():
 
 @check
 def a_refresh_keeps_an_accepted_session_full_only_while_covered():
-    def refresh(stored_scope, accepted, until, verdict, action):
-        family, session = str(uuid.uuid4()), str(uuid.uuid4())
+    """A refresh keeps an accepted session full only while every cause found
+    now is covered by what was approved, reason by reason (DESIGN.md 76)."""
+    def refresh(accepted, until, now, action, with_record=True):
+        family, session, acc = str(uuid.uuid4()), str(uuid.uuid4()), str(uuid.uuid4())
         with s.app.app_context():
             token = s.create_refresh_token(identity=account, additional_claims={
                 "role": "account", "iid": inst.installation_id, "did": inst.device_id,
-                "sid": session, "family": family, "scope": stored_scope})
+                "sid": session, "family": family, "scope": "full"})
+        if with_record and accepted:
+            db.acceptances[acc] = (acc, family, account, inst.installation_id, ",".join(accepted),
+                                   [WX], None, None, s._utc_now() + timedelta(days=5), None)
         db.refresh_row = (family, account, inst.device_id, inst.installation_id,
-                          s._utc_now() + s.REFRESH_TOKEN_LIFETIME, None, stored_scope, None,
-                          ",".join(accepted) or None, until)
-        s._latest_integrity_state = _verdict_state(verdict)
-        s._evaluate_risk_policy = lambda *a, **k: {"effective_action": action, "context": {}}
+                          s._utc_now() + s.REFRESH_TOKEN_LIFETIME, None, "full", None,
+                          ",".join(accepted) or None, until, acc if accepted else None)
+        s._latest_integrity_state = now
+        s._evaluate_risk_policy = _risk_now(action)
         challenge = client.post("/v1/auth/refresh/challenge",
                                 headers={"Authorization": "Bearer " + token}).get_json()
         reply = client.post("/v1/auth/refresh", json={
@@ -2361,23 +2463,30 @@ def a_refresh_keeps_an_accepted_session_full_only_while_covered():
         return payload.get("scope"), payload.get("accepted_causes")
 
     later, earlier = s._utc_now() + timedelta(days=5), s._utc_now() - timedelta(seconds=1)
+    covered, traced = _integrity_now("elevated", WX), _integrity_now("elevated", WX, TRACER)
     try:
         with elevated_integrity(), policy():
-            for args, expected, why in (
-                    (("full", ["integrity_elevated"], later, "elevated", "allow"),
-                     ("full", ["integrity_elevated"]), "a covered cause keeps the session full"),
-                    (("full", ["integrity_elevated"], later, "elevated", "review"),
-                     ("limited", None), "a cause beyond the acceptance narrows it and drops it"),
-                    (("full", ["integrity_elevated"], earlier, "elevated", "allow"),
+            for args, kwargs, expected, why in (
+                    ((["integrity_elevated"], later, covered, "allow"), {},
+                     ("full", ["integrity_elevated"]), "an approved reason keeps the session full"),
+                    ((["integrity_elevated"], later, traced, "allow"), {},
+                     ("limited", None), "a new reason narrows it and drops the acceptance"),
+                    ((["integrity_elevated"], later, covered, "review"), {},
+                     ("limited", None), "a cause beyond the acceptance narrows it"),
+                    ((["integrity_elevated"], earlier, covered, "allow"), {},
                      ("limited", None), "an expired acceptance narrows"),
-                    (("full", [], None, "elevated", "allow"), ("limited", None),
+                    (([], None, covered, "allow"), {}, ("limited", None),
                      "without acceptance a soft cause narrows"),
-                    (("full", ["integrity_elevated"], later, "trusted", "allow"),
+                    ((["integrity_elevated"], later, covered, "allow"), {"with_record": False},
+                     ("limited", None), "an acceptance from before migration 016 narrows"),
+                    ((["integrity_elevated"], later, _verdict_state("trusted"), "allow"), {},
                      ("full", ["integrity_elevated"]), "with no cause left it stays full")):
-                got = refresh(*args)
+                got = refresh(*args, **kwargs)
                 expect(got == expected, "%s: expected %s, got %s" % (why, expected, got))
     finally:
         db.refresh_row = None
+        db.acceptances.clear()
+        db.lapses.clear()
 
 
 @check
@@ -2420,8 +2529,10 @@ def a_signed_out_or_revoked_family_reaches_nothing():
         token = bearer(scope)
         reply = client.post(out, data=body, headers=access_headers("POST", out, body, bearer=token))
         revoked = [p for q, p in db.writes if q.startswith("UPDATE refresh_sessions SET revoked_at")]
-        expect(reply.status_code == 200 and revoked and revoked[-1][0] == family,
-               "a %s session's logout must revoke its family, got %s %s %s"
+        accepted = [p for q, p in db.writes if q.startswith("UPDATE session_acceptances SET revoked_at")]
+        expect(reply.status_code == 200 and revoked and revoked[-1][0] == family
+               and accepted and accepted[-1][0] == family,
+               "a %s session's logout must revoke its family and its acceptances, got %s %s %s"
                % (scope, reply.status_code, reply.get_json(), revoked))
 
 
@@ -2681,6 +2792,46 @@ def evidence_that_stays_incomplete_escalates_to_review():
         got = send(previous, **settings)
         expect(got["verdict"] == "elevated" and got["score"] == 30,
                "%s: expected elevated 30, got %s" % (why, got))
+
+
+@check
+def an_approval_accepts_what_its_request_showed():
+    """DESIGN.md 76. A request records the reasons the approver is shown; the
+    upgrade accepts those, and refuses with upgrade_scope_changed when a new
+    reason or more points or a higher count appeared after the request.
+    Collection problems are left out of the comparison (never accepted
+    either), and a cause made of them alone cannot be requested at all."""
+    elevated = lambda *reasons: {"verdict": "elevated", "reasons": list(reasons)}
+    policy_ = {"reasons": [MULTI], "context": {"device_account_count": 1, "account_device_count": 2}}
+    with policy():
+        reasons, accounts, devices = s._acceptance_snapshot(
+            ["integrity_elevated", "risk_review"],
+            elevated(WX, {"code": "integrity_evidence_incomplete", "points": 30}), policy_)
+        expect([r["code"] for r in reasons] == [WX["code"], MULTI["code"]]
+               and (accounts, devices) == (1, 2),
+               "the snapshot keeps the approvable reasons and the counts: %s" % reasons)
+        expect(_refused(lambda: s._acceptance_snapshot(
+            ["integrity_elevated"], elevated({"code": "integrity_probe_failed:tracer", "points": 30},
+                                             {"code": "integrity_evidence_incomplete", "points": 30}),
+            policy_)) == "complete_scan_required",
+            "collection problems alone cannot be requested or approved")
+        scope = {"request_id": str(uuid.uuid4()), "causes": ["integrity_elevated", "risk_review"],
+                 "reasons": reasons, "device_accounts": 1, "account_devices": 2,
+                 "approved_by_installation": None}
+        within = lambda integrity, policy_now: _refused(
+            lambda: s._require_within_scope(scope, ["integrity_elevated", "risk_review"],
+                                            integrity, policy_now))
+        expect(within(elevated(WX), policy_) is None, "the same reasons are within the request")
+        expect(within(elevated(WX, {"code": "integrity_evidence_incomplete", "points": 30}),
+                      policy_) is None, "a collection problem is not a change of scope")
+        for integrity, policy_now, why in (
+                (elevated(WX, TRACER), policy_, "a new finding"),
+                (elevated(dict(WX, points=45)), policy_, "more points"),
+                (elevated(WX), {"reasons": [dict(MULTI, code="account_has_many_devices", points=60)],
+                                "context": {"device_account_count": 1, "account_device_count": 3}},
+                 "a third device")):
+            expect(within(integrity, policy_now) == "upgrade_scope_changed",
+                   "%s after the request must change its scope" % why)
 
 
 def main():
