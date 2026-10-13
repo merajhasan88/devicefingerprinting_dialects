@@ -88,6 +88,7 @@ class Rows(object):
         self.revoked_families = set()
         self.link_exists = False
         self.link_counts = (0, 0)
+        self.recent_qualities = []
 
     def execute(self, sql, params=None):
         q = " ".join(sql.split())
@@ -121,6 +122,8 @@ class Rows(object):
         elif q.startswith(("SELECT account_id FROM demo_accounts",
                            "SELECT device_id FROM recognized_devices")):
             self.result = (params[0],)  # the anchor row; locking is the engine's job
+        elif q.startswith("SELECT evidence_quality FROM integrity_reports WHERE installation_id"):
+            self.result = [(quality,) for quality in self.recent_qualities]
         elif q.startswith("SELECT 1 FROM device_account_links WHERE device_id"):
             self.result = (1,) if self.link_exists else None
         elif q.startswith("SELECT COUNT(*) FROM device_account_links WHERE device_id"):
@@ -2616,6 +2619,68 @@ def weak_or_contradictory_evidence_is_never_complete():
     status, error = send(probes)
     expect(status == 400 and error.get("code") == "invalid_integrity_probe",
            "a wrongly typed own-code count must be malformed, not ignored: %s %s" % (status, error))
+
+
+@check
+def complete_evidence_paths_refuse_anything_but_a_fresh_complete_scan():
+    """Owner decision of 2026-10-13 (DESIGN.md 76): on the DBA's
+    complete_evidence_paths only a fresh scan that measured everything will do
+    -- incomplete, invalid, partial or legacy evidence is refused whatever the
+    verdict, step-up or acceptance; elsewhere nothing changes."""
+    body = encode({"x": 1})
+
+    def post(quality, age=10):
+        s._latest_integrity_state = lambda iid: {"score": 0, "verdict": "trusted", "fresh": True,
+                                                 "evidence_quality": quality, "age_seconds": age}
+        reply = client.post(ECHO, data=body, headers=access_headers("POST", ECHO, body))
+        return reply.status_code, error_code(reply)
+
+    with elevated_integrity():
+        with policy():
+            expect(post("legacy") == (200, None), "with no paths listed nothing changes")
+        with policy(complete_evidence_paths=ECHO):
+            expect(post("complete") == (200, None), "a fresh complete scan passes")
+            for quality in ("incomplete", "invalid", "partial", "legacy", None):
+                got = post(quality)
+                expect(got == (403, "integrity_complete_evidence_required"),
+                       "%s evidence must be refused on a listed path, got %s" % (quality, got))
+            got = post("complete", age=700)
+            expect(got == (403, "integrity_complete_evidence_required"),
+                   "a complete scan older than the default 600 s must be refused, got %s" % (got,))
+        with policy(complete_evidence_paths=ECHO, complete_evidence_max_age_seconds=900):
+            expect(post("complete", age=700) == (200, None), "the DBA's max age applies")
+
+
+@check
+def evidence_that_stays_incomplete_escalates_to_review():
+    """Owner decision of 2026-10-13 (DESIGN.md 76): incomplete_evidence_review_after
+    (3) incomplete or invalid scans in a row add +30 more -- review, with no
+    finding and nothing for the device memory; a legacy or complete scan in
+    between resets the count; 0 turns it off."""
+    probes = clean("android")
+    probes["tracer"] = {"status": "error", "error": "permission denied"}
+
+    def send(previous, **settings):
+        db.recent_qualities = previous
+        try:
+            with policy(**settings):
+                status, payload = send_report("android", probes)
+        finally:
+            db.recent_qualities = []
+        return payload["integrity"]
+
+    third = send(["incomplete", "invalid"])
+    expect(third["verdict"] == "review" and third["score"] == 60 and third["finding_score"] == 0
+           and "integrity_evidence_persistently_incomplete" in {r["code"] for r in third["reasons"]},
+           "the third incomplete scan in a row must escalate to review: %s" % third)
+    for previous, settings, why in ((["incomplete"], {}, "only two in a row"),
+                                    (["incomplete", "legacy"], {}, "a legacy scan resets the count"),
+                                    (["complete", "incomplete"], {}, "a complete scan resets it"),
+                                    (["incomplete", "invalid"], {"incomplete_evidence_review_after": 0},
+                                     "0 turns it off")):
+        got = send(previous, **settings)
+        expect(got["verdict"] == "elevated" and got["score"] == 30,
+               "%s: expected elevated 30, got %s" % (why, got))
 
 
 def main():

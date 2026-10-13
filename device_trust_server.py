@@ -53,7 +53,7 @@ from contextlib import contextmanager, nullcontext
 from datetime import datetime, timedelta, timezone
 
 import bcrypt
-from flask import Flask, g, jsonify, request
+from flask import Flask, g, has_request_context, jsonify, request
 from flask_jwt_extended import (
     JWTManager,
     create_access_token,
@@ -2151,7 +2151,32 @@ def _is_quality_reason(reason):
     return str(reason.get("code", "")).startswith(_QUALITY_REASON_PREFIXES)
 
 
-def _apply_collection_problems(scored, failed_required, incomplete, invalid=(), legacy=False):
+def _incomplete_streak(cursor, installation_id):
+    """How many of this installation's latest reports, newest first, were
+    incomplete or invalid with no complete one between them. Legacy reports
+    and reports from before migration 015 end the streak: an old collector is
+    not a collection problem."""
+    limit = max(0, _risk_setting_int("incomplete_evidence_review_after", 3))
+    if limit <= 0:
+        return 0
+    cursor.execute(
+        """
+        SELECT evidence_quality FROM integrity_reports
+        WHERE installation_id = %s
+        ORDER BY created_at DESC
+        LIMIT """ + str(limit),
+        (installation_id,),
+    )
+    streak = 0
+    for (quality,) in cursor.fetchall() or []:
+        if quality not in ("incomplete", "invalid"):
+            break
+        streak += 1
+    return streak
+
+
+def _apply_collection_problems(scored, failed_required, incomplete, invalid=(), legacy=False,
+                               streak=None):
     """Score what the scan could not measure apart from what it found.
 
     A probe that failed, answered "ok" without its measurements, or reported
@@ -2196,6 +2221,21 @@ def _apply_collection_problems(scored, failed_required, incomplete, invalid=(), 
             30,
             "%d requested probe(s) measured nothing usable; a complete scan clears this."
             % len(problems),
+        )
+    # Evidence that stays incomplete scan after scan is deliberate blinding
+    # far more often than a passing glitch, which the next scan clears
+    # (owner decision of 2026-10-13): incomplete_evidence_review_after such
+    # scans in a row add +30 more -- review with nothing else found. It is a
+    # collection reason, so it never enters the device memory, and one
+    # complete scan resets the count. 0 turns it off.
+    after = _risk_setting_int("incomplete_evidence_review_after", 3)
+    if problems and after > 0 and streak is not None and streak() + 1 >= after:
+        _integrity_reason(
+            scored["reasons"],
+            "integrity_evidence_persistently_incomplete",
+            30,
+            "%d integrity scans in a row could not be completed; send a complete scan."
+            % after,
         )
     points = lambda reasons: min(100, sum(max(0, int(r.get("points", 0))) for r in reasons))
     scored["score"] = points(scored["reasons"])
@@ -3061,7 +3101,34 @@ def _enforce_integrity_gate(
             "integrity_device_blocked_recently",
             details={"integrity": state, "device_integrity_memory": memory},
         )
+    _require_complete_evidence(state)
     return state
+
+
+def _require_complete_evidence(state):
+    """On the DBA's complete_evidence_paths -- payments, advances -- only a
+    fresh scan that measured everything requested will do (owner decision of
+    2026-10-13): incomplete, invalid, partial or legacy evidence is refused,
+    whatever the verdict, and no upgrade acceptance or step-up proof changes
+    that. Blinding the probes therefore gains nothing where money moves. The
+    app's remedy is a new scan, or an app update for a legacy collector."""
+    if not has_request_context():
+        return
+    if request.path not in _risk_setting_words("complete_evidence_paths", ""):
+        return
+    max_age = _risk_setting_int("complete_evidence_max_age_seconds", INTEGRITY_FRESHNESS_SECONDS)
+    quality = (state or {}).get("evidence_quality")
+    age = (state or {}).get("age_seconds")
+    if quality == "complete" and isinstance(age, int) and age <= max_age:
+        return
+    raise ApiProblem(
+        "This operation needs a fresh, complete integrity scan (at most %d seconds old); "
+        "send a new scan, and update the app if it reports legacy evidence." % max_age,
+        403,
+        "integrity_complete_evidence_required",
+        details={"evidence_quality": quality, "age_seconds": age,
+                 "max_age_seconds": max_age},
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -5614,6 +5681,7 @@ def integrity_report():
             incomplete,
             invalid,
             legacy=collector_version < _EVIDENCE_CONTRACT_VERSION.get(platform, 0),
+            streak=lambda: _incomplete_streak(cursor, installation_id),
         )
         cursor.execute(
             "UPDATE integrity_challenges SET used_at = NOW() WHERE challenge_id = %s",
