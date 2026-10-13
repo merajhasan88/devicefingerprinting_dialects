@@ -47,6 +47,7 @@ Apply migrations **in ascending version order**; each one records its own row in
 | 15 | `015_evidence_quality.sql` | `integrity_reports.evidence_quality` / `finding_score`: what a scan measured, and the score of its findings alone (only findings enter the device memory); an index for the per-request family check; seeds `collection_problems_block` (0), `integrity_device_memory_hours` (24), `complete_evidence_paths` (''), `complete_evidence_max_age_seconds` (600), `incomplete_evidence_review_after` (3) |
 | 16 | `016_scoped_acceptances.sql` | `session_acceptances` (what each upgrade accepted: reasons, points, counts, approver, scan and build; revocable) and `acceptance_lapses` (when an approved session met a reason it did not cover — the business's measurement); `refresh_sessions.acceptance_id`; `session_upgrade_requests.causes` / `reasons` / counts (what the approver is shown); `risk_policy_decisions.acceptance_id`; seeds `acceptance_auto_cover_reasons` ('') |
 | 17 | `017_business_events.sql` | `business_events` (events the customer's backend reports for an account: opaque IDs, short codes, an amount, a keyed hash of a subject — no personal data; never updated or deleted); seeds `business_event_types` (''), `business_graph_depth` (2), `business_graph_max_nodes` (200) |
+| 18 | `018_legacy_acceptances.sql` | seeds `legacy_acceptances` (`carry`): an approval granted before 016 is kept as what it covers at its first use, until its expiry; `drop` makes it cover nothing |
 
 All scripts are guarded and safe to re-run.
 

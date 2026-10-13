@@ -6114,7 +6114,10 @@ Ubuntu's unattended upgrades restarting PostgreSQL and Redis minutes after the i
 history 10:36–10:37 UTC) — not the code; the rerun was clean.
 
 **Changes in behaviour a deployment will notice.**
-- Upgrades granted before 016 accept nothing afterwards: those sessions narrow at their next refresh.
+- Upgrades granted before 016 recorded categories only. Owner decision of 2026-10-13: a business's users
+  must not be made to re-confirm because the server was upgraded. `legacy_acceptances` (migration 018,
+  default `carry`, commit below) keeps each as what it covers at its first use — collection problems
+  excepted — until its own expiry; `drop` makes them cover nothing.
 - A cause made only of collection problems can no longer be approved; the suite's and
   `tools/second_phone.py`'s "elevated" fixture is now test-keys + no boot state (+40).
 - Collectors below contract (Android ≤ 2, the current .NET collectors) read `legacy`: never complete,
@@ -6149,3 +6152,17 @@ granted to `dtadmin` as the migrations document); server `2c14c91` (md5 `3472bd6
 observe, every setting at the owner's defaults, the assertion keys and the business-token drop-in
 removed (the business API answers 404); no server error since 10:40 UTC. The Huawei, OPPO and Vivo
 still run collector 2 and will read `legacy` until they get a build from `7f0bcb9` or later.
+
+**Addendum, same day — approvals granted before 016 are carried over.** The owner, on the plan to make
+pre-016 approvals cover nothing: *"if it's a business their users should not be forced to go through
+this."* `legacy_acceptances` (migration 018, schema 18; DBA setting, owner default `carry`): the first
+time a pre-016 approval is used, by a protected request or a refresh, the server records what it covers
+at that moment — the reasons behind its causes then, collection problems excepted, the counts seen then
+— under an ID derived from the refresh family (so concurrent first uses land on one record), until the
+approval's own expiry. Users do nothing. From then on the reason-by-reason rule applies. `drop` makes
+approvals not yet carried over cover nothing; records carried over earlier stay. The trade-off, stated
+to the owner: a different finding that appeared under an old approval before the upgrade is carried
+over too — what the old rule already allowed until then — and it stops at the first use. Gate 72/72;
+mutations that never carry over or ignore `drop` fail it. Not yet live: the EC2 database is at 17
+with server `2c14c91`; migration 018 and this build go up with the next EC2 session, and the
+carry-over itself is verified on the gate only so far.

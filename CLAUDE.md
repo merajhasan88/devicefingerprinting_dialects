@@ -90,8 +90,8 @@ processes** from the systemd drop-in, with a per-process connection pool (`DB_PO
 `DB_POOL_RECHECK_SECONDS`) and, on SQL Server, a 15 s statement timeout (`DB_QUERY_TIMEOUT`) —
 DESIGN.md 55 and 60. Serve SQL Server with processes, never threads.
 
-**Schema is migrations, DBA-applied.** `migrations/<dialect>/001…017`, applied in order; the server
-refuses to serve unless `schema_migrations` holds the version it requires (currently **17**). A new
+**Schema is migrations, DBA-applied.** `migrations/<dialect>/001…018`, applied in order; the server
+refuses to serve unless `schema_migrations` holds the version it requires (currently **18**). A new
 table needs its grant (`GRANT`/`ALTER DEFAULT PRIVILEGES` on PostgreSQL). Risk and step-up policy
 values live in `risk_policy_settings`, seeded by the migrations with the owner's defaults, which a DBA
 may change — never hard-code a policy value.
@@ -139,7 +139,7 @@ not jailbroken). The emulator AVD `integrity_root_lab` is the disposable root la
 
 See the end of DESIGN.md: section 76 records the critical review of 2026-10-13 and what was built from
 it (sign-out and family checks, admission under locks, evidence quality, scoped acceptances, the
-business API; schema 17); sections 73–75 the handset rounds and SQL Server; sections 66–72 record the 2026-10-05 joint review, the declined attestation
+business API, carried-over approvals; schema 18); sections 73–75 the handset rounds and SQL Server; sections 66–72 record the 2026-10-05 joint review, the declined attestation
 proposal, the limited-session design (67) and its implementation (70, 72), R4 (68), R1 (69) and
 the DBA-tunable bands (71), each with its state;
 section 64 is an open question for the reviewer (the .NET W^X allowance); section 63 records the

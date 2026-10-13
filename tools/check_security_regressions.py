@@ -130,9 +130,15 @@ class Rows(object):
             self.result = self.acceptances.get(params[0])
         elif q.startswith("INSERT INTO session_acceptances"):
             self.writes.append((q, params))
-            self.acceptances[params[0]] = (params[0], params[1], params[2], params[4], params[8],
-                                           getattr(params[9], "adapted", params[9]),
-                                           params[10], params[11], params[15], None)
+            if len(params) == 13:  # a carried-over pre-016 approval
+                row = (params[0], params[1], params[2], params[4], params[6], params[7],
+                       params[8], params[9], params[12])
+            else:
+                row = (params[0], params[1], params[2], params[4], params[8], params[9],
+                       params[10], params[11], params[15])
+            if row[0] in self.acceptances:
+                raise s.DIALECT._driver.errors.UniqueViolation("duplicate acceptance")
+            self.acceptances[row[0]] = row[:5] + (getattr(row[5], "adapted", row[5]),) + row[6:] + (None,)
         elif q.startswith(("UPDATE session_acceptances", "UPDATE risk_policy_decisions")):
             self.writes.append((q, params))
         elif q.startswith(("SAVEPOINT ", "RELEASE SAVEPOINT ", "ROLLBACK TO SAVEPOINT ")):
@@ -2373,13 +2379,37 @@ def an_upgrade_acceptance_covers_what_was_approved_and_nothing_else():
                 expect(get(token) == (403, "integrity_step_up_required"),
                        "a collection problem is never auto-covered")
             s._latest_integrity_state = _integrity_now("elevated", WX)
-            for token_, why in ((_accepted_token(["integrity_elevated"], [WX], revoked=s._utc_now())[0],
-                                 "a revoked acceptance"),
-                                (_accepted_token(["integrity_elevated"], [WX], with_record=False)[0],
-                                 "an acceptance from before migration 016"),
-                                (_full_token(["integrity_elevated"]), "causes without a record")):
-                expect(get(token_) == (403, "integrity_step_up_required"),
-                       "%s must cover nothing" % why)
+            expect(get(_accepted_token(["integrity_elevated"], [WX], revoked=s._utc_now())[0])
+                   == (403, "integrity_step_up_required"), "a revoked acceptance must cover nothing")
+            # An approval from before migration 016 carries causes, no record
+            # (owner decision 2026-10-13): carried over at its first use as
+            # what it covers then, or nothing under legacy_acceptances = drop.
+            with policy(legacy_acceptances="drop"):
+                for token_, why in ((_accepted_token(["integrity_elevated"], [WX], with_record=False)[0],
+                                     "an approval from before migration 016"),
+                                    (_full_token(["integrity_elevated"]), "causes without a record")):
+                    expect(get(token_) == (403, "integrity_step_up_required"),
+                           "%s must cover nothing under drop" % why)
+            db.writes = []
+            old = _full_token(["integrity_elevated"])
+            status, payload = get(old)
+            carried = [p for q, p in db.writes if q.startswith("INSERT INTO session_acceptances")]
+            reasons = getattr(carried[-1][7], "adapted", carried[-1][7]) if carried else None
+            expect(status == 200 and payload["integrity"].get("accepted_by_upgrade") is True
+                   and carried and carried[-1][5] == "legacy"
+                   and [r["code"] for r in reasons] == [WX["code"]],
+                   "carry must keep a pre-016 approval as what it covers now: %s %s %s"
+                   % (status, payload, reasons))
+            expect(get(old)[0] == 200 and len([q for q, _ in db.writes
+                                               if q.startswith("INSERT INTO session_acceptances")]) == 1,
+                   "a carried-over approval is recorded once")
+            s._latest_integrity_state = _integrity_now("elevated", WX, TRACER)
+            expect(get(old) == (403, "integrity_step_up_required"),
+                   "after carrying over, a new reason needs a new decision")
+            s._latest_integrity_state = _integrity_now("elevated", {"code": "integrity_evidence_incomplete",
+                                                                    "points": 30})
+            expect(get(_full_token(["integrity_elevated"])) == (403, "integrity_step_up_required"),
+                   "a collection problem is never carried over")
             s._latest_integrity_state = _verdict_state("trusted")
             token, acc = _accepted_token(["risk_review"], [MULTI], device_accounts=1, account_devices=2)
             s._evaluate_risk_policy = _risk_now("review", MULTI)
@@ -2441,7 +2471,7 @@ def an_upgrade_records_its_acceptance():
 def a_refresh_keeps_an_accepted_session_full_only_while_covered():
     """A refresh keeps an accepted session full only while every cause found
     now is covered by what was approved, reason by reason (DESIGN.md 76)."""
-    def refresh(accepted, until, now, action, with_record=True):
+    def refresh(accepted, until, now, action, with_record=True, settings=None):
         family, session, acc = str(uuid.uuid4()), str(uuid.uuid4()), str(uuid.uuid4())
         with s.app.app_context():
             token = s.create_refresh_token(identity=account, additional_claims={
@@ -2452,7 +2482,8 @@ def a_refresh_keeps_an_accepted_session_full_only_while_covered():
                                    [WX], None, None, s._utc_now() + timedelta(days=5), None)
         db.refresh_row = (family, account, inst.device_id, inst.installation_id,
                           s._utc_now() + s.REFRESH_TOKEN_LIFETIME, None, "full", None,
-                          ",".join(accepted) or None, until, acc if accepted else None)
+                          ",".join(accepted) or None, until,
+                          acc if accepted and with_record else None)
         s._latest_integrity_state = now
         s._evaluate_risk_policy = _risk_now(action)
         challenge = client.post("/v1/auth/refresh/challenge",
@@ -2481,11 +2512,14 @@ def a_refresh_keeps_an_accepted_session_full_only_while_covered():
                     (([], None, covered, "allow"), {}, ("limited", None),
                      "without acceptance a soft cause narrows"),
                     ((["integrity_elevated"], later, covered, "allow"), {"with_record": False},
-                     ("limited", None), "an acceptance from before migration 016 narrows"),
+                     ("full", ["integrity_elevated"]), "a pre-016 acceptance is carried over"),
                     ((["integrity_elevated"], later, _verdict_state("trusted"), "allow"), {},
                      ("full", ["integrity_elevated"]), "with no cause left it stays full")):
                 got = refresh(*args, **kwargs)
                 expect(got == expected, "%s: expected %s, got %s" % (why, expected, got))
+        with elevated_integrity(), policy(legacy_acceptances="drop"):
+            got = refresh(["integrity_elevated"], later, covered, "allow", with_record=False)
+            expect(got == ("limited", None), "under drop a pre-016 acceptance narrows, got %s" % (got,))
     finally:
         db.refresh_row = None
         db.acceptances.clear()

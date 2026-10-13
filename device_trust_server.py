@@ -1174,7 +1174,7 @@ def _get_backend_identity():
 # against a schema it does not understand. /health/* still answers so operators
 # can see why.
 
-REQUIRED_SCHEMA_VERSION = 17
+REQUIRED_SCHEMA_VERSION = 18
 
 _schema_state = None
 _schema_lock = threading.Lock()
@@ -1332,6 +1332,7 @@ _RISK_SETTING_KINDS = {
     "business_event_types": "codes",
     "business_graph_depth": "int",
     "business_graph_max_nodes": "int",
+    "legacy_acceptances": ("carry", "drop"),
 }
 # Lower bounds a value must also meet. Below 100 the "far above the baseline"
 # rule would fire for memory inside the build's own measured envelope.
@@ -4146,6 +4147,77 @@ def _load_acceptance(acceptance_id, family_id, account_id, installation_id):
     }
 
 
+# An approval granted before migration 016 recorded only its categories. Its
+# carried-over record has an ID derived from its refresh family, so the first
+# uses of it -- concurrent or not -- all land on one record.
+_LEGACY_ACCEPTANCE_NAMESPACE = uuid.UUID("6f1f0d3e-2b7a-5c41-9a8e-3d4c5b6a7f80")
+
+
+def _carry_legacy_acceptance(family_id, account_id, device_id, installation_id, causes, until,
+                             integrity=None, policy=None):
+    """The record for an approval granted before migration 016 (DESIGN.md 76).
+
+    With legacy_acceptances = carry (owner default) the first use records what
+    the approval covers at that moment -- the reasons behind its causes now,
+    collection problems excepted, which are never approved -- and the counts
+    seen now, until the approval's own expiry. Its users do nothing; from then
+    on a new reason needs a new decision. With drop, an approval not yet
+    carried over covers nothing. A record carried over earlier stays.
+    """
+    if not isinstance(family_id, str) or not family_id or not causes or until is None:
+        return None
+    acceptance_id = str(uuid.uuid5(_LEGACY_ACCEPTANCE_NAMESPACE, family_id))
+    record = _load_acceptance(acceptance_id, family_id, account_id, installation_id)
+    if record is not None or _risk_setting_str("legacy_acceptances", "carry") != "carry":
+        return record
+    if until <= _utc_now():
+        return None
+    if integrity is None:
+        integrity = _latest_integrity_state(installation_id)
+    if policy is None:
+        policy = _evaluate_risk_policy(
+            "acceptance_carry",
+            device_id,
+            installation_id,
+            account_id=account_id,
+            account_link_pending=False,
+            persist=False,
+        )
+    reasons = []
+    for cause in causes:
+        reasons += [r for r in _cause_reasons(cause, integrity, policy) if not _is_quality_reason(r)]
+    context = (policy or {}).get("context") or {}
+    with _cursor(commit=True) as cursor:
+        savepoint = DIALECT.savepoint("legacy_acceptance")
+        if savepoint:
+            cursor.execute(savepoint[0])
+        try:
+            cursor.execute(
+                """
+                INSERT INTO session_acceptances
+                    (acceptance_id, family_id, account_id, device_id, installation_id, route,
+                     causes, reasons, device_accounts, account_devices, evidence_quality,
+                     integrity_report_id, expires_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (acceptance_id, family_id, account_id, device_id, installation_id, "legacy",
+                 ",".join(sorted(set(causes))), DIALECT.json_param(reasons),
+                 context.get("device_account_count"), context.get("account_device_count"),
+                 (integrity or {}).get("evidence_quality"), (integrity or {}).get("report_id"),
+                 until),
+            )
+        except Exception as error:
+            if not DIALECT.is_unique_violation(error):
+                raise
+            if savepoint:
+                cursor.execute(savepoint[1])
+        else:
+            if savepoint:
+                cursor.execute(savepoint[2])
+    logger.info("Carried over a pre-016 approval: family=%s causes=%s", family_id, ",".join(causes))
+    return _load_acceptance(acceptance_id, family_id, account_id, installation_id)
+
+
 def _record_lapses(record, uncovered, event_type):
     """Write down, once per reason, that an approved session met a reason its
     approval did not cover (DESIGN.md 76). This is the measurement the
@@ -4215,8 +4287,9 @@ def _accepted(accepted, cause, integrity=None, policy=None):
 
 def _session_acceptance(claims, event_type="protected_request"):
     """This full session's acceptance, while its time runs. A session whose
-    upgrade predates migration 016 carries causes but no record, and its
-    acceptance covers nothing: the next refresh narrows it."""
+    upgrade predates migration 016 carries causes but no record: it is carried
+    over at this first use, or covers nothing, as the DBA's legacy_acceptances
+    says."""
     until = claims.get("accepted_until")
     if (
         claims.get("scope") != "full"
@@ -4225,11 +4298,16 @@ def _session_acceptance(claims, event_type="protected_request"):
         or until <= int(_utc_now().timestamp())
     ):
         return _Acceptance(None, event_type)
-    return _Acceptance(
-        _load_acceptance(claims.get("acc"), claims.get("family"),
-                         str(get_jwt_identity()), claims.get("iid")),
-        event_type,
-    )
+    account_id = str(get_jwt_identity())
+    if isinstance(claims.get("acc"), str):
+        record = _load_acceptance(claims["acc"], claims.get("family"), account_id, claims.get("iid"))
+    else:
+        record = _carry_legacy_acceptance(
+            claims.get("family"), account_id, claims.get("did"), claims.get("iid"),
+            [c for c in claims.get("accepted") or [] if isinstance(c, str)],
+            datetime.fromtimestamp(until, timezone.utc),
+        )
+    return _Acceptance(record, event_type)
 
 
 # ---------------------------------------------------------------------------
@@ -6458,11 +6536,16 @@ def refresh_account_tokens():
                 # Judged reason by reason (DESIGN.md 76): every cause found now
                 # must be covered by what was approved; each one that is not is
                 # recorded as a lapse, and the session narrows.
-                acceptance = _Acceptance(
-                    _load_acceptance(session["acceptance_id"], session["family_id"],
-                                     session["account_id"], session["installation_id"]),
-                    "refresh",
-                )
+                if session["acceptance_id"]:
+                    record = _load_acceptance(session["acceptance_id"], session["family_id"],
+                                              session["account_id"], session["installation_id"])
+                else:  # granted before migration 016
+                    record = _carry_legacy_acceptance(
+                        session["family_id"], session["account_id"], session["device_id"],
+                        session["installation_id"], session["accepted_causes"],
+                        session["accepted_until"], integrity=integrity, policy=policy,
+                    )
+                acceptance = _Acceptance(record, "refresh")
                 verdicts = [acceptance.covers(cause, integrity=integrity, policy=policy)
                             for cause in limited]
                 if acceptance.record is not None and all(verdicts):

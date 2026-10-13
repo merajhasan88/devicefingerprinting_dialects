@@ -127,7 +127,7 @@ statement timeout `DB_QUERY_TIMEOUT` (15 s).
   cleartext; require the same of every client build you ship.
 
 **Database.** PostgreSQL 13+ or SQL Server 2017+ (`DB_ENGINE`). Your DBA applies
-`migrations/<engine>/001…017` in order; the server only reads `schema_migrations` and refuses to serve
+`migrations/<engine>/001…018` in order; the server only reads `schema_migrations` and refuses to serve
 on any other version (`/health/ready` says why). Use verified TLS: PostgreSQL `DB_SSLMODE=verify-full`
 with `DB_SSLROOTCERT`; SQL Server always connects with `Encrypt=yes` and `TrustServerCertificate=no`.
 
@@ -183,6 +183,7 @@ defaults and changed by your DBA, never by the server. Notable keys:
 | `complete_evidence_paths` / `complete_evidence_max_age_seconds` | empty / 600 | operations (payments, advances) that need a fresh, complete scan (section 8) |
 | `incomplete_evidence_review_after` | 3 | that many incomplete scans in a row escalate to review (section 8); 0 = off |
 | `acceptance_auto_cover_reasons` | empty | **your business decision**: reasons an approved session accepts even if they appear after the approval (section 7) |
+| `legacy_acceptances` | `carry` | approvals granted before migration 016: `carry` keeps each as what it covers at its first use, until its expiry; `drop` makes them cover nothing, so their users re-confirm (section 7) |
 | `business_event_types` / `business_graph_depth` / `business_graph_max_nodes` | any / 2 / 200 | the business API (section 10) |
 
 **Shared phones and several devices are a business decision.** By default a third account on one
@@ -429,9 +430,17 @@ reference client does; the .NET SDK does not yet; and measure in observe mode, f
 decisions, how many sign-ins would have been limited.
 
 **Database.** Migration 016 adds `session_acceptances` (grant `SELECT, INSERT, UPDATE`) and
-`acceptance_lapses` (grant `SELECT, INSERT`); both are audit evidence, never deleted. Acceptances
-granted before 016 carried causes only; they cover nothing after the upgrade, so those sessions narrow
-at their next refresh.
+`acceptance_lapses` (grant `SELECT, INSERT`); both are audit evidence, never deleted.
+
+**Approvals granted before you upgrade are carried over.** They recorded only their categories, not
+the reasons they approved. With `legacy_acceptances` at its default, `carry` (migration 018), the
+first time such an approval is used — by a request or a refresh — the server records what it covers at
+that moment and keeps that record until the approval's own expiry: your users do nothing, and their
+sessions stay full. From then on the reason-by-reason rule applies. Two things are not carried: a
+collection problem (never approved; the app's next complete scan clears it) and anything after the
+approval's expiry. Set `drop` to have approvals not yet carried over cover nothing instead: those
+sessions narrow at their next refresh and their users re-confirm. A record carried over before you
+switch stays until it expires.
 
 ## 8. Evidence quality, collection problems and sensitive operations
 
@@ -539,5 +548,5 @@ across a phone's accounts adds points" — are yours to run, in your engine, fro
 decision context; the server can apply such rules too, but only if you decide it should.
 
 **Database.** Migration 017 adds `business_events`: grant `SELECT, INSERT`, never `UPDATE` or
-`DELETE`. The server serves only at its schema version (17): a database without 017 answers 503
+`DELETE`. The server serves only at its schema version (18): a database without 017 answers 503
 `schema_version_mismatch` everywhere but `/health`, so no decision ever reads a missing table.
