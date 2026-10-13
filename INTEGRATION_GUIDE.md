@@ -178,6 +178,12 @@ defaults and changed by your DBA, never by the server. Notable keys:
 | `wx_far_above_baseline_percent` | 200 | W^X growth above a build's pin is advisory up to this percentage of it and +40 beyond (section 3); minimum 100 |
 | `developer_options_refuses` / `adb_enabled_refuses` | 0 / 0 | eligibility rules: 1 refuses a device whose latest scan reports the setting on (below) |
 | `rate_anomaly_*`, `population_baseline_*` | off | advisory signals |
+| `collection_problems_block` | 0 | how probes that could not measure are scored (section 8): 0 = +30 once, never remembered for the device; 1 = +30 each, three make a block, remembered for every account on the phone |
+| `integrity_device_memory_hours` | 24 | how long a blocked *finding* follows the physical device across reinstalls; 0 = off |
+| `complete_evidence_paths` / `complete_evidence_max_age_seconds` | empty / 600 | operations (payments, advances) that need a fresh, complete scan (section 8) |
+| `incomplete_evidence_review_after` | 3 | that many incomplete scans in a row escalate to review (section 8); 0 = off |
+| `acceptance_auto_cover_reasons` | empty | **your business decision**: reasons an approved session accepts even if they appear after the approval (section 7) |
+| `business_event_types` / `business_graph_depth` / `business_graph_max_nodes` | any / 2 / 200 | the business API (section 10) |
 
 **Shared phones and several devices are a business decision.** By default a third account on one
 phone, or one account on a third device, is held for review and refused in enforce mode. A business
@@ -321,17 +327,43 @@ refreshed under soft risk becomes limited.
 overrides a hard outcome — and issues a full session in the same refresh family; the old limited
 token stays limited, and a second upgrade of the same session answers 401 `session_rotated`.
 
-**What an upgrade accepts.** An upgrade made with a proof (routes 1–3) while soft causes remain
-accepts exactly those causes for that sign-in: the response carries `accepted_causes` and
-`accepted_until`, and both tokens carry them. Until then — `upgrade_acceptance_hours` (default 720,
-the refresh lifetime, never longer; `0` keeps nothing) or until the user signs out — protected
-requests pass those causes (the outcome is marked `accepted_by_upgrade`) and a refresh keeps the
-session full. Anything worse is judged afresh: a cause the proof did not cover refuses the request and
-narrows the session at its next refresh (dropping the acceptance), and a block, an eligibility rule or
-a device-memory block refuses as always. Two consequences to know: an accepted `elevated` integrity
-verdict no longer needs a step-up proof on every ordinary request (your `stepup_required_paths`
-still do), and a phone approving someone else's upgrade gets no acceptance of its own — it must be
-clean.
+**What an upgrade accepts — exactly what was approved.** An upgrade made with a proof (routes 1–3)
+while soft causes remain records an **acceptance** (`DESIGN.md` §76): the reasons behind those causes
+with their points, the relationship counts seen then (accounts on the phone, devices on the account),
+who approved, which scan and build. The response carries `accepted_causes`, `accepted_until` and
+`acceptance_id`. Until then — `upgrade_acceptance_hours` (default 720, the refresh lifetime, never
+longer; `0` keeps nothing) or until the user signs out — a protected request passes only if every
+reason found now was approved: the same reason with no more points, or, for the accounts-per-phone and
+devices-per-account reasons, no more than the approved counts. The outcome is then marked
+`accepted_by_upgrade` with its `acceptance_id`, and the stored decision row names it. **A new reason,
+more points or a higher count is not covered**, even in the same band — approved runtime growth does
+not cover a debugger found later: the request is judged afresh (a step-up proof per request for an
+`elevated` integrity verdict, a refusal for `review`) and the session narrows at its next refresh. A
+block, an eligibility rule or a device-memory block refuses as always. An accepted `elevated` verdict
+needs no step-up per ordinary request (your `stepup_required_paths` still do), and a phone approving
+someone else's upgrade gets no acceptance of its own — it must be clean.
+
+**Collection problems are never approved.** A probe that could not measure (section 8) is not a
+finding anyone can vouch for: an acceptance never covers one, and a cause made of collection problems
+alone cannot be requested or approved — **403 `complete_scan_required`**, before anyone is prompted.
+A complete scan clears it by itself (route `recheck`).
+
+**What the approver sees, and accepts.** An approval request records the reasons it shows; the
+listing returns them (`limited_causes`, `reasons` with `code`, `points` and the server's `message`),
+and your approving app must show them — approving accepts exactly those. If anything new is found
+between the request and the upgrade, the upgrade answers **409 `upgrade_scope_changed`**: ask again,
+so the approver sees it. An assertion request (route 3) returns the same `reasons`, for your identity
+backend to show; its signature over the request ID binds them.
+
+**Auto-cover is your business's decision, and this is the measurement it needs.** By default every
+new reason after an approval needs a new decision. `acceptance_auto_cover_reasons` lists reason codes
+an approved session accepts even when they appear later — for example runtime growth after an app
+update, if your data shows it re-limits genuine users and never fraud. The product does not choose
+these for you; collection problems can never be listed. To decide, read **when an approved session
+was limited again, and by which new reason**: the first time each new reason meets an approved
+session it is written to `acceptance_lapses`, and `GET /v1/business/acceptance-lapses` returns them
+(section 10). Compare them with your own outcomes (re-approved, denied, fraud) before listing
+anything.
 
 - **`recheck`** (no proof): succeeds once no soft cause remains — for example after a new clean
   integrity scan. A relationship review does not clear by itself (links are permanent): once your own
@@ -391,6 +423,119 @@ UPDATE` on it, never `DELETE`.
 
 **Before you rely on it:** list only low-value paths in `limited_session_paths`; decide per route
 whether its proof is enough for your users; **turn on route 3 if users with one phone must be able to
-recover**; make your app handle `scope`, `session_limited`, `upgrade_routes` and the upgrade flows —
-**the Flutter and .NET SDKs do not handle them yet**; and measure in observe mode, from the stored
+recover**; make your app handle `scope`, `session_limited`, `upgrade_routes`, the upgrade flows,
+`complete_scan_required` and `upgrade_scope_changed`, and show the approver the reasons — the Flutter
+reference client does; the .NET SDK does not yet; and measure in observe mode, from the stored
 decisions, how many sign-ins would have been limited.
+
+**Database.** Migration 016 adds `session_acceptances` (grant `SELECT, INSERT, UPDATE`) and
+`acceptance_lapses` (grant `SELECT, INSERT`); both are audit evidence, never deleted. Acceptances
+granted before 016 carried causes only; they cover nothing after the upgrade, so those sessions narrow
+at their next refresh.
+
+## 8. Evidence quality, collection problems and sensitive operations
+
+Every integrity scan now says what it actually measured (`DESIGN.md` §76), as `evidence_quality` in
+the report response, the integrity state and the stored report:
+
+| quality | meaning |
+|---|---|
+| `complete` | every requested probe ran and returned measurements that agree |
+| `partial` | code integrity compared only part of its targets (an advisory; the score is unchanged) |
+| `legacy` | the collector predates its platform's evidence contract (Android 3, iOS 2): scored as before, never complete — update the app |
+| `incomplete` | a requested probe failed, answered without its measurements, or could not measure (an unreadable process map, no thread enumerated) |
+| `invalid` | measurements that cannot all be true (for example zero writable-executable mappings with their sizes listed) |
+
+**Collection problems count once.** A probe that could not measure is not a finding, and one problem
+— an unreadable process map — can break three probes at once. Each is listed at 0 points
+(`integrity_probe_failed:<probe>`, `integrity_probe_incomplete:<probe>`,
+`integrity_evidence_invalid:<probe>`), and together they add **+30 once**
+(`integrity_evidence_incomplete`): an elevated verdict, cleared by the next complete scan. They never
+enter the device memory: only findings do (`finding_score`, the score without them). Set
+`collection_problems_block` to 1 to have each problem add +30, three of them block, and that block
+follow the device — every account on the phone — for `integrity_device_memory_hours`.
+
+**Evidence that stays incomplete is escalated.** `incomplete_evidence_review_after` (3) incomplete or
+invalid scans of one installation in a row add +30 more — review, refused in enforce mode — so a phone
+whose probes are deliberately blinded cannot stay merely elevated. A passing glitch never gets there:
+one complete scan resets the count. Legacy scans never count. `0` turns it off.
+
+**Sensitive operations need complete evidence.** List payment, advance or similar paths in
+`complete_evidence_paths`: there, only a scan that is `complete` and at most
+`complete_evidence_max_age_seconds` old (600) passes; anything else answers **403
+`integrity_complete_evidence_required`** (`details.evidence_quality`, `age_seconds`,
+`max_age_seconds`), whatever the verdict, step-up proof or acceptance. Your app's remedy is to scan
+again right before the operation, and to update itself if it reports `legacy`. Listing a path forces
+users of older app versions to update before using it.
+
+**Reading the scores.** A report's `score` and `verdict` include collection problems; `finding_score`
+does not. Analytics that look for compromise should read findings and quality separately: three
+observations from one app process are not three independent sources.
+
+## 9. Signing out, and revoked sessions
+
+`POST /v1/auth/logout` (access token and access proof, body `{}`) revokes the caller's refresh family
+on the server: its refresh token stops working, and so does every access token of the family — account
+requests check that the family still has a current session and answer **401 `session_revoked`**. It
+also revokes the family's acceptances. A limited session may sign out. Clearing tokens on the phone
+alone is not a sign-out: a copied token, used with the phone's key, would stay valid until it
+expired. A routine refresh rotates the session but leaves the family current, so requests in flight
+with the previous access token still pass.
+
+**Relationship changes during sign-in.** Sign-ins re-read the relationship counts, under locks, inside
+the transaction that writes the link. If another sign-in linked the same phone or account in between,
+the sign-in answers **409 `relationship_changed`** and writes nothing; ask once more, and the server
+decides on the new counts. (Without this, simultaneous sign-ins could each pass the
+devices-per-account limit — `tools/race_admission.py` shows it on a real database.)
+
+## 10. The business API: events and the phone-account graph
+
+The server guarantees the measurements; **what they should refuse is your business's decision**, so
+nothing here is scored (`DESIGN.md` §76). It is server to server — your backend calls it, never the
+app.
+
+**Access.** Set `BUSINESS_API_TOKEN_SHA256` to the SHA-256 digests (hex) of one or more random bearer
+tokens, comma-separated so you can rotate without a gap; unset, the API answers 404. Calls carry
+`Authorization: Bearer <token>`; anything else answers 401 `business_token_invalid`. Expose
+`/v1/business/*` only to your backend network.
+
+**`POST /v1/business/events`**, `{"events": [...]}`, 1–100 per call. Each event:
+
+| field | required | notes |
+|---|---|---|
+| `event_id` | yes | your idempotency key, 1–64 of `A-Z a-z 0-9 . _ : -`; each is recorded once |
+| `account_id` or `handle` | one of them | the server's opaque account ID, or the sign-in handle (resolved through the same keyed lookup, never stored) |
+| `type` | yes | a short code (`a-z`, `0-9`, `_`), for example `advance_disbursed`, `repayment_failed`, `chargeback`, `credential_changed`; `business_event_types` may restrict them |
+| `occurred_at` | yes | ISO 8601 with offset; not in the future |
+| `amount_minor` + `currency` | no | a whole number of minor units and its ISO 4217 code |
+| `outcome` | no | a short code |
+| `subject_ref` | no | a payee, a destination: stored **only as a keyed hash**, so accounts sharing one can be linked without storing it |
+
+Any other field, free text, an amount without its currency or a future time is refused (400
+`invalid_business_event`, with the event's index and field). The answer lists each event as
+`accepted`, `duplicate` or `rejected` (`unknown_account` — accounts are never created). Events are
+evidence, never updated or deleted.
+
+**`GET /v1/business/graph?account_id=…`** (or `device_id=`, or `handle=`): the phones and accounts
+around one node, to `business_graph_depth` hops (2: the account, its phones, the accounts on them),
+cut at `business_graph_max_nodes` (`truncated: true`). Each account carries its events by type for 1,
+7 and 30 days with 30-day amounts per currency, and how many other accounts share a subject with it;
+each phone its platform, status, first and last seen, installations, latest integrity verdict and
+evidence quality, and whether its integrity memory holds a block; each link its first and last seen;
+and the component its 30-day totals per type.
+
+**`GET /v1/business/acceptance-lapses?since=<ISO time>&limit=<n>`**: when an approved session met a
+reason its approval did not cover, oldest first — `acceptance_id`, `account_id`, `installation_id`,
+`reason_code`, `source`, `points`, `event_type`, `occurred_at`. Page with `next_since`; the key is
+`(acceptance_id, reason_code)`.
+
+**In every decision.** With the business API configured, each risk decision's `context` carries
+`business_events_30d`: this account's counts by type, and those of every account on this phone.
+
+**Not personal data.** Accounts are opaque IDs; subjects are keyed hashes; types and outcomes are short
+codes; nothing else is accepted. Business rules over these measurements — "three failed repayments
+across a phone's accounts adds points" — are yours to run, in your engine, from the graph and the
+decision context; the server can apply such rules too, but only if you decide it should.
+
+**Database.** Migration 017 adds `business_events`: grant `SELECT, INSERT`, never `UPDATE` or
+`DELETE`.

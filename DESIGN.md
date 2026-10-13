@@ -6060,3 +6060,90 @@ once in a session). It now lives only in the root-only `/etc/devicetrust.env`: t
 `test.conf.bak-*` was scrubbed; `/health/ready` answered `ready` on the new password; EC2 stopped again.
 The .NET handoff gained §14–§17. Open: the iPhone round (Codemagic's macOS queue was stalled by an
 incident on their side; the build was cancelled); the Python dialect's ID parameter types (§74).
+
+## 76. The critical review of 2026-10-13, and what was built from it
+
+**The review.** `device_trust_critical_feedback_2026-10-13.md` (reviewed archive
+`devicetrust-review-2026-10-13.tar.gz`, HEAD `89928ae`) accepted the omission of attestation and found
+six problems: R1 an approval accepted a score *band*, so a later, different finding passed for up to
+30 days; R2 relationship limits were checked before a separate transaction wrote the link; R3 probe
+errors added +30 each, so three made a block remembered for the device; R4 weak or contradictory
+evidence could still read `trusted`; R5 runtime allowances rest on spoofable shape and name
+heuristics; R6 ordinary requests did not check session revocation, and there was no server sign-out.
+It recommended separating protocol, measurement quality, abuse findings and authorization; server-owned
+corroboration; temporal checks; precise recovery; and an observation-mode rollout. Each of R1–R4 and
+R6 was reproduced on our own gate or engine before its fix.
+
+**Owner decisions (2026-10-13).** R3: collection problems count once (+30) and stay out of the device
+memory, with a DBA switch back to the old rule; two counters — complete evidence on sensitive
+operations, and escalation of evidence that stays incomplete. R1: an approval accepts the exact
+reasons and points the approver saw, relationship reasons bounded by counts, collection problems
+never; no automatic cover by default — a DBA setting, explicitly the business's decision, with the
+measurement it needs (when an approved session is limited again, and by what). R4: contradictory
+evidence scores +30 as `invalid`, not a 400. First-party fraud: everything DBA-configurable; provide the
+phone-account graph combined with business events — *"Measurements we have to guarantee, leave
+business decisions for them."*
+
+| Change | Commit | Verified |
+|---|---|---|
+| R6: `POST /v1/auth/logout` revokes the family; account requests check the family has a current session (401 `session_revoked`); a routine rotation leaves it current | `aa6e559` | gate (reproduced: a revoked family got 200; two mutations fail it); suite `check_logout_revokes_the_family` |
+| R6, app: Sign out calls the server first | `0f413aa` | analyze |
+| R2: link transaction locks account then device row, re-reads counts, 409 `relationship_changed` on drift; approval budget counted under the account lock | `8d0d820` | gate (SQLite interleaving, endpoint check, four mutations); `tools/race_admission.py` (`5b0832a`) on PostgreSQL 16.15: build before the fix **5 links**, this build **2** (1 linked, 3 `relationship_changed`) |
+| R2, app: ask once more on `relationship_changed` | `ceb93b7` | analyze |
+| R3 + migration 015: collection problems listed at 0 and +30 once; `evidence_quality`, `finding_score`; memory remembers findings; `collection_problems_block`; `integrity_device_memory_hours` | `79b2006` | gate (reproduced: 3 failed probes = 90 block; two mutations) |
+| R4: contradictions → `invalid`; unreadable maps, no threads, missing contract-3 fields → `incomplete`; below-contract collectors → `legacy`; new fields typed | `78642f1` | gate (reproduced: a v2 report read `complete`; three mutations) |
+| Counters: `complete_evidence_paths` (+ max age), `incomplete_evidence_review_after` | `4cdae1d` | gate (three mutations) |
+| Android collector 3: unreadable maps / no threads report an error; `maps_lines` | `7f0bcb9` | release build compiles; **not yet on a phone** |
+| R1 + migration 016: acceptance records, reason/points/count coverage, lapses, auto-cover setting, request scope (409 `upgrade_scope_changed`), `complete_scan_required`, decisions name their acceptance, sign-out revokes acceptances | `e3cc70e` | gate (reproduction by the review's case; five mutations) |
+| R1, app: the approver sees what approving accepts | `251a330` | analyze |
+| Business API + migration 017: events, graph, lapse feed, decision-context counts; nothing scored | `cb241b2`, `b9687c1` | gate (four mutations); suite `check_business_api`; the suite found a PostgreSQL-only bug (empty string as uuid), fixed in `b9687c1` |
+
+**Live runs, EC2 PostgreSQL 16.15, schema 17.**
+
+| Mode | Result |
+|---|---|
+| observe / observe, full suite (76 checks) | **61 passed, 0 failed, 15 skipped** |
+| integrity enforce, routes 1–3 on, a step-up path listed | **72 passed, 0 failed, 4 skipped** |
+| both enforcing: limited sessions, routes, supersede, bands, parallel sign-ins (twice), sign-out, business API, parallel clients | **15 / 15** |
+| `tools/race_admission.py` | before the fix 5 links, this build 2 — PASS |
+| offline gate | **72 / 72** |
+
+A first observe run had three 500s: the business graph's empty-string uuid (fixed), and two caused by
+Ubuntu's unattended upgrades restarting PostgreSQL and Redis minutes after the instance booted (apt
+history 10:36–10:37 UTC) — not the code; the rerun was clean.
+
+**Changes in behaviour a deployment will notice.**
+- Upgrades granted before 016 accept nothing afterwards: those sessions narrow at their next refresh.
+- A cause made only of collection problems can no longer be approved; the suite's and
+  `tools/second_phone.py`'s "elevated" fixture is now test-keys + no boot state (+40).
+- Collectors below contract (Android ≤ 2, the current .NET collectors) read `legacy`: never complete,
+  refused on `complete_evidence_paths`, never counted by the escalation.
+- Every app start costs one refresh (§75); every account request one family check; with the business
+  API configured, every decision two event counts.
+
+**R5 — not changed.** The runtime-growth allowance is the owner's earlier decision and stays. The
+JIT-name exemption (`/art`, `dalvik-`, `jit-cache`) is a name heuristic, as the review says; narrowing
+it without handset data risks +55 false positives on genuine phones, the outcome the owner weighs
+heaviest. Recorded as open, with the review's direction: classify by several properties (memfd-backed,
+dual-mapped, sizes), profile immutable native code apart from generated code, approve baselines from
+the release pipeline only.
+
+**Not built — owner decisions, with my recommendation, in order:** (1) corroboration from what the
+server already sees (sign-in failures per account across installations, enrolment churn, step-up
+failures, denials, exhausted budgets), recording counter outages as degraded evidence rather than
+zero; (2) per-operation "fresh and complete" is built — next, bind a fresh report to the exact
+operation; (3) route 3 for single-phone users before any customer enforces; (4) events from other
+services beyond this API's (network, recovery) — they collide with the no-PII rule; (5) per-installation
+history checks, observe-only first; (6) runtime baselines per build/OS/ABI from the release pipeline;
+(7) observation-mode metrics with separate tuning and evaluation data; (8) the four-question verdict
+as a structured response in the next API version. Scoring rules over business events are one commit
+away if the business wants the server to apply them.
+
+**Open.** A SQL Server round for migrations 015–017 (the hard rule: none ships without the suite on
+both engines). Android builds with collector 3 for the Huawei, OPPO and Vivo. The iPhone round (a new
+iOS build: GitHub Actions or Codemagic). The Python dialect's ID parameter types (§74).
+
+**State.** EC2 `i-0559685f02c4013b1` on PostgreSQL 16.15, schema 17; server `b9687c1` (md5 `f48621b2…`);
+business API configured with a test token (`business.conf`); assertion keys and routes 1–3 on for the
+suite; both modes enforcing — to be returned to observe/observe and the owner's defaults when the
+session ends.
