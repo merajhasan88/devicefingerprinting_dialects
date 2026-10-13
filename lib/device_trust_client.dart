@@ -1822,6 +1822,21 @@ class DeviceRecognitionController extends ChangeNotifier {
   String? pendingUpgradeRequestId;
   List<Map<String, dynamic>> approvalRequests = <Map<String, dynamic>>[];
 
+  /// What approving a request accepts, as the server worded it: one line per
+  /// reason (DESIGN.md 76). An approval covers exactly these; anything found
+  /// later needs a new decision.
+  List<String> approvalReasonLines(Map<String, dynamic> request) {
+    final Object? reasons = request['reasons'];
+    if (reasons is! List) {
+      return <String>[];
+    }
+    return <String>[
+      for (final Object? reason in reasons)
+        if (reason is Map)
+          '- ${reason['message'] ?? reason['code']} (+${reason['points']})',
+    ];
+  }
+
   /// The requests still open by their own expiry. The server leaves out lapsed
   /// and replaced requests (DESIGN.md 75); this hides one that lapsed since the
   /// list was loaded. Found on the Vivo, 2026-10-13: a lapsed request stayed on
@@ -3750,7 +3765,8 @@ class DeviceRecognitionController extends ChangeNotifier {
         ? Map<String, dynamic>.from(request['requesting_installation'] as Map)
         : <String, dynamic>{};
     return '${request['request_id']}: ${from['platform']}, first seen '
-        '${from['first_seen_at']}, joined by ${from['registration_method']}';
+        '${from['first_seen_at']}, joined by ${from['registration_method']}'
+        '${approvalReasonLines(request).map((String l) => '\n  $l').join()}';
   }
 
   Future<void> approveRequest(String requestId) {
@@ -4842,9 +4858,14 @@ class _DeviceRecognitionPageState extends State<DeviceRecognitionPage> {
         ? Map<String, dynamic>.from(request['requesting_installation'] as Map)
         : <String, dynamic>{};
     final String id = request['request_id'] as String? ?? '';
-    return 'Request ${id.length > 8 ? id.substring(0, 8) : id}: '
-        '${from['platform']} phone first seen ${from['first_seen_at']}, '
-        'joined by ${from['registration_method']}';
+    final List<String> reasons = _controller.approvalReasonLines(request);
+    return <String>[
+      'Request ${id.length > 8 ? id.substring(0, 8) : id}: '
+          '${from['platform']} phone first seen ${from['first_seen_at']}, '
+          'joined by ${from['registration_method']}',
+      if (reasons.isNotEmpty) 'Approving accepts:',
+      ...reasons,
+    ].join('\n');
   }
 
   Widget _explanationCard() {
