@@ -98,6 +98,7 @@ class Rows(object):
         self.observations = []
         self.fail_observations = False
         self.approval_requests_last_hour = 0
+        self.budget_oldest = None
         self.app_pins = {}
         self.password_hash = None
 
@@ -202,8 +203,9 @@ class Rows(object):
                 raise s.DIALECT._driver.errors.UniqueViolation("duplicate observation")
             self.writes.append((q, params))
             self.observations.append(params)
-        elif q.startswith("SELECT COUNT(*) FROM session_upgrade_requests WHERE account_id"):
-            self.result = (self.approval_requests_last_hour,)
+        elif q.startswith("SELECT COUNT(*), MIN(created_at) FROM session_upgrade_requests "
+                          "WHERE account_id"):
+            self.result = (self.approval_requests_last_hour, self.budget_oldest)
         elif q.startswith("UPDATE app_pins SET failures = failures + 1"):
             pin = self.app_pins.get(params[0])
             self.rowcount = 0
@@ -3338,27 +3340,34 @@ def an_exhausted_approval_budget_is_recorded_after_its_refusal():
     """DESIGN.md 77. An approval request refused because the account's hourly
     budget is spent answers 429 as before, and the refusal is recorded against
     the asking phone in a unit of its own -- after the refused transaction,
-    which held the account row's lock, has closed."""
+    which held the account row's lock, has closed -- once per budget period:
+    asking again in the same period adds nothing, a new period adds one."""
     path = "/v1/auth/upgrade/request"
     raw = encode({"route": "approval"})
+    db.observations = []
     try:
         with elevated_integrity(), policy(upgrade_other_device_approval=1), unit_depths() as seen:
             s._latest_integrity_state = _verdict_state("elevated")
             bearer = _limited_session("integrity_elevated")
             db.other_full_session = ("approver-session",)
-            for spent, status in ((3, 429), (2, 201)):
-                db.approval_requests_last_hour = spent
+            first_period = s._utc_now() - timedelta(minutes=50)
+            for spent, oldest, status in ((3, first_period, 429), (3, first_period, 429),
+                                          (2, first_period, 201),
+                                          (3, s._utc_now() - timedelta(minutes=5), 429)):
+                db.approval_requests_last_hour, db.budget_oldest = spent, oldest
                 reply = client.post(path, data=raw, headers=access_headers("POST", path, raw,
                                                                            bearer=bearer))
                 expect(reply.status_code == status,
                        "with %d requests this hour expected %s, got %s %s"
                        % (spent, status, reply.status_code, reply.get_json()))
-            expect(_observed(seen) == [("approval_budget_exhausted", "upgrade_budget_exhausted",
-                                        account, inst.device_id, inst.installation_id)]
-                   and seen[0][0] == 1,
-                   "only the refusal is recorded, in its own unit: %s" % seen)
+            stored = [p[1:] for p in db.observations if p[1] == "approval_budget_exhausted"]
+            expect(stored == [("approval_budget_exhausted", "upgrade_budget_exhausted",
+                               account, inst.device_id, inst.installation_id)] * 2
+                   and all(depth == 1 for depth, _ in seen),
+                   "one record per budget period, each in its own unit: %s %s" % (stored, seen))
     finally:
         db.refresh_row, db.other_full_session, db.approval_requests_last_hour = None, None, 0
+        db.budget_oldest = None
 
 
 OBSERVATION_LITE_SCHEMA = """
@@ -3575,7 +3584,7 @@ def a_phones_own_observations_score_against_that_phone():
     store.observe("sign_in_unknown_account", stuffer, times=5)
     store.observe("stepup_failed", stuffer, victims[0], times=3)
     store.denied(stuffer, victims[0])
-    store.observe("approval_budget_exhausted", stuffer, victims[0])
+    store.observe("approval_budget_exhausted", stuffer, victims[0], times=2)
     store.observe("stepup_reenrolled", stuffer, victims[0], times=2)
     decision = store.decide(stuffer, victims[0], cross_checks_enabled=1)
     expect(_cross(decision) == {
@@ -3583,7 +3592,7 @@ def a_phones_own_observations_score_against_that_phone():
         "device_sign_in_unknown_accounts": (30, 5),
         "device_stepup_failures": (30, 3),
         "device_approvals_denied": (30, 1),
-        "device_approval_budget_exhausted": (30, 1),
+        "device_approval_budget_exhausted": (30, 2),
         "device_stepup_reenrolments": (30, 2)},
         "each of the phone's own rules at the owner's defaults: %s" % decision["reasons"])
     expect(decision["recommended_action"] == "block",
@@ -3640,11 +3649,11 @@ def what_one_account_did_on_a_shared_phone_never_counts_against_another():
     store.link(shared[0], bob, age_days=200)
     store.link(shared[0], alice, age_days=0.1)
     store.denied(shared, alice)
-    store.observe("approval_budget_exhausted", shared, alice)
+    store.observe("approval_budget_exhausted", shared, alice, times=2)
     store.observe("stepup_reenrolled", shared, alice, times=2)
     mine = store.decide(shared, alice, cross_checks_enabled=1)
     expect(_cross(mine) == {"device_approvals_denied": (30, 1),
-                            "device_approval_budget_exhausted": (30, 1),
+                            "device_approval_budget_exhausted": (30, 2),
                             "device_stepup_reenrolments": (30, 2)},
            "the account that was denied carries its own events: %s" % mine["reasons"])
     theirs = store.decide(shared, bob, cross_checks_enabled=1)

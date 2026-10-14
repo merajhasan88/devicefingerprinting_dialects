@@ -54,7 +54,7 @@ USING (VALUES
     ('device_approvals_denied_count', '1', 'Approval requests from this phone for one account that the account''s other phone denied, in the window. Another account on the same phone is not affected.'),
     ('device_approvals_denied_points', '30', 'Points for device_approvals_denied.'),
     ('device_approvals_denied_effect', 'limit', 'limit (owner default) = a denied phone is held at review, a limited session, for the window, and a denial alone never blocks it; points = its points are added like any rule''s, and can reach block.'),
-    ('device_approval_budget_exhausted_count', '1', 'Approval requests from this phone for one account refused because that account''s hourly budget was spent, in the window.'),
+    ('device_approval_budget_exhausted_count', '2', 'Budget periods in which this phone found one account''s hourly approval budget spent, in the window: counted once per period however often it asked, so one impatient hour is one.'),
     ('device_approval_budget_exhausted_points', '30', 'Points for device_approval_budget_exhausted.'),
     ('device_stepup_reenrolments_count', '2', 'Step-up keys one account re-enrolled on this phone in the window (after a screen-lock change each user of a shared phone re-enrols once).'),
     ('device_stepup_reenrolments_points', '30', 'Points for device_stepup_reenrolments.')

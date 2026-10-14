@@ -1323,9 +1323,12 @@ _CROSS_CHECK_RULES = (
     ("device_approvals_denied", "device_account", "approval_denied", 1, 30,
      "%d approval requests from this phone for this account were denied in the last %d "
      "hours."),
-    ("device_approval_budget_exhausted", "device_account", "approval_budget_exhausted", 1, 30,
-     "%d approval requests from this phone for this account found its hourly budget spent in "
-     "the last %d hours."),
+    # Counted once per budget period -- until the oldest request in the hour
+    # leaves it -- however often the phone asked meanwhile: one impatient hour
+    # is one, a second period is two (owner decision of 2026-10-14).
+    ("device_approval_budget_exhausted", "device_account", "approval_budget_exhausted", 2, 30,
+     "This phone found this account's hourly approval budget spent in %d separate budget "
+     "periods in the last %d hours."),
     ("device_stepup_reenrolments", "device_account", "stepup_reenrolled", 2, 30,
      "This account's step-up key on this phone was re-enrolled %d times in the last %d "
      "hours."),
@@ -3406,7 +3409,7 @@ def _observed_refusal(code, kind, device_id, installation_id, account_id=None, o
     except ApiProblem as problem:
         if problem.code == code:
             _record_observation(kind, code, device_id, installation_id, account_id,
-                                once_key=once_key)
+                                once_key=once_key() if callable(once_key) else once_key)
         raise
 
 
@@ -7975,9 +7978,12 @@ def upgrade_request():
                 "limited_causes": causes,
                 "reasons": [{k: r[k] for k in ("code", "points", "message", "source")}
                             for r in reasons]}
+    # Recorded once per budget period and phone (DESIGN.md 77): the period is
+    # named by its oldest request's time, set below when the budget is spent.
     exhausted = _observed_refusal(
         "upgrade_budget_exhausted", "approval_budget_exhausted",
         device_id, installation_id, account_id,
+        once_key=lambda: "%s:%s:%s" % (account_id, device_id, g.get("budget_period")),
     )
     with exhausted, _cursor(commit=True) as cursor:
         # Count and insert under the account row's lock, so parallel requests
@@ -7997,12 +8003,16 @@ def upgrade_request():
                 )
             cursor.execute(
                 """
-                SELECT COUNT(*) FROM session_upgrade_requests
+                SELECT COUNT(*), MIN(created_at) FROM session_upgrade_requests
                 WHERE account_id = %s AND route = 'approval' AND created_at > %s
                 """,
                 (account_id, now - timedelta(hours=1)),
             )
-            if int(cursor.fetchone()[0]) >= _risk_setting_int("upgrade_approvals_per_hour", 3):
+            spent, oldest = cursor.fetchone()
+            if int(spent) >= _risk_setting_int("upgrade_approvals_per_hour", 3):
+                # The budget period lasts until its oldest request leaves the
+                # hour; every refusal until then is the same period.
+                g.budget_period = _iso_z(oldest) if oldest is not None else None
                 raise ApiProblem(
                     "Too many approval requests for this account in the last hour.",
                     429,
