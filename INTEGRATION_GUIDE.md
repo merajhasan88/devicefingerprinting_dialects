@@ -635,7 +635,7 @@ the sign-in answers **409 `relationship_changed`** and writes nothing; ask once 
 decides on the new counts. (Without this, simultaneous sign-ins could each pass the
 devices-per-account limit — `tools/race_admission.py` shows it on a real database.)
 
-## 10. The business API: events and the phone-account graph
+## 10. The business API: events, the phone-account graph, integrity reports, PIN support
 
 The server guarantees the measurements; **what they should refuse is your business's decision**, so
 nothing here is scored (`DESIGN.md` §76). It is server to server — your backend calls it, never the
@@ -679,6 +679,18 @@ reason its approval did not cover, oldest first — `acceptance_id`, `account_id
 `?cursor=<next_cursor>`, which carries the last row's time and key, so rows sharing one instant at a
 page edge are never skipped. Each `(acceptance_id, reason_code)` appears once.
 
+**`GET /v1/business/integrity-reports?since=<ISO time>&limit=<n>`**: every integrity report as
+stored, oldest first — the phone's own measurements (`probe_results`), the reasons and score the server
+derived from them, the verdict, the evidence quality, `report_sha256`, `created_at`. At most one filter:
+`device_id=`, `installation_id=`, or `account_id=` (the reports of every phone linked to the account,
+from before the link too: a report describes the phone). `limit` 1–200, default 50; page with
+`?cursor=<next_cursor>` as above. Every field is listed in [MEASUREMENTS.md](MEASUREMENTS.md).
+**`probe_results` identify a phone** — its model, OS build, installed tools, the app's install source:
+hold them as device-identifying data.
+
+**`POST /v1/business/app-pin/unlock`** and **`/reset`**: your support staff, after verifying the
+customer, unlock their app PIN or allow one reset of it — section 12.
+
 **In every decision.** With the business API configured, each risk decision's `context` carries
 `business_events_30d`: this account's counts by type, and those of every account on this phone.
 
@@ -688,8 +700,9 @@ across a phone's accounts adds points" — are yours to run, in your engine, fro
 decision context; the server can apply such rules too, but only if you decide it should.
 
 **Database.** Migration 017 adds `business_events`: grant `SELECT, INSERT`, never `UPDATE` or
-`DELETE`. The server serves only at its schema version (19): a database without 017 answers 503
-`schema_version_mismatch` everywhere but `/health`, so no decision ever reads a missing table.
+`DELETE`; migration 021 adds the index the report feed pages through. The server serves only at its
+schema version (21): a database behind it answers 503 `schema_version_mismatch` everywhere but
+`/health`, so no decision ever reads a missing table.
 
 ## 11. The server's own observations (cross-checks)
 
@@ -707,7 +720,8 @@ installation whose key made the request.
 | `stepup_reenrolled` | a step-up key re-enrolled (in the same transaction as the change) |
 | `token_without_key` | one of this phone's tokens — access or refresh — presented with a proof its key did not sign: copied to another phone. Once per token |
 | `request_replayed` | one of this phone's signed requests sent again. Once per request |
-| `app_pin_failed` / `app_pin_set` | a wrong app PIN; a PIN set or replaced (section 12) |
+| `app_pin_failed` / `app_pin_set` | a wrong app PIN; a PIN set or replaced — `app_pin_set_after_support_reset` when a support reset was used (section 12) |
+| `app_pin_support_unlocked` / `app_pin_support_reset` | your support staff unlocked the account's PIN, or opened a reset; the code is their ticket reference, and no phone is named |
 | denied approval requests | already rows of `session_upgrade_requests` (`denied_at`), counted per requesting phone |
 
 **Measured always.** Every risk decision's `context.server_observations` carries the counts over
@@ -771,6 +785,8 @@ updates or deletes it), an index for denied approvals per phone, and the setting
 runs more indexed queries: two without an account, five with one, six for a phone that joined it
 within the window.
 
+Every kind and code, and every other measurement, is listed in [MEASUREMENTS.md](MEASUREMENTS.md).
+
 **Reading stored decisions.** A phone held by a denial can show a score in the block band with
 `recommended_action` = `review` and `held_by_denial` true: read the action, not the band of the score.
 
@@ -806,12 +822,35 @@ session (a limited one is refused) and the account password. `app_pin_length` di
 earlier PIN and clears its count and lock; this is also how a user with a forgotten or locked PIN gets
 back in: **the user**, in your app, with their password, from a full session on any of their phones —
 no administrator is involved. A user whose only session is limited has no full session to do it from;
-their way back is a clean scan (the session upgrades by itself) or route 3 through your identity
-backend. Whether support staff may also unlock a PIN — a DBA `UPDATE app_pins SET failures = 0,
-locked_at = NULL` after verifying the customer — is your business procedure to decide; nothing in the
-server does it. The server never requires the PIN to set one, nor the screen-lock key to re-enrol one
-(`/v1/installations/stepup-key`), whatever the paths list: a locked PIN or a dead key could otherwise
-never be replaced.
+their way back is a clean scan (the session upgrades by itself), your support staff (below), or route
+3 through your identity backend. The server never requires the PIN to set one, nor the screen-lock key
+to re-enrol one (`/v1/installations/stepup-key`), whatever the paths list: a locked PIN or a dead key
+could otherwise never be replaced.
+
+**Support staff** (`DESIGN.md` §79). Your DBA chooses what they may do, `app_pin_support`: `off` (the
+default), `unlock`, or `unlock_and_reset`. Your support tool calls the business API (section 10) after
+verifying the customer, naming the account and its own ticket reference:
+
+```
+POST /v1/business/app-pin/unlock    {"handle": "…", "reference": "TICKET-4711"}
+POST /v1/business/app-pin/reset     {"account_id": "…", "reference": "TICKET-4711"}
+```
+
+Exactly one of `account_id` or `handle`; `reference` is 1–64 of `A-Z a-z 0-9 . _ : -`, and nothing else
+is accepted (400 `invalid_support_request`, naming the field). **Unlock** clears the count and the lock
+of an existing PIN — for a customer who remembers it (404 `app_pin_not_set` when there is none).
+**Reset**, only under `unlock_and_reset`, also opens a window of `app_pin_support_reset_minutes` (15) in
+which the customer may set a new PIN **even from a limited session** — still with the password, still
+refused if the phone is blocked — once: setting it closes the window, and a second attempt is refused.
+The answer carries `reset_until`; `/v1/account/me` shows `app_pin_reset_open`. Each action is recorded
+for the account (`app_pin_support_unlocked`, `app_pin_support_reset`, with the reference), and the PIN
+set through a reset as `app_pin_set_after_support_reset`, with the phone that set it. Off, both answer
+403 `app_pin_support_disabled`.
+
+**The risk lands on your verification procedure.** Whoever convinces your support staff that they are
+the customer gets the unlock or the reset; during a reset window the password alone sets the PIN, from
+any phone holding a session on the account. Verify as you would for a password reset, keep the window
+short, and check afterwards which phone set the PIN.
 
 **Sending it.** The `X-App-PIN` header, on the request it approves. Never log it — check your proxies
 (the reference server's gunicorn and Caddy write no headers). Refusals:
@@ -823,9 +862,18 @@ never be replaced.
 | `app_pin_locked` (403) | after `app_pin_max_failures` wrong PINs in a row; even the right PIN is refused until a new one is set |
 | `app_pin_not_set` (403) | the account has none yet |
 | `invalid_app_pin` (400) | setting a PIN of the wrong length or with non-digits |
+| `app_pin_reset_lapsed` (403) | a limited session tried to use a support reset that lapsed or was used in the meantime |
 
-`/v1/account/me` reports `step_up`: the method, `app_pin_set`, `app_pin_locked`, `app_pin_length`, so your
-app can ask for what is needed before sending.
+**Your app follows the DBA's policy.** `GET /v1/policy/step-up` needs no token — the app creates its
+step-up key when it first registers, before any account exists — and answers the `method`, the
+`factor`, `mode` and `window_seconds` the screen-lock key must be created with, `app_pin_length`,
+`required_paths` and `app_pin_required_paths`; never cached, rate-limited per source.
+`/v1/account/me` reports the same in `step_up`, with `app_pin_set`, `app_pin_locked` and
+`app_pin_reset_open`. The reference client reads it before registering and creates the key to match;
+an existing key of another factor is replaced while no key is bound, and once one is bound the user is
+asked to re-enrol it with the password (the server would refuse the old one,
+`stepup_factor_mismatch`). A per-use key satisfies a windowed policy. The build's `STEPUP_*` values are
+only the fallback when the server cannot be asked.
 
 **Storage.** One PIN per account (migration 020, `app_pins`; grant `SELECT, INSERT, UPDATE`), kept only as
 bcrypt over an HMAC keyed by a secret derived from `DEVICE_ID_MASTER_SECRET`: a copy of the table alone
@@ -838,3 +886,17 @@ off by default (`upgrade_stepup_same_device`); turning it on gives single-phone 
 integrity-limited session, at the cost that wrong PINs from an attacker's phone can lock the user's PIN
 until they set a new one with their password.
 
+## 13. How long a session lives
+
+Your DBA's choice (`DESIGN.md` §79), within limits we fix:
+
+| setting | default | meaning |
+|---|---|---|
+| `refresh_idle_days` | 30 | a session ends after this many days without a refresh; each refresh extends it — a user who opens the app weekly stays signed in. 1–90 |
+| `session_max_days` | 0 | a session ends this many days after its first sign-in, however often it refreshes; 0 = no limit. Up to 365 |
+
+A session past `session_max_days` is refused with 401 **`session_max_age_reached`**, at the refresh and
+on requests that check the session row; the user signs in again. It applies at once to sessions opened
+before the DBA set it. A refresh token is issued for at most the time left. The access token (10
+minutes) and the device token (10 minutes) are ours, not settings. `/health/ready` reports the
+effective values.
