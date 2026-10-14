@@ -2985,7 +2985,10 @@ CREATE TABLE acceptance_lapses (acceptance_id TEXT, reason_code TEXT, source TEX
                                 occurred_at TSZ, PRIMARY KEY (acceptance_id, reason_code));
 CREATE TABLE server_observations (observation_id TEXT PRIMARY KEY, kind TEXT NOT NULL, code TEXT,
                                   account_id TEXT, device_id TEXT, installation_id TEXT,
-                                  occurred_at TSZ NOT NULL);
+                                  occurred_at TSZ NOT NULL DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE app_pins (account_id TEXT PRIMARY KEY, pin_hash BLOB,
+                       failures INTEGER NOT NULL DEFAULT 0, locked_at TSZ, reset_until TSZ,
+                       set_at TSZ, set_by_installation TEXT);
 CREATE TABLE session_upgrade_requests (request_id TEXT PRIMARY KEY, device_id TEXT, denied_at TSZ);
 """
 BUSINESS_TOKEN = "business-token-for-the-gate"
@@ -4062,6 +4065,191 @@ def approving_and_the_same_phone_route_follow_the_method():
             expect(not offered(), "under screen_lock a phone without a key is not offered route 1")
     finally:
         db.app_pins, db.refresh_row, db.step_jwk = {}, None, step.jwk
+
+
+@check
+def a_support_reset_lets_a_limited_session_set_a_pin_once():
+    """DESIGN.md 79. A limited session never sets a PIN -- unless support has
+    opened a reset for the account: then a limited session may set a new PIN,
+    with the password, before the reset lapses. Once: the change consumes the
+    reset in the same statement, so two requests that both saw it open set one
+    PIN between them. A wrong password leaves the reset open, and a blocked
+    phone is still refused. A row holding only a reset is no PIN: it verifies
+    nothing, counts no attempt, and route 1 is not offered on it."""
+    import bcrypt as _bcrypt
+    db.observations = []
+    db.password_hash = _bcrypt.hashpw(b"Passw0rd123", _bcrypt.gensalt(4))
+    path, body = "/v1/account/app-pin", {"password": "Passw0rd123", "pin": PIN}
+    real_open, real_gate, real_policy = (s._support_reset_open, s._enforce_integrity_gate,
+                                         s._evaluate_risk_policy)
+
+    def reset(minutes, pin_hash=None):
+        db.app_pins = {account: {"hash": pin_hash, "failures": 0, "locked_at": None, "by": None,
+                                 "reset_until": s._utc_now() + timedelta(minutes=minutes)}}
+
+    def set_limited(password="Passw0rd123"):
+        return pin_call(path, dict(body, password=password),
+                        bearer=_limited_session("integrity_elevated"))
+
+    def blocked(*args, **kwargs):
+        raise s.ApiProblem("The device is blocked.", 403, "integrity_blocked")
+
+    try:
+        with isolated_stepup():
+            trusted_gate, allowing = s._enforce_integrity_gate, s._evaluate_risk_policy
+            reset(15)
+            state = s._app_pin_state(account)
+            expect(state["app_pin_set"] is False and state["app_pin_reset_open"] is True,
+                   "a reset alone is not a PIN: %s" % state)
+            with policy(stepup_method="app_pin", upgrade_stepup_same_device=1):
+                reply = pin_call(SENSITIVE, {"amount": 1}, pin=PIN)
+                expect(error_code(reply) == "app_pin_not_set"
+                       and db.app_pins[account]["failures"] == 0,
+                       "a reset alone verifies nothing and counts no attempt: %s %s"
+                       % (error_code(reply), db.app_pins[account]))
+                db.step_jwk = None
+                offered = lambda: "stepup" in s._upgrade_routes(db, account, inst.installation_id,
+                                                                ["integrity_elevated"])
+                expect(not offered(), "nor is route 1 offered on a reset alone")
+                reset(15, b"$2b$04$a-verifier")
+                expect(offered(), "while a PIN that is set, with a reset open, is")
+                reset(15)
+                db.step_jwk = step.jwk
+            reply = set_limited(password="Wrong-Passw0rd")
+            expect(reply.status_code == 401 and db.app_pins[account]["reset_until"] is not None,
+                   "a wrong password is refused and leaves the reset open: %s %s"
+                   % (reply.status_code, error_code(reply)))
+            for patch, code in (("_enforce_integrity_gate", "integrity_blocked"),
+                                ("_evaluate_risk_policy", "risk_policy_blocked")):
+                if patch == "_enforce_integrity_gate":
+                    s._enforce_integrity_gate = blocked
+                else:
+                    s._evaluate_risk_policy = lambda *a, **k: {"effective_action": "block"}
+                reply = set_limited()
+                s._enforce_integrity_gate, s._evaluate_risk_policy = trusted_gate, allowing
+                expect(reply.status_code == 403 and error_code(reply) == code
+                       and db.app_pins[account]["hash"] is None,
+                       "a blocked phone is refused even with a reset open, got %s %s"
+                       % (reply.status_code, error_code(reply)))
+            reply = set_limited()
+            pin_row = db.app_pins[account]
+            expect(reply.status_code == 200 and pin_row["hash"] is not None
+                   and pin_row["reset_until"] is None and pin_row["by"] == inst.installation_id
+                   and [p[1:3] for p in db.observations][-1]
+                   == ("app_pin_set", "app_pin_set_after_support_reset"),
+                   "with the reset open a limited session sets the PIN, recorded as such: "
+                   "%s %s %s" % (reply.status_code, error_code(reply), db.observations[-1:]))
+            reply = set_limited()
+            expect(reply.status_code == 403 and error_code(reply) == "session_limited",
+                   "the reset serves once, got %s %s" % (reply.status_code, error_code(reply)))
+            reset(-1)
+            reply = set_limited()
+            expect(reply.status_code == 403 and error_code(reply) == "session_limited",
+                   "a lapsed reset opens nothing, got %s %s"
+                   % (reply.status_code, error_code(reply)))
+            # Two requests both saw it open; the other one's change consumed it.
+            original = s._bcrypt_hash_bytes(s._app_pin_material(account, "135799"))
+            reset(15, original)
+            db.app_pins[account]["reset_until"] = None
+            s._support_reset_open = lambda account_id: True
+            reply = set_limited()
+            s._support_reset_open = real_open
+            expect(reply.status_code == 403 and error_code(reply) == "app_pin_reset_lapsed"
+                   and db.app_pins[account]["hash"] == original,
+                   "the loser of two must change nothing, got %s %s"
+                   % (reply.status_code, error_code(reply)))
+            reset(15, original)
+            reply = pin_call(path, body, bearer=_full_session())
+            expect(reply.status_code == 200 and db.app_pins[account]["reset_until"] is None,
+                   "a PIN set from a full session closes the reset too: %s %s"
+                   % (reply.status_code, db.app_pins[account]))
+    finally:
+        s._support_reset_open, s._enforce_integrity_gate, s._evaluate_risk_policy = (
+            real_open, real_gate, real_policy)
+        db.app_pins, db.password_hash, db.refresh_row, db.step_jwk = {}, None, None, step.jwk
+
+
+@check
+def support_unlocks_or_resets_an_app_pin_only_as_the_dba_allows():
+    """DESIGN.md 79. Support's tool, a business API caller, after verifying the
+    customer, unlocks a locked app PIN -- or, where the DBA allows it, opens
+    one reset for app_pin_support_reset_minutes. Off by default: both answer
+    app_pin_support_disabled. Each names exactly one account, by account_id or
+    handle, with the caller's own ticket reference, recorded as the server's
+    observation (no phone); nothing else is accepted. Unlocking needs a PIN to
+    unlock; a reset on an account without one opens a row holding only it."""
+    unlock, reset = "/v1/business/app-pin/unlock", "/v1/business/app-pin/reset"
+    with business_store() as connection:
+        locked = business_account(connection, "support-locked")
+        bare = business_account(connection, "support-bare")
+        connection.execute("INSERT INTO app_pins (account_id, pin_hash, failures, locked_at) "
+                           "VALUES (?, ?, 5, ?)", (locked, b"verifier", s._utc_now()))
+        ask = {"account_id": locked, "reference": "TICKET-1"}
+        status, payload = business_call("POST", unlock, ask, token="")
+        expect(status == 401, "support needs the business token, got %s" % status)
+        for path in (unlock, reset):
+            status, payload = business_call("POST", path, ask)
+            expect(status == 403 and payload["error"]["code"] == "app_pin_support_disabled",
+                   "off by default, %s must refuse: %s %s" % (path, status, payload))
+        with business_policy(app_pin_support="unlock"):
+            status, payload = business_call("POST", reset, ask)
+            expect(status == 403 and payload["error"]["code"] == "app_pin_support_disabled",
+                   "unlock alone must not open a reset: %s %s" % (status, payload))
+            for bad, field in (
+                    ({"account_id": locked}, "reference"),
+                    ({"account_id": locked, "reference": "ticket 1"}, "reference"),
+                    ({"account_id": locked, "reference": "x" * 65}, "reference"),
+                    ({"reference": "T-1"}, "account_id"),
+                    ({"account_id": locked, "handle": "support-locked", "reference": "T-1"},
+                     "account_id"),
+                    ({"account_id": locked, "reference": "T-1", "note": "x"}, "note")):
+                status, payload = business_call("POST", unlock, bad)
+                error = payload.get("error") or {}
+                expect(status == 400 and error.get("code") == "invalid_support_request"
+                       and (error.get("details") or {}).get("field") == field,
+                       "%s must be refused on %s: %s %s" % (sorted(bad), field, status, payload))
+            status, payload = business_call("POST", unlock, {"account_id": str(uuid.uuid4()),
+                                                             "reference": "T-2"})
+            expect(status == 404 and payload["error"]["code"] == "unknown_account",
+                   "an unknown account: %s %s" % (status, payload))
+            status, payload = business_call("POST", unlock, {"handle": "support-bare",
+                                                             "reference": "T-3"})
+            expect(status == 404 and payload["error"]["code"] == "app_pin_not_set",
+                   "no PIN, nothing to unlock: %s %s" % (status, payload))
+            status, payload = business_call("POST", unlock, {"handle": "support-locked",
+                                                             "reference": "T-4"})
+            row = connection.execute("SELECT failures, locked_at, reset_until FROM app_pins "
+                                     "WHERE account_id = ?", (locked,)).fetchone()
+            expect(status == 200 and payload == {"account_id": locked, "unlocked": True,
+                                                 "reset_until": None}
+                   and tuple(row) == (0, None, None),
+                   "unlock clears the count and the lock, and opens no reset: %s %s %s"
+                   % (status, payload, row))
+        with business_policy(app_pin_support="unlock_and_reset", app_pin_support_reset_minutes=20):
+            before = s._utc_now()
+            for reference in ("T-5", "T-6"):
+                status, payload = business_call("POST", reset, {"account_id": bare,
+                                                                "reference": reference})
+                row = connection.execute("SELECT pin_hash, reset_until FROM app_pins "
+                                         "WHERE account_id = ?", (bare,)).fetchone()
+                expect(status == 200 and row[0] is None
+                       and before + timedelta(minutes=20) <= row[1]
+                       <= s._utc_now() + timedelta(minutes=20)
+                       and payload["reset_until"] == s._iso_z(row[1]),
+                       "a reset opens for the DBA's minutes, a row holding only it: %s %s %s"
+                       % (status, payload, row))
+        with business_policy(app_pin_support="unlock"):
+            status, payload = business_call("POST", unlock, {"account_id": bare,
+                                                             "reference": "T-7"})
+            expect(status == 404 and payload["error"]["code"] == "app_pin_not_set",
+                   "a row holding only a reset has no PIN to unlock: %s %s" % (status, payload))
+        seen = [tuple(r) for r in connection.execute(
+            "SELECT kind, code, account_id, device_id, installation_id "
+            "FROM server_observations ORDER BY rowid")]
+        expect(seen == [("app_pin_support_unlocked", "T-4", locked, None, None),
+                        ("app_pin_support_reset", "T-5", bare, None, None),
+                        ("app_pin_support_reset", "T-6", bare, None, None)],
+               "each support action is recorded once, with its reference: %s" % seen)
 
 
 @check
