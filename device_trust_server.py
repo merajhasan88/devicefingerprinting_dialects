@@ -106,6 +106,9 @@ _CHALLENGE_MAC_KEY = hmac.new(
 _BUSINESS_SUBJECT_PEPPER = hmac.new(
     _ROOT_SECRET, b"business-subject-v1", hashlib.sha256
 ).digest()
+# App PINs (DESIGN.md 78) are stored only as bcrypt over an HMAC keyed by this:
+# a copy of the table without the root secret cannot be searched at all.
+_APP_PIN_PEPPER = hmac.new(_ROOT_SECRET, b"app-pin-v1", hashlib.sha256).digest()
 
 
 def _business_token_digests():
@@ -1186,7 +1189,7 @@ def _get_backend_identity():
 # against a schema it does not understand. /health/* still answers so operators
 # can see why.
 
-REQUIRED_SCHEMA_VERSION = 19
+REQUIRED_SCHEMA_VERSION = 20
 
 _schema_state = None
 _schema_lock = threading.Lock()
@@ -1326,6 +1329,8 @@ _CROSS_CHECK_RULES = (
     ("device_stepup_reenrolments", "device_account", "stepup_reenrolled", 2, 30,
      "This account's step-up key on this phone was re-enrolled %d times in the last %d "
      "hours."),
+    ("device_app_pin_failures", "device_account", "app_pin_failed", 3, 30,
+     "%d wrong app PINs for this account came from this phone in the last %d hours."),
 )
 CROSS_CHECK_WINDOW_HOURS = 24
 
@@ -1384,6 +1389,10 @@ _RISK_SETTING_KINDS = {
     "cross_checks_enabled": "bool",
     "cross_check_window_hours": "int",
     "device_approvals_denied_effect": ("limit", "points"),
+    "stepup_method": ("screen_lock", "app_pin", "screen_lock_and_app_pin"),
+    "app_pin_required_paths": "paths",
+    "app_pin_length": "int",
+    "app_pin_max_failures": "int",
 }
 _RISK_SETTING_KINDS.update(
     ("%s_%s" % (rule[0], part), "int")
@@ -1400,6 +1409,13 @@ _RISK_SETTING_MINIMUMS = {
     "business_graph_depth": 1,
     "business_graph_max_nodes": 1,
     "cross_check_window_hours": 1,
+    "app_pin_length": 4,
+    # Unlimited guesses at a 4-12 digit PIN is no setting: at least one.
+    "app_pin_max_failures": 1,
+}
+# Upper bounds a value must also meet.
+_RISK_SETTING_MAXIMUMS = {
+    "app_pin_length": 12,
 }
 _RISK_SETTING_BOOL_WORDS = ("0", "1", "true", "false", "yes", "no", "on", "off")
 # Rows whose absence would silently weaken a gate instead of restoring the
@@ -1446,6 +1462,8 @@ def _validate_risk_settings(values):
             valid = value in kind
         if valid and key in _RISK_SETTING_MINIMUMS:
             valid = int(value) >= _RISK_SETTING_MINIMUMS[key]
+        if valid and key in _RISK_SETTING_MAXIMUMS:
+            valid = int(value) <= _RISK_SETTING_MAXIMUMS[key]
         if not valid:
             raise ValueError("risk_policy_settings.%s has an invalid value" % key)
     # The relationship bands must rise: step-up < review < block. A missing
@@ -3319,6 +3337,8 @@ _OBSERVATION_KINDS = (
     "stepup_reenrolled",
     "token_without_key",
     "request_replayed",
+    "app_pin_failed",
+    "app_pin_set",
 )
 # Observations recorded at most once per token or per request take an ID
 # derived from it, so a duplicate is the database's own refusal.
@@ -3427,13 +3447,14 @@ def _server_observation_counts(cursor, device_id, installation_id, account_id, n
     # This account on this phone: a denial, an exhausted budget or a
     # re-enrolment says nothing about another account sharing the phone.
     device_account = dict.fromkeys(
-        ("approval_denied", "approval_budget_exhausted", "stepup_reenrolled"), 0
+        ("approval_denied", "approval_budget_exhausted", "stepup_reenrolled", "app_pin_failed"),
+        0,
     )
     cursor.execute(
         """
         SELECT kind, COUNT(*) FROM server_observations
         WHERE device_id = %s AND account_id = %s AND occurred_at >= %s
-          AND kind IN ('approval_budget_exhausted', 'stepup_reenrolled')
+          AND kind IN ('approval_budget_exhausted', 'stepup_reenrolled', 'app_pin_failed')
         GROUP BY kind
         UNION ALL
         SELECT 'approval_denied', COUNT(*) FROM session_upgrade_requests
@@ -4137,25 +4158,84 @@ def _stepup_required_paths():
     return {p.strip() for p in raw.replace(";", ",").split(",") if p.strip()}
 
 
-def _enforce_step_up(installation_id, account_id):
-    """Verify a step-up proof where one is required, or offered; return it.
+def _app_pin_required_paths():
+    raw = _risk_setting_str("app_pin_required_paths", "")
+    return {p.strip() for p in raw.replace(";", ",").split(",") if p.strip()}
 
-    Required on the DBA-designated sensitive paths (none by default). On any
-    other authenticated account request a client may attach one anyway, to
-    satisfy an elevated integrity verdict (DESIGN.md 63): it is verified exactly
-    as on a sensitive path, and an invalid one refuses the request rather than
-    being ignored. Returns g.step_up when a proof was verified, else None.
-    Every decision is logged with its outcome code, so an operator can see
-    step-up activity, and a downgraded key in use, without a new table.
+
+# Where a PIN is set or replaced (DESIGN.md 78). The PIN is never required
+# there: a locked or forgotten PIN could otherwise never be replaced.
+_APP_PIN_PATH = "/v1/account/app-pin"
+
+
+def _stepup_factors():
+    """(the screen-lock key, the app PIN): which factors a step-up needs under
+    the DBA's stepup_method, wherever one is required (DESIGN.md 78)."""
+    method = _risk_setting_str("stepup_method", "screen_lock")
+    return method != "app_pin", method != "screen_lock"
+
+
+def _prove_step_up(installation_id, account_id, need_key, need_pin, required=None):
+    """Verify the step-up factors this request carries or must carry: the
+    screen-lock key's proof v2, the app PIN, or both (DESIGN.md 78). A missing
+    PIN is named before anything is checked, so asking for it costs no attempt,
+    and the key is checked before the PIN, so a bad proof never spends one; a
+    refusal for a missing factor names the factors required (`required`, by
+    default both flags). Returns the key's auth when the key was proven."""
+    needs = required if required is not None else [
+        name for name, needed in (("screen_lock", need_key), ("app_pin", need_pin)) if needed
+    ]
+    details = {"step_up": {"method": _risk_setting_str("stepup_method", "screen_lock"),
+                           "needs": needs}}
+    if need_pin and not request.headers.get("X-App-PIN"):
+        raise ApiProblem("This operation needs the app PIN.", 403, "app_pin_required",
+                         details=details)
+    key_auth = None
+    if need_key:
+        try:
+            key_auth = _verify_step_up(installation_id, account_id)
+        except ApiProblem as problem:
+            if problem.code == "stepup_required" and problem.details is None:
+                problem.details = details
+            raise
+    if need_pin:
+        _verify_app_pin(account_id, get_jwt().get("did"), installation_id)
+    return key_auth
+
+
+def _enforce_step_up(installation_id, account_id):
+    """Verify the step-up a request must carry, or offers; return it.
+
+    Required on the DBA-designated paths, none by default: stepup_required_paths,
+    proven as stepup_method says -- the screen-lock key, the app PIN the server
+    checks, or both -- and app_pin_required_paths, which need the app PIN on top
+    (DESIGN.md 78). On any other authenticated account request a client may
+    attach a factor anyway, to satisfy an elevated integrity verdict (DESIGN.md
+    63): it is verified exactly as on a required path, and an invalid one
+    refuses the request rather than being ignored. Returns g.step_up only when
+    every factor the method names was proven, else None. Every decision is
+    logged with its outcome code -- never the PIN.
     """
+    key_method, pin_method = _stepup_factors()
     required = request.path in _stepup_required_paths()
-    offered = bool(
+    key_required = required and key_method
+    pin_required = request.path != _APP_PIN_PATH and (
+        (required and pin_method) or request.path in _app_pin_required_paths()
+    )
+    need_key = key_required or bool(
         request.headers.get("X-Step-Up-Proof") or request.headers.get("X-Step-Up-Signature")
     )
-    if not required and not offered:
+    need_pin = pin_required or (
+        request.path != _APP_PIN_PATH and bool(request.headers.get("X-App-PIN"))
+    )
+    if not need_key and not need_pin:
         return None
     try:
-        key_auth = _verify_step_up(installation_id, account_id)
+        key_auth = _prove_step_up(
+            installation_id, account_id, need_key, need_pin,
+            required=[name for name, needed in (("screen_lock", key_required),
+                                                ("app_pin", pin_required)) if needed],
+        )
     except ApiProblem as problem:
         logger.info(
             "Step-up refused: installation=%s path=%s code=%s",
@@ -4164,19 +4244,137 @@ def _enforce_step_up(installation_id, account_id):
             problem.code,
         )
         raise
-    downgrade = _stepup_policy_downgrade(key_auth)
-    g.step_up = {"key_auth": key_auth, "policy_downgrade": downgrade}
+    if (key_method and not need_key) or (pin_method and not need_pin):
+        # What was offered verified, but the method asks for more: no step-up.
+        return None
+    downgrade = _stepup_policy_downgrade(key_auth) if key_auth is not None else None
+    g.step_up = {
+        "key_auth": key_auth,
+        "policy_downgrade": downgrade,
+        "app_pin": need_pin,
+        "method": _risk_setting_str("stepup_method", "screen_lock"),
+    }
     logger.info(
-        "Step-up verified: installation=%s path=%s factor=%s key_mode=%s "
-        "window_seconds=%s policy_downgrade=%s",
+        "Step-up verified: installation=%s path=%s method=%s factor=%s key_mode=%s "
+        "window_seconds=%s policy_downgrade=%s app_pin=%s",
         installation_id,
         request.path,
-        key_auth.get("factor"),
-        key_auth.get("mode"),
-        key_auth.get("window_seconds"),
+        g.step_up["method"],
+        (key_auth or {}).get("factor"),
+        (key_auth or {}).get("mode"),
+        (key_auth or {}).get("window_seconds"),
         downgrade,
+        need_pin,
     )
     return g.step_up
+
+
+def _app_pin_well_formed(pin):
+    length = _risk_setting_int("app_pin_length", 6)
+    return isinstance(pin, str) and len(pin) == length and pin.isascii() and pin.isdigit()
+
+
+def _app_pin_material(account_id, pin):
+    """What bcrypt hashes for an app PIN: an HMAC of the account and the PIN,
+    keyed by a secret the database never holds (DESIGN.md 78)."""
+    return hmac.new(
+        _APP_PIN_PEPPER, ("%s:%s" % (account_id, pin)).encode("utf-8"), hashlib.sha256
+    ).hexdigest().encode("ascii")
+
+
+def _verify_app_pin(account_id, device_id, installation_id):
+    """Check the app PIN this request carries (X-App-PIN), counting the attempt
+    first (DESIGN.md 78).
+
+    One atomic UPDATE claims the attempt before anything is compared, so
+    concurrent guesses never exceed app_pin_max_failures, and bcrypt runs
+    outside any unit of work (on SQL Server a unit holds the worker's lock). A
+    right PIN clears the count; the last wrong one locks the PIN until the user
+    sets a new one with the account password. Each wrong PIN is the server's
+    own observation (app_pin_failed), for this account on this phone.
+    """
+    account_id = str(account_id)
+    pin = request.headers.get("X-App-PIN", "")
+    max_failures = max(1, _risk_setting_int("app_pin_max_failures", 5))
+    with _cursor(commit=True) as cursor:
+        cursor.execute(
+            """
+            UPDATE app_pins SET failures = failures + 1
+            WHERE account_id = %s AND locked_at IS NULL AND failures < %s
+            """,
+            (account_id, max_failures),
+        )
+        claimed = cursor.rowcount == 1
+        cursor.execute(
+            "SELECT pin_hash, failures, locked_at FROM app_pins WHERE account_id = %s",
+            (account_id,),
+        )
+        row = cursor.fetchone()
+    if row is None:
+        raise ApiProblem(
+            "No app PIN is set for this account; set one first.", 403, "app_pin_not_set"
+        )
+    locked_message = (
+        "The app PIN is locked after too many wrong attempts; set a new one with the "
+        "account password."
+    )
+    if not claimed:
+        if row[2] is None:  # the count reached a maximum the DBA has since lowered
+            with _cursor(commit=True) as cursor:
+                cursor.execute(
+                    "UPDATE app_pins SET locked_at = NOW() "
+                    "WHERE account_id = %s AND locked_at IS NULL",
+                    (account_id,),
+                )
+        raise ApiProblem(locked_message, 403, "app_pin_locked")
+    if _app_pin_well_formed(pin) and bcrypt.checkpw(
+        _app_pin_material(account_id, pin), _bcrypt_db_bytes(row[0])
+    ):
+        with _cursor(commit=True) as cursor:
+            cursor.execute(
+                "UPDATE app_pins SET failures = 0 WHERE account_id = %s", (account_id,)
+            )
+        g.app_pin_verified = True
+        return
+    failures = int(row[1])
+    locked = failures >= max_failures
+    if locked:
+        with _cursor(commit=True) as cursor:
+            cursor.execute(
+                "UPDATE app_pins SET locked_at = NOW() "
+                "WHERE account_id = %s AND locked_at IS NULL",
+                (account_id,),
+            )
+    _record_observation(
+        "app_pin_failed",
+        "app_pin_locked" if locked else "app_pin_invalid",
+        device_id,
+        installation_id,
+        account_id=account_id,
+    )
+    if locked:
+        raise ApiProblem(locked_message, 403, "app_pin_locked")
+    raise ApiProblem(
+        "The app PIN is wrong.",
+        403,
+        "app_pin_invalid",
+        details={"attempts_left": max_failures - failures},
+    )
+
+
+def _app_pin_state(account_id):
+    """Whether this account has an app PIN, and whether it is locked."""
+    with _cursor() as cursor:
+        cursor.execute(
+            "SELECT locked_at FROM app_pins WHERE account_id = %s", (str(account_id),)
+        )
+        row = cursor.fetchone()
+    return {
+        "method": _risk_setting_str("stepup_method", "screen_lock"),
+        "app_pin_set": row is not None,
+        "app_pin_locked": bool(row is not None and row[0] is not None),
+        "app_pin_length": _risk_setting_int("app_pin_length", 6),
+    }
 
 
 # Step-up refusals that are not a failed proof (DESIGN.md 77): a request sent
@@ -6624,8 +6822,89 @@ def account_me():
             "access_proof": "accepted",
             "trust_policy": policy,
             "integrity": integrity,
+            # What a step-up needs here, so an app can ask for it up front.
+            "step_up": _app_pin_state(get_jwt_identity()),
         }
     )
+
+
+@app.post(_APP_PIN_PATH)
+@jwt_required()
+def set_app_pin():
+    """Set or replace this account's app PIN (DESIGN.md 78).
+
+    Needs a current full session -- a limited one never sets a PIN -- and the
+    account password re-entered now; as at login, every gate runs before the
+    password is compared. A new PIN clears the failure count and any lock: it
+    is how a user who forgot or locked their PIN gets back in, with the
+    password. Recorded as app_pin_set against the phone that set it, so a
+    reset made somewhere else is visible. Only a verifier is stored.
+    """
+    account_id = str(get_jwt_identity())
+    _enforce_rate_limit("app_pin_set", account_id)
+    claims, policy, integrity = _require_trusted_account_request("app_pin_set")
+    _require_full_session(claims)
+    body = _json_body()
+    password = _password_bytes(body.get("password"))
+    pin = body.get("pin")
+    if not _app_pin_well_formed(pin):
+        raise ApiProblem(
+            "The app PIN must be %d digits." % _risk_setting_int("app_pin_length", 6),
+            400,
+            "invalid_app_pin",
+        )
+    with _cursor() as cursor:
+        cursor.execute(
+            "SELECT password_hash FROM demo_accounts WHERE account_id = %s", (account_id,)
+        )
+        row = cursor.fetchone()
+    if row is None or not bcrypt.checkpw(password, _bcrypt_db_bytes(row[0])):
+        _record_observation(
+            "sign_in_failed",
+            "app_pin_set_invalid_credentials",
+            claims.get("did"),
+            claims.get("iid"),
+            account_id=account_id,
+        )
+        raise ApiProblem("The account credentials are invalid.", 401, "invalid_credentials")
+    pin_hash = _bcrypt_hash_bytes(_app_pin_material(account_id, pin))
+    with _cursor(commit=True) as cursor:
+        update = (
+            "UPDATE app_pins SET pin_hash = %s, failures = 0, locked_at = NULL, "
+            "set_at = NOW(), set_by_installation = %s WHERE account_id = %s"
+        )
+        cursor.execute(update, (pin_hash, claims.get("iid"), account_id))
+        if cursor.rowcount == 0:
+            # A first PIN; two at once both miss the UPDATE, and the loser's
+            # INSERT hits the primary key -- then it simply updates.
+            savepoint = DIALECT.savepoint("app_pin_insert")
+            if savepoint:
+                cursor.execute(savepoint[0])
+            try:
+                cursor.execute(
+                    "INSERT INTO app_pins (account_id, pin_hash, set_by_installation) "
+                    "VALUES (%s, %s, %s)",
+                    (account_id, pin_hash, claims.get("iid")),
+                )
+            except Exception as error:
+                if not DIALECT.is_unique_violation(error):
+                    raise
+                if savepoint:
+                    cursor.execute(savepoint[1])
+                cursor.execute(update, (pin_hash, claims.get("iid"), account_id))
+            else:
+                if savepoint:
+                    cursor.execute(savepoint[2])
+        _record_observation(
+            "app_pin_set",
+            "app_pin_set",
+            claims.get("did"),
+            claims.get("iid"),
+            account_id=account_id,
+            cursor=cursor,
+        )
+    logger.info("App PIN set: account=%s installation=%s", account_id, claims.get("iid"))
+    return jsonify({"app_pin_set": True, "step_up": _app_pin_state(account_id)})
 
 
 @app.get("/v1/policy/me")
@@ -6662,6 +6941,7 @@ def account_sensitive_echo():
             "sensitive_echo": body,
             "step_up": "verified" if step_up else "not_required",
             "step_up_key": step_up,
+            "app_pin": "verified" if g.get("app_pin_verified") else "not_required",
         }
     )
 
@@ -7300,8 +7580,9 @@ def _verify_upgrade_proof(route, body, claims, account_id, installation_id, caus
         )
     if route == "stepup":
         # Bound to this very upgrade request, like any step-up proof v2; the
-        # access proof's nonce, claimed once, makes it single-use.
-        _verify_step_up(installation_id, account_id)
+        # access proof's nonce, claimed once, makes it single-use. Proven as the
+        # DBA's stepup_method says (DESIGN.md 78).
+        _prove_step_up(installation_id, account_id, *_stepup_factors())
     elif route == "assertion":
         g.upgrade_assertion = _verify_upgrade_assertion(
             body.get("assertion"),
@@ -7828,7 +8109,7 @@ def approve_upgrade(request_id):
         persist=True,
     )
     _enforce_risk_policy(policy)
-    _verify_step_up(installation_id, account_id)
+    _prove_step_up(installation_id, account_id, *_stepup_factors())
     with _cursor(commit=True) as cursor:
         changed = _grant_approval(cursor, request_id, account_id, installation_id)
         if changed != 1:

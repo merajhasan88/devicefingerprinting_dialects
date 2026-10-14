@@ -49,6 +49,7 @@ Apply migrations **in ascending version order**; each one records its own row in
 | 17 | `017_business_events.sql` | `business_events` (events the customer's backend reports for an account: opaque IDs, short codes, an amount, a keyed hash of a subject — no personal data; never updated or deleted); seeds `business_event_types` (''), `business_graph_depth` (2), `business_graph_max_nodes` (200) |
 | 18 | `018_legacy_acceptances.sql` | seeds `legacy_acceptances` (`carry`): an approval granted before 016 is kept as what it covers at its first use, until its expiry; `drop` makes it cover nothing |
 | 19 | `019_server_observations.sql` | `server_observations` (what the server itself saw: wrong passwords, sign-ins to unknown accounts, step-up proofs that did not verify, exhausted approval budgets, step-up re-enrolments — opaque IDs only; never updated or deleted) and an index for denied approvals per phone; seeds `cross_checks_enabled` (0: measured into every decision, scored nowhere), `cross_check_window_hours` (24), each rule's `_count` / `_points`, and `device_approvals_denied_effect` (`limit`: a denied phone is held at review, never blocked by the denial) |
+| 20 | `020_app_pin.sql` | `app_pins` (one app PIN per account, stored only as bcrypt over a keyed HMAC, with its failure count and lock; never deleted); seeds `stepup_method` (`screen_lock`, the interim default), `app_pin_required_paths` (''), `app_pin_length` (6), `app_pin_max_failures` (5) and the `device_app_pin_failures` rule |
 
 All scripts are guarded and safe to re-run.
 
@@ -83,6 +84,9 @@ suffices there.
 (the test database did): `GRANT SELECT, INSERT, UPDATE ON session_upgrade_requests TO app_user;`. It
 is audit evidence — every approval request and assertion nonce and what became of it — and the server
 never deletes from it, so it needs no `DELETE`.
+
+**Migration 020 adds `app_pins`.** Without default privileges: `GRANT SELECT, INSERT, UPDATE ON
+app_pins TO app_user;` — a credential store: the server never deletes from it (DESIGN.md 78).
 
 **Migration 019 adds `server_observations`.** Without default privileges: `GRANT SELECT, INSERT ON
 server_observations TO app_user;` — the server only ever inserts into it (DESIGN.md 77).

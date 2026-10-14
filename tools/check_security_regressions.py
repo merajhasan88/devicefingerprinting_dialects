@@ -95,6 +95,8 @@ class Rows(object):
         self.observations = []
         self.fail_observations = False
         self.approval_requests_last_hour = 0
+        self.app_pins = {}
+        self.password_hash = None
 
     def execute(self, sql, params=None):
         q = " ".join(sql.split())
@@ -199,6 +201,39 @@ class Rows(object):
             self.observations.append(params)
         elif q.startswith("SELECT COUNT(*) FROM session_upgrade_requests WHERE account_id"):
             self.result = (self.approval_requests_last_hour,)
+        elif q.startswith("UPDATE app_pins SET failures = failures + 1"):
+            pin = self.app_pins.get(params[0])
+            self.rowcount = 0
+            if pin and pin["locked_at"] is None and pin["failures"] < params[1]:
+                pin["failures"] += 1
+                self.rowcount = 1
+        elif q.startswith("SELECT pin_hash, failures, locked_at FROM app_pins"):
+            pin = self.app_pins.get(params[0])
+            self.result = (pin["hash"], pin["failures"], pin["locked_at"]) if pin else None
+        elif q.startswith("SELECT locked_at FROM app_pins"):
+            pin = self.app_pins.get(params[0])
+            self.result = (pin["locked_at"],) if pin else None
+        elif q.startswith("UPDATE app_pins SET failures = 0"):
+            self.app_pins[params[0]]["failures"] = 0
+        elif q.startswith("UPDATE app_pins SET locked_at = NOW()"):
+            pin = self.app_pins[params[0]]
+            self.rowcount = 0
+            if pin["locked_at"] is None:
+                pin["locked_at"] = s._utc_now()
+                self.rowcount = 1
+        elif q.startswith("UPDATE app_pins SET pin_hash"):
+            pin = self.app_pins.get(params[2])
+            self.rowcount = 0
+            if pin is not None:
+                pin.update(hash=params[0], failures=0, locked_at=None, by=params[1])
+                self.rowcount = 1
+        elif q.startswith("INSERT INTO app_pins"):
+            if params[0] in self.app_pins:
+                raise s.DIALECT._driver.errors.UniqueViolation("duplicate app pin")
+            self.app_pins[params[0]] = {"hash": params[1], "failures": 0, "locked_at": None,
+                                        "by": params[2]}
+        elif q.startswith("SELECT password_hash FROM demo_accounts WHERE account_id"):
+            self.result = (self.password_hash,) if self.password_hash else None
         elif q.startswith("INSERT INTO session_upgrade_requests"):
             self.writes.append((q, params))
         elif q.startswith(("DELETE FROM access_proof_nonces", "UPDATE app_installations",
@@ -3686,6 +3721,265 @@ def a_token_used_without_its_key_is_recorded_once_per_token():
         "payload": payload["payload"], "signature": thief.sign_b64(payload["payload"])})
     expect(len(db.observations) == before,
            "the public verify step must record nothing: %s" % db.observations[before:])
+
+
+# ---------------------------------------------------------------------------
+# The app PIN and the DBA's step-up method (DESIGN.md 78)
+# ---------------------------------------------------------------------------
+
+PIN = "246810"
+
+
+def pin_store(pin=PIN, failures=0, locked=False):
+    """This account's app PIN in the fixture, as the server would store it."""
+    db.app_pins = {account: {
+        "hash": s._bcrypt_hash_bytes(s._app_pin_material(account, pin)),
+        "failures": failures, "locked_at": s._utc_now() if locked else None, "by": None}}
+
+
+def pin_call(path, body, bearer=None, stepup=False, pin=None):
+    raw = encode(body)
+    nonce = fresh_nonce()
+    head = access_headers("POST", path, raw, bearer=bearer, nonce=nonce)
+    if stepup:
+        head.update(stepup_headers("POST", path, raw, nonce, bearer=bearer))
+    if pin is not None:
+        head["X-App-PIN"] = pin
+    return client.post(path, data=raw, headers=head)
+
+
+def _full_session():
+    """A full access token and the refresh-session row it belongs to."""
+    family, session = str(uuid.uuid4()), str(uuid.uuid4())
+    with s.app.app_context():
+        bearer = s.create_access_token(identity=account, additional_claims={
+            "role": "account", "iid": inst.installation_id, "did": inst.device_id,
+            "sid": session, "family": family, "scope": "full"})
+    db.refresh_row = (family, account, inst.device_id, inst.installation_id,
+                      s._utc_now() + s.REFRESH_TOKEN_LIFETIME, None, "full", None, None, None)
+    return bearer
+
+
+def _needs(reply):
+    return (((reply.get_json() or {}).get("error") or {}).get("details") or {}).get(
+        "step_up", {}).get("needs")
+
+
+@check
+def the_step_up_method_is_the_dbas_choice():
+    """DESIGN.md 78 (owner, 2026-10-14: build every option, the DBA chooses).
+    On a step-up path, screen_lock needs the screen-lock key's proof, app_pin
+    the app PIN the server checks, screen_lock_and_app_pin both; a refusal for
+    a missing factor names every factor needed. app_pin_required_paths add the
+    PIN on top of any method. The interim default is screen_lock."""
+    pin_store()
+    try:
+        with isolated_stepup():
+            expect(s._stepup_factors() == (True, False), "the interim default is screen_lock")
+            for method, factors, outcome in (
+                    ("screen_lock", {"stepup": True}, 200),
+                    ("screen_lock", {"pin": PIN}, ("stepup_required", ["screen_lock"])),
+                    ("app_pin", {"pin": PIN}, 200),
+                    ("app_pin", {"stepup": True}, ("app_pin_required", ["app_pin"])),
+                    ("screen_lock_and_app_pin", {"stepup": True, "pin": PIN}, 200),
+                    ("screen_lock_and_app_pin", {"stepup": True},
+                     ("app_pin_required", ["screen_lock", "app_pin"])),
+                    ("screen_lock_and_app_pin", {"pin": PIN},
+                     ("stepup_required", ["screen_lock", "app_pin"]))):
+                with policy(stepup_method=method):
+                    reply = pin_call(SENSITIVE, {"amount": 1}, **factors)
+                if outcome == 200:
+                    payload = reply.get_json() or {}
+                    expect(reply.status_code == 200 and payload.get("step_up") == "verified"
+                           and payload.get("app_pin") == ("verified" if "pin" in factors
+                                                          else "not_required"),
+                           "%s with %s must pass, got %s %s"
+                           % (method, sorted(factors), reply.status_code, payload))
+                else:
+                    expect(reply.status_code == 403 and error_code(reply) == outcome[0]
+                           and _needs(reply) == outcome[1],
+                           "%s with %s must answer %s naming %s, got %s %s %s"
+                           % (method, sorted(factors), outcome[0], outcome[1],
+                              reply.status_code, error_code(reply), _needs(reply)))
+            with policy(app_pin_required_paths=ECHO):
+                reply = pin_call(ECHO, {"x": 1})
+                expect(reply.status_code == 403 and error_code(reply) == "app_pin_required",
+                       "a path listed for the PIN needs it under screen_lock too, got %s %s"
+                       % (reply.status_code, error_code(reply)))
+                expect(pin_call(ECHO, {"x": 1}, pin=PIN).status_code == 200,
+                       "and passes with it")
+    finally:
+        db.app_pins = {}
+
+
+class _CountingBcrypt(object):
+    """bcrypt, noting how many units of work were open at each comparison."""
+
+    def __init__(self, real, depth, order):
+        self.real, self.depth, self.order = real, depth, order
+
+    def checkpw(self, password, hashed):
+        self.order.append(("bcrypt", self.depth[0]))
+        return self.real.checkpw(password, hashed)
+
+    def __getattr__(self, name):
+        return getattr(self.real, name)
+
+
+@check
+def an_app_pin_attempt_is_claimed_before_it_is_compared():
+    """DESIGN.md 78. Each attempt is claimed by one atomic UPDATE before the
+    PIN is compared, and bcrypt runs outside any unit of work (on SQL Server a
+    unit holds the worker's lock); wrong PINs count down, the last one locks
+    the PIN -- which then refuses even the right PIN -- and each wrong PIN is
+    the server's own observation. A new PIN set with the password unlocks it."""
+    import bcrypt as _bcrypt
+    pin_store()
+    db.observations = []
+    depth, order, real_cursor, real_bcrypt = [0], [], s._cursor, s.bcrypt
+
+    @contextmanager
+    def tracked(commit=False):
+        depth[0] += 1
+        try:
+            with real_cursor(commit=commit) as inner:
+                yield _ClaimCursor(inner, depth, order)
+        finally:
+            depth[0] -= 1
+
+    s._cursor, s.bcrypt = tracked, _CountingBcrypt(real_bcrypt, depth, order)
+    db.password_hash = _bcrypt.hashpw(b"Passw0rd123", _bcrypt.gensalt(4))
+    try:
+        with isolated_stepup(), policy(stepup_method="app_pin", app_pin_max_failures=3):
+            answers = []
+            for _ in range(3):
+                reply = pin_call(SENSITIVE, {"amount": 1}, pin="135799")
+                error = (reply.get_json() or {}).get("error") or {}
+                answers.append((error_code(reply), (error.get("details") or {}).get("attempts_left")))
+            expect(answers == [("app_pin_invalid", 2), ("app_pin_invalid", 1),
+                               ("app_pin_locked", None)],
+                   "three wrong PINs with a maximum of 3: %s" % answers)
+            claims_then_compares = [kind for kind, _ in order if kind in ("claim", "bcrypt")]
+            expect(claims_then_compares[:2] == ["claim", "bcrypt"]
+                   and all(d == 0 for kind, d in order if kind == "bcrypt"),
+                   "the attempt must be claimed first, and bcrypt run outside any unit: %s"
+                   % order)
+            reply = pin_call(SENSITIVE, {"amount": 1}, pin=PIN)
+            expect(error_code(reply) == "app_pin_locked",
+                   "a locked PIN refuses even the right PIN, got %s" % error_code(reply))
+            failed = [p[2] for p in db.observations if p[1] == "app_pin_failed"]
+            expect(failed == ["app_pin_invalid", "app_pin_invalid", "app_pin_locked"],
+                   "each wrong PIN is recorded: %s" % failed)
+            reply = pin_call("/v1/account/app-pin", {"password": "Passw0rd123", "pin": PIN},
+                             bearer=_full_session())
+            expect(reply.status_code == 200, "a new PIN with the password: %s %s"
+                   % (reply.status_code, reply.get_json()))
+            expect(pin_call(SENSITIVE, {"amount": 1}, pin=PIN).status_code == 200,
+                   "the new PIN unlocks")
+    finally:
+        s._cursor, s.bcrypt = real_cursor, real_bcrypt
+        db.app_pins, db.password_hash, db.refresh_row = {}, None, None
+
+
+class _ClaimCursor(_DepthCursor):
+    def execute(self, sql, params=None):
+        if " ".join(sql.split()).startswith("UPDATE app_pins SET failures = failures + 1"):
+            self.seen.append(("claim", self.depth[0]))
+        return self.inner.execute(sql, params)
+
+
+@check
+def only_a_full_session_with_the_password_sets_an_app_pin():
+    """DESIGN.md 78. A limited session never sets a PIN; a full one needs the
+    account password now (a wrong one is a failed sign-in, recorded) and a
+    PIN of the DBA's length. Only a verifier is stored -- bcrypt over an HMAC
+    keyed by the root secret, so neither the PIN nor its plain hash checks
+    against it -- and the change is recorded. Setting a PIN never needs one,
+    or a locked PIN could never be replaced."""
+    import bcrypt as _bcrypt
+    db.app_pins, db.observations = {}, []
+    db.password_hash = _bcrypt.hashpw(b"Passw0rd123", _bcrypt.gensalt(4))
+    path = "/v1/account/app-pin"
+    try:
+        with isolated_stepup():
+            reply = pin_call(path, {"password": "Passw0rd123", "pin": PIN},
+                             bearer=_limited_session("integrity_elevated"))
+            expect(reply.status_code == 403 and error_code(reply) == "session_limited",
+                   "a limited session must not set a PIN, got %s %s"
+                   % (reply.status_code, error_code(reply)))
+            with policy(limited_session_paths=path):
+                reply = pin_call(path, {"password": "Passw0rd123", "pin": PIN},
+                                 bearer=_limited_session("integrity_elevated"))
+            expect(reply.status_code == 403 and error_code(reply) == "full_session_required",
+                   "nor where a DBA lets limited sessions reach the path, got %s %s"
+                   % (reply.status_code, error_code(reply)))
+            full = _full_session()
+            reply = pin_call(path, {"password": "Wrong-Passw0rd", "pin": PIN}, bearer=full)
+            expect(reply.status_code == 401 and error_code(reply) == "invalid_credentials"
+                   and [p[1:3] for p in db.observations]
+                   == [("sign_in_failed", "app_pin_set_invalid_credentials")],
+                   "a wrong password is refused and recorded: %s %s"
+                   % (reply.status_code, db.observations))
+            for bad in ("12ab56", "123", "1234567", 246810):
+                reply = pin_call(path, {"password": "Passw0rd123", "pin": bad}, bearer=full)
+                expect(reply.status_code == 400 and error_code(reply) == "invalid_app_pin",
+                       "PIN %r must be refused, got %s %s" % (bad, reply.status_code,
+                                                             error_code(reply)))
+            with policy(stepup_method="app_pin", stepup_required_paths=path + "," + SENSITIVE,
+                        app_pin_required_paths=path):
+                reply = pin_call(path, {"password": "Passw0rd123", "pin": PIN}, bearer=full)
+            expect(reply.status_code == 200 and reply.get_json()["step_up"]["app_pin_set"] is True,
+                   "a full session with the password sets the PIN, and needs none to do it: "
+                   "%s %s" % (reply.status_code, reply.get_json()))
+            stored = db.app_pins[account]["hash"]
+            expect(stored.startswith(b"$2") and PIN.encode() not in stored
+                   and _bcrypt.checkpw(s._app_pin_material(account, PIN), stored)
+                   and not _bcrypt.checkpw(PIN.encode(), stored),
+                   "only bcrypt over the keyed HMAC may be stored: %r" % stored[:7])
+            expect(db.app_pins[account]["by"] == inst.installation_id
+                   and [p[1] for p in db.observations][-1] == "app_pin_set",
+                   "the change is recorded with the phone that made it: %s" % db.observations)
+    finally:
+        db.app_pins, db.password_hash, db.refresh_row = {}, None, None
+
+
+@check
+def approving_and_the_same_phone_route_follow_the_method():
+    """DESIGN.md 78. Approving another phone's request, and route 1 (the
+    same-phone upgrade), prove the DBA's stepup_method like a step-up path:
+    under app_pin the PIN, not the screen-lock key."""
+    family, session = str(uuid.uuid4()), str(uuid.uuid4())
+    with s.app.app_context():
+        full = s.create_access_token(identity=account, additional_claims={
+            "role": "account", "iid": inst.installation_id, "did": inst.device_id,
+            "sid": session, "family": family, "scope": "full"})
+    rid = str(uuid.uuid4())
+    approve = "/v1/auth/approvals/%s/approve" % rid
+    pin_store()
+    try:
+        with elevated_integrity(), policy(stepup_method="app_pin", upgrade_stepup_same_device=1):
+            s._latest_integrity_state = _verdict_state("trusted")
+            db.refresh_row = (family, account, inst.device_id, inst.installation_id,
+                              s._utc_now() + s.REFRESH_TOKEN_LIFETIME, None, "full", None,
+                              None, None)
+            reply = pin_call(approve, {}, bearer=full, stepup=True)
+            expect(reply.status_code == 403 and error_code(reply) == "app_pin_required",
+                   "under app_pin a screen-lock proof alone must not approve, got %s %s"
+                   % (reply.status_code, error_code(reply)))
+            reply = pin_call(approve, {}, bearer=full, pin=PIN)
+            expect(reply.status_code == 200, "the PIN approves, got %s %s"
+                   % (reply.status_code, reply.get_json()))
+            s._latest_integrity_state = _verdict_state("elevated")
+            limited = _limited_session("integrity_elevated")
+            reply = pin_call("/v1/auth/upgrade", {"route": "stepup"}, bearer=limited, stepup=True)
+            expect(reply.status_code == 403 and error_code(reply) == "app_pin_required",
+                   "route 1 under app_pin needs the PIN, got %s %s"
+                   % (reply.status_code, error_code(reply)))
+            reply = pin_call("/v1/auth/upgrade", {"route": "stepup"}, bearer=limited, pin=PIN)
+            expect(reply.status_code == 200 and (reply.get_json() or {}).get("scope") == "full",
+                   "route 1 with the PIN upgrades, got %s %s" % (reply.status_code, reply.get_json()))
+    finally:
+        db.app_pins, db.refresh_row = {}, None
 
 
 @check
