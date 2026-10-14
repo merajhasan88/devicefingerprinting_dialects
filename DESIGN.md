@@ -6277,6 +6277,7 @@ bcrypt check, an unknown handle does not. Archiving it is the DBA's call.
 | A newcomer judged by the failures before it joined | `051f0c5` | gate; three more mutations caught |
 | Other **phones'** failures, not other installations' (a reinstall on the user's own phone is not "elsewhere"); `approval_denied` in the context as in the graph | `53b4097` | gate (the mistype check includes a reinstall; a mutation back to installations fails it); live |
 | A denied phone held at review (limited), never blocked by the denial; points 30; `device_approvals_denied_effect` | `0a77436` | gate 82 (a new check; three mutations caught); live |
+| A mistaken deny, undone (script, live): denied → the phone signs in limited (`held_by_denial`, score 115, review) → asks again → the approver sees `device_approvals_denied` → approves → full; a protected request passes as accepted; a refresh stays full | — | live, PASS |
 | Suite route 2: deny, then the budget; the denied phone stays limited and may ask again | `9f5ab0c` | live: enforce with cross-checks on, full suite **71 / 0 / 7** (a first run that kept the budget before the denial failed 70 / 1 / 7: the exhausted-budget rule blocked the phone, as above); off, targeted 3 / 3 |
 | Suite: `check_server_observations` (any mode), `check_server_observations_scored` | `66d8dec` | live |
 | Suite route 2: budget before the denial; the denial rule checked live | `3be29d7` | live |
