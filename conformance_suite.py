@@ -1936,6 +1936,37 @@ def check_server_observations_scored(api, ctx):
            % (points, threshold, st, _decision_of(pl).get("reasons")))
 
 
+@check("observations: a stolen token and a replayed request are recorded once each")
+def check_stolen_token_recorded(api, ctx):
+    """DESIGN.md 77, owner decision of 2026-10-14. A fresh account's access
+    token is presented three times with proofs another phone signed, and one
+    valid request is sent three times: each is refused as before, and the
+    account's own decision then counts one stolen token and one replayed
+    request -- once each, not once per attempt -- on the account and its phone."""
+    owner, owner_token = _observing_phone(api)
+    st, pl = open_account(api, owner, owner_token, "stolen-%s" % secrets.token_hex(4))
+    expect(st in (200, 201), "open account failed: %s %s" % (st, pl))
+    access = pl["access_token"]
+    thief = Installation()
+    for _ in range(3):
+        st, pl = protected(api, owner, "POST", "/v1/account/protected-echo", access, {"x": 1},
+                           signer=thief)
+        expect(st == 401 and error_code(pl) == "invalid_installation_signature",
+               "a token without its key must answer 401 invalid_installation_signature: %s %s"
+               % (st, pl))
+    headers, body_text = build_proof(owner, "POST", "/v1/account/protected-echo", access,
+                                     {"replay": True})
+    statuses = [api.call("POST", "/v1/account/protected-echo", body_text=body_text,
+                         bearer=access, headers=headers)[0] for _ in range(3)]
+    expect(statuses == [200, 401, 401], "one send and two replays expected, got %s" % statuses)
+    st, pl = protected(api, owner, "GET", "/v1/policy/me", access)
+    expect(st == 200, "policy/me failed: %s %s" % (st, pl))
+    seen = pl["policy"]["context"]["server_observations"]
+    expect(seen["account"]["token_without_key"] == 1 and seen["account"]["request_replayed"] == 1
+           and seen["device"]["token_without_key"] == 1 and seen["device"]["request_replayed"] == 1,
+           "one stolen token and one replayed request, on the account and its phone: %s" % seen)
+
+
 @check("session: sign-out revokes the family at once; a routine refresh does not")
 def check_logout_revokes_the_family(api, ctx):
     """Review R6 (DESIGN.md 76). After a refresh the previous access token still

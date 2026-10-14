@@ -193,6 +193,8 @@ class Rows(object):
         elif q.startswith("INSERT INTO server_observations"):
             if self.fail_observations:
                 raise RuntimeError("simulated observation write failure")
+            if params[0] in {row[0] for row in self.observations}:
+                raise s.DIALECT._driver.errors.UniqueViolation("duplicate observation")
             self.writes.append((q, params))
             self.observations.append(params)
         elif q.startswith("SELECT COUNT(*) FROM session_upgrade_requests WHERE account_id"):
@@ -243,7 +245,8 @@ def fresh_nonce():
     return c.b64u(os.urandom(32))
 
 
-def access_headers(method, path, body=b"", bearer=None, nonce=None, version=2, query=""):
+def access_headers(method, path, body=b"", bearer=None, nonce=None, version=2, query="",
+                   signer=None):
     bearer = bearer or token
     proof = {"version": version, "installation_id": inst.installation_id,
              "method": method, "path": path, "body_sha256": c.sha256_hex(body),
@@ -253,7 +256,8 @@ def access_headers(method, path, body=b"", bearer=None, nonce=None, version=2, q
         proof["query"] = query
     raw = c.b64u(encode(proof))
     return {"Authorization": "Bearer " + bearer, "X-Access-Proof": raw,
-            "X-Access-Signature": inst.sign_b64(raw), "Content-Type": "application/json"}
+            "X-Access-Signature": (signer or inst).sign_b64(raw),
+            "Content-Type": "application/json"}
 
 
 def stepup_headers(method, route, body, nonce, factor="passcode", signer=None,
@@ -3611,6 +3615,77 @@ def what_one_account_did_on_a_shared_phone_never_counts_against_another():
            "the other account on the phone must carry none of it, though the phone's own "
            "measurements show it: %s %s" % (theirs["reasons"],
                                             theirs["context"]["server_observations"]))
+
+
+@check
+def a_token_used_without_its_key_is_recorded_once_per_token():
+    """DESIGN.md 77, owner decision of 2026-10-14. A token presented with a
+    proof its installation's key did not sign -- an access token or a refresh
+    token copied to another phone -- is refused as before (401
+    invalid_installation_signature) and recorded against the account and the
+    phone it belongs to, once per token: three tries add one row, a second
+    token one more, so a stolen token cannot flood the table. A signed request
+    sent again is recorded once per request (access_proof_replay). Nothing is
+    recorded for the public installation verify step, where anyone may name
+    any installation."""
+    thief = c.Installation()
+    db.observations = []
+    with isolated_stepup():
+        for bearer in (token, token, token, None):
+            if bearer is None:
+                with s.app.app_context():
+                    bearer = s.create_access_token(identity=account, additional_claims={
+                        "role": "account", "iid": inst.installation_id, "did": inst.device_id,
+                        "sid": str(uuid.uuid4()), "family": str(uuid.uuid4())})
+            reply = client.get("/v1/account/me", headers=access_headers(
+                "GET", "/v1/account/me", bearer=bearer, signer=thief))
+            expect(reply.status_code == 401 and error_code(reply) == "invalid_installation_signature",
+                   "a token without its key must stay a 401, got %s %s"
+                   % (reply.status_code, error_code(reply)))
+        stolen = [p[1:] for p in db.observations if p[1] == "token_without_key"]
+        expect(stolen == [("token_without_key", "invalid_installation_signature", account,
+                           inst.device_id, inst.installation_id)] * 2,
+               "one row per stolen token, against its own account and phone: %s" % stolen)
+        head = access_headers("GET", "/v1/account/me")
+        expect(client.get("/v1/account/me", headers=head).status_code == 200, "setup: a valid request")
+        for _ in range(2):
+            reply = client.get("/v1/account/me", headers=head)
+            expect(reply.status_code == 401 and error_code(reply) == "access_proof_replay",
+                   "a replay must stay a 401, got %s %s" % (reply.status_code, error_code(reply)))
+        replays = [p[1:3] for p in db.observations if p[1] == "request_replayed"]
+        expect(replays == [("request_replayed", "access_proof_replay")],
+               "one row per replayed request: %s" % replays)
+    family, session = str(uuid.uuid4()), str(uuid.uuid4())
+    with s.app.app_context():
+        refresh = s.create_refresh_token(identity=account, additional_claims={
+            "role": "account", "iid": inst.installation_id, "did": inst.device_id,
+            "sid": session, "family": family})
+    db.refresh_row = (family, account, inst.device_id, inst.installation_id,
+                      s._utc_now() + s.REFRESH_TOKEN_LIFETIME, None, "full", None, None, None)
+    try:
+        for _ in range(2):
+            challenge = client.post("/v1/auth/refresh/challenge",
+                                    headers={"Authorization": "Bearer " + refresh}).get_json()
+            reply = client.post("/v1/auth/refresh", headers={"Authorization": "Bearer " + refresh},
+                                json={"challenge_id": challenge["challenge_id"],
+                                      "payload": challenge["payload"],
+                                      "signature": thief.sign_b64(challenge["payload"])})
+            expect(reply.status_code == 401 and error_code(reply) == "invalid_installation_signature",
+                   "a refresh token without its key must stay a 401, got %s %s"
+                   % (reply.status_code, error_code(reply)))
+    finally:
+        db.refresh_row = None
+    stolen = [p for p in db.observations if p[1] == "token_without_key"]
+    expect(len(stolen) == 3 and stolen[-1][3] == account,
+           "a stolen refresh token is recorded once too: %s" % stolen)
+    before = len(db.observations)
+    payload = client.post("/v1/installations/challenge",
+                          json={"installation_id": inst.installation_id}).get_json()
+    client.post("/v1/installations/verify", json={
+        "installation_id": inst.installation_id, "challenge_id": payload["challenge_id"],
+        "payload": payload["payload"], "signature": thief.sign_b64(payload["payload"])})
+    expect(len(db.observations) == before,
+           "the public verify step must record nothing: %s" % db.observations[before:])
 
 
 @check

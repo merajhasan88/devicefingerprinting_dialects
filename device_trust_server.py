@@ -3306,18 +3306,27 @@ def _policy_action(score, hard_block=False):
 # wrong password for an account; sign_in_unknown_account: a sign-in to a
 # handle no account has; stepup_failed: a step-up proof offered that did not
 # verify; approval_budget_exhausted: an approval request refused by the
-# account's hourly budget; stepup_reenrolled: a step-up key replaced. Denied
-# approvals are already rows of session_upgrade_requests and are counted there.
+# account's hourly budget; stepup_reenrolled: a step-up key replaced;
+# token_without_key: one of this phone's tokens presented without its key
+# (copied elsewhere), once per token; request_replayed: one of its signed
+# requests sent again, once per request. Denied approvals are already rows of
+# session_upgrade_requests and are counted there.
 _OBSERVATION_KINDS = (
     "sign_in_failed",
     "sign_in_unknown_account",
     "stepup_failed",
     "approval_budget_exhausted",
     "stepup_reenrolled",
+    "token_without_key",
+    "request_replayed",
 )
+# Observations recorded at most once per token or per request take an ID
+# derived from it, so a duplicate is the database's own refusal.
+_OBSERVATION_ONCE_NAMESPACE = uuid.UUID("0b7d6c2e-58f4-5a3e-9c1d-7e2a4b6f8d90")
 
 
-def _record_observation(kind, code, device_id, installation_id, account_id=None, cursor=None):
+def _record_observation(kind, code, device_id, installation_id, account_id=None, cursor=None,
+                        once_key=None):
     """Record one server observation.
 
     With a cursor the row joins the caller's transaction, so a change and its
@@ -3325,17 +3334,22 @@ def _record_observation(kind, code, device_id, installation_id, account_id=None,
     whose transaction was rolled back: the caller has left that block, so no
     lock it took is still held. A standalone record is evidence, not a gate:
     if it cannot be written that is logged, and the request still ends with
-    its own answer -- a wrong password stays a 401, never a 500.
+    its own answer -- a wrong password stays a 401, never a 500. With
+    `once_key` (a token's jti, a request's nonce) it is written at most once:
+    someone repeating a stolen token adds one row, not one per attempt.
     """
     if kind not in _OBSERVATION_KINDS:
         raise ValueError("unknown observation kind %r" % kind)
+    if once_key is not None and cursor is not None:
+        raise ValueError("a once-only observation is recorded in its own unit")
     statement = (
         "INSERT INTO server_observations "
         "(observation_id, kind, code, account_id, device_id, installation_id) "
         "VALUES (%s, %s, %s, %s, %s, %s)"
     )
     values = (
-        str(uuid.uuid4()),
+        str(uuid.uuid5(_OBSERVATION_ONCE_NAMESPACE, "%s:%s" % (kind, once_key)))
+        if once_key is not None else str(uuid.uuid4()),
         kind,
         code,
         str(account_id) if account_id is not None else None,
@@ -3348,7 +3362,9 @@ def _record_observation(kind, code, device_id, installation_id, account_id=None,
     try:
         with _cursor(commit=True) as own:
             own.execute(statement, values)
-    except Exception:
+    except Exception as error:
+        if once_key is not None and DIALECT.is_unique_violation(error):
+            return  # already recorded for this token or request
         logger.exception(
             "A server observation could not be recorded: kind=%s code=%s account=%s "
             "device=%s installation=%s",
@@ -3361,7 +3377,7 @@ def _record_observation(kind, code, device_id, installation_id, account_id=None,
 
 
 @contextmanager
-def _observed_refusal(code, kind, device_id, installation_id, account_id=None):
+def _observed_refusal(code, kind, device_id, installation_id, account_id=None, once_key=None):
     """Record observation `kind` when the block refuses with `code`. Entered
     before the block's cursor, it records after that cursor has rolled back
     and released its locks:  with _observed_refusal(...), _cursor(...) as c:"""
@@ -3369,7 +3385,8 @@ def _observed_refusal(code, kind, device_id, installation_id, account_id=None):
         yield
     except ApiProblem as problem:
         if problem.code == code:
-            _record_observation(kind, code, device_id, installation_id, account_id)
+            _record_observation(kind, code, device_id, installation_id, account_id,
+                                once_key=once_key)
         raise
 
 
@@ -5134,13 +5151,20 @@ def _require_access_proof(required_role="account"):
         )
 
     # This is the cryptographic possession check. A copied access token from
-    # Phone A, signed by Phone B's non-exportable key, fails here.
-    _verify_installation_signature(
-        key_algorithm,
-        public_key_jwk,
-        proof_bytes,
-        signature,
-    )
+    # Phone A, signed by Phone B's non-exportable key, fails here -- and is
+    # recorded against the account and phone the token belongs to, once per
+    # token (DESIGN.md 77); so is a signed request sent a second time, once
+    # per request. The token's claims are the server's own, so a stranger
+    # cannot write against someone else's phone.
+    owner = str(get_jwt_identity()) if claims.get("role") == "account" else None
+    with _observed_refusal("invalid_installation_signature", "token_without_key",
+                           device_id, installation_id, owner, once_key=token_jti):
+        _verify_installation_signature(
+            key_algorithm,
+            public_key_jwk,
+            proof_bytes,
+            signature,
+        )
 
     # Consume the client nonce after signature verification, so an unverified
     # request can never burn a nonce.
@@ -5148,9 +5172,13 @@ def _require_access_proof(required_role="account"):
         # Redis expires nonces itself, so there is no sweep and no INSERT; the
         # database work below still runs, because last_seen_at feeds the
         # relationship-risk signals and must not depend on the nonce backend.
-        _claim_nonce_redis(nonce_hash, installation_id)
+        with _observed_refusal("access_proof_replay", "request_replayed",
+                               device_id, installation_id, owner, once_key=nonce_hash):
+            _claim_nonce_redis(nonce_hash, installation_id)
 
-    with _cursor(commit=True) as cursor:
+    replayed = _observed_refusal("access_proof_replay", "request_replayed",
+                                 device_id, installation_id, owner, once_key=nonce_hash)
+    with replayed, _cursor(commit=True) as cursor:
         # An access token outlives its refresh family by up to its lifetime.
         # A signed-out or reuse-revoked family stops here at once (review R6,
         # DESIGN.md 76); a routine rotation leaves the newest session current,
@@ -6853,13 +6881,18 @@ def refresh_account_tokens():
             "invalid_refresh_binding",
         )
 
-    _verify_challenge(
-        installation_id,
-        challenge_id,
-        payload,
-        signature,
-        "refresh:%s" % session_id,
-    )
+    # A refresh token used on another phone fails the key check: recorded,
+    # once per token, like an access token (DESIGN.md 77).
+    with _observed_refusal("invalid_installation_signature", "token_without_key",
+                           claims.get("did"), installation_id, str(get_jwt_identity()),
+                           once_key=claims.get("jti")):
+        _verify_challenge(
+            installation_id,
+            challenge_id,
+            payload,
+            signature,
+            "refresh:%s" % session_id,
+        )
 
     with _cursor() as cursor:
         policy_session = _refresh_session(cursor, claims, lock=False)
