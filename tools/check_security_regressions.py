@@ -4320,6 +4320,53 @@ def the_business_reads_every_integrity_report_page_by_page():
 
 
 @check
+def the_app_reads_the_dbas_step_up_policy():
+    """DESIGN.md 79 (G4). The step-up policy is readable before sign-in, so an
+    app creates its screen-lock key as the DBA chose -- factor, mode, window
+    -- and knows whether the PIN is the method and how long it is. Never
+    cached; budgeted per source. The account's own view carries the same."""
+    path = "/v1/policy/step-up"
+    chosen = dict(stepup_method="screen_lock_and_app_pin", stepup_factor="biometric",
+                  stepup_mode="windowed", stepup_window_seconds=60, app_pin_length=8,
+                  stepup_required_paths=SENSITIVE + "," + ECHO, app_pin_required_paths=ECHO)
+    expected = {"method": "screen_lock_and_app_pin", "factor": "biometric", "mode": "windowed",
+                "window_seconds": 60, "app_pin_length": 8,
+                "required_paths": sorted([SENSITIVE, ECHO]), "app_pin_required_paths": [ECHO]}
+    with policy(**chosen):
+        reply = client.get(path)
+        expect(reply.status_code == 200 and reply.get_json() == expected
+               and reply.headers.get("Cache-Control") == "no-store",
+               "the policy as the DBA chose it, never cached: %s %s %s"
+               % (reply.status_code, reply.get_json(), reply.headers.get("Cache-Control")))
+        with isolated_stepup():
+            reply = client.get("/v1/account/me", headers=access_headers(
+                "GET", "/v1/account/me", b""))
+        state = (reply.get_json() or {}).get("step_up") or {}
+        expect(reply.status_code == 200
+               and {k: state.get(k) for k in expected} == expected
+               and state.get("app_pin_set") is False,
+               "the account's view carries the same policy: %s %s"
+               % (reply.status_code, reply.get_json()))
+    with policy(stepup_mode="per_use", stepup_window_seconds=60):
+        expect(client.get(path).get_json()["window_seconds"] == 0,
+               "a per_use policy has no window")
+    saved = (s.RATE_LIMIT_ENABLED, s.REDIS_URL, s._REDIS_CLIENT)
+    fake = FakeRedis()
+    s.RATE_LIMIT_ENABLED, s.REDIS_URL, s._REDIS_CLIENT = True, "redis://fixture", fake
+    try:
+        expect(client.get(path).status_code == 200
+               and any(k.startswith("dt:rate:policy_read_source:") for k in fake.counts),
+               "the policy read is budgeted per source: %s" % sorted(fake.counts))
+        for key in [k for k in fake.counts if k.startswith("dt:rate:policy_read_source:")]:
+            fake.counts[key] = s.RATE_LIMIT_SOURCE_MAX_ATTEMPTS
+        reply = client.get(path)
+        expect(reply.status_code == 429, "an exhausted source budget refuses, got %s"
+               % reply.status_code)
+    finally:
+        s.RATE_LIMIT_ENABLED, s.REDIS_URL, s._REDIS_CLIENT = saved
+
+
+@check
 def the_relationship_rules_are_the_dbas():
     """DESIGN.md 79 (owner: "put them under DBA"). A new phone, a known
     phone's new installation, reinstall velocity, a missing or stale scan and
