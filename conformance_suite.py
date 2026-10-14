@@ -1943,7 +1943,7 @@ def _skip_unless_screen_lock(settings, sensitive_path=False):
     Under the DBA's other step-up methods (DESIGN.md 78) -- or, for the checks
     on the sensitive path, where that path also needs the app PIN -- the app
     PIN checks cover the same flows."""
-    method = settings.get("stepup_method") or "screen_lock"
+    method = _method(settings)
     if method != "screen_lock":
         raise Skip("stepup_method is %s; this check proves the screen-lock key, the app PIN "
                    "checks cover the same flows" % method)
@@ -1954,10 +1954,36 @@ def _skip_unless_screen_lock(settings, sensitive_path=False):
 SENSITIVE_PATH = "/v1/account/sensitive-echo"
 
 
+def _method(settings):
+    """The live stepup_method; a missing row means the owner's default."""
+    return settings.get("stepup_method") or "app_pin"
+
+
+def _approver(api, settings):
+    """A phone holding a full session on a new account, able to prove a
+    step-up the way the live stepup_method asks (DESIGN.md 78): its step-up
+    key, the account's app PIN (set here), or both. Returns (installation,
+    handle, access token, prove, missing): prove(path, body) sends what is
+    needed; missing is the code a request without any factor answers."""
+    method = _method(settings)
+    inst, _, handle, access, stepup = _pin_phone(api, settings, method != "app_pin")
+    pin = None
+    if method != "screen_lock":
+        pin, _ = _two_pins(settings)
+        st, pl = _set_pin(api, inst, access, pin)
+        expect(st == 200, "setting the approver's app PIN: %s %s" % (st, pl))
+
+    def prove(path, body=None):
+        return pin_call(api, inst, path, access, body or {}, pin=pin, stepup=stepup)
+
+    missing = "stepup_required" if method == "screen_lock" else "app_pin_required"
+    return inst, handle, access, prove, missing
+
+
 def _pin_factors(settings, path=SENSITIVE_PATH):
     """(the screen-lock key, the app PIN): what `path` needs under the live
     settings (DESIGN.md 78)."""
-    method = settings.get("stepup_method") or "screen_lock"
+    method = _method(settings)
     required = path in _setting_words(settings, "stepup_required_paths", "")
     return (required and method != "app_pin",
             path in _setting_words(settings, "app_pin_required_paths", "")
@@ -2124,7 +2150,7 @@ def check_app_pin_approval(api, ctx):
     key where the method names both), and so does route 1 where it is on; the
     phone that asked then upgrades."""
     settings = live_settings(api)
-    method = settings.get("stepup_method") or "screen_lock"
+    method = _method(settings)
     if method == "screen_lock":
         raise Skip("stepup_method is screen_lock; the route 2 check proves the screen-lock key")
     if ctx["mode"] != "enforce":
@@ -2427,9 +2453,9 @@ def check_upgrade_route_stepup(api, ctx):
 def check_upgrade_route_approval(api, ctx):
     """DESIGN.md 70. A second installation of the account, holding a full
     session, lists the request (no hardware attributes), approves it with its
-    own step-up proof, and the limited session upgrades once. Without step-up,
-    or denied, it does not; requests per account are budgeted."""
-    _skip_unless_screen_lock(live_settings(api))
+    own step-up -- the key, the app PIN or both, as the live stepup_method
+    says (DESIGN.md 78) -- and the limited session upgrades once. Without
+    step-up, or denied, it does not; requests per account are budgeted."""
     settings = live_settings(api)
     if not _setting_on(settings, "upgrade_other_device_approval") and \
             "upgrade_other_device_approval" in settings:
@@ -2439,18 +2465,7 @@ def check_upgrade_route_approval(api, ctx):
     if int(settings.get("upgrade_approvals_per_hour", "3")) < 2:
         raise Skip("upgrade_approvals_per_hour is below 2; this check raises two requests")
     integrity_context(ctx)
-    factor = settings.get("stepup_factor", "passcode")
-    approver = Installation()
-    stepup_priv, stepup_jwk = stepup_jwk_pair()
-    st, pl = enrol(api, approver, fresh_hint(), stepup_public_key=stepup_jwk,
-                   stepup_key_auth={"factor": factor, "mode": "per_use", "window_seconds": 0})
-    expect(st in (200, 201), "enrol failed: %s %s" % (st, pl))
-    approver_token = device_token(api, approver)
-    submit_report(api, approver, approver_token)
-    handle = "r2-%s" % secrets.token_hex(4)
-    st, pl = open_account(api, approver, approver_token, handle)
-    expect(st in (200, 201) and pl.get("scope") == "full", "setup: approver account: %s %s" % (st, pl))
-    approver_access = pl["access_token"]
+    approver, handle, approver_access, prove, missing = _approver(api, settings)
 
     phone = Installation()
     st, pl = enrol(api, phone, fresh_hint())
@@ -2485,9 +2500,10 @@ def check_upgrade_route_approval(api, ctx):
            "the approver must see the request and only what it needs, got %s %s" % (st, listed))
     path = "/v1/auth/approvals/%s/approve" % rid
     st, pl = protected(api, approver, "POST", path, approver_access, {})
-    expect(st == 403 and error_code(pl) == "stepup_required",
-           "approving without step-up must be refused, got %s %s" % (st, error_code(pl)))
-    st, pl = stepup_call(api, approver, stepup_priv, "POST", path, approver_access, {}, factor)
+    expect(st == 403 and error_code(pl) == missing,
+           "approving without step-up must be refused with %s, got %s %s"
+           % (missing, st, error_code(pl)))
+    st, pl = prove(path)
     expect(st == 200 and pl.get("approved") is True, "approving with step-up failed: %s %s" % (st, pl))
     st, up = protected(api, phone, "POST", "/v1/auth/upgrade", limited,
                        {"route": "approval", "request_id": rid})
@@ -2554,8 +2570,8 @@ def check_upgrade_route_approval(api, ctx):
 def check_upgrade_request_supersedes(api, ctx):
     """DESIGN.md 75. A phone that asks for approval again replaces its own
     pending request: the approver lists only the newest, the older one can be
-    neither approved nor used, and the newest upgrades as usual."""
-    _skip_unless_screen_lock(live_settings(api))
+    neither approved nor used, and the newest upgrades as usual. The approver
+    proves the live stepup_method's factors (DESIGN.md 78)."""
     settings = live_settings(api)
     if not _setting_on(settings, "upgrade_other_device_approval") and \
             "upgrade_other_device_approval" in settings:
@@ -2565,18 +2581,7 @@ def check_upgrade_request_supersedes(api, ctx):
     if int(settings.get("upgrade_approvals_per_hour", "3")) < 2:
         raise Skip("upgrade_approvals_per_hour is below 2; this check raises two requests")
     integrity_context(ctx)
-    factor = settings.get("stepup_factor", "passcode")
-    approver = Installation()
-    stepup_priv, stepup_jwk = stepup_jwk_pair()
-    st, pl = enrol(api, approver, fresh_hint(), stepup_public_key=stepup_jwk,
-                   stepup_key_auth={"factor": factor, "mode": "per_use", "window_seconds": 0})
-    expect(st in (200, 201), "enrol failed: %s %s" % (st, pl))
-    approver_token = device_token(api, approver)
-    submit_report(api, approver, approver_token)
-    handle = "r2s-%s" % secrets.token_hex(4)
-    st, pl = open_account(api, approver, approver_token, handle)
-    expect(st in (200, 201) and pl.get("scope") == "full", "setup: approver account: %s %s" % (st, pl))
-    approver_access = pl["access_token"]
+    approver, handle, approver_access, prove, _ = _approver(api, settings)
 
     phone = Installation()
     st, pl = enrol(api, phone, fresh_hint())
@@ -2597,16 +2602,14 @@ def check_upgrade_request_supersedes(api, ctx):
     st, listed = protected(api, approver, "GET", "/v1/auth/approvals", approver_access)
     ids = [a.get("request_id") for a in (listed.get("approvals") or [])] if st == 200 else []
     expect(ids == [new], "the approver must see only the newest request, got %s %s" % (st, ids))
-    st, pl = stepup_call(api, approver, stepup_priv, "POST", "/v1/auth/approvals/%s/approve" % old,
-                         approver_access, {}, factor)
+    st, pl = prove("/v1/auth/approvals/%s/approve" % old)
     expect(st == 409 and error_code(pl) == "approval_superseded",
            "approving a replaced request must answer approval_superseded, got %s %s" % (st, error_code(pl)))
     st, up = protected(api, phone, "POST", "/v1/auth/upgrade", limited,
                        {"route": "approval", "request_id": old})
     expect(st == 403 and _details(up).get("state") == "superseded",
            "a replaced request must read as superseded, got %s %s" % (st, up))
-    st, pl = stepup_call(api, approver, stepup_priv, "POST", "/v1/auth/approvals/%s/approve" % new,
-                         approver_access, {}, factor)
+    st, pl = prove("/v1/auth/approvals/%s/approve" % new)
     expect(st == 200 and pl.get("approved") is True, "approving the newest request failed: %s %s" % (st, pl))
     st, up = protected(api, phone, "POST", "/v1/auth/upgrade", limited,
                        {"route": "approval", "request_id": new})
@@ -2688,25 +2691,19 @@ def check_upgrade_route_assertion(api, ctx):
 def check_elevated_step_up(api, ctx):
     """Review F11 (DESIGN.md 63). An elevated verdict used to answer
     integrity_step_up_required although no step-up proof could satisfy it. On
-    an authenticated account request a valid proof for that request now does;
-    without one the refusal stands."""
-    _skip_unless_screen_lock(live_settings(api))
+    an authenticated account request a valid step-up for that request now does
+    -- the key, the app PIN or both, as the live stepup_method says (DESIGN.md
+    78); without one the refusal stands."""
     if ctx["mode"] != "enforce":
         raise Skip("server is in observe mode")
-    _, health = api.call("GET", "/health/ready")
-    settings = ((health if isinstance(health, dict) else {}).get("scoring_flags") or {}).get(
-        "risk_policy_settings") or {}
-    factor = settings.get("stepup_factor", "passcode")
-    inst = Installation()
-    stepup_priv, stepup_jwk = stepup_jwk_pair()
-    st, pl = enrol(api, inst, fresh_hint(), stepup_public_key=stepup_jwk,
-                   stepup_key_auth={"factor": factor, "mode": "per_use", "window_seconds": 0})
-    expect(st in (200, 201), "enrol failed: %s %s" % (st, pl))
-    tok = device_token(api, inst)
-    submit_report(api, inst, tok)
-    st, pl = open_account(api, inst, tok, "el-%s" % secrets.token_hex(4))
-    expect(st in (200, 201), "account open failed: %s %s" % (st, pl))
-    access = pl["access_token"]
+    settings = live_settings(api)
+    method = _method(settings)
+    inst, tok, _, access, stepup = _pin_phone(api, settings, method != "app_pin")
+    pin = None
+    if method != "screen_lock":
+        pin, _ = _two_pins(settings)
+        st, pl = _set_pin(api, inst, access, pin)
+        expect(st == 200, "setting the app PIN: %s %s" % (st, pl))
     decision = submit_report(api, inst, tok, lambda probes: probes.update(
         {"mounts": {"status": "error", "error": "permission denied"}}))
     expect(decision["verdict"] == "elevated", "setup: expected elevated, got %s" % decision)
@@ -2714,10 +2711,10 @@ def check_elevated_step_up(api, ctx):
     st, pl = protected(api, inst, "POST", "/v1/account/protected-echo", access, body)
     expect(st == 403 and error_code(pl) == "integrity_step_up_required",
            "without step-up expected 403 integrity_step_up_required, got %s %s" % (st, error_code(pl)))
-    st, pl = stepup_call(api, inst, stepup_priv, "POST", "/v1/account/protected-echo",
-                         access, body, factor)
+    st, pl = pin_call(api, inst, "/v1/account/protected-echo", access, body, pin=pin,
+                      stepup=stepup)
     expect(st == 200 and (pl.get("integrity") or {}).get("satisfied_by_step_up") is True,
-           "a step-up proof must satisfy the elevated verdict, got %s %s" % (st, pl))
+           "a step-up (%s) must satisfy the elevated verdict, got %s %s" % (method, st, pl))
 
 
 # ---------------------------------------------------------------------------
@@ -3319,7 +3316,6 @@ def check_stepup_reenrol(api, ctx):
     only with the access proof, the account password and a signature by the new
     key bound to this request. A wrong password or a proof signed by another key
     is refused and changes nothing; the right one replaces the bound key."""
-    _skip_unless_screen_lock(live_settings(api), sensitive_path=True)
     auth = {"factor": "passcode", "mode": "per_use", "window_seconds": 0}
     inst = Installation()
     old_priv, old_jwk = stepup_jwk_pair()
@@ -3380,6 +3376,9 @@ def check_stepup_reenrol(api, ctx):
         "risk_policy_settings") or {}
     if "/v1/account/sensitive-echo" not in (settings.get("stepup_required_paths") or ""):
         return
+    if _method(settings) != "screen_lock" or SENSITIVE_PATH in _setting_words(
+            settings, "app_pin_required_paths", ""):
+        return  # the tail proves the screen-lock key alone on the sensitive path
     factor = settings.get("stepup_factor", "passcode")
     st, pl = open_account(api, inst, tok, "re2-%s" % secrets.token_hex(4), "Second0ne123")
     expect(st in (200, 201), "second account open failed: %s %s" % (st, pl))
