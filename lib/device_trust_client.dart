@@ -35,7 +35,9 @@ const String injectedStolenAccessToken = String.fromEnvironment(
 
 // Step-up for sensitive operations (DESIGN.md 51 and 53). Optional: an
 // integrating app opts in; this lab build enables it so the flow can be
-// tested. Factor and mode must match the server's risk_policy_settings.
+// tested. The factor, mode and window follow the DBA's policy, read from
+// GET /v1/policy/step-up (DESIGN.md 79); these build values are only the
+// fallback when the server cannot be asked.
 //   --dart-define=STEPUP_ENABLED=false
 //   --dart-define=STEPUP_FACTOR=biometric
 //   --dart-define=STEPUP_MODE=windowed --dart-define=STEPUP_WINDOW_SECONDS=60
@@ -293,20 +295,100 @@ class StepUpKeyMetadata {
   }
 }
 
+/// The DBA's step-up policy as the server states it (GET /v1/policy/step-up,
+/// DESIGN.md 79), or the build's STEPUP_* values when the server could not
+/// be asked ([fromServer] false; the method is then unknown until sign-in).
+class StepUpPolicy {
+  const StepUpPolicy({
+    required this.method,
+    required this.factor,
+    required this.mode,
+    required this.windowSeconds,
+    required this.fromServer,
+  });
+
+  static const StepUpPolicy buildFallback = StepUpPolicy(
+    method: null,
+    factor: stepUpFactor,
+    mode: stepUpMode,
+    windowSeconds: stepUpWindowSeconds,
+    fromServer: false,
+  );
+
+  final String? method;
+  final String factor;
+  final String mode;
+  final int windowSeconds;
+  final bool fromServer;
+
+  factory StepUpPolicy.fromServer(Map<String, dynamic> value) {
+    final Object? method = value['method'];
+    final Object? factor = value['factor'];
+    final Object? mode = value['mode'];
+    final Object? window = value['window_seconds'];
+    if (method is! String ||
+        (factor != 'passcode' && factor != 'biometric') ||
+        (mode != 'per_use' && mode != 'windowed') ||
+        window is! int ||
+        window < 0 ||
+        window > 3600 ||
+        (mode == 'windowed' && window < 1)) {
+      throw const FormatException(
+        'The server returned a step-up policy this app cannot follow.',
+      );
+    }
+    return StepUpPolicy(
+      method: method,
+      factor: factor as String,
+      mode: mode as String,
+      windowSeconds: window,
+      fromServer: true,
+    );
+  }
+
+  /// Whether the screen-lock key takes part in a step-up at all: under the
+  /// app PIN alone it does not, so its factor is not yet a problem.
+  bool get usesScreenLock => method != 'app_pin';
+
+  /// The key satisfies this policy: the same factor (the server refuses any
+  /// other), and a per-use key or a window no longer than the policy's. A
+  /// per-use key satisfies a windowed policy.
+  bool accepts(StepUpKeyMetadata key) =>
+      key.factor == factor &&
+      (key.mode == 'per_use' ||
+          (mode == 'windowed' && key.windowSeconds <= windowSeconds));
+
+  String get description =>
+      '${method ?? 'method unknown'}; key $factor, '
+      '${mode == 'per_use' ? 'per-use' : '${windowSeconds}s window'}'
+      '${fromServer ? '' : ' (build fallback)'}';
+}
+
 class NativeStepUpKey {
   static const MethodChannel _channel = MethodChannel(
     'devicefingerprinting/stepup_key_v1',
   );
 
-  Future<StepUpKeyMetadata> getOrCreateKey() async {
+  /// The deployment's mode, which decides whether a windowed key first tries
+  /// to sign inside an open hardware window. Set from the server's policy.
+  String configuredMode = stepUpMode;
+
+  /// Returns the existing key as the keystore enforces it, or creates one
+  /// with these values: an existing key is never changed, so a caller that
+  /// needs other values deletes it first.
+  Future<StepUpKeyMetadata> getOrCreateKey({
+    String factor = stepUpFactor,
+    String mode = stepUpMode,
+    int windowSeconds = stepUpWindowSeconds,
+  }) async {
     try {
       final Map<String, dynamic>? value =
           await _channel.invokeMapMethod<String, dynamic>(
         'getOrCreateKey',
         <String, dynamic>{
-          'factor': stepUpFactor,
-          'mode': stepUpMode,
-          'window_seconds': stepUpWindowSeconds,
+          'factor': factor,
+          'mode': mode,
+          'window_seconds': windowSeconds,
         },
       );
       if (value == null) {
@@ -338,7 +420,7 @@ class NativeStepUpKey {
         <String, dynamic>{
           'payload': payloadBase64Url,
           'reason': reason,
-          'mode': stepUpMode,
+          'mode': configuredMode,
         },
       );
       if (signature == null || signature.isEmpty) {
@@ -1471,6 +1553,13 @@ class DeviceApi {
     return AccountSession.fromApi(value);
   }
 
+  /// The DBA's step-up policy, readable before sign-in (DESIGN.md 79).
+  Future<StepUpPolicy> stepUpPolicy() async {
+    return StepUpPolicy.fromServer(
+      await _request('GET', '/v1/policy/step-up'),
+    );
+  }
+
   Future<Map<String, dynamic>> accountMe({
     required String accessToken,
     required InstallationIdentity signingIdentity,
@@ -1845,6 +1934,14 @@ class DeviceRecognitionController extends ChangeNotifier {
   StepUpKeyMetadata? stepUpKey;
   String? stepUpUnavailable;
   String? stepUpTestResult;
+
+  /// The step-up policy the key was last prepared for (DESIGN.md 79).
+  StepUpPolicy? stepUpPolicy;
+
+  /// This phone's bound key was made for another factor than the server's
+  /// policy now names, so every step-up with it would be refused
+  /// (stepup_factor_mismatch) until the user re-enrols with the password.
+  String? stepUpPolicyMismatch;
   String? limitedSessionResult;
   String? pendingUpgradeRequestId;
   List<Map<String, dynamic>> approvalRequests = <Map<String, dynamic>>[];
@@ -1982,15 +2079,62 @@ class DeviceRecognitionController extends ChangeNotifier {
     });
   }
 
-  Future<void> _prepareStepUpKey() async {
+  Future<StepUpPolicy> _readStepUpPolicy() async {
+    try {
+      final StepUpPolicy policy = await _api.stepUpPolicy();
+      debugPrint('STEPUP: server policy ${policy.description}');
+      return policy;
+    } on ApiException catch (error) {
+      debugPrint('STEPUP: policy unavailable (${error.code ?? error.message}); '
+          'using the build values');
+    } on FormatException catch (error) {
+      debugPrint('STEPUP: ${error.message} Using the build values.');
+    }
+    return StepUpPolicy.buildFallback;
+  }
+
+  /// Prepares the screen-lock key as the server's policy says (DESIGN.md 79).
+  /// An existing key that does not satisfy it is replaced while the server
+  /// holds no key for this installation, or when [replaceMismatched] (a
+  /// re-enrolment, which binds the new key). A bound key is never replaced
+  /// silently: the server would refuse the new one until a re-enrolment, so
+  /// a factor the policy no longer names is reported instead.
+  Future<void> _prepareStepUpKey({bool replaceMismatched = false}) async {
     stepUpKey = null;
     stepUpUnavailable = null;
+    stepUpPolicyMismatch = null;
     if (!stepUpEnabled) {
       stepUpUnavailable = 'disabled in this build (STEPUP_ENABLED=false)';
       return;
     }
+    final StepUpPolicy policy = await _readStepUpPolicy();
+    stepUpPolicy = policy;
+    _stepUpKeyProvider.configuredMode = policy.mode;
     try {
-      final StepUpKeyMetadata key = await _stepUpKeyProvider.getOrCreateKey();
+      StepUpKeyMetadata key = await _stepUpKeyProvider.getOrCreateKey(
+        factor: policy.factor,
+        mode: policy.mode,
+        windowSeconds: policy.windowSeconds,
+      );
+      if (!key.created && !policy.accepts(key)) {
+        final RegistrationState? current = registration;
+        final bool bound = current != null &&
+            current.stepupKeyRegistered &&
+            current.stepupKeyMatches != false;
+        if (replaceMismatched || !bound) {
+          debugPrint('STEPUP: replacing a ${key.description} key for the '
+              'policy ${policy.description}');
+          await _stepUpKeyProvider.deleteKey();
+          key = await _stepUpKeyProvider.getOrCreateKey(
+            factor: policy.factor,
+            mode: policy.mode,
+            windowSeconds: policy.windowSeconds,
+          );
+        } else if (key.factor != policy.factor && policy.usesScreenLock) {
+          stepUpPolicyMismatch =
+              'this key is ${key.factor}; the server now requires ${policy.factor}';
+        }
+      }
       stepUpKey = key;
       debugPrint(
         'STEPUP: key ${key.description}, ${key.securityLevel}, '
@@ -2022,7 +2166,8 @@ class DeviceRecognitionController extends ChangeNotifier {
     final StepUpKeyMetadata? key = stepUpKey;
     return key != null &&
         key.thumbprint == _boundStepUpThumbprint &&
-        !_stepUpKeyOtherAccount;
+        !_stepUpKeyOtherAccount &&
+        stepUpPolicyMismatch == null;
   }
 
   /// The server answered stepup_key_other_account: this phone's step-up key
@@ -2048,8 +2193,8 @@ class DeviceRecognitionController extends ChangeNotifier {
       if (session == null || currentIdentity == null) {
         throw ApiException('Log in first: re-enrolment needs the account.');
       }
-      if (stepUpKey == null) {
-        await _prepareStepUpKey();
+      if (stepUpKey == null || stepUpPolicyMismatch != null) {
+        await _prepareStepUpKey(replaceMismatched: true);
       }
       final StepUpKeyMetadata? key = stepUpKey;
       if (key == null) {
@@ -2131,6 +2276,9 @@ class DeviceRecognitionController extends ChangeNotifier {
     } else if (_stepUpKeyOtherAccount) {
       server = 'bound to another account on this phone: re-enrol it with '
           "this account's password below";
+    } else if (stepUpPolicyMismatch != null) {
+      server = "the server's step-up policy changed ($stepUpPolicyMismatch): "
+          're-enrol it with your password below';
     } else if (key.thumbprint != _boundStepUpThumbprint) {
       server = 'not confirmed as the bound key: re-enrol it with your '
           'password below';
@@ -2140,8 +2288,10 @@ class DeviceRecognitionController extends ChangeNotifier {
     final String downgrade = current?.stepupPolicyDowngrade == true
         ? '; weaker than server policy (downgrade recorded)'
         : '';
+    final StepUpPolicy? policy = stepUpPolicy;
     return 'Step-up key: ${key.description}, ${key.securityLevel}; '
-        '$server$downgrade';
+        '$server$downgrade'
+        '${policy == null ? '' : '\nStep-up policy: ${policy.description}'}';
   }
 
   Future<void> _registerAndProve() async {
