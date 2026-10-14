@@ -3441,8 +3441,8 @@ def what_the_server_saw_is_measured_always_and_scored_only_when_enabled():
     expect(measured["account"]["sign_in_failed"] == 5
            and measured["account"]["sign_in_failed_elsewhere"] == 5
            and measured["account"]["sign_in_failed_installations"] == 5
-           and measured["newcomer"] is True and measured["scored"] is False
-           and measured["window_hours"] == 24,
+           and measured["newcomer"]["sign_in_failed_elsewhere_before"] == 5
+           and measured["scored"] is False and measured["window_hours"] == 24,
            "the decision must carry what the server saw: %s" % measured)
     expect(not _cross(observe_only) and observe_only["score"] == 10,
            "observe first: nothing may score while cross_checks_enabled is off, got %s %s"
@@ -3474,28 +3474,37 @@ def what_the_server_saw_is_measured_always_and_scored_only_when_enabled():
 def an_accounts_failures_judge_a_newcomer_never_a_phone_it_already_used():
     """DESIGN.md 77, the false-positive rule first. A user mistyping on their
     own phone is not counted against anyone: the account's rule counts other
-    installations only. And failures someone causes on an account never
-    restrict a phone the account used before them -- only a phone being linked
-    now, or linked within the window."""
+    installations only. Failures someone causes on an account never restrict a
+    phone that was there before them -- long-standing, or the phone that opened
+    the account this morning. Only a phone that joined after them, or is
+    joining now, is judged, by the failures in the window before it joined."""
     store = ObservationStore()
     acct = str(uuid.uuid4())
-    owner, recent, newcomer = store.phone(), store.phone(), store.phone(age_days=0)
+    owner, opener, late, joining = (store.phone(), store.phone(), store.phone(),
+                                    store.phone(age_days=0))
     store.link(owner[0], acct, age_days=200)
-    store.link(recent[0], acct, age_days=0.5)
-    store.observe("sign_in_failed", newcomer, acct, times=9)
-    mine = store.decide(newcomer, acct, pending=True, cross_checks_enabled=1)
-    expect(mine["context"]["server_observations"]["account"]["sign_in_failed_elsewhere"] == 0
-           and not _cross(mine),
+    store.link(opener[0], acct, age_days=0.5)
+    store.observe("sign_in_failed", joining, acct, times=9)
+    mine = store.decide(joining, acct, pending=True, cross_checks_enabled=1)
+    expect(mine["context"]["server_observations"]["newcomer"]["sign_in_failed_elsewhere_before"]
+           == 0 and not _cross(mine),
            "nine mistypes on the phone now signing in must not count: %s" % mine["reasons"])
     for _ in range(5):
-        store.observe("sign_in_failed", store.phone(), acct)
+        store.observe("sign_in_failed", store.phone(), acct, age_hours=2)
+    store.link(late[0], acct, age_days=1.0 / 24)
     incumbent = store.decide(owner, acct, cross_checks_enabled=1)
-    expect(incumbent["context"]["server_observations"]["newcomer"] is False and not _cross(incumbent),
-           "a phone the account used before must not be judged: %s" % incumbent["reasons"])
-    for phone in (recent, newcomer):
-        decision = store.decide(phone, acct, pending=phone is newcomer, cross_checks_enabled=1)
-        expect("account_sign_in_failures_elsewhere" in _cross(decision),
-               "a phone new to the account is judged: %s" % decision["reasons"])
+    expect(incumbent["context"]["server_observations"]["newcomer"] is None
+           and not _cross(incumbent),
+           "a phone the account used long before must not be judged: %s" % incumbent["reasons"])
+    opened = store.decide(opener, acct, cross_checks_enabled=1)
+    expect(opened["context"]["server_observations"]["newcomer"]["sign_in_failed_elsewhere_before"]
+           == 0 and not _cross(opened),
+           "the phone that opened the account before the failures must not be judged: %s"
+           % opened["context"]["server_observations"])
+    for phone, pending in ((late, False), (joining, True)):
+        decision = store.decide(phone, acct, pending=pending, cross_checks_enabled=1)
+        expect(_cross(decision).get("account_sign_in_failures_elsewhere") == (30, 5),
+               "a phone that joined after five failures is judged: %s" % decision["reasons"])
 
 
 @check

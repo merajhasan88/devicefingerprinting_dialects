@@ -1298,13 +1298,15 @@ _risk_settings_lock = threading.Lock()
 # cross_check_window_hours. Each rule's count and points are DBA settings,
 # <code>_count and <code>_points, seeded by migration 019 with the defaults
 # below (0 switches a rule off); none adds points unless cross_checks_enabled.
-# A phone's rules count what that phone did. The account's rule counts what
-# OTHER installations did on the account and judges only a phone new to it.
+# A phone's rules count what that phone did. The account's rule judges only a
+# phone new to the account, by the wrong passwords OTHER installations sent in
+# the window before it joined.
 #   (code, scope, measured key, default count, default points, message)
 _CROSS_CHECK_RULES = (
-    ("account_sign_in_failures_elsewhere", "account", "sign_in_failed_elsewhere", 5, 30,
+    ("account_sign_in_failures_elsewhere", "newcomer", "sign_in_failed_elsewhere_before",
+     5, 30,
      "%d wrong-password sign-ins to this account came from other installations in the "
-     "last %d hours, and this phone is new to the account."),
+     "%d hours before this phone joined it."),
     ("device_sign_in_failures_many_accounts", "device", "sign_in_failed_accounts", 3, 60,
      "Wrong-password sign-ins to %d different accounts came from this phone in the last "
      "%d hours."),
@@ -3365,9 +3367,13 @@ def _observed_refusal(code, kind, device_id, installation_id, account_id=None):
         raise
 
 
-def _server_observation_counts(cursor, device_id, installation_id, account_id, since):
-    """What this server observed since `since`: on this phone, for every
-    account, and on this account, from every phone (DESIGN.md 77)."""
+def _server_observation_counts(cursor, device_id, installation_id, account_id, now, window,
+                               joined_at=None):
+    """What this server observed in the `window` before `now`: on this phone,
+    for every account, and on this account, from every phone (DESIGN.md 77).
+    With `joined_at` -- this phone is new to the account -- also the wrong
+    passwords other installations sent in the window before it joined."""
+    since = now - window
     device = dict.fromkeys(_OBSERVATION_KINDS, 0)
     device["sign_in_failed_accounts"] = 0
     cursor.execute(
@@ -3423,7 +3429,23 @@ def _server_observation_counts(cursor, device_id, installation_id, account_id, s
         (account_id, since, installation_id),
     )
     account["sign_in_failed_elsewhere"] = int(cursor.fetchone()[0])
-    return {"device": device, "account": account}
+    newcomer = None
+    if joined_at is not None:
+        # The window before this phone joined: failures after it cannot have
+        # been what let it in. Joining now, that is the window just counted.
+        before = account["sign_in_failed_elsewhere"]
+        if joined_at < now:
+            cursor.execute(
+                """
+                SELECT COUNT(*) FROM server_observations
+                WHERE account_id = %s AND occurred_at >= %s AND occurred_at <= %s
+                  AND kind = 'sign_in_failed' AND installation_id <> %s
+                """,
+                (account_id, joined_at - window, joined_at, installation_id),
+            )
+            before = int(cursor.fetchone()[0])
+        newcomer = {"joined_at": _iso_z(joined_at), "sign_in_failed_elsewhere_before": before}
+    return {"device": device, "account": account, "newcomer": newcomer}
 
 
 def _evaluate_risk_policy(
@@ -3545,9 +3567,17 @@ def _evaluate_risk_policy(
             account_device_count = int(cursor.fetchone()[0])
 
         window_hours = _risk_setting_int("cross_check_window_hours", CROSS_CHECK_WINDOW_HOURS)
-        observed_since = _utc_now() - timedelta(hours=window_hours)
+        window = timedelta(hours=window_hours)
+        observed_at = _utc_now()
+        # A phone new to the account (DESIGN.md 77): joining it now, or joined
+        # within the window. One the account used before is never new to it.
+        joined_at = None
+        if account_id is not None and account_link_pending and not link_exists:
+            joined_at = observed_at
+        elif link_first_seen is not None and link_first_seen >= observed_at - window:
+            joined_at = link_first_seen
         observations = _server_observation_counts(
-            cursor, device_id, installation_id, account_id, observed_since
+            cursor, device_id, installation_id, account_id, observed_at, window, joined_at
         )
 
     add_link = bool(account_id is not None and account_link_pending and not link_exists)
@@ -3778,18 +3808,14 @@ def _evaluate_risk_policy(
 
     # The server's own observations (DESIGN.md 77), scored only where the DBA
     # has switched them on. A phone's rules count what that phone did. The
-    # account's rule counts what OTHER installations did on the account and
-    # judges only a phone new to it -- being linked now, or linked within the
-    # window -- so failures someone causes on an account never restrict the
-    # phones that account already used.
-    newcomer = account_id is not None and (
-        add_link or (link_first_seen is not None and link_first_seen >= observed_since)
-    )
+    # account's rule judges only a phone new to the account, by the failures
+    # other installations sent before it joined -- so failures someone causes
+    # on an account never restrict a phone that was there before them.
     cross_checks_scored = _risk_setting_bool("cross_checks_enabled", False)
     if cross_checks_scored:
         for code, scope, key, default_count, default_points, message in _CROSS_CHECK_RULES:
             measured = observations.get(scope)
-            if measured is None or (scope == "account" and not newcomer):
+            if measured is None:
                 continue
             threshold = _risk_setting_int(code + "_count", default_count)
             count = int(measured.get(key, 0))
@@ -3841,10 +3867,7 @@ def _evaluate_risk_policy(
         ),
         # Measured into every decision, scored or not (DESIGN.md 77).
         "server_observations": dict(
-            observations,
-            window_hours=window_hours,
-            newcomer=newcomer,
-            scored=cross_checks_scored,
+            observations, window_hours=window_hours, scored=cross_checks_scored
         ),
         "request_rate": request_rate,
     }
