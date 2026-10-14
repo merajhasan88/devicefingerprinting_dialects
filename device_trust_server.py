@@ -4440,23 +4440,41 @@ def _verify_app_pin(account_id, device_id, installation_id):
     )
 
 
+def _stepup_policy_public():
+    """The step-up policy as the DBA chose it, for the app to follow (DESIGN.md
+    79): the method; the factor, mode and window a screen-lock key must be
+    created with; the app PIN's length; and the paths that need each."""
+    mode = _risk_setting_str("stepup_mode", "per_use")
+    return {
+        "method": _risk_setting_str("stepup_method", STEPUP_METHOD_DEFAULT),
+        "factor": _risk_setting_str("stepup_factor", "passcode"),
+        "mode": mode,
+        "window_seconds": (_risk_setting_int("stepup_window_seconds", 0)
+                           if mode == "windowed" else 0),
+        "app_pin_length": _risk_setting_int("app_pin_length", 6),
+        "required_paths": sorted(_stepup_required_paths()),
+        "app_pin_required_paths": sorted(_app_pin_required_paths()),
+    }
+
+
 def _app_pin_state(account_id):
-    """Whether this account has an app PIN, whether it is locked, and whether
-    support has opened a reset (DESIGN.md 78, 79)."""
+    """The step-up policy, and this account's app PIN: whether it is set,
+    whether it is locked, whether support has opened a reset (DESIGN.md 78,
+    79)."""
     with _cursor() as cursor:
         cursor.execute(
             "SELECT pin_hash, locked_at, reset_until FROM app_pins WHERE account_id = %s",
             (str(account_id),),
         )
         row = cursor.fetchone()
-    return {
-        "method": _risk_setting_str("stepup_method", STEPUP_METHOD_DEFAULT),
+    state = _stepup_policy_public()
+    state.update({
         "app_pin_set": bool(row is not None and row[0] is not None),
         "app_pin_locked": bool(row is not None and row[1] is not None),
         "app_pin_reset_open": bool(row is not None and row[2] is not None
                                    and row[2] > _utc_now()),
-        "app_pin_length": _risk_setting_int("app_pin_length", 6),
-    }
+    })
+    return state
 
 
 def _support_reset_open(account_id):
@@ -6958,6 +6976,20 @@ def account_login():
         )
 
     return jsonify(tokens)
+
+
+@app.get("/v1/policy/step-up")
+def policy_step_up():
+    """The DBA's step-up policy, before sign-in (DESIGN.md 79). An app creates
+    its screen-lock key when it first registers, before any account exists,
+    so it reads here which factor, mode and window to create it with -- and
+    whether a PIN is the method -- instead of fixing them at build time. The
+    policy is no secret: the server enforces it either way. Never cached, so
+    a DBA's change reaches the next app that asks."""
+    _limit_source("policy_read")
+    response = jsonify(_stepup_policy_public())
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 @app.get("/v1/account/me")
