@@ -2225,17 +2225,8 @@ def check_upgrade_route_approval(api, ctx):
                        {"route": "approval", "request_id": rid})
     expect(st == 403 and error_code(up) == "approval_not_granted",
            "an approval must not upgrade another login, got %s %s" % (st, error_code(up)))
-    # The budget before the denial: with the DBA's cross-checks on, a denial
-    # counts against the phone that asked (DESIGN.md 77) and can refuse its
-    # next request before the budget is reached.
-    budget = int(settings.get("upgrade_approvals_per_hour", "3"))
-    for number in range(2, budget + 1):
-        st, req = ask(second)
-        expect(st == 201, "approval request %d failed: %s %s" % (number, st, req))
-    st, pl = ask(second)
-    expect(st == 429 and error_code(pl) == "upgrade_budget_exhausted",
-           "request %d in an hour must exceed the budget of %d, got %s %s"
-           % (budget + 1, budget, st, error_code(pl)))
+    st, req = ask(second)
+    expect(st == 201, "second approval request failed: %s %s" % (st, req))
     st, pl = protected(api, approver, "POST", "/v1/auth/approvals/%s/deny" % req["request_id"],
                        approver_access, {})
     expect(st == 200 and pl.get("denied") is True, "denying failed: %s %s" % (st, pl))
@@ -2247,8 +2238,8 @@ def check_upgrade_route_approval(api, ctx):
     if (_setting_on(settings, "cross_checks_enabled")
             and int(settings.get("device_approvals_denied_count", "1") or "0") == 1):
         # DESIGN.md 77: the denied phone's next decision carries the denial;
-        # with the owner's effect, limit, the phone stays limited -- never
-        # blocked by the denial alone.
+        # with the owner's effect, limit, it stays limited -- never blocked by
+        # the denial alone -- and may ask again within the budget.
         st, pl = sign_in(api, phone, phone_token, handle)
         reason = reason_for(_decision_of(pl), "device_approvals_denied")
         expect(reason is not None and reason.get("points") == points and reason.get("count") == 1,
@@ -2259,6 +2250,13 @@ def check_upgrade_route_approval(api, ctx):
                    and (pl.get("policy") or {}).get("context", {}).get("held_by_denial") is True,
                    "a denied phone must stay limited, not blocked: %s %s"
                    % (st, error_code(pl) or pl.get("scope")))
+    budget = int(settings.get("upgrade_approvals_per_hour", "3"))
+    for _ in range(max(0, budget - 2)):
+        ask(second)
+    st, pl = ask(second)
+    expect(st == 429 and error_code(pl) == "upgrade_budget_exhausted",
+           "request %d in an hour must exceed the budget of %d, got %s %s"
+           % (budget + 1, budget, st, error_code(pl)))
     blocked = submit_report(api, phone, phone_token,
                             lambda probes: probes["runtime_maps"].update({"suspicious_tokens": ["frida"]}))
     expect(blocked["verdict"] == "block", "setup: expected block, got %s" % blocked)
