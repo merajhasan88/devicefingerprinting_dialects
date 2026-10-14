@@ -3386,6 +3386,8 @@ _OBSERVATION_KINDS = (
     "request_replayed",
     "app_pin_failed",
     "app_pin_set",
+    "app_pin_support_unlocked",
+    "app_pin_support_reset",
 )
 # Observations recorded at most once per token or per request take an ID
 # derived from it, so a duplicate is the database's own refusal.
@@ -4376,6 +4378,7 @@ def _verify_app_pin(account_id, device_id, installation_id):
             """
             UPDATE app_pins SET failures = failures + 1
             WHERE account_id = %s AND locked_at IS NULL AND failures < %s
+              AND pin_hash IS NOT NULL
             """,
             (account_id, max_failures),
         )
@@ -4385,7 +4388,7 @@ def _verify_app_pin(account_id, device_id, installation_id):
             (account_id,),
         )
         row = cursor.fetchone()
-    if row is None:
+    if row is None or row[0] is None:
         raise ApiProblem(
             "No app PIN is set for this account; set one first.", 403, "app_pin_not_set"
         )
@@ -4438,18 +4441,32 @@ def _verify_app_pin(account_id, device_id, installation_id):
 
 
 def _app_pin_state(account_id):
-    """Whether this account has an app PIN, and whether it is locked."""
+    """Whether this account has an app PIN, whether it is locked, and whether
+    support has opened a reset (DESIGN.md 78, 79)."""
     with _cursor() as cursor:
         cursor.execute(
-            "SELECT locked_at FROM app_pins WHERE account_id = %s", (str(account_id),)
+            "SELECT pin_hash, locked_at, reset_until FROM app_pins WHERE account_id = %s",
+            (str(account_id),),
         )
         row = cursor.fetchone()
     return {
         "method": _risk_setting_str("stepup_method", STEPUP_METHOD_DEFAULT),
-        "app_pin_set": row is not None,
-        "app_pin_locked": bool(row is not None and row[0] is not None),
+        "app_pin_set": bool(row is not None and row[0] is not None),
+        "app_pin_locked": bool(row is not None and row[1] is not None),
+        "app_pin_reset_open": bool(row is not None and row[2] is not None
+                                   and row[2] > _utc_now()),
         "app_pin_length": _risk_setting_int("app_pin_length", 6),
     }
+
+
+def _support_reset_open(account_id):
+    """Support opened a reset for this account, and it has not lapsed."""
+    with _cursor() as cursor:
+        cursor.execute(
+            "SELECT reset_until FROM app_pins WHERE account_id = %s", (str(account_id),)
+        )
+        row = cursor.fetchone()
+    return row is not None and row[0] is not None and row[0] > _utc_now()
 
 
 # Step-up refusals that are not a failed proof (DESIGN.md 77): a request sent
@@ -5542,6 +5559,10 @@ def _require_limited_session_path(claims):
         return
     if request.path in _risk_setting_words("limited_session_paths", ""):
         return
+    # The one exception (DESIGN.md 79): support opened a reset after verifying
+    # the customer, so this phone may set a new PIN, once, before it lapses.
+    if request.path == _APP_PIN_PATH and _support_reset_open(get_jwt_identity()):
+        return
     causes = claims.get("limited") or []
     with _cursor() as cursor:
         routes = _upgrade_routes(
@@ -5601,10 +5622,11 @@ def _upgrade_routes(cursor, account_id, installation_id, causes):
             )
         if open_now and need_pin:
             cursor.execute(
-                "SELECT locked_at FROM app_pins WHERE account_id = %s", (str(account_id),)
+                "SELECT pin_hash, locked_at FROM app_pins WHERE account_id = %s",
+                (str(account_id),),
             )
             row = cursor.fetchone()
-            open_now = row is not None and row[0] is None
+            open_now = row is not None and row[0] is not None and row[1] is None
         if open_now:
             routes.append("stepup")
     if "approval" in enabled and _has_other_full_session(
@@ -6968,11 +6990,39 @@ def set_app_pin():
     is how a user who forgot or locked their PIN gets back in, with the
     password. Recorded as app_pin_set against the phone that set it, so a
     reset made somewhere else is visible. Only a verifier is stored.
+
+    The one exception (DESIGN.md 79): when support has opened a reset for the
+    account -- after verifying the customer, where the DBA allows it -- a
+    limited session on one of the account's phones may set a new PIN, still
+    with the password, once, before the reset lapses. A hard outcome still
+    refuses. Whoever talks support into a reset is the business's
+    verification procedure to stop.
     """
     account_id = str(get_jwt_identity())
     _enforce_rate_limit("app_pin_set", account_id)
-    claims, policy, integrity = _require_trusted_account_request("app_pin_set")
-    _require_full_session(claims)
+    via_reset = get_jwt().get("scope") == "limited" and _support_reset_open(account_id)
+    if via_reset:
+        claims = _require_access_proof("account")
+        _enforce_integrity_gate(claims.get("did"), claims.get("iid"), limited_ok=True)
+        policy = _evaluate_risk_policy(
+            "app_pin_set",
+            claims.get("did"),
+            claims.get("iid"),
+            account_id=account_id,
+            account_link_pending=False,
+            persist=True,
+        )
+        _enforce_risk_policy(policy, limited_ok=True)
+        with _cursor() as cursor:
+            if _refresh_session(cursor, claims, lock=False)["revoked"]:
+                raise ApiProblem(
+                    "This session was signed out or revoked; sign in again.",
+                    401,
+                    "session_revoked",
+                )
+    else:
+        claims, policy, integrity = _require_trusted_account_request("app_pin_set")
+        _require_full_session(claims)
     body = _json_body()
     password = _password_bytes(body.get("password"))
     pin = body.get("pin")
@@ -7000,9 +7050,21 @@ def set_app_pin():
     with _cursor(commit=True) as cursor:
         update = (
             "UPDATE app_pins SET pin_hash = %s, failures = 0, locked_at = NULL, "
-            "set_at = NOW(), set_by_installation = %s WHERE account_id = %s"
+            "reset_until = NULL, set_at = NOW(), set_by_installation = %s "
+            "WHERE account_id = %s"
         )
-        cursor.execute(update, (pin_hash, claims.get("iid"), account_id))
+        if via_reset:
+            # Consumes the reset in the same statement, so it serves once.
+            cursor.execute(update + " AND reset_until > %s",
+                           (pin_hash, claims.get("iid"), account_id, _utc_now()))
+            if cursor.rowcount != 1:
+                raise ApiProblem(
+                    "The support reset has lapsed or was used; ask support again.",
+                    403,
+                    "app_pin_reset_lapsed",
+                )
+        else:
+            cursor.execute(update, (pin_hash, claims.get("iid"), account_id))
         if cursor.rowcount == 0:
             # A first PIN; two at once both miss the UPDATE, and the loser's
             # INSERT hits the primary key -- then it simply updates.
@@ -7026,7 +7088,7 @@ def set_app_pin():
                     cursor.execute(savepoint[2])
         _record_observation(
             "app_pin_set",
-            "app_pin_set",
+            "app_pin_set_after_support_reset" if via_reset else "app_pin_set",
             claims.get("did"),
             claims.get("iid"),
             account_id=account_id,
@@ -8691,6 +8753,102 @@ def business_graph():
         "links": [edges[key] for key in sorted(edges)],
         "component_business_events_30d": component,
     })
+
+
+_SUPPORT_REFERENCE = re.compile(r"[A-Za-z0-9._:-]{1,64}")
+
+
+def _app_pin_support(action):
+    """Support staff unlock a customer's locked app PIN -- or, where the DBA
+    allows it, also open one reset (DESIGN.md 79). Server to server: the
+    company's support tool calls it after verifying the customer, naming the
+    account (or handle) and its own ticket reference, which is recorded with
+    the action. Off unless the DBA sets app_pin_support."""
+    _require_business_caller()
+    allowed = {"unlock": ("unlock", "unlock_and_reset"), "reset": ("unlock_and_reset",)}[action]
+    if _risk_setting_str("app_pin_support", "off") not in allowed:
+        raise ApiProblem(
+            "Support %s of app PINs is not enabled here (app_pin_support)." % action,
+            403,
+            "app_pin_support_disabled",
+        )
+    body = _json_body()
+    unknown = sorted(set(body) - {"account_id", "handle", "reference"})
+    if unknown:
+        raise ApiProblem("%s is not a known field." % unknown[0], 400, "invalid_support_request",
+                         details={"field": unknown[0]})
+    reference = body.get("reference")
+    if not isinstance(reference, str) or _SUPPORT_REFERENCE.fullmatch(reference) is None:
+        raise ApiProblem("reference, your ticket, must be 1-64 of A-Z a-z 0-9 . _ : -",
+                         400, "invalid_support_request", details={"field": "reference"})
+    if ("account_id" in body) == ("handle" in body):
+        raise ApiProblem("Give exactly one of account_id or handle.", 400,
+                         "invalid_support_request", details={"field": "account_id"})
+    with _cursor() as cursor:
+        if "account_id" in body:
+            cursor.execute("SELECT account_id FROM demo_accounts WHERE account_id = %s",
+                           (_uuid_text(body["account_id"], "account_id"),))
+        else:
+            cursor.execute("SELECT account_id FROM demo_accounts WHERE handle_lookup = %s",
+                           (_handle_lookup(body["handle"]),))
+        row = cursor.fetchone()
+    if row is None:
+        raise ApiProblem("No such account.", 404, "unknown_account")
+    account_id = str(row[0])
+    reset_until = None
+    with _cursor(commit=True) as cursor:
+        if action == "unlock":
+            cursor.execute(
+                "UPDATE app_pins SET failures = 0, locked_at = NULL "
+                "WHERE account_id = %s AND pin_hash IS NOT NULL",
+                (account_id,),
+            )
+            if cursor.rowcount != 1:
+                raise ApiProblem("This account has no app PIN to unlock.", 404, "app_pin_not_set")
+        else:
+            reset_until = _utc_now() + timedelta(
+                minutes=_risk_setting_int("app_pin_support_reset_minutes", 15))
+            update = ("UPDATE app_pins SET failures = 0, locked_at = NULL, reset_until = %s "
+                      "WHERE account_id = %s")
+            cursor.execute(update, (reset_until, account_id))
+            if cursor.rowcount == 0:
+                # No PIN yet: the row holds only the reset. Two at once: the
+                # loser's INSERT hits the key, and it simply updates.
+                savepoint = DIALECT.savepoint("app_pin_support")
+                if savepoint:
+                    cursor.execute(savepoint[0])
+                try:
+                    cursor.execute(
+                        "INSERT INTO app_pins (account_id, pin_hash, reset_until) "
+                        "VALUES (%s, NULL, %s)",
+                        (account_id, reset_until),
+                    )
+                except Exception as error:
+                    if not DIALECT.is_unique_violation(error):
+                        raise
+                    if savepoint:
+                        cursor.execute(savepoint[1])
+                    cursor.execute(update, (reset_until, account_id))
+                else:
+                    if savepoint:
+                        cursor.execute(savepoint[2])
+        _record_observation(
+            "app_pin_support_unlocked" if action == "unlock" else "app_pin_support_reset",
+            reference, None, None, account_id=account_id, cursor=cursor,
+        )
+    logger.warning("App PIN support %s: account=%s reference=%s", action, account_id, reference)
+    return jsonify({"account_id": account_id, "unlocked": True,
+                    "reset_until": _iso_z(reset_until) if reset_until else None})
+
+
+@app.post("/v1/business/app-pin/unlock")
+def business_app_pin_unlock():
+    return _app_pin_support("unlock")
+
+
+@app.post("/v1/business/app-pin/reset")
+def business_app_pin_reset():
+    return _app_pin_support("reset")
 
 
 @app.get("/v1/business/acceptance-lapses")

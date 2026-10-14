@@ -210,15 +210,34 @@ class Rows(object):
         elif q.startswith("UPDATE app_pins SET failures = failures + 1"):
             pin = self.app_pins.get(params[0])
             self.rowcount = 0
-            if pin and pin["locked_at"] is None and pin["failures"] < params[1]:
+            if (pin and pin["locked_at"] is None and pin["failures"] < params[1]
+                    and (pin["hash"] is not None or "pin_hash IS NOT NULL" not in q)):
                 pin["failures"] += 1
                 self.rowcount = 1
         elif q.startswith("SELECT pin_hash, failures, locked_at FROM app_pins"):
             pin = self.app_pins.get(params[0])
             self.result = (pin["hash"], pin["failures"], pin["locked_at"]) if pin else None
-        elif q.startswith("SELECT locked_at FROM app_pins"):
+        elif q.startswith("SELECT pin_hash, locked_at, reset_until FROM app_pins"):
             pin = self.app_pins.get(params[0])
-            self.result = (pin["locked_at"],) if pin else None
+            self.result = (pin["hash"], pin["locked_at"], pin.get("reset_until")) if pin else None
+        elif q.startswith("SELECT pin_hash, locked_at FROM app_pins"):
+            pin = self.app_pins.get(params[0])
+            self.result = (pin["hash"], pin["locked_at"]) if pin else None
+        elif q.startswith("SELECT reset_until FROM app_pins"):
+            pin = self.app_pins.get(params[0])
+            self.result = (pin.get("reset_until"),) if pin else None
+        elif q.startswith("UPDATE app_pins SET failures = 0, locked_at = NULL, reset_until = %s"):
+            pin = self.app_pins.get(params[1])
+            self.rowcount = 0
+            if pin is not None:
+                pin.update(failures=0, locked_at=None, reset_until=params[0])
+                self.rowcount = 1
+        elif q.startswith("UPDATE app_pins SET failures = 0, locked_at = NULL"):
+            pin = self.app_pins.get(params[0])
+            self.rowcount = 0
+            if pin is not None and (pin["hash"] is not None or "pin_hash IS NOT NULL" not in q):
+                pin.update(failures=0, locked_at=None)
+                self.rowcount = 1
         elif q.startswith("UPDATE app_pins SET failures = 0"):
             self.app_pins[params[0]]["failures"] = 0
         elif q.startswith("UPDATE app_pins SET locked_at = NOW()"):
@@ -230,9 +249,17 @@ class Rows(object):
         elif q.startswith("UPDATE app_pins SET pin_hash"):
             pin = self.app_pins.get(params[2])
             self.rowcount = 0
-            if pin is not None:
+            if pin is not None and (len(params) == 3 or (
+                    pin.get("reset_until") is not None and pin["reset_until"] > params[3])):
                 pin.update(hash=params[0], failures=0, locked_at=None, by=params[1])
+                if "reset_until = NULL" in q:
+                    pin["reset_until"] = None
                 self.rowcount = 1
+        elif q.startswith("INSERT INTO app_pins (account_id, pin_hash, reset_until)"):
+            if params[0] in self.app_pins:
+                raise s.DIALECT._driver.errors.UniqueViolation("duplicate app pin")
+            self.app_pins[params[0]] = {"hash": None, "failures": 0, "locked_at": None,
+                                        "by": None, "reset_until": params[1]}
         elif q.startswith("INSERT INTO app_pins"):
             if params[0] in self.app_pins:
                 raise s.DIALECT._driver.errors.UniqueViolation("duplicate app pin")
