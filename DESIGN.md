@@ -6415,6 +6415,7 @@ PostgreSQL 16.15, schema 20, server `17f07dc` (md5 `627e96a8…`):
 .NET SDK (handoff §21).
 
 **State.** EC2 stopped; PostgreSQL 16.15 at schema 20 (`app_pins` granted `SELECT, INSERT, UPDATE` to
-`dtadmin`); server `17f07dc`; observe / observe; every setting at the owner's defaults —
+`dtadmin`); server `17f07dc` — the re-enrolment exemption (`24ca162`, gate only) goes up next session;
+observe / observe; every setting at the owner's defaults —
 `stepup_method` `screen_lock`, no step-up or PIN paths, route 1 off, cross-checks off; no errors in
 the journal since boot.
