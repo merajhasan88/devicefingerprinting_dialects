@@ -1314,13 +1314,18 @@ _CROSS_CHECK_RULES = (
      "%d sign-ins to accounts that do not exist came from this phone in the last %d hours."),
     ("device_stepup_failures", "device", "stepup_failed", 3, 30,
      "%d step-up proofs from this phone did not verify in the last %d hours."),
-    ("device_approvals_denied", "device", "approval_denied", 1, 30,
-     "%d approval requests from this phone were denied in the last %d hours."),
-    ("device_approval_budget_exhausted", "device", "approval_budget_exhausted", 1, 30,
-     "%d approval requests from this phone found the account's hourly budget spent in the "
-     "last %d hours."),
-    ("device_stepup_reenrolments", "device", "stepup_reenrolled", 2, 30,
-     "The step-up key on this phone was re-enrolled %d times in the last %d hours."),
+    # What an approval flow or a re-enrolment says concerns one account on the
+    # phone, never the others sharing it: these three count this account on
+    # this phone.
+    ("device_approvals_denied", "device_account", "approval_denied", 1, 30,
+     "%d approval requests from this phone for this account were denied in the last %d "
+     "hours."),
+    ("device_approval_budget_exhausted", "device_account", "approval_budget_exhausted", 1, 30,
+     "%d approval requests from this phone for this account found its hourly budget spent in "
+     "the last %d hours."),
+    ("device_stepup_reenrolments", "device_account", "stepup_reenrolled", 2, 30,
+     "This account's step-up key on this phone was re-enrolled %d times in the last %d "
+     "hours."),
 )
 CROSS_CHECK_WINDOW_HOURS = 24
 
@@ -3371,9 +3376,10 @@ def _observed_refusal(code, kind, device_id, installation_id, account_id=None):
 def _server_observation_counts(cursor, device_id, installation_id, account_id, now, window,
                                joined_at=None):
     """What this server observed in the `window` before `now`: on this phone,
-    for every account, and on this account, from every phone (DESIGN.md 77).
-    With `joined_at` -- this phone is new to the account -- also the wrong
-    passwords other phones sent in the window before it joined."""
+    for every account; on this account, from every phone; and for this account
+    on this phone (DESIGN.md 77). With `joined_at` -- this phone is new to the
+    account -- also the wrong passwords other phones sent in the window before
+    it joined."""
     since = now - window
     device = dict.fromkeys(_OBSERVATION_KINDS, 0)
     device["sign_in_failed_accounts"] = 0
@@ -3400,7 +3406,26 @@ def _server_observation_counts(cursor, device_id, installation_id, account_id, n
     )
     device["approval_denied"] = int(cursor.fetchone()[0])
     if account_id is None:
-        return {"device": device, "account": None, "newcomer": None}
+        return {"device": device, "account": None, "device_account": None, "newcomer": None}
+    # This account on this phone: a denial, an exhausted budget or a
+    # re-enrolment says nothing about another account sharing the phone.
+    device_account = dict.fromkeys(
+        ("approval_denied", "approval_budget_exhausted", "stepup_reenrolled"), 0
+    )
+    cursor.execute(
+        """
+        SELECT kind, COUNT(*) FROM server_observations
+        WHERE device_id = %s AND account_id = %s AND occurred_at >= %s
+          AND kind IN ('approval_budget_exhausted', 'stepup_reenrolled')
+        GROUP BY kind
+        UNION ALL
+        SELECT 'approval_denied', COUNT(*) FROM session_upgrade_requests
+        WHERE device_id = %s AND account_id = %s AND denied_at >= %s
+        """,
+        (device_id, account_id, since, device_id, account_id, since),
+    )
+    for kind, count in cursor.fetchall() or []:
+        device_account[str(kind)] = int(count)
     account = dict.fromkeys(
         (kind for kind in _OBSERVATION_KINDS if kind != "sign_in_unknown_account"), 0
     )
@@ -3447,7 +3472,8 @@ def _server_observation_counts(cursor, device_id, installation_id, account_id, n
             )
             before = int(cursor.fetchone()[0])
         newcomer = {"joined_at": _iso_z(joined_at), "sign_in_failed_elsewhere_before": before}
-    return {"device": device, "account": account, "newcomer": newcomer}
+    return {"device": device, "account": account, "device_account": device_account,
+            "newcomer": newcomer}
 
 
 def _evaluate_risk_policy(

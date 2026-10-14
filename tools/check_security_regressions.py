@@ -3345,6 +3345,7 @@ CREATE TABLE device_account_links (
 CREATE TABLE session_upgrade_requests (
     request_id TEXT PRIMARY KEY,
     device_id  TEXT NOT NULL,
+    account_id TEXT NOT NULL,
     denied_at  TSZ
 );
 CREATE TABLE server_observations (
@@ -3398,10 +3399,11 @@ class ObservationStore(object):
                 (str(uuid.uuid4()), kind, account_id, phone[0], phone[1],
                  self.now - timedelta(hours=age_hours)))
 
-    def denied(self, phone, times=1):
+    def denied(self, phone, account_id, times=1):
         for _ in range(times):
-            self.connection.execute("INSERT INTO session_upgrade_requests VALUES (?, ?, ?)",
-                                    (str(uuid.uuid4()), phone[0], self.now - timedelta(hours=1)))
+            self.connection.execute("INSERT INTO session_upgrade_requests VALUES (?, ?, ?, ?)",
+                                    (str(uuid.uuid4()), phone[0], account_id,
+                                     self.now - timedelta(hours=1)))
 
     def decide(self, phone, account_id=None, pending=False, **settings):
         """The real _evaluate_risk_policy, not persisted, under these settings."""
@@ -3530,10 +3532,10 @@ def a_phones_own_observations_score_against_that_phone():
         store.observe("sign_in_failed", stuffer, victim)
     store.observe("sign_in_unknown_account", stuffer, times=5)
     store.observe("stepup_failed", stuffer, victims[0], times=3)
-    store.denied(stuffer)
+    store.denied(stuffer, victims[0])
     store.observe("approval_budget_exhausted", stuffer, victims[0])
     store.observe("stepup_reenrolled", stuffer, victims[0], times=2)
-    decision = store.decide(stuffer, cross_checks_enabled=1)
+    decision = store.decide(stuffer, victims[0], cross_checks_enabled=1)
     expect(_cross(decision) == {
         "device_sign_in_failures_many_accounts": (60, 3),
         "device_sign_in_unknown_accounts": (30, 5),
@@ -3557,9 +3559,10 @@ def a_denied_phone_is_held_limited_and_never_blocked_by_the_denial_alone():
     without the denial still blocks. With effect points the points are simply
     added, and can block."""
     store = ObservationStore()
+    acct = str(uuid.uuid4())
     quiet, busy, blocked = store.phone(), store.phone(), store.phone()
     for phone in (quiet, busy, blocked):
-        store.denied(phone)
+        store.denied(phone, acct)
     store.observe("sign_in_unknown_account", busy, times=5)
     store.observe("stepup_failed", busy, str(uuid.uuid4()), times=3)
     for victim in (str(uuid.uuid4()) for _ in range(3)):
@@ -3567,7 +3570,7 @@ def a_denied_phone_is_held_limited_and_never_blocked_by_the_denial_alone():
     store.observe("sign_in_unknown_account", blocked, times=5)
     for phone, action, score, held in ((quiet, "review", 30, True), (busy, "review", 90, True),
                                        (blocked, "block", 120, False)):
-        decision = store.decide(phone, cross_checks_enabled=1)
+        decision = store.decide(phone, acct, cross_checks_enabled=1)
         expect(decision["recommended_action"] == action and decision["score"] == score
                and decision["context"]["held_by_denial"] is held
                and _cross(decision).get("device_approvals_denied") == (30, 1),
@@ -3575,10 +3578,39 @@ def a_denied_phone_is_held_limited_and_never_blocked_by_the_denial_alone():
                % (action, score, held, decision["recommended_action"], decision["score"],
                   decision["reasons"]))
     for phone, action in ((quiet, "step_up"), (busy, "block")):
-        decision = store.decide(phone, cross_checks_enabled=1, device_approvals_denied_effect="points")
+        decision = store.decide(phone, acct, cross_checks_enabled=1,
+                                device_approvals_denied_effect="points")
         expect(decision["recommended_action"] == action
                and decision["context"]["held_by_denial"] is False,
                "points: expected %s, got %s" % (action, decision["recommended_action"]))
+
+
+@check
+def what_one_account_did_on_a_shared_phone_never_counts_against_another():
+    """DESIGN.md 77, found in review: two people share a phone (the owner's
+    own legitimate case). Person A's new sign-in is denied by A's other phone,
+    A exhausts A's approval budget and re-enrols A's step-up key twice; person
+    B, long established on the same phone, carries none of it -- no denial
+    hold, no points -- while A's decisions carry all three."""
+    store = ObservationStore()
+    alice, bob = str(uuid.uuid4()), str(uuid.uuid4())
+    shared = store.phone()
+    store.link(shared[0], bob, age_days=200)
+    store.link(shared[0], alice, age_days=0.1)
+    store.denied(shared, alice)
+    store.observe("approval_budget_exhausted", shared, alice)
+    store.observe("stepup_reenrolled", shared, alice, times=2)
+    mine = store.decide(shared, alice, cross_checks_enabled=1)
+    expect(_cross(mine) == {"device_approvals_denied": (30, 1),
+                            "device_approval_budget_exhausted": (30, 1),
+                            "device_stepup_reenrolments": (30, 2)},
+           "the account that was denied carries its own events: %s" % mine["reasons"])
+    theirs = store.decide(shared, bob, cross_checks_enabled=1)
+    expect(not _cross(theirs) and theirs["context"]["held_by_denial"] is False
+           and theirs["context"]["server_observations"]["device"]["approval_denied"] == 1,
+           "the other account on the phone must carry none of it, though the phone's own "
+           "measurements show it: %s %s" % (theirs["reasons"],
+                                            theirs["context"]["server_observations"]))
 
 
 @check
