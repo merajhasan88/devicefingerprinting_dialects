@@ -479,8 +479,11 @@ verified live. **Not run:** migrations 015–019 against SQL Server.
 
 ## 21. Added 2026-10-14 (later) — stolen tokens recorded; the step-up method and the app PIN (DESIGN.md §77, §78, schema 20)
 
-**Nothing changes for the SDK at the interim default** (`stepup_method` = `screen_lock`). What a
-deployment can now turn on, and what the SDK needs for it:
+**The owner's default is now the app PIN** (`stepup_method` = `app_pin`, `4fff85d`): approving another
+phone's request needs the approver's app PIN, so the SDK must offer setting a PIN (the account has
+none until it does: `app_pin_not_set`) and send it when approving. `screen_lock` and
+`screen_lock_and_app_pin` remain DBA choices. The exhausted-budget cross-check now counts budget
+periods and fires at 2 (`b90ad27`). What a deployment can turn on, and what the SDK needs for it:
 
 - **The app PIN.** `POST /v1/account/app-pin` `{"password", "pin"}` with a full session sets or replaces it
   (`invalid_app_pin` 400 for a wrong format; `invalid_credentials` 401). Send it as the `X-App-PIN`

@@ -6217,7 +6217,7 @@ points are proposals for the owner, seeded by 019, each `<code>_count` / `<code>
 | `device_sign_in_unknown_accounts` | 5 / +30 | this phone's sign-ins to accounts that do not exist |
 | `device_stepup_failures` | 3 / +30 | this phone's step-up proofs that did not verify |
 | `device_approvals_denied` | 1 / +30, **held at review** | this account's approval requests from this phone, denied by its other phone (owner decision below) |
-| `device_approval_budget_exhausted` | 1 / +30 | this account's requests from this phone refused by its spent budget |
+| `device_approval_budget_exhausted` | 2 / +30 | budget periods in which this phone found this account's hourly budget spent — once per period however often it asked (owner decision, `b90ad27`) |
 | `device_stepup_reenrolments` | 2 / +30 | this account's step-up keys re-enrolled on this phone |
 
 **False positives, the owner's standing test.**
@@ -6360,7 +6360,7 @@ fully compromised OS defeats either.
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `stepup_method` | `screen_lock` — **interim, the owner decides** | how a step-up is proven wherever one is required (the step-up paths, approving another phone, route 1, an elevated scan): `screen_lock`, `app_pin`, `screen_lock_and_app_pin` |
+| `stepup_method` | `app_pin` — **the owner's default** (`4fff85d`) | how a step-up is proven wherever one is required (the step-up paths, approving another phone, route 1, an elevated scan): `app_pin`, `screen_lock`, `screen_lock_and_app_pin` |
 | `app_pin_required_paths` | '' | paths that need the app PIN on top of anything else — the hybrid recommended to the owner: the screen lock everywhere, the PIN on payee changes and large transfers |
 | `app_pin_length` | 6 | 4–12 digits |
 | `app_pin_max_failures` | 5 | wrong PINs in a row before the PIN locks; at least 1 |
@@ -6414,8 +6414,24 @@ PostgreSQL 16.15, schema 20, server `17f07dc` (md5 `627e96a8…`):
 **Not done.** SQL Server for 015–020 (the owner's go). A handset round with the harness build. The
 .NET SDK (handoff §21).
 
+**Owner decisions, 2026-10-14 (later).** *"Default: server/App PIN"* — `stepup_method` defaults to `app_pin`
+(`4fff85d`). The consequence, told to the owner plainly: every account must set a PIN before it can
+approve another phone (`app_pin_not_set` until then); the customer's app has to offer that screen.
+*"Approval budget: go with your recommendation but as ever keep it DBA configurable"* — the
+exhausted-budget rule counts budget periods, not refusals (`b90ad27`): one record per period and phone,
+the period named by its oldest request (which ends it by leaving the hour), and the rule fires at 2
+(DBA count and points). The suite's approval, supersede and elevated checks follow the live method
+(`d134371`). Who resets a locked PIN: the user, in the app, with the password, from a full session —
+a support-staff unlock by a DBA `UPDATE` is the business's procedure to decide, not built.
+
+| Live, EC2 PostgreSQL 16.15, server `b90ad27`-era file (md5 `4e5f8917…`) | Result |
+|---|---|
+| both enforce, cross-checks on, a step-up path, route 1 on — **under the default `app_pin`** | **75 / 0 / 7** |
+| the same under `screen_lock`: route 2, supersede, elevated, re-enrolment, the key's proof binding, route 1 | 7 / 7 |
+| six approval requests in one budget period | 3 × 201, 3 × 429, **one** observation; the rule (count 2) did not fire |
+
 **State.** EC2 stopped; PostgreSQL 16.15 at schema 20 (`app_pins` granted `SELECT, INSERT, UPDATE` to
-`dtadmin`); server `17f07dc` — the re-enrolment exemption (`24ca162`, gate only) goes up next session;
-observe / observe; every setting at the owner's defaults —
-`stepup_method` `screen_lock`, no step-up or PIN paths, route 1 off, cross-checks off; no errors in
-the journal since boot.
+`dtadmin`; the 019 and 020 rows brought to the edited files by hand); server as committed in
+`b90ad27` (md5 `4e5f8917…`, the re-enrolment exemption included); observe / observe; every setting at
+the owner's defaults — `stepup_method` `app_pin`, no step-up or PIN paths, route 1 off, cross-checks
+off; no errors in the journal since boot.

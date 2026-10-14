@@ -175,7 +175,7 @@ defaults and changed by your DBA, never by the server. Notable keys:
 | `elevated_risk_refuses` | 0 | 1 makes an elevated decision refuse in enforce mode |
 | `stepup_required_paths` | empty | comma-separated request paths that require a step-up proof |
 | `stepup_factor` / `stepup_mode` / `stepup_window_seconds` | passcode / per_use / 0 | the step-up policy |
-| `stepup_method` / `app_pin_required_paths` | `screen_lock` (interim) / empty | how a step-up is proven — the screen-lock key, an app PIN the server checks, or both — and paths that need the PIN on top (section 12) |
+| `stepup_method` / `app_pin_required_paths` | `app_pin` / empty | how a step-up is proven — an app PIN the server checks (the default), the screen-lock key, or both — and paths that need the PIN on top (section 12) |
 | `app_pin_length` / `app_pin_max_failures` | 6 / 5 | the app PIN's digits, and wrong PINs in a row before it locks (section 12) |
 | `wx_far_above_baseline_percent` | 200 | W^X growth above a build's pin is advisory up to this percentage of it and +40 beyond (section 3); minimum 100 |
 | `developer_options_refuses` / `adb_enabled_refuses` | 0 / 0 | eligibility rules: 1 refuses a device whose latest scan reports the setting on (below) |
@@ -597,7 +597,7 @@ counts and points below are the defaults migration 019 seeds — proposals for y
 | `device_sign_in_unknown_accounts` | 5 / 30 | this phone's sign-ins to accounts that do not exist |
 | `device_stepup_failures` | 3 / 30 | this phone's step-up proofs that did not verify |
 | `device_approvals_denied` | 1 / 30 | this account's approval requests from this phone, denied by its other phone — and, with `device_approvals_denied_effect` = `limit` (default), the phone is held at review for this account (below) |
-| `device_approval_budget_exhausted` | 1 / 30 | this account's approval requests from this phone refused by its spent budget |
+| `device_approval_budget_exhausted` | 2 / 30 | budget periods in which this phone found this account's hourly approval budget spent — counted once per period, however often it asked, so one impatient hour is one |
 | `device_stepup_reenrolments` | 2 / 30 | this account's step-up keys re-enrolled on this phone |
 
 What they do not do, by design:
@@ -646,8 +646,8 @@ A step-up is the user proving they are present for one operation. Your DBA choos
 
 | `stepup_method` | the request must carry |
 |---|---|
-| `screen_lock` (interim default) | a proof signed by the phone's step-up key, which the phone's screen lock (passcode or biometric) unlocks |
-| `app_pin` | the account's app PIN, which the server checks |
+| `app_pin` (default) | the account's app PIN, which the server checks |
+| `screen_lock` | a proof signed by the phone's step-up key, which the phone's screen lock (passcode or biometric) unlocks |
 | `screen_lock_and_app_pin` | both |
 
 It applies wherever a step-up is required: the paths in `stepup_required_paths`, approving another
@@ -661,10 +661,20 @@ typed and type it back itself; a **biometric** screen lock (`stepup_factor` = `b
 factor it cannot observe. The server sees, counts and locks app PIN attempts; it sees nothing of the
 screen lock. The screen lock keeps nothing on your server; the app PIN keeps a verifier.
 
+**Every account needs a PIN before it can approve.** Under the default, approving another phone's
+request needs the approver's app PIN; an account without one is answered `app_pin_not_set`. Your app
+must offer the screen to set it — the reference harness has one — and should ask for it before the
+first approval, not at it.
+
 **Setting the PIN.** `POST /v1/account/app-pin` with `{"password": …, "pin": "123456"}` — a current full
 session (a limited one is refused) and the account password. `app_pin_length` digits. It replaces any
 earlier PIN and clears its count and lock; this is also how a user with a forgotten or locked PIN gets
-back in. The server never requires the PIN to set one, nor the screen-lock key to re-enrol one
+back in: **the user**, in your app, with their password, from a full session on any of their phones —
+no administrator is involved. A user whose only session is limited has no full session to do it from;
+their way back is a clean scan (the session upgrades by itself) or route 3 through your identity
+backend. Whether support staff may also unlock a PIN — a DBA `UPDATE app_pins SET failures = 0,
+locked_at = NULL` after verifying the customer — is your business procedure to decide; nothing in the
+server does it. The server never requires the PIN to set one, nor the screen-lock key to re-enrol one
 (`/v1/installations/stepup-key`), whatever the paths list: a locked PIN or a dead key could otherwise
 never be replaced.
 
