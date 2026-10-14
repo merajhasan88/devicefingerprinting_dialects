@@ -25,16 +25,22 @@ e-mail, telephone number or network address with them.
 
 A scan answers a challenge the server issued; the server chooses the probes (mandatory ones on every
 scan, plus a random draw of the optional ones) and the installation key signs the complete report. The
-phone never sends a score. The report:
+phone never sends a score. The signed report:
 
-| Field | Meaning |
-|---|---|
-| `collector_version` | the native collector's version |
-| `platform` | `android` or `ios` |
-| `challenge_nonce_echo` | the challenge's nonce, echoed |
-| `sdk_int` (Android) / `os_version` (iOS) | the OS version |
-| `test_fixture_applied` | the debug-only synthetic fixture, or empty; refused on a release build |
-| `probes` | one object per requested probe, below |
+| Field | Meaning | Stored |
+|---|---|---|
+| `challenge_id`, `challenge_nonce` | the challenge it answers; each answers once | `integrity_reports.challenge_id` |
+| `installation_id` | the installation whose key signed it | yes |
+| `platform` | `android` or `ios` | yes |
+| `collector_version` | the native collector's version (Android 3, iOS 2 today) | yes |
+| `collected_at` | the phone's clock, which must be within the allowed skew | checked, not stored |
+| `probe_results` | one object per requested probe, below | yes, as sent |
+| `version` | the report format, 1 | checked |
+
+The server adds `report_id`, `device_id`, the SHA-256 of the signed bytes (`report_sha256`), its
+reasons, score, verdict, evidence quality and `created_at`. The native collector also tells the app
+the OS version (`sdk_int` on Android, `os_version` on iOS) and the name of any debug fixture; the app
+checks the nonce echo and does not send these, so they are not stored.
 
 Every probe answers `status`: `ok`, `error` (with `error`, and on Android `error_type`) or
 `unsupported` (with `reason`). An `error` is a collection problem, never a clean result (§2,
