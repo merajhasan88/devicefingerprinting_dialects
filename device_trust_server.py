@@ -1174,7 +1174,7 @@ def _get_backend_identity():
 # against a schema it does not understand. /health/* still answers so operators
 # can see why.
 
-REQUIRED_SCHEMA_VERSION = 18
+REQUIRED_SCHEMA_VERSION = 19
 
 _schema_state = None
 _schema_lock = threading.Lock()
@@ -1281,6 +1281,35 @@ _RISK_SETTINGS_RETRY_SECONDS = 5
 _risk_settings_cache = {"at": 0.0, "values": None, "failed_at": None, "error": None}
 _risk_settings_lock = threading.Lock()
 
+# The server's own observations as rules (DESIGN.md 77): what the server saw
+# and recorded itself -- never what a phone reports -- counted over
+# cross_check_window_hours. Each rule's count and points are DBA settings,
+# <code>_count and <code>_points, seeded by migration 019 with the defaults
+# below (0 switches a rule off); none adds points unless cross_checks_enabled.
+# A phone's rules count what that phone did. The account's rule counts what
+# OTHER installations did on the account and judges only a phone new to it.
+#   (code, scope, measured key, default count, default points, message)
+_CROSS_CHECK_RULES = (
+    ("account_sign_in_failures_elsewhere", "account", "sign_in_failed_elsewhere", 5, 30,
+     "%d wrong-password sign-ins to this account came from other installations in the "
+     "last %d hours, and this phone is new to the account."),
+    ("device_sign_in_failures_many_accounts", "device", "sign_in_failed_accounts", 3, 60,
+     "Wrong-password sign-ins to %d different accounts came from this phone in the last "
+     "%d hours."),
+    ("device_sign_in_unknown_accounts", "device", "sign_in_unknown_account", 5, 30,
+     "%d sign-ins to accounts that do not exist came from this phone in the last %d hours."),
+    ("device_stepup_failures", "device", "stepup_failed", 3, 30,
+     "%d step-up proofs from this phone did not verify in the last %d hours."),
+    ("device_approvals_denied", "device", "approvals_denied", 1, 60,
+     "%d approval requests from this phone were denied in the last %d hours."),
+    ("device_approval_budget_exhausted", "device", "approval_budget_exhausted", 1, 30,
+     "%d approval requests from this phone found the account's hourly budget spent in the "
+     "last %d hours."),
+    ("device_stepup_reenrolments", "device", "stepup_reenrolled", 2, 30,
+     "The step-up key on this phone was re-enrolled %d times in the last %d hours."),
+)
+CROSS_CHECK_WINDOW_HOURS = 24
+
 # What each known setting must parse as. A value that does not is a DBA typo;
 # substituting the default would hide it, so the snapshot is refused instead.
 # Keys not listed here pass through unchecked.
@@ -1333,7 +1362,14 @@ _RISK_SETTING_KINDS = {
     "business_graph_depth": "int",
     "business_graph_max_nodes": "int",
     "legacy_acceptances": ("carry", "drop"),
+    "cross_checks_enabled": "bool",
+    "cross_check_window_hours": "int",
 }
+_RISK_SETTING_KINDS.update(
+    ("%s_%s" % (rule[0], part), "int")
+    for rule in _CROSS_CHECK_RULES
+    for part in ("count", "points")
+)
 # Lower bounds a value must also meet. Below 100 the "far above the baseline"
 # rule would fire for memory inside the build's own measured envelope.
 _RISK_SETTING_MINIMUMS = {
@@ -1343,6 +1379,7 @@ _RISK_SETTING_MINIMUMS = {
     "complete_evidence_max_age_seconds": 30,
     "business_graph_depth": 1,
     "business_graph_max_nodes": 1,
+    "cross_check_window_hours": 1,
 }
 _RISK_SETTING_BOOL_WORDS = ("0", "1", "true", "false", "yes", "no", "on", "off")
 # Rows whose absence would silently weaken a gate instead of restoring the
@@ -3241,6 +3278,126 @@ def _policy_action(score, hard_block=False):
     return "allow"
 
 
+# The server's own observations (DESIGN.md 77): only what this server decided
+# or changed itself, never a phone's account of anything. sign_in_failed: a
+# wrong password for an account; sign_in_unknown_account: a sign-in to a
+# handle no account has; stepup_failed: a step-up proof offered that did not
+# verify; approval_budget_exhausted: an approval request refused by the
+# account's hourly budget; stepup_reenrolled: a step-up key replaced. Denied
+# approvals are already rows of session_upgrade_requests and are counted there.
+_OBSERVATION_KINDS = (
+    "sign_in_failed",
+    "sign_in_unknown_account",
+    "stepup_failed",
+    "approval_budget_exhausted",
+    "stepup_reenrolled",
+)
+
+
+def _record_observation(kind, code, device_id, installation_id, account_id=None, cursor=None):
+    """Record one server observation.
+
+    With a cursor the row joins the caller's transaction, so a change and its
+    record commit together. Without one it is its own unit, for a refusal
+    whose transaction was rolled back: the caller has left that block, so no
+    lock it took is still held. A standalone record is evidence, not a gate:
+    if it cannot be written that is logged, and the request still ends with
+    its own answer -- a wrong password stays a 401, never a 500.
+    """
+    if kind not in _OBSERVATION_KINDS:
+        raise ValueError("unknown observation kind %r" % kind)
+    statement = (
+        "INSERT INTO server_observations "
+        "(observation_id, kind, code, account_id, device_id, installation_id) "
+        "VALUES (%s, %s, %s, %s, %s, %s)"
+    )
+    values = (
+        str(uuid.uuid4()),
+        kind,
+        code,
+        str(account_id) if account_id is not None else None,
+        str(device_id) if device_id is not None else None,
+        str(installation_id) if installation_id is not None else None,
+    )
+    if cursor is not None:
+        cursor.execute(statement, values)
+        return
+    try:
+        with _cursor(commit=True) as own:
+            own.execute(statement, values)
+    except Exception:
+        logger.exception(
+            "A server observation could not be recorded: kind=%s code=%s account=%s "
+            "device=%s installation=%s",
+            kind,
+            code,
+            account_id,
+            device_id,
+            installation_id,
+        )
+
+
+def _server_observation_counts(cursor, device_id, installation_id, account_id, since):
+    """What this server observed since `since`: on this phone, for every
+    account, and on this account, from every phone (DESIGN.md 77)."""
+    device = dict.fromkeys(_OBSERVATION_KINDS, 0)
+    device["sign_in_failed_accounts"] = 0
+    cursor.execute(
+        """
+        SELECT kind, COUNT(*), COUNT(DISTINCT account_id)
+        FROM server_observations
+        WHERE device_id = %s AND occurred_at >= %s
+        GROUP BY kind
+        """,
+        (device_id, since),
+    )
+    for kind, count, accounts in cursor.fetchall() or []:
+        if kind in _OBSERVATION_KINDS:
+            device[str(kind)] = int(count)
+        if kind == "sign_in_failed":
+            device["sign_in_failed_accounts"] = int(accounts)
+    cursor.execute(
+        """
+        SELECT COUNT(*) FROM session_upgrade_requests
+        WHERE device_id = %s AND denied_at >= %s
+        """,
+        (device_id, since),
+    )
+    device["approvals_denied"] = int(cursor.fetchone()[0])
+    if account_id is None:
+        return {"device": device, "account": None}
+    account = dict.fromkeys(
+        (kind for kind in _OBSERVATION_KINDS if kind != "sign_in_unknown_account"), 0
+    )
+    account["sign_in_failed_installations"] = 0
+    cursor.execute(
+        """
+        SELECT kind, COUNT(*), COUNT(DISTINCT installation_id)
+        FROM server_observations
+        WHERE account_id = %s AND occurred_at >= %s
+        GROUP BY kind
+        """,
+        (account_id, since),
+    )
+    for kind, count, installations in cursor.fetchall() or []:
+        if kind in account:
+            account[str(kind)] = int(count)
+        if kind == "sign_in_failed":
+            account["sign_in_failed_installations"] = int(installations)
+    # A user mistyping on their own phone is not evidence against anyone: the
+    # account's rule counts only the failures of other installations.
+    cursor.execute(
+        """
+        SELECT COUNT(*) FROM server_observations
+        WHERE account_id = %s AND occurred_at >= %s
+          AND kind = 'sign_in_failed' AND installation_id <> %s
+        """,
+        (account_id, since, installation_id),
+    )
+    account["sign_in_failed_elsewhere"] = int(cursor.fetchone()[0])
+    return {"device": device, "account": account}
+
+
 def _evaluate_risk_policy(
     event_type,
     device_id,
@@ -3334,17 +3491,20 @@ def _evaluate_risk_policy(
         recent_reinstall_count = int(cursor.fetchone()[0])
 
         link_exists = False
+        link_first_seen = None
         account_device_count = 0
         if account_id is not None:
             cursor.execute(
                 """
-                SELECT 1
+                SELECT first_seen_at
                 FROM device_account_links
                 WHERE device_id = %s AND account_id = %s
                 """,
                 (device_id, account_id),
             )
-            link_exists = cursor.fetchone() is not None
+            link_row = cursor.fetchone()
+            link_exists = link_row is not None
+            link_first_seen = link_row[0] if link_exists else None
 
             cursor.execute(
                 """
@@ -3355,6 +3515,12 @@ def _evaluate_risk_policy(
                 (account_id,),
             )
             account_device_count = int(cursor.fetchone()[0])
+
+        window_hours = _risk_setting_int("cross_check_window_hours", CROSS_CHECK_WINDOW_HOURS)
+        observed_since = _utc_now() - timedelta(hours=window_hours)
+        observations = _server_observation_counts(
+            cursor, device_id, installation_id, account_id, observed_since
+        )
 
     add_link = bool(account_id is not None and account_link_pending and not link_exists)
     projected_device_account_count = device_account_count + (1 if add_link else 0)
@@ -3606,6 +3772,8 @@ def _evaluate_risk_policy(
         "device_integrity_memory_hours": _risk_setting_int(
             "integrity_device_memory_hours", INTEGRITY_DEVICE_MEMORY_HOURS
         ),
+        # Measured into every decision, scored or not (DESIGN.md 77).
+        "server_observations": dict(observations, window_hours=window_hours),
     }
     if BUSINESS_API_TOKEN_SHA256:
         # Measurements only (DESIGN.md 76): the business decides what they mean.
