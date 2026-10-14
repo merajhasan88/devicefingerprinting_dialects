@@ -3337,6 +3337,19 @@ def _record_observation(kind, code, device_id, installation_id, account_id=None,
         )
 
 
+@contextmanager
+def _observed_refusal(code, kind, device_id, installation_id, account_id=None):
+    """Record observation `kind` when the block refuses with `code`. Entered
+    before the block's cursor, it records after that cursor has rolled back
+    and released its locks:  with _observed_refusal(...), _cursor(...) as c:"""
+    try:
+        yield
+    except ApiProblem as problem:
+        if problem.code == code:
+            _record_observation(kind, code, device_id, installation_id, account_id)
+        raise
+
+
 def _server_observation_counts(cursor, device_id, installation_id, account_id, since):
     """What this server observed since `since`: on this phone, for every
     account, and on this account, from every phone (DESIGN.md 77)."""
@@ -4017,7 +4030,37 @@ def _enforce_step_up(installation_id, account_id):
     return g.step_up
 
 
+# Step-up refusals that are not a failed proof (DESIGN.md 77): a request sent
+# without one is the ordinary first leg (the app then asks for the screen
+# lock), and a key that is missing, another account's or the installation key
+# is this installation's state, not an attempt.
+_STEPUP_NOT_ATTEMPTS = frozenset((
+    "stepup_required",
+    "stepup_key_not_registered",
+    "stepup_key_other_account",
+    "stepup_key_not_independent",
+))
+
+
 def _verify_step_up(installation_id, account_id):
+    """_check_step_up, with every proof that did not verify recorded as the
+    server's own observation against this phone -- whichever caller asked:
+    a sensitive path, the same-device upgrade route, or an approver."""
+    try:
+        return _check_step_up(installation_id, account_id)
+    except ApiProblem as problem:
+        if problem.code not in _STEPUP_NOT_ATTEMPTS:
+            _record_observation(
+                "stepup_failed",
+                problem.code,
+                get_jwt().get("did"),
+                installation_id,
+                account_id=account_id,
+            )
+        raise
+
+
+def _check_step_up(installation_id, account_id):
     """Verify the step-up proof on a sensitive path; return the key's auth.
 
     Proof v2 (DESIGN.md 63) is a step-up-key signature over the complete
@@ -6350,13 +6393,23 @@ def account_login():
             (lookup,),
         )
         row = cursor.fetchone()
-        if row is None or not bcrypt.checkpw(password, _bcrypt_db_bytes(row[1])):
-            raise ApiProblem(
-                "The account credentials are invalid.",
-                401,
-                "invalid_credentials",
-            )
-        account_id = str(row[0])
+    if row is None or not bcrypt.checkpw(password, _bcrypt_db_bytes(row[1])):
+        # The server's own observation (DESIGN.md 77), against the account
+        # when there is one and the phone whose key asked. The answer is the
+        # same either way, so the record reveals nothing to the caller.
+        _record_observation(
+            "sign_in_failed" if row is not None else "sign_in_unknown_account",
+            "invalid_credentials",
+            device_id,
+            installation_id,
+            account_id=row[0] if row is not None else None,
+        )
+        raise ApiProblem(
+            "The account credentials are invalid.",
+            401,
+            "invalid_credentials",
+        )
+    account_id = str(row[0])
     policy = _evaluate_risk_policy(
         "account_login",
         device_id,
@@ -6493,6 +6546,15 @@ def reenrol_stepup_key():
             installation_id,
             code,
         )
+        # A wrong password here is a failed sign-in like any other; a new key
+        # whose proof does not verify is a failed step-up (DESIGN.md 77).
+        if code == "invalid_credentials":
+            kind, recorded = "sign_in_failed", "stepup_reenrol_invalid_credentials"
+        else:
+            kind, recorded = "stepup_failed", code
+        _record_observation(
+            kind, recorded, claims.get("did"), installation_id, account_id=account_id
+        )
         return ApiProblem(message, status, code)
 
     proof_bytes = _b64url_decode(body.get("stepup_key_proof"), "stepup_key_proof", 4096)
@@ -6558,6 +6620,15 @@ def reenrol_stepup_key():
                 account_id,
                 installation_id,
             ),
+        )
+        # In the same transaction: a replaced key always leaves its record.
+        _record_observation(
+            "stepup_reenrolled",
+            "stepup_reenrolled",
+            claims.get("did"),
+            installation_id,
+            account_id=account_id,
+            cursor=cursor,
         )
     downgrade = _stepup_policy_downgrade(stepup_auth)
     logger.info(
@@ -7425,7 +7496,11 @@ def upgrade_request():
                 "limited_causes": causes,
                 "reasons": [{k: r[k] for k in ("code", "points", "message", "source")}
                             for r in reasons]}
-    with _cursor(commit=True) as cursor:
+    exhausted = _observed_refusal(
+        "upgrade_budget_exhausted", "approval_budget_exhausted",
+        device_id, installation_id, account_id,
+    )
+    with exhausted, _cursor(commit=True) as cursor:
         # Count and insert under the account row's lock, so parallel requests
         # cannot all pass the budget count before any is inserted (review R2).
         cursor.execute(

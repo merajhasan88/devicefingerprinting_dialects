@@ -92,6 +92,7 @@ class Rows(object):
         self.acceptances = {}
         self.lapses = set()
         self.request_scope = None
+        self.observations = []
 
     def execute(self, sql, params=None):
         q = " ".join(sql.split())
@@ -187,6 +188,9 @@ class Rows(object):
             self.nonces.add(params[0])
         elif q.startswith("INSERT INTO integrity_reports"):
             self.writes.append((q, params))
+        elif q.startswith("INSERT INTO server_observations"):
+            self.writes.append((q, params))
+            self.observations.append(params)
         elif q.startswith(("DELETE FROM access_proof_nonces", "UPDATE app_installations",
                            "UPDATE recognized_devices", "UPDATE integrity_challenges",
                            "UPDATE refresh_sessions")):
