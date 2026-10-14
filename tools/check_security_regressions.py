@@ -93,6 +93,8 @@ class Rows(object):
         self.lapses = set()
         self.request_scope = None
         self.observations = []
+        self.fail_observations = False
+        self.approval_requests_last_hour = 0
 
     def execute(self, sql, params=None):
         q = " ".join(sql.split())
@@ -189,8 +191,14 @@ class Rows(object):
         elif q.startswith("INSERT INTO integrity_reports"):
             self.writes.append((q, params))
         elif q.startswith("INSERT INTO server_observations"):
+            if self.fail_observations:
+                raise RuntimeError("simulated observation write failure")
             self.writes.append((q, params))
             self.observations.append(params)
+        elif q.startswith("SELECT COUNT(*) FROM session_upgrade_requests WHERE account_id"):
+            self.result = (self.approval_requests_last_hour,)
+        elif q.startswith("INSERT INTO session_upgrade_requests"):
+            self.writes.append((q, params))
         elif q.startswith(("DELETE FROM access_proof_nonces", "UPDATE app_installations",
                            "UPDATE recognized_devices", "UPDATE integrity_challenges",
                            "UPDATE refresh_sessions")):
@@ -3114,6 +3122,447 @@ def acceptance_lapses_are_read_in_order():
                                      query={"since": s._iso_z(tie)})
         expect([l["reason_code"] for l in page["lapses"]] == ["new_device"],
                "since= is exclusive: %s" % page)
+
+
+# ---------------------------------------------------------------------------
+# The server's own observations (DESIGN.md 77)
+# ---------------------------------------------------------------------------
+
+
+class _DepthCursor(object):
+    """Notes how many units of work were open at each observation insert."""
+
+    def __init__(self, inner, depth, seen):
+        self.inner, self.depth, self.seen = inner, depth, seen
+
+    def execute(self, sql, params=None):
+        if " ".join(sql.split()).startswith("INSERT INTO server_observations"):
+            self.seen.append((self.depth[0], tuple(params)))
+        return self.inner.execute(sql, params)
+
+    def __getattr__(self, name):
+        return getattr(self.inner, name)
+
+
+@contextmanager
+def unit_depths():
+    """Each server_observations insert as (open units, params). Depth 1 is a
+    unit of its own: the refused one had already closed (and rolled back)."""
+    depth, seen, real = [0], [], s._cursor
+
+    @contextmanager
+    def tracked(commit=False):
+        depth[0] += 1
+        try:
+            with real(commit=commit) as inner:
+                yield _DepthCursor(inner, depth, seen)
+        finally:
+            depth[0] -= 1
+
+    s._cursor = tracked
+    try:
+        yield seen
+    finally:
+        s._cursor = real
+
+
+def _observed(seen):
+    """(kind, code, account, device, installation) of each insert."""
+    return [params[1:] for _, params in seen]
+
+
+@check
+def failed_sign_ins_are_recorded_against_the_account_and_the_phone():
+    """DESIGN.md 77. A wrong password is the server's own observation, written
+    against the account and the phone whose key asked, in a unit of its own; a
+    handle no account has is recorded without an account; the answer is the
+    same 401 either way. A right password records nothing, and a record that
+    cannot be written leaves the 401 a 401."""
+    import bcrypt as _bcrypt
+    path = "/v1/accounts/login"
+    hashed = _bcrypt.hashpw(b"Passw0rd123", _bcrypt.gensalt(4))
+
+    def login(password, handle="someone"):
+        raw = encode({"handle": handle, "password": password})
+        return client.post(path, data=raw, headers=access_headers("POST", path, raw, device_token))
+
+    try:
+        with elevated_integrity(), policy(), unit_depths() as seen:
+            s._latest_integrity_state = _verdict_state("trusted")
+            s._evaluate_risk_policy = lambda *a, **k: {
+                "effective_action": "allow", "recommended_action": "allow",
+                "context": {"device_account_count": 0, "account_device_count": 1}}
+            db.link_counts = (0, 1)
+            db.account_row = (account, hashed)
+            reply = login("not-the-password")
+            expect(reply.status_code == 401 and error_code(reply) == "invalid_credentials",
+                   "a wrong password must stay 401, got %s %s" % (reply.status_code, error_code(reply)))
+            db.account_row = None
+            reply = login("anything-at-all", handle="nobody-has-this")
+            expect(reply.status_code == 401 and error_code(reply) == "invalid_credentials",
+                   "an unknown handle must answer the same 401, got %s" % reply.status_code)
+            expect(_observed(seen) == [
+                ("sign_in_failed", "invalid_credentials", account, inst.device_id, inst.installation_id),
+                ("sign_in_unknown_account", "invalid_credentials", None, inst.device_id,
+                 inst.installation_id)],
+                "each failure is recorded against the account and the phone: %s" % _observed(seen))
+            expect([depth for depth, _ in seen] == [1, 1],
+                   "each record is a unit of its own, outside the refused one: %s" % seen)
+            db.account_row = (account, hashed)
+            reply = login("Passw0rd123")
+            expect(reply.status_code == 200 and len(seen) == 2,
+                   "a right password must record nothing, got %s, %d records"
+                   % (reply.status_code, len(seen)))
+            db.fail_observations = True
+            reply = login("still-wrong")
+            expect(reply.status_code == 401 and error_code(reply) == "invalid_credentials",
+                   "an unwritable record must leave the 401 alone, got %s %s"
+                   % (reply.status_code, error_code(reply)))
+    finally:
+        db.account_row, db.link_counts, db.fail_observations = None, (0, 0), False
+
+
+@check
+def failed_step_up_proofs_are_recorded_and_a_missing_one_is_not():
+    """DESIGN.md 77. A step-up proof that does not verify -- bound to another
+    body, or signed by a key that is not the step-up key -- is recorded against
+    the phone with its refusal code. No proof at all (the ordinary first leg,
+    after which the app asks for the screen lock) and a valid proof record
+    nothing."""
+    with isolated_stepup(), unit_depths() as seen:
+        reply = sensitive(INTENDED, access_headers("POST", SENSITIVE, INTENDED))
+        expect(reply.status_code == 403 and error_code(reply) == "stepup_required",
+               "no proof: expected stepup_required, got %s %s" % (reply.status_code, error_code(reply)))
+        for body_signed, signer, code in ((CHANGED, None, "stepup_binding_mismatch"),
+                                          (INTENDED, inst, "stepup_signature_invalid")):
+            nonce = fresh_nonce()
+            head = access_headers("POST", SENSITIVE, INTENDED, nonce=nonce)
+            head.update(stepup_headers("POST", SENSITIVE, body_signed, nonce, signer=signer))
+            reply = sensitive(INTENDED, head)
+            expect(reply.status_code == 403 and error_code(reply) == code,
+                   "expected %s, got %s %s" % (code, reply.status_code, error_code(reply)))
+        nonce = fresh_nonce()
+        head = access_headers("POST", SENSITIVE, INTENDED, nonce=nonce)
+        head.update(stepup_headers("POST", SENSITIVE, INTENDED, nonce))
+        expect(sensitive(INTENDED, head).status_code == 200, "a valid proof must pass")
+    expect(_observed(seen) == [
+        ("stepup_failed", "stepup_binding_mismatch", account, inst.device_id, inst.installation_id),
+        ("stepup_failed", "stepup_signature_invalid", account, inst.device_id, inst.installation_id)],
+        "exactly the two failed proofs are recorded: %s" % _observed(seen))
+
+
+@check
+def an_exhausted_approval_budget_is_recorded_after_its_refusal():
+    """DESIGN.md 77. An approval request refused because the account's hourly
+    budget is spent answers 429 as before, and the refusal is recorded against
+    the asking phone in a unit of its own -- after the refused transaction,
+    which held the account row's lock, has closed."""
+    path = "/v1/auth/upgrade/request"
+    raw = encode({"route": "approval"})
+    try:
+        with elevated_integrity(), policy(upgrade_other_device_approval=1), unit_depths() as seen:
+            s._latest_integrity_state = _verdict_state("elevated")
+            bearer = _limited_session("integrity_elevated")
+            db.other_full_session = ("approver-session",)
+            for spent, status in ((3, 429), (2, 201)):
+                db.approval_requests_last_hour = spent
+                reply = client.post(path, data=raw, headers=access_headers("POST", path, raw,
+                                                                           bearer=bearer))
+                expect(reply.status_code == status,
+                       "with %d requests this hour expected %s, got %s %s"
+                       % (spent, status, reply.status_code, reply.get_json()))
+            expect(_observed(seen) == [("approval_budget_exhausted", "upgrade_budget_exhausted",
+                                        account, inst.device_id, inst.installation_id)]
+                   and seen[0][0] == 1,
+                   "only the refusal is recorded, in its own unit: %s" % seen)
+    finally:
+        db.refresh_row, db.other_full_session, db.approval_requests_last_hour = None, None, 0
+
+
+OBSERVATION_LITE_SCHEMA = """
+CREATE TABLE recognized_devices (
+    device_id  TEXT PRIMARY KEY,
+    platform   TEXT NOT NULL,
+    status     TEXT NOT NULL,
+    created_at TSZ NOT NULL
+);
+CREATE TABLE app_installations (
+    installation_id         TEXT PRIMARY KEY,
+    device_id               TEXT NOT NULL,
+    status                  TEXT NOT NULL,
+    registration_method     TEXT NOT NULL,
+    registration_confidence TEXT,
+    created_at              TSZ NOT NULL,
+    verified_at             TSZ,
+    device_confirmed_at     TSZ
+);
+CREATE TABLE device_account_links (
+    device_id     TEXT NOT NULL,
+    account_id    TEXT NOT NULL,
+    first_seen_at TSZ NOT NULL,
+    PRIMARY KEY (device_id, account_id)
+);
+CREATE TABLE session_upgrade_requests (
+    request_id TEXT PRIMARY KEY,
+    device_id  TEXT NOT NULL,
+    denied_at  TSZ
+);
+CREATE TABLE server_observations (
+    observation_id  TEXT PRIMARY KEY,
+    kind            TEXT NOT NULL,
+    code            TEXT,
+    account_id      TEXT,
+    device_id       TEXT,
+    installation_id TEXT,
+    occurred_at     TSZ NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f+00:00', 'now'))
+);
+"""
+
+
+class ObservationStore(object):
+    """The server's own SQL for decisions on SQLite: phones, links, and what
+    the server observed. Each phone's latest scan is a clean, fresh report --
+    the faked clean report the cross-checks exist to see past."""
+
+    def __init__(self):
+        self.connection = sqlite3.connect(":memory:", detect_types=sqlite3.PARSE_DECLTYPES)
+        self.connection.executescript(OBSERVATION_LITE_SCHEMA)
+        self.now = s._utc_now()
+
+    def phone(self, age_days=30):
+        device, installation = str(uuid.uuid4()), str(uuid.uuid4())
+        created = self.now - timedelta(days=age_days)
+        self.connection.execute("INSERT INTO recognized_devices VALUES (?, 'android', 'active', ?)",
+                                (device, created))
+        self.connection.execute(
+            "INSERT INTO app_installations VALUES (?, ?, 'active', 'new_device', 'new', ?, ?, NULL)",
+            (installation, device, created, created))
+        return device, installation
+
+    def link(self, device, account_id, age_days):
+        self.connection.execute("INSERT INTO device_account_links VALUES (?, ?, ?)",
+                                (device, account_id, self.now - timedelta(days=age_days)))
+
+    def observe(self, kind, phone, account_id=None, times=1, age_hours=0.0):
+        for _ in range(times):
+            self.connection.execute(
+                "INSERT INTO server_observations VALUES (?, ?, 'test', ?, ?, ?, ?)",
+                (str(uuid.uuid4()), kind, account_id, phone[0], phone[1],
+                 self.now - timedelta(hours=age_hours)))
+
+    def denied(self, phone, times=1):
+        for _ in range(times):
+            self.connection.execute("INSERT INTO session_upgrade_requests VALUES (?, ?, ?)",
+                                    (str(uuid.uuid4()), phone[0], self.now - timedelta(hours=1)))
+
+    def decide(self, phone, account_id=None, pending=False, **settings):
+        """The real _evaluate_risk_policy, not persisted, under these settings."""
+        values = dict(db.settings, **{key: str(value) for key, value in settings.items()})
+        saved = (s._cursor, s._latest_integrity_state, s._device_integrity_memory)
+        connection = self.connection
+
+        @contextmanager
+        def lite_cursor(commit=False):
+            yield LiteCursor(connection)
+            connection.commit()
+
+        s._risk_settings_cache.update(values=values, at=time.monotonic(), failed_at=None, error=None)
+        s._cursor = lite_cursor
+        s._latest_integrity_state = lambda iid: {"score": 0, "verdict": "trusted", "fresh": True}
+        s._device_integrity_memory = lambda did, iid: None
+        try:
+            return s._evaluate_risk_policy("account_login", phone[0], phone[1], account_id=account_id,
+                                           account_link_pending=pending, persist=False)
+        finally:
+            s._cursor, s._latest_integrity_state, s._device_integrity_memory = saved
+            s._risk_settings_cache.update(values=dict(db.settings), at=time.monotonic(),
+                                          failed_at=None, error=None)
+
+
+def _cross(decision):
+    return {r["code"]: (r["points"], r.get("count")) for r in decision["reasons"]
+            if r["code"] in {rule[0] for rule in s._CROSS_CHECK_RULES}}
+
+
+@check
+def what_the_server_saw_is_measured_always_and_scored_only_when_enabled():
+    """DESIGN.md 77. Reproduced first: before 019 a phone with a faked clean
+    report signed in to an account right after other phones had failed its
+    password five times, and the decision held no trace of them. Now every
+    decision carries the counts; with cross_checks_enabled off (the owner's
+    default) nothing scores, and on, the DBA's counts and points apply."""
+    store = ObservationStore()
+    acct = str(uuid.uuid4())
+    newcomer = store.phone(age_days=0)
+    for _ in range(5):
+        store.observe("sign_in_failed", store.phone(), acct)
+    observe_only = store.decide(newcomer, acct, pending=True)
+    measured = observe_only["context"]["server_observations"]
+    expect(measured["account"]["sign_in_failed"] == 5
+           and measured["account"]["sign_in_failed_elsewhere"] == 5
+           and measured["account"]["sign_in_failed_installations"] == 5
+           and measured["newcomer"] is True and measured["scored"] is False
+           and measured["window_hours"] == 24,
+           "the decision must carry what the server saw: %s" % measured)
+    expect(not _cross(observe_only) and observe_only["score"] == 10,
+           "observe first: nothing may score while cross_checks_enabled is off, got %s %s"
+           % (observe_only["score"], observe_only["reasons"]))
+    scored = store.decide(newcomer, acct, pending=True, cross_checks_enabled=1)
+    expect(_cross(scored) == {"account_sign_in_failures_elsewhere": (30, 5)}
+           and scored["score"] == 40,
+           "enabled, five failures from elsewhere add the owner's default +30: %s"
+           % scored["reasons"])
+    tuned = store.decide(newcomer, acct, pending=True, cross_checks_enabled=1,
+                         account_sign_in_failures_elsewhere_count=6)
+    expect(not _cross(tuned), "a count the DBA raised past five must not fire: %s" % tuned["reasons"])
+    tuned = store.decide(newcomer, acct, pending=True, cross_checks_enabled=1,
+                         account_sign_in_failures_elsewhere_points=60)
+    expect(_cross(tuned) == {"account_sign_in_failures_elsewhere": (60, 5)}
+           and tuned["recommended_action"] == "review",
+           "the DBA's points apply: %s" % tuned["reasons"])
+    off = store.decide(newcomer, acct, pending=True, cross_checks_enabled=1,
+                       account_sign_in_failures_elsewhere_count=0)
+    expect(not _cross(off), "a count of 0 switches the rule off: %s" % off["reasons"])
+    store.observe("sign_in_failed", store.phone(), acct, times=3, age_hours=30)
+    later = store.decide(newcomer, acct, pending=True, cross_checks_enabled=1)
+    expect(later["context"]["server_observations"]["account"]["sign_in_failed"] == 5,
+           "failures older than the window must not count: %s"
+           % later["context"]["server_observations"])
+
+
+@check
+def an_accounts_failures_judge_a_newcomer_never_a_phone_it_already_used():
+    """DESIGN.md 77, the false-positive rule first. A user mistyping on their
+    own phone is not counted against anyone: the account's rule counts other
+    installations only. And failures someone causes on an account never
+    restrict a phone the account used before them -- only a phone being linked
+    now, or linked within the window."""
+    store = ObservationStore()
+    acct = str(uuid.uuid4())
+    owner, recent, newcomer = store.phone(), store.phone(), store.phone(age_days=0)
+    store.link(owner[0], acct, age_days=200)
+    store.link(recent[0], acct, age_days=0.5)
+    store.observe("sign_in_failed", newcomer, acct, times=9)
+    mine = store.decide(newcomer, acct, pending=True, cross_checks_enabled=1)
+    expect(mine["context"]["server_observations"]["account"]["sign_in_failed_elsewhere"] == 0
+           and not _cross(mine),
+           "nine mistypes on the phone now signing in must not count: %s" % mine["reasons"])
+    for _ in range(5):
+        store.observe("sign_in_failed", store.phone(), acct)
+    incumbent = store.decide(owner, acct, cross_checks_enabled=1)
+    expect(incumbent["context"]["server_observations"]["newcomer"] is False and not _cross(incumbent),
+           "a phone the account used before must not be judged: %s" % incumbent["reasons"])
+    for phone in (recent, newcomer):
+        decision = store.decide(phone, acct, pending=phone is newcomer, cross_checks_enabled=1)
+        expect("account_sign_in_failures_elsewhere" in _cross(decision),
+               "a phone new to the account is judged: %s" % decision["reasons"])
+
+
+@check
+def a_phones_own_observations_score_against_that_phone():
+    """DESIGN.md 77. Wrong passwords to three accounts, sign-ins to accounts
+    that do not exist, step-up proofs that did not verify, denied approval
+    requests, an exhausted approval budget and re-enrolled step-up keys each
+    count against the phone that caused them -- and only that phone."""
+    store = ObservationStore()
+    victims = [str(uuid.uuid4()) for _ in range(3)]
+    stuffer, clean_phone = store.phone(), store.phone()
+    for victim in victims:
+        store.observe("sign_in_failed", stuffer, victim)
+    store.observe("sign_in_unknown_account", stuffer, times=5)
+    store.observe("stepup_failed", stuffer, victims[0], times=3)
+    store.denied(stuffer)
+    store.observe("approval_budget_exhausted", stuffer, victims[0])
+    store.observe("stepup_reenrolled", stuffer, victims[0], times=2)
+    decision = store.decide(stuffer, cross_checks_enabled=1)
+    expect(_cross(decision) == {
+        "device_sign_in_failures_many_accounts": (60, 3),
+        "device_sign_in_unknown_accounts": (30, 5),
+        "device_stepup_failures": (30, 3),
+        "device_approvals_denied": (60, 1),
+        "device_approval_budget_exhausted": (30, 1),
+        "device_stepup_reenrolments": (30, 2)},
+        "each of the phone's own rules at the owner's defaults: %s" % decision["reasons"])
+    expect(decision["recommended_action"] == "block",
+           "together they are well past the block band: %s" % decision["score"])
+    expect(not _cross(store.decide(clean_phone, cross_checks_enabled=1)),
+           "another phone is untouched")
+
+
+@check
+def a_counter_outage_is_degraded_evidence_never_a_rate_of_zero():
+    """DESIGN.md 77; review of 2026-10-13. With the request-rate rule on and its
+    counter unreadable -- Redis unreachable, or none configured -- the decision
+    says so (state unavailable, request_rate_unavailable listed at 0 points),
+    never reads it as a rate of zero, and never restricts anyone for an outage.
+    A rate limiter that could not run is noted on the request's decision."""
+    store = ObservationStore()
+    phone = store.phone()
+    saved = (s.REDIS_URL, s._redis, s.RATE_LIMIT_ENABLED)
+
+    def broken():
+        raise ConnectionError("simulated Redis outage")
+
+    try:
+        fake = FakeRedis()
+        s.REDIS_URL, s._redis = "redis://gate.invalid:6379/0", lambda: fake
+        healthy = store.decide(phone, rate_anomaly_enabled=1)
+        expect(healthy["context"]["request_rate"] == {"state": "measured", "count": 1,
+                                                       "window_seconds": 60},
+               "a working counter is measured: %s" % healthy["context"]["request_rate"])
+        for url, client_factory in (("redis://gate.invalid:6379/0", broken), ("", broken)):
+            s.REDIS_URL, s._redis = url, client_factory
+            decision = store.decide(phone, rate_anomaly_enabled=1)
+            expect(decision["context"]["request_rate"]["state"] == "unavailable"
+                   and "count" not in decision["context"]["request_rate"]
+                   and {"request_rate_unavailable": 0} == {
+                       r["code"]: r["points"] for r in decision["reasons"]
+                       if r["code"].startswith("request_rate")}
+                   and decision["score"] == healthy["score"],
+                   "an unreadable counter (REDIS_URL=%r) is degraded, not 0: %s %s"
+                   % (url, decision["context"]["request_rate"], decision["reasons"]))
+        off = store.decide(phone)
+        expect(off["context"]["request_rate"] == {"state": "off"}
+               and "rate_limiter" not in off["context"],
+               "the rule off reads off: %s" % off["context"])
+        s.RATE_LIMIT_ENABLED = True
+        for url in ("redis://gate.invalid:6379/0", ""):
+            s.REDIS_URL = url
+            with s.app.test_request_context("/v1/accounts/login", method="POST"):
+                s._enforce_rate_limit("accounts_login", "someone")
+                noted = store.decide(phone)
+            expect(noted["context"].get("rate_limiter") == "unavailable",
+                   "a rate limiter that could not run (REDIS_URL=%r) is noted: %s"
+                   % (url, noted["context"]))
+    finally:
+        s.REDIS_URL, s._redis, s.RATE_LIMIT_ENABLED = saved
+
+
+@check
+def an_approval_covers_a_counted_reason_only_up_to_its_count():
+    """DESIGN.md 77, the R1 rule for count-following reasons: an approval that
+    saw three failed step-up proofs covers three or fewer, not a fourth."""
+    approved = {"revoked_at": None, "expires_at": s._utc_now() + timedelta(days=1),
+                "causes": ["risk_step_up"], "device_accounts": 1, "account_devices": 1,
+                "reasons": [{"code": "device_stepup_failures", "points": 30,
+                             "source": "relationship", "count": 3}]}
+
+    def covered(count, record=approved):
+        policy_now = {"reasons": [{"code": "device_stepup_failures", "points": 30,
+                                   "count": count, "message": "m"}],
+                      "context": {"device_account_count": 1, "account_device_count": 1}}
+        with policy():
+            return s._acceptance_covers(record, "risk_step_up", policy=policy_now)[0]
+
+    expect(covered(3) and covered(2), "up to the approved count is covered")
+    expect(not covered(4), "a fourth failure was never approved")
+    countless = dict(approved, reasons=[dict(approved["reasons"][0])])
+    del countless["reasons"][0]["count"]
+    expect(not covered(1, countless), "an approval without the count covers none")
+    entries = s._reason_entries([{"code": "device_stepup_failures", "points": 30, "count": 3,
+                                  "message": "m"}], "relationship")
+    expect(entries and entries[0].get("count") == 3,
+           "what an approver is shown keeps the count: %s" % entries)
 
 
 def main():
