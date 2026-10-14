@@ -936,9 +936,19 @@ def _claim_nonce_redis(nonce_hash, installation_id):
         )
 
 
+def _rate_limiter_unavailable():
+    """This request went unthrottled; its risk decision says so (DESIGN.md 77)."""
+    if has_request_context():
+        g.rate_limiter_unavailable = True
+
+
 def _enforce_rate_limit(bucket, identity, limit=None):
-    """Throttle repeated attempts. Fails open by design."""
-    if not RATE_LIMIT_ENABLED or not REDIS_URL:
+    """Throttle repeated attempts. Fails open by design -- and an outage is
+    noted on the request, never passed off as a throttle that ran."""
+    if not RATE_LIMIT_ENABLED:
+        return
+    if not REDIS_URL:
+        _rate_limiter_unavailable()
         return
     key = "dt:rate:%s:%s" % (bucket, identity)
     try:
@@ -948,6 +958,7 @@ def _enforce_rate_limit(bucket, identity, limit=None):
             client.expire(key, RATE_LIMIT_WINDOW_SECONDS)
     except Exception:
         logger.exception("The Redis rate limiter is unreachable; allowing.")
+        _rate_limiter_unavailable()
         return
     if attempts > (limit or RATE_LIMIT_MAX_ATTEMPTS):
         raise ApiProblem(
@@ -984,14 +995,15 @@ def _maintenance_due(name):
 
 
 def _key_request_rate(installation_id, window_seconds):
-    """Requests seen for one installation in the current window.
+    """Requests seen for one installation in the current window, or None.
 
-    A per-installation Redis counter, incremented once per risk evaluation. It
-    fails open to 0 (no Redis, or Redis unreachable) so a transient cache outage
-    can never itself become a lockout.
+    A per-installation Redis counter, incremented once per risk evaluation.
+    None when it cannot be read -- no Redis configured, or Redis unreachable:
+    degraded evidence, never a measured rate of zero (DESIGN.md 77). Nothing
+    refuses on None, so a cache outage still cannot become a lockout.
     """
     if not REDIS_URL:
-        return 0
+        return None
     key = "dt:reqrate:%s" % installation_id
     try:
         client = _redis()
@@ -1000,8 +1012,8 @@ def _key_request_rate(installation_id, window_seconds):
             client.expire(key, max(1, int(window_seconds)))
         return int(count)
     except Exception:
-        logger.exception("Request-rate counter unreachable; treating rate as 0.")
-        return 0
+        logger.exception("Request-rate counter unreachable; deciding without it.")
+        return None
 
 
 def _connect_db():
@@ -3243,14 +3255,17 @@ def _account_device_points(reasons, projected_count):
     return 0, False
 
 
-def _policy_reason(reasons, code, points, message):
-    reasons.append(
-        {
-            "code": code,
-            "points": int(points),
-            "message": message,
-        }
-    )
+def _policy_reason(reasons, code, points, message, count=None):
+    reason = {
+        "code": code,
+        "points": int(points),
+        "message": message,
+    }
+    if count is not None:
+        # A reason that follows a count carries it, and an approval covers it
+        # only up to the count the approver saw (DESIGN.md 77).
+        reason["count"] = int(count)
+    reasons.append(reason)
 
 
 def _policy_bands():
@@ -3707,12 +3722,28 @@ def _evaluate_risk_policy(
     # Server-side request-rate anomaly (DESIGN.md 51.6): opt-in, advisory, and
     # device-unfalsifiable. Only counts when the DBA has enabled it, so it costs
     # nothing on a default deployment.
+    request_rate = {"state": "off"}
     if _risk_setting_bool("rate_anomaly_enabled", False):
         rate_limit = _risk_setting_int("rate_anomaly_max_requests", 120)
-        rate_count = _key_request_rate(
-            installation_id, _risk_setting_int("rate_anomaly_window_seconds", 60)
-        )
-        if rate_limit > 0 and rate_count > rate_limit:
+        rate_window = _risk_setting_int("rate_anomaly_window_seconds", 60)
+        rate_count = _key_request_rate(installation_id, rate_window)
+        if rate_count is None:
+            # Degraded evidence, not a rate of zero (DESIGN.md 77). Listed at 0
+            # points -- an outage must not restrict everyone -- and kept in the
+            # context, so a decision made without the counter says so.
+            request_rate = {"state": "unavailable", "window_seconds": rate_window}
+            _policy_reason(
+                reasons,
+                "request_rate_unavailable",
+                0,
+                "The request-rate counter could not be read, so this decision was "
+                "made without it.",
+            )
+        else:
+            request_rate = {
+                "state": "measured", "count": rate_count, "window_seconds": rate_window,
+            }
+        if rate_count is not None and rate_limit > 0 and rate_count > rate_limit:
             rate_points = _risk_setting_int("rate_anomaly_points", 30)
             _policy_reason(
                 reasons,
@@ -3744,6 +3775,29 @@ def _evaluate_risk_policy(
                 "(%d)." % (pop_metric, pop_value, pop_threshold),
             )
             score += pop_points
+
+    # The server's own observations (DESIGN.md 77), scored only where the DBA
+    # has switched them on. A phone's rules count what that phone did. The
+    # account's rule counts what OTHER installations did on the account and
+    # judges only a phone new to it -- being linked now, or linked within the
+    # window -- so failures someone causes on an account never restrict the
+    # phones that account already used.
+    newcomer = account_id is not None and (
+        add_link or (link_first_seen is not None and link_first_seen >= observed_since)
+    )
+    cross_checks_scored = _risk_setting_bool("cross_checks_enabled", False)
+    if cross_checks_scored:
+        for code, scope, key, default_count, default_points, message in _CROSS_CHECK_RULES:
+            measured = observations.get(scope)
+            if measured is None or (scope == "account" and not newcomer):
+                continue
+            threshold = _risk_setting_int(code + "_count", default_count)
+            count = int(measured.get(key, 0))
+            if threshold <= 0 or count < threshold:
+                continue
+            points = _risk_setting_int(code + "_points", default_points)
+            _policy_reason(reasons, code, points, message % (count, window_hours), count=count)
+            score += points
 
     recommended_action = _policy_action(score, hard_block=hard_block)
     effective_action = (
@@ -3786,8 +3840,16 @@ def _evaluate_risk_policy(
             "integrity_device_memory_hours", INTEGRITY_DEVICE_MEMORY_HOURS
         ),
         # Measured into every decision, scored or not (DESIGN.md 77).
-        "server_observations": dict(observations, window_hours=window_hours),
+        "server_observations": dict(
+            observations,
+            window_hours=window_hours,
+            newcomer=newcomer,
+            scored=cross_checks_scored,
+        ),
+        "request_rate": request_rate,
     }
+    if has_request_context() and g.get("rate_limiter_unavailable"):
+        context["rate_limiter"] = "unavailable"
     if BUSINESS_API_TOKEN_SHA256:
         # Measurements only (DESIGN.md 76): the business decides what they mean.
         context["business_events_30d"] = _business_event_counts(device_id, account_id)
@@ -4247,8 +4309,12 @@ def _reason_entries(reasons, source):
         points = reason.get("points", 0)
         points = points if isinstance(points, int) and not isinstance(points, bool) else 0
         if points > 0:
-            entries.append({"code": str(reason["code"]), "points": points, "source": source,
-                            "message": str(reason.get("message", ""))[:240]})
+            entry = {"code": str(reason["code"]), "points": points, "source": source,
+                     "message": str(reason.get("message", ""))[:240]}
+            count = reason.get("count")
+            if isinstance(count, int) and not isinstance(count, bool):
+                entry["count"] = count
+            entries.append(entry)
     return entries
 
 
@@ -4302,6 +4368,8 @@ def _acceptance_covers(record, cause, integrity=None, policy=None, ignore_qualit
     ):
         return False, current
     approved = {(r.get("source"), r.get("code")): r.get("points", 0) for r in record["reasons"]}
+    approved_counts = {(r.get("source"), r.get("code")): _as_int(r.get("count"))
+                       for r in record["reasons"] if r.get("count") is not None}
     auto = _risk_setting_words("acceptance_auto_cover_reasons", "")
     context = (policy or {}).get("context") or {}
     uncovered = []
@@ -4321,6 +4389,12 @@ def _acceptance_covers(record, cause, integrity=None, policy=None, ignore_qualit
                     context.get("account_device_count")) > record["account_devices"]:
                 uncovered.append(reason)
         elif approved.get((reason["source"], code), -1) < points:
+            uncovered.append(reason)
+        elif "count" in reason and (
+                approved_counts.get((reason["source"], code)) is None
+                or reason["count"] > approved_counts[(reason["source"], code)]):
+            # A count-following reason (DESIGN.md 77): covered up to the count
+            # the approver saw, never beyond it.
             uncovered.append(reason)
     return not uncovered, uncovered
 
