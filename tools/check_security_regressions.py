@@ -3801,6 +3801,20 @@ def the_step_up_method_is_the_dbas_choice():
                            "%s with %s must answer %s naming %s, got %s %s %s"
                            % (method, sorted(factors), outcome[0], outcome[1],
                               reply.status_code, error_code(reply), _needs(reply)))
+            # Neither factor is required where it is itself replaced: a dead key
+            # or a locked PIN could otherwise never be.
+            with policy(stepup_method="screen_lock_and_app_pin",
+                        stepup_required_paths="/v1/installations/stepup-key,/v1/account/app-pin"):
+                for path, needs in (("/v1/installations/stepup-key", ["app_pin"]),
+                                    ("/v1/account/app-pin", ["screen_lock"])):
+                    with s.app.test_request_context(path, method="POST"):
+                        try:
+                            s._enforce_step_up(inst.installation_id, account)
+                            got = None
+                        except s.ApiProblem as problem:
+                            got = ((problem.details or {}).get("step_up") or {}).get("needs")
+                    expect(got == needs, "on %s only %s may be required, got %s"
+                           % (path, needs, got))
             with policy(app_pin_required_paths=ECHO):
                 reply = pin_call(ECHO, {"x": 1})
                 expect(reply.status_code == 403 and error_code(reply) == "app_pin_required",

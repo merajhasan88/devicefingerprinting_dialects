@@ -4164,8 +4164,11 @@ def _app_pin_required_paths():
 
 
 # Where a PIN is set or replaced (DESIGN.md 78). The PIN is never required
-# there: a locked or forgotten PIN could otherwise never be replaced.
+# there: a locked or forgotten PIN could otherwise never be replaced. Nor is
+# the screen-lock key required where it is re-enrolled: a dead key could
+# otherwise never be replaced (DESIGN.md 58).
 _APP_PIN_PATH = "/v1/account/app-pin"
+_STEPUP_KEY_PATH = "/v1/installations/stepup-key"
 
 
 def _stepup_factors():
@@ -4218,7 +4221,7 @@ def _enforce_step_up(installation_id, account_id):
     """
     key_method, pin_method = _stepup_factors()
     required = request.path in _stepup_required_paths()
-    key_required = required and key_method
+    key_required = required and key_method and request.path != _STEPUP_KEY_PATH
     pin_required = request.path != _APP_PIN_PATH and (
         (required and pin_method) or request.path in _app_pin_required_paths()
     )
