@@ -2903,6 +2903,10 @@ CREATE TABLE business_events (event_id TEXT PRIMARY KEY,
 CREATE TABLE acceptance_lapses (acceptance_id TEXT, reason_code TEXT, source TEXT, points INTEGER,
                                 account_id TEXT, installation_id TEXT, event_type TEXT,
                                 occurred_at TSZ, PRIMARY KEY (acceptance_id, reason_code));
+CREATE TABLE server_observations (observation_id TEXT PRIMARY KEY, kind TEXT NOT NULL, code TEXT,
+                                  account_id TEXT, device_id TEXT, installation_id TEXT,
+                                  occurred_at TSZ NOT NULL);
+CREATE TABLE session_upgrade_requests (request_id TEXT PRIMARY KEY, device_id TEXT, denied_at TSZ);
 """
 BUSINESS_TOKEN = "business-token-for-the-gate"
 
@@ -3086,6 +3090,42 @@ def the_business_graph_combines_links_and_events():
         expect(counts == {"account": {"repayment_failed": 2},
                           "device": {"repayment_failed": 3}},
                "decision context counts by account and by phone: %s" % counts)
+
+
+@check
+def the_business_graph_carries_what_the_server_saw():
+    """DESIGN.md 77: the measurements are the business's to act on. Each
+    account and phone in the graph carries the server's own observations by
+    kind and window -- a phone's denied approval requests among them -- and
+    nothing older than 30 days."""
+    with business_store() as conn:
+        alice = business_account(conn, "alice")
+        phone, other = str(uuid.uuid4()), str(uuid.uuid4())
+        business_link(conn, phone, alice)
+        now = s._utc_now()
+        for kind, device_id, account_id, age in (
+                ("sign_in_failed", other, alice, timedelta(hours=2)),
+                ("sign_in_failed", other, alice, timedelta(days=3)),
+                ("sign_in_failed", other, alice, timedelta(days=40)),
+                ("stepup_failed", phone, alice, timedelta(days=10)),
+                ("sign_in_unknown_account", phone, None, timedelta(hours=1))):
+            conn.execute("INSERT INTO server_observations VALUES (?, ?, 'test', ?, ?, ?, ?)",
+                         (str(uuid.uuid4()), kind, account_id, device_id, str(uuid.uuid4()),
+                          now - age))
+        conn.execute("INSERT INTO session_upgrade_requests VALUES (?, ?, ?)",
+                     (str(uuid.uuid4()), phone, now - timedelta(days=2)))
+        status, graph = business_call("GET", "/v1/business/graph", query={"account_id": alice})
+        account_node = graph["accounts"][0]["server_observations"]
+        device_node = graph["devices"][0]["server_observations"]
+        expect(status == 200 and account_node == {
+            "sign_in_failed": {"1d": 1, "7d": 2, "30d": 2},
+            "stepup_failed": {"1d": 0, "7d": 0, "30d": 1}},
+            "the account's observations, from every phone: %s" % account_node)
+        expect(device_node == {
+            "stepup_failed": {"1d": 0, "7d": 0, "30d": 1},
+            "sign_in_unknown_account": {"1d": 1, "7d": 1, "30d": 1},
+            "approval_denied": {"1d": 0, "7d": 1, "30d": 1}},
+            "the phone's observations, for every account: %s" % device_node)
 
 
 @check

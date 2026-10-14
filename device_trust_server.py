@@ -7951,6 +7951,48 @@ def _business_event_counts(device_id, account_id):
     return counts
 
 
+def _observation_windows(cursor, column, value):
+    """The server's own observations (DESIGN.md 77) on one account or phone,
+    by kind, in the last 1, 7 and 30 days. `column` is account_id or
+    device_id, never caller input."""
+    now = _utc_now()
+    cutoffs = {label: now - timedelta(days=days) for label, days in _BUSINESS_WINDOWS}
+    cursor.execute(
+        """
+        SELECT kind,
+               SUM(CASE WHEN occurred_at >= %s THEN 1 ELSE 0 END),
+               SUM(CASE WHEN occurred_at >= %s THEN 1 ELSE 0 END),
+               COUNT(*)
+        FROM server_observations
+        WHERE """ + column + """ = %s AND occurred_at >= %s
+        GROUP BY kind
+        """,
+        (cutoffs["1d"], cutoffs["7d"], value, cutoffs["30d"]),
+    )
+    found = {
+        str(kind): {"1d": int(day or 0), "7d": int(week or 0), "30d": int(month or 0)}
+        for kind, day, week, month in cursor.fetchall() or []
+    }
+    if column == "device_id":
+        # Denied approval requests are rows of session_upgrade_requests.
+        cursor.execute(
+            """
+            SELECT SUM(CASE WHEN denied_at >= %s THEN 1 ELSE 0 END),
+                   SUM(CASE WHEN denied_at >= %s THEN 1 ELSE 0 END),
+                   COUNT(*)
+            FROM session_upgrade_requests
+            WHERE device_id = %s AND denied_at >= %s
+            """,
+            (cutoffs["1d"], cutoffs["7d"], value, cutoffs["30d"]),
+        )
+        day, week, month = cursor.fetchone()
+        if month:
+            found["approval_denied"] = {
+                "1d": int(day or 0), "7d": int(week or 0), "30d": int(month),
+            }
+    return found
+
+
 def _business_account_node(cursor, account_id):
     now = _utc_now()
     cutoffs = {label: now - timedelta(days=days) for label, days in _BUSINESS_WINDOWS}
@@ -7994,6 +8036,7 @@ def _business_account_node(cursor, account_id):
         "created_at": _iso_z(row[0]) if row else None,
         "business_events": events,
         "accounts_sharing_a_subject_30d": int(shared[0]) if shared else 0,
+        "server_observations": _observation_windows(cursor, "account_id", account_id),
     }
 
 
@@ -8031,6 +8074,7 @@ def _business_device_node(cursor, device_id):
             "verdict": report[0], "evidence_quality": report[1],
             "created_at": _iso_z(report[2]),
         } if report else None,
+        "server_observations": _observation_windows(cursor, "device_id", device_id),
     }
 
 
