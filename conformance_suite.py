@@ -50,6 +50,7 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 
@@ -1842,6 +1843,49 @@ def check_business_api(api, ctx):
     expect(st == 200 and isinstance(feed.get("lapses"), list), "lapse feed: %s %s" % (st, feed))
 
 
+@check("business: every integrity report, with its measurements, page by page")
+def check_business_integrity_reports(api, ctx):
+    """DESIGN.md 79 (G5). Needs DEVICE_TRUST_BUSINESS_TOKEN. A fresh phone
+    sends two scans; the feed filtered to the phone returns both, oldest
+    first, one per page, each with the phone's probe_results and the
+    server's reasons; two filters at once are refused."""
+    token = os.environ.get("DEVICE_TRUST_BUSINESS_TOKEN", "")
+    if not token:
+        raise Skip("set DEVICE_TRUST_BUSINESS_TOKEN to the business API token to run this")
+    business = {"Authorization": "Bearer " + token}
+    inst, device = _observing_phone(api)
+    submit_report(api, inst, device)
+    reports, cursor = [], None
+    for _ in range(3):
+        query = {"device_id": inst.device_id, "limit": "1"}
+        if cursor:
+            query["cursor"] = cursor
+        st, page = api.call("GET", "/v1/business/integrity-reports?"
+                            + urllib.parse.urlencode(query), headers=business)
+        expect(st == 200 and len(page.get("reports", [])) <= 1, "a page: %s %s" % (st, page))
+        reports += page["reports"]
+        cursor = page["next_cursor"]
+    expect(len(reports) == 2 and len({r["report_id"] for r in reports}) == 2
+           and all(r["device_id"] == inst.device_id for r in reports)
+           and reports[0]["created_at"] <= reports[1]["created_at"],
+           "both scans, once each, oldest first: %s" % [(r["report_id"], r["created_at"])
+                                                        for r in reports])
+    first = reports[0]
+    expect(isinstance(first.get("probe_results"), dict) and "app_identity" in first["probe_results"]
+           and isinstance(first.get("reasons"), list) and first.get("platform") == "android"
+           and len(first.get("report_sha256") or "") == 64,
+           "a report carries the measurements and the reasons: %s" % sorted(first))
+    st, pl = api.call("GET", "/v1/business/integrity-reports?" + urllib.parse.urlencode(
+        {"device_id": inst.device_id, "installation_id": inst.installation_id}), headers=business)
+    expect(st == 400 and error_code(pl) == "invalid_filter",
+           "two filters must be refused: %s %s" % (st, pl))
+
+
+def _support(api, token, action, body):
+    return api.call("POST", "/v1/business/app-pin/%s" % action,
+                    headers={"Authorization": "Bearer " + token}, body_text=json.dumps(body))
+
+
 def _observing_phone(api):
     """A fresh phone with a device token and a clean report."""
     inst = Installation()
@@ -2094,6 +2138,121 @@ def check_app_pin(api, ctx):
     st, pl = protected(api, inst, "GET", "/v1/policy/me", access)
     counted = pl["policy"]["context"]["server_observations"]["device_account"]["app_pin_failed"]
     expect(counted == max_failures + 1, "each wrong PIN is counted: %s" % counted)
+
+
+@check("step-up: the app reads the DBA's step-up policy before sign-in")
+def check_step_up_policy(api, ctx):
+    """DESIGN.md 79 (G4). GET /v1/policy/step-up needs no token and answers
+    what the live settings say -- the method, the factor, mode and window a
+    screen-lock key is created with, the PIN's length, the paths; an
+    account's own /v1/account/me carries the same."""
+    settings = live_settings(api)
+    mode = settings.get("stepup_mode", "per_use")
+    expected = {
+        "method": _method(settings),
+        "factor": settings.get("stepup_factor", "passcode"),
+        "mode": mode,
+        "window_seconds": (int(settings.get("stepup_window_seconds", "0") or "0")
+                           if mode == "windowed" else 0),
+        "app_pin_length": int(settings.get("app_pin_length", "6") or "6"),
+        "required_paths": sorted(_setting_words(settings, "stepup_required_paths", "")),
+        "app_pin_required_paths": sorted(_setting_words(settings, "app_pin_required_paths", "")),
+    }
+    st, policy = api.call("GET", "/v1/policy/step-up")
+    expect(st == 200 and policy == expected,
+           "the policy must be the live settings: %s %s, expected %s" % (st, policy, expected))
+    inst, _, _, access, _ = _pin_phone(api, settings, False)
+    st, me = protected(api, inst, "GET", "/v1/account/me", access)
+    expect(st == 200 and {key: me["step_up"].get(key) for key in expected} == expected,
+           "the account's view carries the same: %s %s" % (st, me.get("step_up")))
+
+
+@check("support: unlock a locked app PIN, as the DBA's app_pin_support allows")
+def check_app_pin_support_unlock(api, ctx):
+    """DESIGN.md 79. Needs DEVICE_TRUST_BUSINESS_TOKEN. Off (the default),
+    both support actions answer app_pin_support_disabled. Where the DBA
+    allows unlock, a PIN locked by wrong attempts is unlocked by support --
+    naming the account by handle, with a ticket reference -- and the right
+    PIN passes again; the action is counted for the account. A reset is
+    refused unless the DBA allows unlock_and_reset."""
+    token = os.environ.get("DEVICE_TRUST_BUSINESS_TOKEN", "")
+    if not token:
+        raise Skip("set DEVICE_TRUST_BUSINESS_TOKEN to the business API token to run this")
+    settings = live_settings(api)
+    level = settings.get("app_pin_support", "off")
+    echo = "/v1/account/protected-echo"
+    if _pin_factors(settings, echo)[0]:
+        raise Skip("the echo path needs the screen-lock key here")
+    inst, _, handle, access, _ = _pin_phone(api, settings, False)
+    st, me = protected(api, inst, "GET", "/v1/account/me", access)
+    expect(st == 200, "setup: %s %s" % (st, me))
+    account_id = me["account_id"]
+    reference = "SUITE-%s" % secrets.token_hex(4)
+    if level == "off":
+        for action in ("unlock", "reset"):
+            st, pl = _support(api, token, action, {"account_id": account_id,
+                                                   "reference": reference})
+            expect(st == 403 and error_code(pl) == "app_pin_support_disabled",
+                   "app_pin_support is off: %s must refuse, got %s %s" % (action, st, pl))
+        return
+    max_failures = int(settings.get("app_pin_max_failures", "5") or "5")
+    if max_failures > 10:
+        raise Skip("app_pin_max_failures=%s is too high for a bounded run" % max_failures)
+    pin, wrong = _two_pins(settings)
+    st, pl = _set_pin(api, inst, access, pin)
+    expect(st == 200, "setting the PIN: %s %s" % (st, pl))
+    answers = [error_code(pin_call(api, inst, echo, access, {"x": 1}, pin=wrong)[1])
+               for _ in range(max_failures)]
+    expect(answers[-1] == "app_pin_locked", "%d wrong PINs lock it: %s" % (max_failures, answers))
+    st, pl = _support(api, token, "unlock", {"handle": handle, "reference": reference})
+    expect(st == 200 and pl == {"account_id": account_id, "unlocked": True, "reset_until": None},
+           "support unlocks it: %s %s" % (st, pl))
+    st, pl = pin_call(api, inst, echo, access, {"x": 1}, pin=pin)
+    expect(st == 200, "the right PIN passes again: %s %s" % (st, pl))
+    st, pl = protected(api, inst, "GET", "/v1/policy/me", access)
+    counted = pl["policy"]["context"]["server_observations"]["account"]
+    expect(counted.get("app_pin_support_unlocked") == 1,
+           "the unlock is counted for the account: %s" % counted)
+    if level == "unlock":
+        st, pl = _support(api, token, "reset", {"account_id": account_id, "reference": reference})
+        expect(st == 403 and error_code(pl) == "app_pin_support_disabled",
+               "unlock alone allows no reset: %s %s" % (st, pl))
+
+
+@check("support: a reset lets a limited session set a new app PIN, once")
+def check_app_pin_support_reset(api, ctx):
+    """DESIGN.md 79. Needs DEVICE_TRUST_BUSINESS_TOKEN, app_pin_support =
+    unlock_and_reset, and enforce mode. A limited session cannot set a PIN;
+    after support opens a reset it can, with the password -- a wrong one
+    leaves the reset open -- and only once."""
+    token = os.environ.get("DEVICE_TRUST_BUSINESS_TOKEN", "")
+    if not token:
+        raise Skip("set DEVICE_TRUST_BUSINESS_TOKEN to the business API token to run this")
+    settings = live_settings(api)
+    if settings.get("app_pin_support", "off") != "unlock_and_reset":
+        raise Skip("app_pin_support is %s here; a reset needs unlock_and_reset"
+                   % settings.get("app_pin_support", "off"))
+    inst, device, handle = _limited_setup(api, ctx)
+    st, pl = sign_in(api, inst, device, handle)
+    expect(st == 200 and pl.get("scope") == "limited", "setup: a limited session: %s %s" % (st, pl))
+    limited = pl["access_token"]
+    pin, _ = _two_pins(settings)
+    st, pl = _set_pin(api, inst, limited, pin)
+    expect(st == 403 and error_code(pl) == "session_limited",
+           "without a reset a limited session sets no PIN: %s %s" % (st, pl))
+    st, pl = _support(api, token, "reset", {"handle": handle,
+                                            "reference": "SUITE-%s" % secrets.token_hex(4)})
+    expect(st == 200 and pl.get("reset_until"), "support opens a reset: %s %s" % (st, pl))
+    st, pl = _set_pin(api, inst, limited, pin, password="Wrong-Passw0rd")
+    expect(st == 401 and error_code(pl) == "invalid_credentials",
+           "a wrong password is refused: %s %s" % (st, pl))
+    st, pl = _set_pin(api, inst, limited, pin)
+    expect(st == 200 and pl["step_up"]["app_pin_set"] is True
+           and pl["step_up"]["app_pin_reset_open"] is False,
+           "with the reset open the limited session sets the PIN: %s %s" % (st, pl))
+    st, pl = _set_pin(api, inst, limited, pin)
+    expect(st == 403 and error_code(pl) == "session_limited", "the reset serves once: %s %s"
+           % (st, pl))
 
 
 @check("step-up: concurrent wrong app PINs never pass the attempt limit", db_sensitive=True)
