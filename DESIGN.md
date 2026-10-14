@@ -6212,7 +6212,7 @@ points are proposals for the owner, seeded by 019, each `<code>_count` / `<code>
 
 | reason | default | counts |
 |---|---|---|
-| `account_sign_in_failures_elsewhere` | 5 / +30 | wrong passwords from **other** installations in the window **before this phone joined the account**; only for a phone joining now or within the window |
+| `account_sign_in_failures_elsewhere` | 5 / +30 | wrong passwords from **other** phones in the window **before this phone joined the account**; only for a phone joining now or within the window |
 | `device_sign_in_failures_many_accounts` | 3 / +60 | different accounts this phone failed a password on |
 | `device_sign_in_unknown_accounts` | 5 / +30 | this phone's sign-ins to accounts that do not exist |
 | `device_stepup_failures` | 3 / +30 | this phone's step-up proofs that did not verify |
@@ -6221,8 +6221,9 @@ points are proposals for the owner, seeded by 019, each `<code>_count` / `<code>
 | `device_stepup_reenrolments` | 2 / +30 | step-up keys re-enrolled on this phone |
 
 **False positives, the owner's standing test.**
-- A genuine user mistyping on their own phone is never counted against anyone: the account rule counts
-  other installations only; a phone's own rules need several accounts or unknown accounts.
+- A genuine user mistyping on their own phone is never counted against anyone, even after reinstalling
+  the app there: the account rule counts other phones only (`device_id`, not the installation — found
+  in review before the owner saw it); a phone's own rules need several accounts or unknown accounts.
 - Failures someone causes on an account never restrict a phone that was there before them — a
   long-standing phone or the one that opened the account that morning — so a password guesser cannot
   degrade the owner's phones. This was refined during the work (`051f0c5`): the first version judged
@@ -6261,6 +6262,7 @@ bcrypt check, an unknown handle does not. Archiving it is the DBA's call.
 | Gate: eight checks (80) | `e529f10` | all eight fail on `60da827`; ten mutations caught |
 | Business graph carries the observations | `5367de3` | gate (81); two mutations caught; live |
 | A newcomer judged by the failures before it joined | `051f0c5` | gate; three more mutations caught |
+| Other **phones'** failures, not other installations' (a reinstall on the user's own phone is not "elsewhere"); `approval_denied` in the context as in the graph | `53b4097` | gate (the mistype check includes a reinstall; a mutation back to installations fails it) — **not yet on EC2** |
 | Suite: `check_server_observations` (any mode), `check_server_observations_scored` | `66d8dec` | live |
 | Suite route 2: budget before the denial; the denial rule checked live | `3be29d7` | live |
 
@@ -6285,5 +6287,7 @@ phones, so a phone that only failed sign-ins on an account is visible in that ac
 as a node. Not recorded: rate-limit 429s and `relationship_changed`.
 
 **State.** EC2 `i-0559685f02c4013b1` stopped; PostgreSQL 16.15 at schema 19 (`server_observations`
-granted `SELECT, INSERT` to `dtadmin`); server `051f0c5`; observe / observe, every setting at the
+granted `SELECT, INSERT` to `dtadmin`; its 019 description rows carry the earlier wording, "other
+installations" — text only); server `051f0c5`, one behavioural commit behind (`53b4097`, deploy next
+session); observe / observe, every setting at the
 owner's defaults (`cross_checks_enabled` 0), nonce store on Redis, business-token drop-in removed (404).

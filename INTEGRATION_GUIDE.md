@@ -573,9 +573,9 @@ installation whose key made the request.
 **Measured always.** Every risk decision's `context.server_observations` carries the counts over
 `cross_check_window_hours` (24): for the phone, across every account (`sign_in_failed`,
 `sign_in_failed_accounts` — how many different accounts, `sign_in_unknown_account`, `stepup_failed`,
-`approvals_denied`, `approval_budget_exhausted`, `stepup_reenrolled`); for the account, from every
+`approval_denied`, `approval_budget_exhausted`, `stepup_reenrolled`); for the account, from every
 phone (`sign_in_failed`, `sign_in_failed_installations`, `sign_in_failed_elsewhere` — from
-installations other than the one asking, and the other kinds); `newcomer`, for a phone joining the
+phones other than the one asking, and the other kinds); `newcomer`, for a phone joining the
 account now or within the window (`joined_at`, `sign_in_failed_elsewhere_before`), else null;
 `window_hours`; and `scored`. The graph (section 10) carries them per account and phone.
 
@@ -585,7 +585,7 @@ counts and points below are the defaults migration 019 seeds — proposals for y
 
 | reason | count / points | counts |
 |---|---|---|
-| `account_sign_in_failures_elsewhere` | 5 / 30 | wrong passwords sent to the account by **other** installations in the window **before this phone joined it** — judged only for a phone joining now or within the window |
+| `account_sign_in_failures_elsewhere` | 5 / 30 | wrong passwords sent to the account by **other** phones in the window **before this phone joined it** — judged only for a phone joining now or within the window |
 | `device_sign_in_failures_many_accounts` | 3 / 60 | different accounts this phone sent a wrong password to |
 | `device_sign_in_unknown_accounts` | 5 / 30 | this phone's sign-ins to accounts that do not exist |
 | `device_stepup_failures` | 3 / 30 | this phone's step-up proofs that did not verify |
@@ -595,8 +595,9 @@ counts and points below are the defaults migration 019 seeds — proposals for y
 
 What they do not do, by design:
 
-- **A user mistyping on their own phone is never counted against anyone**: the account's rule counts
-  other installations only, and a phone's own rules need several accounts or unknown accounts.
+- **A user mistyping on their own phone is never counted against anyone**, even after reinstalling the
+  app there: the account's rule counts other phones only, and a phone's own rules need several accounts
+  or unknown accounts.
 - **Failures someone causes on an account never restrict a phone that was there before them** — a
   long-standing phone, or the one that opened the account this morning. Only a phone that joined
   after them is judged, so an attacker guessing a password cannot degrade the owner's phones.
