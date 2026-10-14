@@ -476,3 +476,29 @@ default, 0. Pull DESIGN.md §77 and migration 019. What you may see, and what to
 enforce with cross-checks on 71/0/7, both enforce at the owner's defaults 70/0/8, a Redis outage
 recorded as degraded and unscored, `tools/race_admission.py` PASS, and the §19 carry-over (018) now
 verified live. **Not run:** migrations 015–019 against SQL Server.
+
+## 21. Added 2026-10-14 (later) — stolen tokens recorded; the step-up method and the app PIN (DESIGN.md §77, §78, schema 20)
+
+**Nothing changes for the SDK at the interim default** (`stepup_method` = `screen_lock`). What a
+deployment can now turn on, and what the SDK needs for it:
+
+- **The app PIN.** `POST /v1/account/app-pin` `{"password", "pin"}` with a full session sets or replaces it
+  (`invalid_app_pin` 400 for a wrong format; `invalid_credentials` 401). Send it as the `X-App-PIN`
+  header on the request it approves — a sensitive path, approving another phone's request, a route-1
+  upgrade — where the DBA's `stepup_method` (`app_pin`, `screen_lock_and_app_pin`) or
+  `app_pin_required_paths` ask. Handle `app_pin_required` and `stepup_required` (403, both with
+  `details.step_up.needs`), `app_pin_invalid` (403, `details.attempts_left`), `app_pin_locked` (403: offer
+  "set a new PIN with your password"), `app_pin_not_set` (403). `/v1/account/me` carries `step_up`
+  (method, `app_pin_set`, `app_pin_locked`, `app_pin_length`) so the UI can ask up front. Never log the
+  header.
+- **Approving without a step-up key** works under `app_pin`: send the PIN alone. Route 1 is now listed in
+  `upgrade_routes` when the phone can give what the method asks (a bound key and/or a set, unlocked PIN).
+- **New observation kinds** in `context.server_observations`: `token_without_key` and `request_replayed`
+  (once per token / per request), `app_pin_failed`, `app_pin_set`; `device_account.app_pin_failed` feeds
+  a new rule, `device_app_pin_failures`. Tolerate the keys.
+- **Suite:** 82 checks — `check_stolen_token_recorded`, `check_app_pin`, `check_app_pin_concurrent`,
+  `check_app_pin_approval`; the six screen-lock checks skip under another method, naming why.
+
+**Verified on our side:** gate 88/88; EC2 PostgreSQL 16.15 at schema 20: observe 62/0/20, enforce with
+cross-checks 74/0/8, each method's PIN checks PASS (incl. 9 concurrent wrong PINs against a limit of 5:
+exactly 5 compared). **Not run:** migrations 015–020 on SQL Server; the harness build on a phone.

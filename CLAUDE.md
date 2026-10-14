@@ -90,8 +90,8 @@ processes** from the systemd drop-in, with a per-process connection pool (`DB_PO
 `DB_POOL_RECHECK_SECONDS`) and, on SQL Server, a 15 s statement timeout (`DB_QUERY_TIMEOUT`) —
 DESIGN.md 55 and 60. Serve SQL Server with processes, never threads.
 
-**Schema is migrations, DBA-applied.** `migrations/<dialect>/001…019`, applied in order; the server
-refuses to serve unless `schema_migrations` holds the version it requires (currently **19**). A new
+**Schema is migrations, DBA-applied.** `migrations/<dialect>/001…020`, applied in order; the server
+refuses to serve unless `schema_migrations` holds the version it requires (currently **20**). A new
 table needs its grant (`GRANT`/`ALTER DEFAULT PRIVILEGES` on PostgreSQL). Risk and step-up policy
 values live in `risk_policy_settings`, seeded by the migrations with the owner's defaults, which a DBA
 may change — never hard-code a policy value.
@@ -99,19 +99,19 @@ may change — never hard-code a policy value.
 ## Commands
 
 ```bash
-# Conformance suite — the gate. 78 checks; needs `cryptography` (harness only).
+# Conformance suite — the gate. 82 checks; needs `cryptography` (harness only).
 python3 conformance_suite.py --base-url https://<endpoint>
 #   Scoring checks need the server started with INTEGRITY_ANDROID_CERT_SHA256 set to the
 #   certificate the suite prints, or empty to disable the allow-list.
 #   Enforcement and limited-session checks SKIP unless INTEGRITY_MODE=enforce; opt-in checks
 #   (rate anomaly, population baseline, step-up, eligibility rules, upgrade routes 1 and 3,
-#   scored cross-checks) SKIP
+#   scored cross-checks, the app PIN where no path needs it) SKIP
 #   until their risk_policy_settings rows are enabled; route 3 also needs the suite's JWKS
 #   (it prints it) in the file named by UPGRADE_ASSERTION_JWKS_FILE.
 #   check_parallel_clients (4 concurrent flows) must pass on any new backend BEFORE handset
 #   or paid-database time is spent on it.
 
-# Offline security regression gate (81 checks; DESIGN.md 63, 76, 77): no database needed
+# Offline security regression gate (88 checks; DESIGN.md 63, 76-78): no database needed
 python3 tools/check_security_regressions.py
 # Native scanner on the host (from a scratch dir; clang++ or g++)
 clang++ -std=c++17 -O1 -Wall -Wextra -Itools/native -Iandroid/app/src/main/cpp \
@@ -138,8 +138,9 @@ not jailbroken). The emulator AVD `integrity_root_lab` is the disposable root la
 
 ## Current point of work
 
-See the end of DESIGN.md: section 77 records the server's own observations (cross-checks measured into
-every decision, scored only where the DBA enables them; schema 19); section 76 the critical review of
+See the end of DESIGN.md: section 78 records the step-up method — the screen lock, an app PIN the
+server checks, or both, the DBA's choice (schema 20); section 77 the server's own observations
+(cross-checks measured into every decision, scored only where the DBA enables them); section 76 the critical review of
 2026-10-13 and what was built from it (sign-out and family checks, admission under locks, evidence
 quality, scoped acceptances, the business API, carried-over approvals); sections 73–75 the handset rounds and SQL Server; sections 66–72 record the 2026-10-05 joint review, the declined attestation
 proposal, the limited-session design (67) and its implementation (70, 72), R4 (68), R1 (69) and

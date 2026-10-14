@@ -175,6 +175,8 @@ defaults and changed by your DBA, never by the server. Notable keys:
 | `elevated_risk_refuses` | 0 | 1 makes an elevated decision refuse in enforce mode |
 | `stepup_required_paths` | empty | comma-separated request paths that require a step-up proof |
 | `stepup_factor` / `stepup_mode` / `stepup_window_seconds` | passcode / per_use / 0 | the step-up policy |
+| `stepup_method` / `app_pin_required_paths` | `screen_lock` (interim) / empty | how a step-up is proven — the screen-lock key, an app PIN the server checks, or both — and paths that need the PIN on top (section 12) |
+| `app_pin_length` / `app_pin_max_failures` | 6 / 5 | the app PIN's digits, and wrong PINs in a row before it locks (section 12) |
 | `wx_far_above_baseline_percent` | 200 | W^X growth above a build's pin is advisory up to this percentage of it and +40 beyond (section 3); minimum 100 |
 | `developer_options_refuses` / `adb_enabled_refuses` | 0 / 0 | eligibility rules: 1 refuses a device whose latest scan reports the setting on (below) |
 | `rate_anomaly_*`, `population_baseline_*` | off | advisory signals |
@@ -568,6 +570,9 @@ installation whose key made the request.
 | `stepup_failed` | a step-up (screen-lock) proof that did not verify — on a sensitive path, the same-phone upgrade route, or an approver's phone — with its refusal code. A request sent without a proof is not one: that is the ordinary first leg, after which your app asks for the screen lock |
 | `approval_budget_exhausted` | an approval request refused because the account's hourly budget was spent |
 | `stepup_reenrolled` | a step-up key re-enrolled (in the same transaction as the change) |
+| `token_without_key` | one of this phone's tokens — access or refresh — presented with a proof its key did not sign: copied to another phone. Once per token |
+| `request_replayed` | one of this phone's signed requests sent again. Once per request |
+| `app_pin_failed` / `app_pin_set` | a wrong app PIN; a PIN set or replaced (section 12) |
 | denied approval requests | already rows of `session_upgrade_requests` (`denied_at`), counted per requesting phone |
 
 **Measured always.** Every risk decision's `context.server_observations` carries the counts over
@@ -633,3 +638,56 @@ within the window.
 
 **Reading stored decisions.** A phone held by a denial can show a score in the block band with
 `recommended_action` = `review` and `held_by_denial` true: read the action, not the band of the score.
+
+## 12. Step-up: the screen lock, an app PIN the server checks, or both
+
+A step-up is the user proving they are present for one operation. Your DBA chooses how
+(`DESIGN.md` §78):
+
+| `stepup_method` | the request must carry |
+|---|---|
+| `screen_lock` (interim default) | a proof signed by the phone's step-up key, which the phone's screen lock (passcode or biometric) unlocks |
+| `app_pin` | the account's app PIN, which the server checks |
+| `screen_lock_and_app_pin` | both |
+
+It applies wherever a step-up is required: the paths in `stepup_required_paths`, approving another
+phone's request, route 1 (the same-phone upgrade) and an elevated scan satisfied by a step-up. Paths in
+`app_pin_required_paths` need the PIN **in addition**, whatever the method — for example the screen
+lock everywhere and the PIN on payee changes and large transfers.
+
+**What each protects against.** A thief who watched the phone's passcode passes the screen lock but
+not an app PIN. Malware on the phone with Android's Accessibility permission can read either as it is
+typed and type it back itself; a **biometric** screen lock (`stepup_factor` = `biometric`) is the one
+factor it cannot observe. The server sees, counts and locks app PIN attempts; it sees nothing of the
+screen lock. The screen lock keeps nothing on your server; the app PIN keeps a verifier.
+
+**Setting the PIN.** `POST /v1/account/app-pin` with `{"password": …, "pin": "123456"}` — a current full
+session (a limited one is refused) and the account password. `app_pin_length` digits. It replaces any
+earlier PIN and clears its count and lock; this is also how a user with a forgotten or locked PIN gets
+back in. Don't list this path in `app_pin_required_paths`: the server never requires a PIN to set one.
+
+**Sending it.** The `X-App-PIN` header, on the request it approves. Never log it — check your proxies
+(the reference server's gunicorn and Caddy write no headers). Refusals:
+
+| code | meaning |
+|---|---|
+| `app_pin_required` / `stepup_required` (403) | a factor is missing; `details.step_up.needs` lists what this request needs |
+| `app_pin_invalid` (403) | wrong; `details.attempts_left` |
+| `app_pin_locked` (403) | after `app_pin_max_failures` wrong PINs in a row; even the right PIN is refused until a new one is set |
+| `app_pin_not_set` (403) | the account has none yet |
+| `invalid_app_pin` (400) | setting a PIN of the wrong length or with non-digits |
+
+`/v1/account/me` reports `step_up`: the method, `app_pin_set`, `app_pin_locked`, `app_pin_length`, so your
+app can ask for what is needed before sending.
+
+**Storage.** One PIN per account (migration 020, `app_pins`; grant `SELECT, INSERT, UPDATE`), kept only as
+bcrypt over an HMAC keyed by a secret derived from `DEVICE_ID_MASTER_SECRET`: a copy of the table alone
+cannot be searched. With the table **and** the root secret, a 4–12 digit PIN can be found by brute
+force in hours — protect the root secret as you would a signing key.
+
+**Route 1 and single-phone users.** Under `app_pin` the same-phone upgrade proves the account's PIN,
+which an attacker signing in on their own phone does not have — unlike that phone's screen lock. It is
+off by default (`upgrade_stepup_same_device`); turning it on gives single-phone users a way to clear an
+integrity-limited session, at the cost that wrong PINs from an attacker's phone can lock the user's PIN
+until they set a new one with their password.
+
