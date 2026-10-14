@@ -589,7 +589,7 @@ counts and points below are the defaults migration 019 seeds — proposals for y
 | `device_sign_in_failures_many_accounts` | 3 / 60 | different accounts this phone sent a wrong password to |
 | `device_sign_in_unknown_accounts` | 5 / 30 | this phone's sign-ins to accounts that do not exist |
 | `device_stepup_failures` | 3 / 30 | this phone's step-up proofs that did not verify |
-| `device_approvals_denied` | 1 / 60 | this phone's approval requests the account's other phone denied |
+| `device_approvals_denied` | 1 / 30 | this phone's approval requests the account's other phone denied — and, with `device_approvals_denied_effect` = `limit` (default), the phone is held at review (below) |
 | `device_approval_budget_exhausted` | 1 / 30 | this phone's approval requests refused by the spent budget |
 | `device_stepup_reenrolments` | 2 / 30 | step-up keys re-enrolled on this phone |
 
@@ -603,10 +603,15 @@ What they do not do, by design:
   after them is judged, so an attacker guessing a password cannot degrade the owner's phones.
 - They are velocity signals: each holds for the window and then lapses. A lasting mark is your
   business's — your DBA's settings, or your own engine over the graph and the decision context.
-- Interplay to decide before enabling: a phone limited at sign-in is usually already in review, so a
-  denial's +60 takes it to block — it can no longer prompt the account's other phone for the window.
-  That stops prompt-bombing; it also means one mistaken "deny" holds a genuine new phone for the
-  window. Lower `device_approvals_denied_points` if you prefer that phone to stay limited instead.
+- **A denied phone stays limited.** With `device_approvals_denied_effect` = `limit` (the default), a
+  denial holds the phone at review — a limited session — for the window, even if the cause it was
+  limited for clears, and a denial alone never blocks it; anything else that blocks still does. It may
+  ask again within the hourly budget, and the approver sees the earlier denial among the reasons, so a
+  mistaken "deny" is undone by approving the next request. `context.held_by_denial` says when the hold
+  decided. `points` instead adds `device_approvals_denied_points` like any rule, which can reach block.
+- Exhausting the approval budget has no such hold: its +30 on a phone already in review blocks it for
+  the window. Lower `device_approval_budget_exhausted_points` (or set its count to 0) if you prefer
+  that phone to stay limited.
 - An approval covers one of these reasons only up to the count the approver saw (`count` on the
   reason); more failures afterwards need a new approval.
 

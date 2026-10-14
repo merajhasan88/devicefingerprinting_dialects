@@ -457,12 +457,13 @@ default, 0. Pull DESIGN.md §77 and migration 019. What you may see, and what to
   `points`, `message`, `source`); the message states the count.
 - **`request_rate_unavailable` at 0 points** appears whenever the DBA's request-rate rule is on and its
   counter is unreadable. Do not present a 0-point reason as a problem.
-- **A denied phone may now be refused before the budget.** With cross-checks on, a denial adds +60
-  against the phone that asked; a phone already limited at review reaches block and its next request
-  answers 403 `risk_policy_blocked` (details carry the decision) instead of 429
-  `upgrade_budget_exhausted`. If your port of the route-2 check denies before it exhausts the budget,
-  reorder it as the reference did (`3be29d7`): budget first, then the denial; where the DBA's denial
-  rule is on, the denied phone's next sign-in decision lists `device_approvals_denied` with its count.
+- **A denied phone stays limited** (owner decision, `0a77436`). With cross-checks on and the default
+  `device_approvals_denied_effect` = `limit`, the denied phone's next sign-in answers 200 with a
+  limited session, its decision lists `device_approvals_denied` (+30, `count`) and
+  `context.held_by_denial` is true; it may ask again within the budget. Your route-2 port can keep its
+  order (deny, then exhaust the budget) — the reference went back to it (`9f5ab0c`). Note the other
+  order fails with cross-checks on: an exhausted budget adds +30 with no hold, and on a phone already
+  at review that blocks (403 `risk_policy_blocked`).
 - **Suite:** 78 checks — `check_server_observations` (runs in any mode: two other phones' wrong
   passwords and an unknown handle are counted in the account's decision, the guessing phone's own, and
   a phone joining afterwards, not the opener's) and `check_server_observations_scored` (skips unless

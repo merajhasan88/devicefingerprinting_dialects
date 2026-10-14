@@ -6216,7 +6216,7 @@ points are proposals for the owner, seeded by 019, each `<code>_count` / `<code>
 | `device_sign_in_failures_many_accounts` | 3 / +60 | different accounts this phone failed a password on |
 | `device_sign_in_unknown_accounts` | 5 / +30 | this phone's sign-ins to accounts that do not exist |
 | `device_stepup_failures` | 3 / +30 | this phone's step-up proofs that did not verify |
-| `device_approvals_denied` | 1 / +60 | this phone's approval requests denied by the account's other phone |
+| `device_approvals_denied` | 1 / +30, **held at review** | this phone's approval requests denied by the account's other phone (owner decision below) |
 | `device_approval_budget_exhausted` | 1 / +30 | this phone's requests refused by the spent budget |
 | `device_stepup_reenrolments` | 2 / +30 | step-up keys re-enrolled on this phone |
 
@@ -6230,11 +6230,24 @@ points are proposals for the owner, seeded by 019, each `<code>_count` / `<code>
   every phone linked within the window, which would have held the opener of a new account.
 - Clock skew: a phone whose clock is far off fails every step-up (`stepup_timestamp_outside_window`)
   and would reach `device_stepup_failures`; its step-ups fail anyway.
-- **Interplay the owner should decide before enabling:** a phone limited at sign-in usually already sits
-  in review, so a denial's +60 takes it to block: it can no longer prompt the account's other phone for
-  the window. That ends prompt-bombing — and one mistaken "deny" holds a genuine new phone for 24 hours.
-  Found by the suite (below). A lower `device_approvals_denied_points` keeps such a phone limited
-  instead.
+- **A denied phone stays limited — owner decision, 2026-10-14.** The suite found that a phone limited at
+  sign-in usually already sits in review (85: a second device +35, a new phone +10, an elevated scan
+  +40), so the first default, a denial at +60, blocked it for the window — one mistaken "deny" would
+  have held a genuine new phone for 24 hours. The owner: *"Lower the denial points and keep it at
+  limited but make the setting DBA configurable."* Lower points alone could not promise it: they add to
+  whatever else the phone scores (at 85 any +5 blocks), and a phone scoring low would go full again
+  once its first cause cleared — a faked clean scan would undo the denial. So, with
+  `device_approvals_denied_effect` = `limit` (the default; `0a77436`), a denial **holds the phone at
+  review** — a limited session — for the window, even if its first cause clears, and never blocks it
+  by itself; whatever blocks without the denial still blocks. The phone may ask again within the
+  budget, and the approver sees the denial among the reasons; `context.held_by_denial` says when the
+  hold decided. The points are 30 (from 60) and stay a DBA setting; `points` makes them plain points
+  that can block.
+- **Still open for the owner:** exhausting the approval budget adds +30 with no such hold, so a phone
+  already in review that asks a fourth time within the hour is blocked for the window (the suite saw
+  it: a phone that exhausted the budget, then was denied, was blocked by the budget rule). The same
+  `limit` treatment could apply to it.
+- **The window** is a DBA setting, `cross_check_window_hours` (24); the owner agreed on 2026-10-14.
 - These are velocity signals: each lapses with its window. A lasting mark is the business's (DBA
   settings, or its own engine over the graph and the context) — the owner's rule, *"Measurements we
   have to guarantee, leave business decisions for them."*
@@ -6262,7 +6275,9 @@ bcrypt check, an unknown handle does not. Archiving it is the DBA's call.
 | Gate: eight checks (80) | `e529f10` | all eight fail on `60da827`; ten mutations caught |
 | Business graph carries the observations | `5367de3` | gate (81); two mutations caught; live |
 | A newcomer judged by the failures before it joined | `051f0c5` | gate; three more mutations caught |
-| Other **phones'** failures, not other installations' (a reinstall on the user's own phone is not "elsewhere"); `approval_denied` in the context as in the graph | `53b4097` | gate (the mistype check includes a reinstall; a mutation back to installations fails it) — **not yet on EC2** |
+| Other **phones'** failures, not other installations' (a reinstall on the user's own phone is not "elsewhere"); `approval_denied` in the context as in the graph | `53b4097` | gate (the mistype check includes a reinstall; a mutation back to installations fails it); live |
+| A denied phone held at review (limited), never blocked by the denial; points 30; `device_approvals_denied_effect` | `0a77436` | gate 82 (a new check; three mutations caught); live |
+| Suite route 2: deny, then the budget; the denied phone stays limited and may ask again | `9f5ab0c` | live: enforce with cross-checks on, full suite **71 / 0 / 7** (a first run that kept the budget before the denial failed 70 / 1 / 7: the exhausted-budget rule blocked the phone, as above); off, targeted 3 / 3 |
 | Suite: `check_server_observations` (any mode), `check_server_observations_scored` | `66d8dec` | live |
 | Suite route 2: budget before the denial; the denial rule checked live | `3be29d7` | live |
 
@@ -6287,7 +6302,8 @@ phones, so a phone that only failed sign-ins on an account is visible in that ac
 as a node. Not recorded: rate-limit 429s and `relationship_changed`.
 
 **State.** EC2 `i-0559685f02c4013b1` stopped; PostgreSQL 16.15 at schema 19 (`server_observations`
-granted `SELECT, INSERT` to `dtadmin`; its 019 description rows carry the earlier wording, "other
-installations" — text only); server `051f0c5`, one behavioural commit behind (`53b4097`, deploy next
-session); observe / observe, every setting at the
-owner's defaults (`cross_checks_enabled` 0), nonce store on Redis, business-token drop-in removed (404).
+granted `SELECT, INSERT` to `dtadmin`; migration 019 was edited after it first went on, so its rows
+were brought to the file by hand — the effect row added, the denial points 60 → 30, two descriptions);
+server `0a77436` (md5 `2dbd143e…`); observe / observe, every setting at the owner's defaults
+(`cross_checks_enabled` 0), nonce store on Redis, business-token drop-in removed (404); no errors in
+the journal since boot.
