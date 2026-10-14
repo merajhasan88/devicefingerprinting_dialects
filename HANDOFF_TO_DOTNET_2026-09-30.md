@@ -507,3 +507,37 @@ periods and fires at 2 (`b90ad27`). What a deployment can turn on, and what the 
 **Verified on our side:** gate 88/88; EC2 PostgreSQL 16.15 at schema 20: observe 62/0/20, enforce with
 cross-checks 74/0/8, each method's PIN checks PASS (incl. 9 concurrent wrong PINs against a limit of 5:
 exactly 5 compared). **Not run:** migrations 015–020 on SQL Server; the harness build on a phone.
+
+## 22. Added 2026-10-14 (latest) — the step-up policy at runtime, session lifetimes, PIN support (DESIGN.md §79, schema 21)
+
+The server requires **schema 21**. What the SDK must do:
+
+- **Create the step-up key as the server's policy says.** `GET /v1/policy/step-up` needs no token and
+  answers `method`, `factor`, `mode`, `window_seconds`, `app_pin_length`, `required_paths`,
+  `app_pin_required_paths`. Read it before registering and create the key with that factor, mode and
+  window. An existing key satisfies the policy when its factor matches and it is per-use, or windowed no
+  longer than the policy's window (a per-use key satisfies a windowed policy). One that does not: delete
+  and recreate it while the server holds no key for the installation; once one is bound, show "re-enrol
+  your step-up key" (password + the new key's proof, `/v1/installations/stepup-key`) and recreate it
+  there — the server refuses a key of another factor (`stepup_factor_mismatch`). Your build settings
+  remain only the fallback when the server cannot be asked. The reference is
+  `_prepareStepUpKey` / `StepUpPolicy` in `lib/device_trust_client.dart` (`5e269c5`).
+- **`/v1/account/me` `step_up`** now also carries `factor`, `mode`, `window_seconds`, `required_paths`,
+  `app_pin_required_paths` and `app_pin_reset_open`. Tolerate the keys.
+- **Session lifetimes are the DBA's.** A refresh token now lives `refresh_idle_days` (30 by default,
+  1–90), and a DBA may cap a session from its first sign-in (`session_max_days`): handle 401
+  `session_max_age_reached` — on refresh and on requests that check the session — by signing in again,
+  like `refresh_session_expired`.
+- **A support reset.** Where the business enables it, its support staff can open a reset of an
+  account's app PIN; then a **limited** session may `POST /v1/account/app-pin` `{"password", "pin"}`
+  once. Offer "set a new PIN" in the limited-session screen; `session_limited` means no reset is open,
+  `app_pin_reset_lapsed` (403) that it lapsed or was used meanwhile. The support endpoints themselves
+  (`/v1/business/app-pin/unlock`, `/reset`) are server to server — not the SDK's.
+- **New observation kinds and code**: `app_pin_support_unlocked`, `app_pin_support_reset` (no phone),
+  and `app_pin_set_after_support_reset`. Tolerate them. Every code is now listed in `MEASUREMENTS.md`.
+- **Suite:** 86 checks — `check_step_up_policy`, `check_business_integrity_reports`,
+  `check_app_pin_support_unlock`, `check_app_pin_support_reset`.
+
+**Verified on our side:** gate 97/97. The Dart client's policy reading is analysed, not yet run on a
+phone. **Not run:** migrations 015–021 on SQL Server.
+

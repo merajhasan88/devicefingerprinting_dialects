@@ -6435,3 +6435,86 @@ a support-staff unlock by a DBA `UPDATE` is the business's procedure to decide, 
 `b90ad27` (md5 `4e5f8917…`, the re-enrolment exemption included); observe / observe; every setting at
 the owner's defaults — `stepup_method` `app_pin`, no step-up or PIN paths, route 1 off, cross-checks
 off; no errors in the journal since boot.
+
+## 79. Who configures what: the owner's answers, and what was built (2026-10-14)
+
+**Why.** The owner set the division of labour — *"Leave it to them to figure out business logic but
+our job is 1) give them defaults, 2) give them every possible measurement from app, 3) a means to
+apply logic on servers and the app that may differ from defaults"* — and an audit of the code against
+it (`WHO_CONFIGURES_WHAT.md`) found ten gaps. The owner's answers: *"Support unlock: build the
+mechanism. Add this to one of the options available to the relevant team."* *"G1: put them under
+DBA."* *"G2: defer it to later after we have finished testing. It will be done. Note it down. Just
+not now."* *"G3: do after G2."* *"G4: modify it so it can follow DBA choice."* *"G5: build it."*
+*"G6: after G3."* *"G7: update it now."* *"G8: make it DBA configurable. 30-day is default but to check
+with /advisor."* *"G9: can you elaborate?"* *"G10: fill the gaps, we will do that afterwards."* Asked
+whether "platform / operations" is DevOps: yes, and the audit map now says DevOps.
+
+**What was built** (migration 021, schema 21; both engines):
+
+- **G1, the relationship rules** (`b714b88`). A new phone (+10 for 24 h), a known phone's new
+  installation (+15), reinstall velocity (3 → +35, 4 → +60, block at 5, over 24 h), no scan (+40), a
+  stale scan (+35, fresh for 600 s), another installation on the phone blocked (+50) and the
+  hardware-backing policy are DBA settings, seeded at the values the code used; the environment
+  variables answer only a missing row; 0 switches a rule off. The gate now fails when the server reads
+  a setting no migration seeds, seeds one it never reads, or falls back to a value other than the
+  seeded one (`c945267`).
+- **G8, how long a session lives** (`b714b88`). `refresh_idle_days` 30 (1–90): each refresh extends the
+  session, so a user who opens the app weekly stays signed in — the default the advisor confirmed.
+  `session_max_days` 0 (off; up to 365) caps a session from its first sign-in however often it
+  refreshes: 401 `session_max_age_reached`, at once for sessions opened before the DBA set it; a refresh
+  token is issued for at most the time left. The bounds are ours.
+- **Support unlock and reset of an app PIN** (`68393c5`, gate `f0bce4b`). `app_pin_support`: `off` (the
+  default — turning it on is the business's call), `unlock`, `unlock_and_reset`. The business API (the
+  company's support tool, server to server, after verifying the customer):
+  `POST /v1/business/app-pin/unlock` clears the count and lock of an existing PIN;
+  `POST /v1/business/app-pin/reset` also sets `app_pins.reset_until` (`app_pin_support_reset_minutes`,
+  15). Exactly one of `account_id` or `handle`, and the caller's ticket `reference` (the `event_id`
+  character rule), recorded as `app_pin_support_unlocked` / `app_pin_support_reset` with the reference
+  as the code and no phone. While a reset is open, a **limited** session may set a new PIN — the one
+  exception to "a limited session never sets a PIN" — still with the password, still through the
+  integrity gate and the risk policy (a block refuses), and the UPDATE that sets it requires
+  `reset_until > now` and clears it, so two requests that both saw it open set one PIN between them
+  (`app_pin_reset_lapsed` for the other); recorded as `app_pin_set_after_support_reset` with the phone.
+  A PIN set from a full session closes an open reset too. A reset on an account without a PIN leaves a
+  row holding only the reset (`pin_hash` is nullable from 021): it verifies nothing, counts no
+  attempt, offers no route 1 and cannot be "unlocked". **The residual, stated in the guide:** whoever
+  convinces support that they are the customer gets the unlock or the reset, and during the window the
+  password alone sets the PIN from any phone holding a session on the account — the business's
+  verification procedure is the control; the window is short and the record names the phone.
+- **G4, the app follows the DBA's step-up policy** (`493fc5c`, `5e269c5`). `GET /v1/policy/step-up`,
+  readable before sign-in because the key is created when the app first registers: the method, the
+  factor, mode and window the screen-lock key must be created with, the PIN's length and the paths;
+  `Cache-Control: no-store`; budgeted per source. `/v1/account/me`'s `step_up` carries the same. The
+  Dart client reads it before registering and asks the keystore for a matching key; an existing key
+  that does not satisfy the policy (another factor, or a longer window — a per-use key satisfies a
+  windowed policy) is replaced while the server holds no key for the installation, or during a
+  re-enrolment; a bound key of another factor is reported and not used, and the user is asked to
+  re-enrol with the password. The build's `STEPUP_*` values are the fallback when the server cannot be
+  asked. `flutter analyze` adds nothing; **not yet run on a phone**.
+- **G5, every measurement** (`598e610`, `651791e`, `8d8a275`, `c5d70ea`).
+  `GET /v1/business/integrity-reports` returns every stored report — `probe_results` as the phone sent
+  them, the reasons, score, verdict, evidence quality, `report_sha256` — oldest first, paged by time and
+  report ID like the lapse feed, with at most one filter (`device_id`, `installation_id`, or
+  `account_id` for every phone linked to the account); an index on `integrity_reports(created_at,
+  report_id)` in 021 serves it. `MEASUREMENTS.md` lists every probe and field, every integrity and
+  relationship reason with its points, the cross-check rules, every observation kind and code and every
+  decision-context field; the gate reads the source with `ast` and fails on any code it does not name.
+  `probe_results` are flagged as device-identifying data. Found while cataloguing: the native collectors
+  report the OS version (`sdk_int`, `os_version`) to the app, which does not send it, so it is not
+  stored — a measurement the server could have and does not.
+- **G7, the settings reference** (`7dda77b`, gate `c945267`). `tools/settings_reference.py` renders all
+  89 seeded settings from the migrations, grouped by migration with each row's own description, into
+  the guide's §5 and the audit map's §2 between markers; the gate fails when a document differs from
+  the migrations, or when the PostgreSQL and SQL Server migrations seed different keys, defaults or
+  descriptions.
+
+**Not built, by the owner's decision.** G2 (a Flutter package) — after testing is finished; G3 (an
+app-developer guide) after G2; G6 (a front page) after G3; G10 (migrations 015–021 on SQL Server) —
+afterwards. G9 (the "Python SDK" claim) — explained to the owner, who chooses between narrowing the
+claim to a Python reference client for the business API and building one.
+
+**Verified offline.** Gate **97/97** — nine new checks; mutations caught: fourteen of the support
+mechanism, four of the report feed, four of the policy endpoint, three of the catalog (and a row
+removed from it), four of the settings reference. Suite **86** checks (four new: the step-up policy,
+the report feed, support unlock, support reset; the business ones need the business token).
+
