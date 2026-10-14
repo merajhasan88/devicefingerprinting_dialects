@@ -23,6 +23,7 @@ PostgreSQL or SQL Server.
 Needs the server's own dependencies plus `cryptography` (via the conformance
 suite's software key), exactly like conformance_suite.py.
 """
+import ast
 import json
 import os
 import random
@@ -50,6 +51,9 @@ os.environ["INTEGRITY_MODE"] = "enforce"
 os.environ["DEVICE_POLICY_MODE"] = "enforce"
 
 REPO = Path(sys.argv[1] if len(sys.argv) > 1 else Path(__file__).resolve().parents[1]).resolve()
+# The documents always come from this tool's own repository, even when REPO
+# names another server file (a mutation run).
+DOCS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 import device_trust_server as s  # noqa: E402
 import conformance_suite as c  # noqa: E402
@@ -4364,6 +4368,74 @@ def the_app_reads_the_dbas_step_up_policy():
                % reply.status_code)
     finally:
         s.RATE_LIMIT_ENABLED, s.REDIS_URL, s._REDIS_CLIENT = saved
+
+
+def _source_measurements():
+    """Every code, kind and field the server source can emit, by kind."""
+    tree = ast.parse(Path(s.__file__).read_text(encoding="utf-8"))
+
+    def literals(node):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return [node.value]
+        if isinstance(node, ast.IfExp):
+            return literals(node.body) + literals(node.orelse)
+        return []
+
+    found = {"integrity reason": set(), "relationship reason": set(),
+             "observation code": set(), "context field": set()}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            name, args = node.func.id, node.args
+            if name == "_integrity_reason" and len(args) > 1:
+                found["integrity reason"].update(literals(args[1]))
+            elif name == "_policy_reason" and len(args) > 1:
+                found["relationship reason"].update(literals(args[1]))
+            elif name == "_record_observation" and len(args) > 1:
+                found["observation code"].update(literals(args[1]))
+            elif name == "_observed_refusal" and args:
+                found["observation code"].update(literals(args[0]))
+        elif (isinstance(node, ast.FunctionDef) and node.name == "_evaluate_risk_policy"):
+            for inner in ast.walk(node):
+                if (isinstance(inner, ast.Assign) and isinstance(inner.value, ast.Dict)
+                        and [ast.unparse(t) for t in inner.targets] == ["context"]):
+                    found["context field"].update(literals_of_keys(inner.value))
+                elif (isinstance(inner, ast.Subscript) and ast.unparse(inner.value) == "context"):
+                    found["context field"].update(literals(inner.slice))
+        elif isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mod):
+            for text in literals(node.left):
+                if text.startswith("integrity_") and text.endswith(":%s"):
+                    found["integrity reason"].add(text[:-2] + "<probe>")
+    found["cross-check rule"] = {rule[0] for rule in s._CROSS_CHECK_RULES}
+    found["observation kind"] = set(s._OBSERVATION_KINDS)
+    fields = set()
+    for contract in (s._PROBE_REQUIRED_FIELDS, s._PROBE_OPTIONAL_FIELDS):
+        for probes in contract.values():
+            for probe, names in probes.items():
+                fields.add(probe)
+                fields.update(names)
+    found["probe or field"] = fields
+    return found
+
+
+def literals_of_keys(node):
+    return [k.value for k in node.keys if isinstance(k, ast.Constant) and isinstance(k.value, str)]
+
+
+@check
+def the_measurement_catalog_lists_every_code():
+    """DESIGN.md 79 (G5). MEASUREMENTS.md names every integrity and relationship
+    reason code, cross-check rule, observation kind and code, decision-context
+    field, and every probe field of the server's evidence contract: a code the
+    source can emit but the catalog does not name fails here."""
+    catalog = (DOCS / "MEASUREMENTS.md").read_text(encoding="utf-8")
+    found = _source_measurements()
+    expect(len(found["integrity reason"]) >= 60 and len(found["relationship reason"]) >= 20
+           and len(found["observation kind"]) >= 11 and len(found["context field"]) >= 25,
+           "the source scan found too little to be trusted: %s"
+           % {kind: len(names) for kind, names in found.items()})
+    missing = sorted("%s %s" % (kind, name) for kind, names in found.items()
+                     for name in names if "`%s`" % name not in catalog)
+    expect(not missing, "MEASUREMENTS.md does not name: %s" % missing)
 
 
 @check
