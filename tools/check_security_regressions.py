@@ -2974,7 +2974,9 @@ CREATE TABLE device_account_links (device_id TEXT, account_id TEXT, first_instal
                                    PRIMARY KEY (device_id, account_id));
 CREATE TABLE integrity_reports (report_id TEXT PRIMARY KEY, installation_id TEXT, device_id TEXT,
                                 score INTEGER, verdict TEXT, hard_block BOOLEAN, created_at TSZ,
-                                evidence_quality TEXT, finding_score INTEGER);
+                                evidence_quality TEXT, finding_score INTEGER, platform TEXT,
+                                collector_version INTEGER, reasons TEXT, probe_results TEXT,
+                                report_sha256 TEXT);
 CREATE TABLE business_events (event_id TEXT PRIMARY KEY,
                               account_id TEXT NOT NULL REFERENCES demo_accounts(account_id),
                               event_type TEXT NOT NULL, occurred_at TSZ NOT NULL,
@@ -4250,6 +4252,71 @@ def support_unlocks_or_resets_an_app_pin_only_as_the_dba_allows():
                         ("app_pin_support_reset", "T-5", bare, None, None),
                         ("app_pin_support_reset", "T-6", bare, None, None)],
                "each support action is recorded once, with its reference: %s" % seen)
+
+
+@check
+def the_business_reads_every_integrity_report_page_by_page():
+    """DESIGN.md 79. The business feed returns each stored report with the
+    phone's measurements and the server's reasons, oldest first; the cursor
+    carries the last report's time and id, so reports sharing a timestamp at a
+    page edge are neither skipped nor repeated. At most one filter: a phone, an
+    installation, or an account -- every phone linked to it, reports from
+    before the link included."""
+    path = "/v1/business/integrity-reports"
+    with business_store() as connection:
+        account_id = business_account(connection, "report-reader")
+        phone, other = str(uuid.uuid4()), str(uuid.uuid4())
+        business_link(connection, phone, account_id)
+        install = str(uuid.uuid4())
+        start = s._utc_now() - timedelta(hours=3)
+        rows = []
+        for minutes, device in ((0, phone), (0, phone), (0, other), (30, other), (60, phone)):
+            report = str(uuid.uuid4())
+            created = start + timedelta(minutes=minutes)
+            connection.execute(
+                "INSERT INTO integrity_reports (report_id, installation_id, device_id, score, "
+                "verdict, hard_block, created_at, evidence_quality, finding_score, platform, "
+                "collector_version, reasons, probe_results, report_sha256) "
+                "VALUES (?, ?, ?, 8, 'trusted', 0, ?, 'complete', 0, 'android', 3, ?, ?, ?)",
+                (report, install if device == phone else str(uuid.uuid4()), device, created,
+                 json.dumps([{"code": "android_developer_options", "points": 8}]),
+                 json.dumps({"debug_state": {"developer_options": True}}), "ab" * 32))
+            rows.append((created, report, device))
+        rows.sort()
+        status, payload = business_call("GET", path, token="", query={})
+        expect(status == 401, "the feed needs the business token, got %s" % status)
+        seen, query = [], {"limit": "2"}
+        for _ in range(4):
+            status, payload = business_call("GET", path, query=query)
+            expect(status == 200, "a page: %s %s" % (status, payload))
+            seen.extend(r["report_id"] for r in payload["reports"])
+            query = {"limit": "2", "cursor": payload["next_cursor"]}
+        expect(seen == [r[1] for r in rows],
+               "pages of two must return each report once, in order: %s" % seen)
+        first = business_call("GET", path, query={"limit": "1"})[1]["reports"][0]
+        expect(first["probe_results"] == {"debug_state": {"developer_options": True}}
+               and first["reasons"] == [{"code": "android_developer_options", "points": 8}]
+               and first["platform"] == "android" and first["collector_version"] == 3
+               and first["hard_block"] is False and first["evidence_quality"] == "complete"
+               and first["report_sha256"] == "ab" * 32,
+               "a report carries the phone's measurements and the server's reasons: %s" % first)
+        for name, value, expected in (
+                ("device_id", other, [r[1] for r in rows if r[2] == other]),
+                ("installation_id", install, [r[1] for r in rows if r[2] == phone]),
+                ("account_id", account_id, [r[1] for r in rows if r[2] == phone])):
+            status, payload = business_call("GET", path, query={name: value})
+            expect(status == 200 and [r["report_id"] for r in payload["reports"]] == expected,
+                   "filtered by %s: %s %s" % (name, status, payload))
+        status, payload = business_call("GET", path, query={
+            "since": s._iso_z(rows[2][0]), "device_id": phone})
+        expect([r["report_id"] for r in payload["reports"]] == [rows[4][1]],
+               "since returns only what came after it: %s" % payload)
+        for query, code in (({"device_id": phone, "account_id": account_id}, "invalid_filter"),
+                            ({"cursor": "not-a-cursor"}, "invalid_cursor"),
+                            ({"device_id": "not-a-uuid"}, None)):
+            status, payload = business_call("GET", path, query=query)
+            expect(status == 400 and (code is None or payload["error"]["code"] == code),
+                   "%s must be refused: %s %s" % (sorted(query), status, payload))
 
 
 @check
