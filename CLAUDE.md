@@ -90,16 +90,20 @@ processes** from the systemd drop-in, with a per-process connection pool (`DB_PO
 `DB_POOL_RECHECK_SECONDS`) and, on SQL Server, a 15 s statement timeout (`DB_QUERY_TIMEOUT`) —
 DESIGN.md 55 and 60. Serve SQL Server with processes, never threads.
 
-**Schema is migrations, DBA-applied.** `migrations/<dialect>/001…020`, applied in order; the server
-refuses to serve unless `schema_migrations` holds the version it requires (currently **20**). A new
+**Schema is migrations, DBA-applied.** `migrations/<dialect>/001…021`, applied in order; the server
+refuses to serve unless `schema_migrations` holds the version it requires (currently **21**). A new
 table needs its grant (`GRANT`/`ALTER DEFAULT PRIVILEGES` on PostgreSQL). Risk and step-up policy
 values live in `risk_policy_settings`, seeded by the migrations with the owner's defaults, which a DBA
-may change — never hard-code a policy value.
+may change — never hard-code a policy value; the gate fails when the server reads a setting no
+migration seeds, or falls back to a value other than the seeded one. The settings reference in
+`INTEGRATION_GUIDE.md` §5 and `WHO_CONFIGURES_WHAT.md` §2 is generated: after changing a migration's
+settings run `python3 tools/settings_reference.py --write`. Every reason code, observation kind and
+probe field the server can emit must be named in `MEASUREMENTS.md` (also gated).
 
 ## Commands
 
 ```bash
-# Conformance suite — the gate. 82 checks; needs `cryptography` (harness only).
+# Conformance suite — the gate. 86 checks; needs `cryptography` (harness only).
 python3 conformance_suite.py --base-url https://<endpoint>
 #   Scoring checks need the server started with INTEGRITY_ANDROID_CERT_SHA256 set to the
 #   certificate the suite prints, or empty to disable the allow-list.
@@ -107,12 +111,15 @@ python3 conformance_suite.py --base-url https://<endpoint>
 #   (rate anomaly, population baseline, step-up, eligibility rules, upgrade routes 1 and 3,
 #   scored cross-checks, the app PIN where no path needs it) SKIP
 #   until their risk_policy_settings rows are enabled; route 3 also needs the suite's JWKS
-#   (it prints it) in the file named by UPGRADE_ASSERTION_JWKS_FILE.
+#   (it prints it) in the file named by UPGRADE_ASSERTION_JWKS_FILE. The business API checks
+#   (events, the report feed, PIN support) need DEVICE_TRUST_BUSINESS_TOKEN in the environment.
 #   check_parallel_clients (4 concurrent flows) must pass on any new backend BEFORE handset
 #   or paid-database time is spent on it.
 
-# Offline security regression gate (88 checks; DESIGN.md 63, 76-78): no database needed
+# Offline security regression gate (97 checks; DESIGN.md 63, 76-79): no database needed
 python3 tools/check_security_regressions.py
+# The generated settings reference (G7): print, or rewrite it in the two documents
+python3 tools/settings_reference.py [--write]
 # Native scanner on the host (from a scratch dir; clang++ or g++)
 clang++ -std=c++17 -O1 -Wall -Wextra -Itools/native -Iandroid/app/src/main/cpp \
     tools/native/check_code_integrity.cpp -o check_code_integrity && ./check_code_integrity
@@ -138,7 +145,11 @@ not jailbroken). The emulator AVD `integrity_root_lab` is the disposable root la
 
 ## Current point of work
 
-See the end of DESIGN.md: section 78 records the step-up method — the screen lock, an app PIN the
+See the end of DESIGN.md: section 79 records the owner's answers to the who-configures-what audit
+(`WHO_CONFIGURES_WHAT.md`) and what was built — the relationship rules and session lifetimes as DBA
+settings, support unlock and reset of an app PIN, the step-up policy read by the app at runtime, the
+business feed of integrity reports, the measurement catalog and the generated settings reference
+(schema 21); G2, G3, G6 and G10 are deferred by the owner; section 78 records the step-up method — the screen lock, an app PIN the
 server checks, or both, the DBA's choice (schema 20); section 77 the server's own observations
 (cross-checks measured into every decision, scored only where the DBA enables them); section 76 the critical review of
 2026-10-13 and what was built from it (sign-out and family checks, admission under locks, evidence
