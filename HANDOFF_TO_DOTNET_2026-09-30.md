@@ -438,3 +438,37 @@ at schema 17: observe 61/0/15; integrity enforce with routes 1–3 72/0/4; both 
 `tools/race_admission.py` 5 links before the fix, 2 after. **Not run:** migration 018 and the
 carry-over on any database (gate only); anything from 015 on against SQL Server; collector 3 on a
 handset; an iPhone round. Your `validation.md` §"Not covered" can point here for the server side.
+
+## 20. Added 2026-10-14 — the server's own observations (DESIGN.md §77, schema 19)
+
+Server-side; **nothing is required of the SDK** while the DBA leaves `cross_checks_enabled` at its
+default, 0. Pull DESIGN.md §77 and migration 019. What you may see, and what to tolerate:
+
+- **Decision `context`** gains `server_observations` (counts of what the server itself saw: wrong
+  passwords, sign-ins to unknown accounts, failed step-up proofs, denied approval requests, exhausted
+  approval budgets, step-up re-enrolments — for the phone, the account and a `newcomer`),
+  `request_rate` (`off` / `measured` / `unavailable`) and, when this request's rate limiter could not
+  run, `rate_limiter: "unavailable"`. Read them if your harness shows the context; never require them.
+- **Relationship reasons may carry `count`.** With cross-checks enabled, seven codes can appear —
+  `account_sign_in_failures_elsewhere`, `device_sign_in_failures_many_accounts`,
+  `device_sign_in_unknown_accounts`, `device_stepup_failures`, `device_approvals_denied`,
+  `device_approval_budget_exhausted`, `device_stepup_reenrolments` — each with `count`. Your reason
+  model must accept the extra key. They reach the approver through the existing listing (`code`,
+  `points`, `message`, `source`); the message states the count.
+- **`request_rate_unavailable` at 0 points** appears whenever the DBA's request-rate rule is on and its
+  counter is unreadable. Do not present a 0-point reason as a problem.
+- **A denied phone may now be refused before the budget.** With cross-checks on, a denial adds +60
+  against the phone that asked; a phone already limited at review reaches block and its next request
+  answers 403 `risk_policy_blocked` (details carry the decision) instead of 429
+  `upgrade_budget_exhausted`. If your port of the route-2 check denies before it exhausts the budget,
+  reorder it as the reference did (`3be29d7`): budget first, then the denial; where the DBA's denial
+  rule is on, the denied phone's next sign-in decision lists `device_approvals_denied` with its count.
+- **Suite:** 78 checks — `check_server_observations` (runs in any mode: two other phones' wrong
+  passwords and an unknown handle are counted in the account's decision, the guessing phone's own, and
+  a phone joining afterwards, not the opener's) and `check_server_observations_scored` (skips unless
+  enabled).
+
+**Verified on our side:** offline gate 81/81; EC2 PostgreSQL 16.15 at schema 19: observe 61/0/17, both
+enforce with cross-checks on 71/0/7, both enforce at the owner's defaults 70/0/8, a Redis outage
+recorded as degraded and unscored, `tools/race_admission.py` PASS, and the §19 carry-over (018) now
+verified live. **Not run:** migrations 015–019 against SQL Server.
