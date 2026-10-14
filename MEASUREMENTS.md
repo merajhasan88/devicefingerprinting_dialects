@@ -101,12 +101,15 @@ if enabled.
 
 Collection problems (DESIGN.md 66): `integrity_probe_failed:<probe>` (a requested probe answered
 `error`), `integrity_probe_incomplete:<probe>` (an `ok` probe without its contract fields) and
-`integrity_evidence_invalid:<probe>` (measurements that contradict each other) score 0 each — or 30 each
-where the DBA sets `collection_problems_block` — and are summed up as:
+`integrity_evidence_invalid:<probe>` (measurements that contradict each other). Under the owner's
+default (`collection_problems_block` 0) each scores 0 and one `integrity_evidence_incomplete` row adds
+30 for all of them; where the DBA sets it to 1, each scores 30 and that summary row does not appear.
+`integrity_evidence_persistently_incomplete` adds 30 more after `incomplete_evidence_review_after` (3)
+incomplete scans in a row, under either setting.
 
 | Code | Points | Hard | Report-only | Platform | Meaning |
 |---|---|---|---|---|---|
-| `integrity_evidence_incomplete` | 30 |  |  | both | N requested probe(s) measured nothing usable; a complete scan clears this. |
+| `integrity_evidence_incomplete` | 30 |  |  | both | N requested probe(s) measured nothing usable; a complete scan clears this. Only under `collection_problems_block` 0. |
 | `integrity_evidence_persistently_incomplete` | 30 |  |  | both | N integrity scans in a row could not be completed; send a complete scan. |
 | `key_hardware_backing_unreported` | 100 | yes |  | both | `hardware_backing_policy` = required, and this installation never reported how its key is stored. |
 | `key_software_backed` | 100 or 30 | when required |  | both | The installation key is software-backed (a claim of the phone): 100 and hard under `required`, 30 under `advisory`. |
