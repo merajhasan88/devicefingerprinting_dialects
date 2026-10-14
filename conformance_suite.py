@@ -1840,6 +1840,102 @@ def check_business_api(api, ctx):
     expect(st == 200 and isinstance(feed.get("lapses"), list), "lapse feed: %s %s" % (st, feed))
 
 
+def _observing_phone(api):
+    """A fresh phone with a device token and a clean report."""
+    inst = Installation()
+    st, pl = enrol(api, inst, fresh_hint())
+    expect(st in (200, 201), "enrol failed: %s %s" % (st, pl))
+    token = device_token(api, inst)
+    submit_report(api, inst, token)
+    return inst, token
+
+
+def _decision_of(payload):
+    """The relationship decision in a sign-in answer, allowed or refused."""
+    error = payload.get("error") if isinstance(payload.get("error"), dict) else {}
+    return payload.get("policy") or (error.get("details") or {}).get("policy") or {}
+
+
+@check("observations: wrong passwords and unknown accounts are measured into decisions")
+def check_server_observations(api, ctx):
+    """DESIGN.md 77, measured whatever the DBA's switch. An account on one
+    phone; a second phone sends it two wrong passwords and tries a handle no
+    account has; a third sends one. The account's decisions count three
+    failures from two other installations; the second phone's own decision
+    counts two failures on one account and one unknown account; a phone
+    joining the account now is judged by the three. Every 401 is the same."""
+    owner, owner_token = _observing_phone(api)
+    handle = "obs-%s" % secrets.token_hex(4)
+    st, pl = open_account(api, owner, owner_token, handle)
+    expect(st in (200, 201), "open account failed: %s %s" % (st, pl))
+    access = pl["access_token"]
+    guesser, guesser_token = _observing_phone(api)
+    other, other_token = _observing_phone(api)
+    for inst, token, who in ((guesser, guesser_token, handle), (guesser, guesser_token, handle),
+                             (guesser, guesser_token, "nobody-%s" % secrets.token_hex(6)),
+                             (other, other_token, handle)):
+        st, pl = sign_in(api, inst, token, who, password="Wrong-Passw0rd")
+        expect(st == 401 and error_code(pl) == "invalid_credentials",
+               "a wrong password or unknown handle must answer 401 invalid_credentials: %s %s"
+               % (st, pl))
+    st, pl = protected(api, owner, "GET", "/v1/policy/me", access)
+    expect(st == 200, "policy/me failed: %s %s" % (st, pl))
+    seen = pl["policy"]["context"]["server_observations"]
+    expect(seen["account"]["sign_in_failed"] == 3
+           and seen["account"]["sign_in_failed_installations"] == 2
+           and seen["account"]["sign_in_failed_elsewhere"] == 3,
+           "the account's decision must count three failures from two phones: %s" % seen)
+    expect(seen["newcomer"] is not None
+           and seen["newcomer"]["sign_in_failed_elsewhere_before"] == 0,
+           "the phone that opened the account before the failures is not judged by them: %s"
+           % seen["newcomer"])
+    expect(seen["scored"] is _setting_on(live_settings(api), "cross_checks_enabled"),
+           "scored must follow cross_checks_enabled: %s" % seen)
+    st, pl = open_account(api, guesser, guesser_token, "obs-own-%s" % secrets.token_hex(4))
+    expect(st in (200, 201), "the guessing phone's own account failed: %s %s" % (st, pl))
+    device = pl["policy"]["context"]["server_observations"]["device"]
+    expect(device["sign_in_failed"] == 2 and device["sign_in_failed_accounts"] == 1
+           and device["sign_in_unknown_account"] == 1,
+           "the guessing phone's own decision must count what it did: %s" % device)
+    joining, joining_token = _observing_phone(api)
+    st, pl = sign_in(api, joining, joining_token, handle)
+    newcomer = (_decision_of(pl).get("context") or {}).get("server_observations", {}).get("newcomer")
+    expect(newcomer and newcomer["sign_in_failed_elsewhere_before"] == 3,
+           "a phone joining now is judged by the failures before it: %s %s" % (st, newcomer))
+
+
+@check("observations: with cross-checks enabled, a phone joining after failures elsewhere is scored")
+def check_server_observations_scored(api, ctx):
+    """DESIGN.md 77. Runs where the DBA has set cross_checks_enabled = 1, with
+    the account rule's count at most 10; derives its expectations from the
+    live settings. A phone joining an account after that many wrong passwords
+    from another phone carries account_sign_in_failures_elsewhere with the
+    DBA's points and the count."""
+    settings = live_settings(api)
+    if not _setting_on(settings, "cross_checks_enabled"):
+        raise Skip("cross_checks_enabled is off (the owner's default: observe first)")
+    threshold = int(settings.get("account_sign_in_failures_elsewhere_count", "5") or "5")
+    points = int(settings.get("account_sign_in_failures_elsewhere_points", "30") or "30")
+    if not 0 < threshold <= 10:
+        raise Skip("account_sign_in_failures_elsewhere_count=%s is off or too high to run"
+                   % threshold)
+    owner, owner_token = _observing_phone(api)
+    handle = "obs-scored-%s" % secrets.token_hex(4)
+    st, pl = open_account(api, owner, owner_token, handle)
+    expect(st in (200, 201), "open account failed: %s %s" % (st, pl))
+    guesser, guesser_token = _observing_phone(api)
+    for _ in range(threshold):
+        st, pl = sign_in(api, guesser, guesser_token, handle, password="Wrong-Passw0rd")
+        expect(st == 401, "a wrong password must be refused: %s %s" % (st, pl))
+    joining, joining_token = _observing_phone(api)
+    st, pl = sign_in(api, joining, joining_token, handle)
+    reason = reason_for(_decision_of(pl), "account_sign_in_failures_elsewhere")
+    expect(reason is not None and reason.get("points") == points
+           and reason.get("count") == threshold,
+           "expected account_sign_in_failures_elsewhere +%d (count %d); got %s %s"
+           % (points, threshold, st, _decision_of(pl).get("reasons")))
+
+
 @check("session: sign-out revokes the family at once; a routine refresh does not")
 def check_logout_revokes_the_family(api, ctx):
     """Review R6 (DESIGN.md 76). After a refresh the previous access token still
