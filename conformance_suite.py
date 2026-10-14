@@ -1938,14 +1938,17 @@ def check_server_observations_scored(api, ctx):
            % (points, threshold, st, _decision_of(pl).get("reasons")))
 
 
-def _skip_unless_screen_lock(settings):
+def _skip_unless_screen_lock(settings, sensitive_path=False):
     """These checks prove the screen-lock key's step-up (DESIGN.md 63, 70).
-    Under the DBA's other step-up methods (DESIGN.md 78) the app PIN checks
-    cover the same flows."""
+    Under the DBA's other step-up methods (DESIGN.md 78) -- or, for the checks
+    on the sensitive path, where that path also needs the app PIN -- the app
+    PIN checks cover the same flows."""
     method = settings.get("stepup_method") or "screen_lock"
     if method != "screen_lock":
         raise Skip("stepup_method is %s; this check proves the screen-lock key, the app PIN "
                    "checks cover the same flows" % method)
+    if sensitive_path and SENSITIVE_PATH in _setting_words(settings, "app_pin_required_paths", ""):
+        raise Skip("the sensitive path also needs the app PIN here; check_app_pin covers it")
 
 
 SENSITIVE_PATH = "/v1/account/sensitive-echo"
@@ -2163,17 +2166,26 @@ def check_app_pin_approval(api, ctx):
                        {"route": "approval", "request_id": req["request_id"]})
     expect(st == 200 and up.get("scope") == "full", "the approved phone upgrades: %s %s" % (st, up))
     if _setting_on(settings, "upgrade_stepup_same_device"):
-        st, pl = sign_in(api, phone, phone_token, handle)
+        # Route 1 clears integrity causes only: a single-phone account whose
+        # own phone turns elevated, its PIN set while the session was full.
+        single, single_token, single_handle, single_access, single_key = _pin_phone(
+            api, settings, with_key)
+        st, pl = _set_pin(api, single, single_access, pin)
+        expect(st == 200, "setting the PIN: %s %s" % (st, pl))
+        submit_report(api, single, single_token, _elevate)
+        st, pl = sign_in(api, single, single_token, single_handle)
+        expect(st == 200 and pl.get("scope") == "limited"
+               and "stepup" in (pl.get("upgrade_routes") or []),
+               "the limited login must offer route 1: %s %s" % (st, pl))
         limited = pl["access_token"]
-        if pl.get("scope") == "limited" and "stepup" in (pl.get("upgrade_routes") or []):
-            st, up = pin_call(api, phone, "/v1/auth/upgrade", limited, {"route": "stepup"},
-                              stepup=phone_key)
-            expect(st == 403 and error_code(up) == "app_pin_required",
-                   "route 1 without the PIN: %s %s" % (st, up))
-            st, up = pin_call(api, phone, "/v1/auth/upgrade", limited, {"route": "stepup"},
-                              pin=pin, stepup=phone_key)
-            expect(st == 200 and up.get("scope") == "full", "route 1 with the PIN: %s %s"
-                   % (st, up))
+        st, up = pin_call(api, single, "/v1/auth/upgrade", limited, {"route": "stepup"},
+                          stepup=single_key)
+        expect(st == 403 and error_code(up) == "app_pin_required",
+               "route 1 without the PIN: %s %s" % (st, up))
+        st, up = pin_call(api, single, "/v1/auth/upgrade", limited, {"route": "stepup"},
+                          pin=pin, stepup=single_key)
+        expect(st == 200 and up.get("scope") == "full" and up.get("upgraded_by") == "stepup",
+               "route 1 with the PIN upgrades: %s %s" % (st, up))
 
 
 @check("observations: a stolen token and a replayed request are recorded once each")
@@ -3077,7 +3089,7 @@ def check_step_up(api, ctx):
     F1) -> 403 stepup_binding_mismatch; a v1 proof -> 403
     stepup_proof_version_unsupported; a key registered with another factor ->
     403 stepup_factor_mismatch."""
-    _skip_unless_screen_lock(live_settings(api))
+    _skip_unless_screen_lock(live_settings(api), sensitive_path=True)
     _, health = api.call("GET", "/health/ready")
     scoring = health.get("scoring_flags", {}) if isinstance(health, dict) else {}
     settings = scoring.get("risk_policy_settings", {})
@@ -3307,7 +3319,7 @@ def check_stepup_reenrol(api, ctx):
     only with the access proof, the account password and a signature by the new
     key bound to this request. A wrong password or a proof signed by another key
     is refused and changes nothing; the right one replaces the bound key."""
-    _skip_unless_screen_lock(live_settings(api))
+    _skip_unless_screen_lock(live_settings(api), sensitive_path=True)
     auth = {"factor": "passcode", "mode": "per_use", "window_seconds": 0}
     inst = Installation()
     old_priv, old_jwk = stepup_jwk_pair()
