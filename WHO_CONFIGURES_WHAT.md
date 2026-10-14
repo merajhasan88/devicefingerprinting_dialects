@@ -26,10 +26,10 @@ even if the same people wear two hats.
 
 | What | Values | Why it is ours |
 |---|---|---|
-| The integrity findings and their points | e.g. Frida in memory +90, a hooking framework +80, a Frida port +75, Magisk/KernelSU/APatch +75, bootloader unlocked +60, writable system partition +55, `ro.secure=0` +50, test-keys +25, signing-certificate mismatch +100 and a hard block (`_score_android_integrity`, `_score_ios_integrity`) | Measured on our handset battery. What a finding weighs is the product's expertise and the same for every customer |
+| The integrity findings and their points | e.g. Frida in memory +90, a hooking framework +80, a Frida port +75, a root-management framework +75, Verified Boot not green or the bootloader unlocked +60, writable system partition +55, `ro.secure=0` +50, test-keys +25, signing-certificate mismatch +100 and a hard block (`_score_android_integrity`, `_score_ios_integrity`) | Measured on our handset battery. What a finding weighs is the product's expertise and the same for every customer |
 | The integrity verdict bands | 0–29 trusted, 30–59 elevated, 60–89 review, 90+ block | Owner decision: not DBA-configurable |
 | How evidence quality is judged | complete, partial, incomplete, invalid, legacy; collection problems +30 once; evidence contracts Android 3, iOS 2 | Our measurement rules |
-| The probe plan | six mandatory Android probes plus four random optional ones (`INTEGRITY_RANDOM_OPTIONAL_PROBES`) | Collection design |
+| The probe plan | fourteen mandatory Android probes plus `emulator` drawn at random (`INTEGRITY_RANDOM_OPTIONAL_PROBES`); six mandatory iOS probes | Collection design |
 | The protocol | ES256 installation key, access-proof v2 over the whole request, single-use nonces, step-up proof v2, MACed challenges, replay defence | Security; changing it breaks every client |
 | Lifetimes | access token 10 min, device token 10 min, **refresh 30 days**, challenge 2 min, proof clock skew ±120 s, nonce retention 10 min | Security parameters. The refresh lifetime is the one a business may reasonably want to choose (gap G8) |
 | Invariants | links and observations are never deleted; a block always refuses; a limited session never sets a PIN; neither the PIN nor the key is ever required to replace itself; PIN attempts are claimed before they are compared; a stolen token is recorded once | The guarantees the product makes |
