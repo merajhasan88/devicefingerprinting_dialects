@@ -127,7 +127,7 @@ statement timeout `DB_QUERY_TIMEOUT` (15 s).
   cleartext; require the same of every client build you ship.
 
 **Database.** PostgreSQL 13+ or SQL Server 2017+ (`DB_ENGINE`). Your DBA applies
-`migrations/<engine>/001…018` in order; the server only reads `schema_migrations` and refuses to serve
+`migrations/<engine>/001…019` in order; the server only reads `schema_migrations` and refuses to serve
 on any other version (`/health/ready` says why). Use verified TLS: PostgreSQL `DB_SSLMODE=verify-full`
 with `DB_SSLROOTCERT`; SQL Server always connects with `Encrypt=yes` and `TrustServerCertificate=no`.
 
@@ -185,6 +185,7 @@ defaults and changed by your DBA, never by the server. Notable keys:
 | `acceptance_auto_cover_reasons` | empty | **your business decision**: reasons an approved session accepts even if they appear after the approval (section 7) |
 | `legacy_acceptances` | `carry` | approvals granted before migration 016: `carry` keeps each as what it covers at its first use, until its expiry; `drop` makes them cover nothing, so their users re-confirm (section 7) |
 | `business_event_types` / `business_graph_depth` / `business_graph_max_nodes` | any / 2 / 200 | the business API (section 10) |
+| `cross_checks_enabled` / `cross_check_window_hours` | 0 / 24 | the server's own observations (section 11): always measured into every decision; 1 scores them with the rules' `<code>_count` / `<code>_points` |
 
 **Shared phones and several devices are a business decision.** By default a third account on one
 phone, or one account on a third device, is held for review and refused in enforce mode. A business
@@ -531,7 +532,9 @@ cut at `business_graph_max_nodes` (`truncated: true`). Each account carries its 
 7 and 30 days with 30-day amounts per currency, and how many other accounts share a subject with it;
 each phone its platform, status, first and last seen, installations, latest integrity verdict and
 evidence quality, and whether its integrity memory holds a block; each link its first and last seen;
-and the component its 30-day totals per type.
+and the component its 30-day totals per type. Each account and phone also carries
+`server_observations`: what the server itself saw on it, by kind, for 1, 7 and 30 days (section 11) —
+on a phone, its denied approval requests among them (`approval_denied`).
 
 **`GET /v1/business/acceptance-lapses?since=<ISO time>&limit=<n>`**: when an approved session met a
 reason its approval did not cover, oldest first — `acceptance_id`, `account_id`, `installation_id`,
@@ -548,5 +551,72 @@ across a phone's accounts adds points" — are yours to run, in your engine, fro
 decision context; the server can apply such rules too, but only if you decide it should.
 
 **Database.** Migration 017 adds `business_events`: grant `SELECT, INSERT`, never `UPDATE` or
-`DELETE`. The server serves only at its schema version (18): a database without 017 answers 503
+`DELETE`. The server serves only at its schema version (19): a database without 017 answers 503
 `schema_version_mismatch` everywhere but `/health`, so no decision ever reads a missing table.
+
+## 11. The server's own observations (cross-checks)
+
+A phone can send a clean scan that is not true. What it cannot hide is what the **server** sees when
+it refuses or changes something, so the server records those itself (`DESIGN.md` §77) — never what a
+phone reports, and no personal data: the account's opaque ID when there is one, the phone and the
+installation whose key made the request.
+
+| kind | recorded when |
+|---|---|
+| `sign_in_failed` | a wrong password at sign-in (code `invalid_credentials`), or at step-up re-enrolment (`stepup_reenrol_invalid_credentials`) |
+| `sign_in_unknown_account` | a sign-in to a handle no account has — recorded without an account; the answer is the same 401 |
+| `stepup_failed` | a step-up (screen-lock) proof that did not verify — on a sensitive path, the same-phone upgrade route, or an approver's phone — with its refusal code. A request sent without a proof is not one: that is the ordinary first leg, after which your app asks for the screen lock |
+| `approval_budget_exhausted` | an approval request refused because the account's hourly budget was spent |
+| `stepup_reenrolled` | a step-up key re-enrolled (in the same transaction as the change) |
+| denied approval requests | already rows of `session_upgrade_requests` (`denied_at`), counted per requesting phone |
+
+**Measured always.** Every risk decision's `context.server_observations` carries the counts over
+`cross_check_window_hours` (24): for the phone, across every account (`sign_in_failed`,
+`sign_in_failed_accounts` — how many different accounts, `sign_in_unknown_account`, `stepup_failed`,
+`approvals_denied`, `approval_budget_exhausted`, `stepup_reenrolled`); for the account, from every
+phone (`sign_in_failed`, `sign_in_failed_installations`, `sign_in_failed_elsewhere` — from
+installations other than the one asking, and the other kinds); `newcomer`, for a phone joining the
+account now or within the window (`joined_at`, `sign_in_failed_elsewhere_before`), else null;
+`window_hours`; and `scored`. The graph (section 10) carries them per account and phone.
+
+**Scored only where your DBA switches them on** (`cross_checks_enabled`, default 0 — observe first).
+Then each rule adds its points once its count is reached; `0` as a count switches a rule off. The
+counts and points below are the defaults migration 019 seeds — proposals for you to tune:
+
+| reason | count / points | counts |
+|---|---|---|
+| `account_sign_in_failures_elsewhere` | 5 / 30 | wrong passwords sent to the account by **other** installations in the window **before this phone joined it** — judged only for a phone joining now or within the window |
+| `device_sign_in_failures_many_accounts` | 3 / 60 | different accounts this phone sent a wrong password to |
+| `device_sign_in_unknown_accounts` | 5 / 30 | this phone's sign-ins to accounts that do not exist |
+| `device_stepup_failures` | 3 / 30 | this phone's step-up proofs that did not verify |
+| `device_approvals_denied` | 1 / 60 | this phone's approval requests the account's other phone denied |
+| `device_approval_budget_exhausted` | 1 / 30 | this phone's approval requests refused by the spent budget |
+| `device_stepup_reenrolments` | 2 / 30 | step-up keys re-enrolled on this phone |
+
+What they do not do, by design:
+
+- **A user mistyping on their own phone is never counted against anyone**: the account's rule counts
+  other installations only, and a phone's own rules need several accounts or unknown accounts.
+- **Failures someone causes on an account never restrict a phone that was there before them** — a
+  long-standing phone, or the one that opened the account this morning. Only a phone that joined
+  after them is judged, so an attacker guessing a password cannot degrade the owner's phones.
+- They are velocity signals: each holds for the window and then lapses. A lasting mark is your
+  business's — your DBA's settings, or your own engine over the graph and the decision context.
+- Interplay to decide before enabling: a phone limited at sign-in is usually already in review, so a
+  denial's +60 takes it to block — it can no longer prompt the account's other phone for the window.
+  That stops prompt-bombing; it also means one mistaken "deny" holds a genuine new phone for the
+  window. Lower `device_approvals_denied_points` if you prefer that phone to stay limited instead.
+- An approval covers one of these reasons only up to the count the approver saw (`count` on the
+  reason); more failures afterwards need a new approval.
+
+**A counter that could not be read is degraded evidence, not zero.** With `rate_anomaly_enabled` on
+and its Redis counter unreachable (or no Redis configured), the decision says
+`request_rate: {"state": "unavailable"}` and lists `request_rate_unavailable` at **0 points** — an
+outage must not restrict everyone — instead of reading it as a rate of zero. A request whose rate
+limiter could not run carries `context.rate_limiter = "unavailable"`. The observations themselves are
+in the database, so a Redis outage does not touch them.
+
+**Database.** Migration 019 adds `server_observations` (grant `SELECT, INSERT` — the server never
+updates or deletes it), an index for denied approvals per phone, and the settings above. Each decision
+runs more indexed queries: two without an account, four with one, five for a phone that joined it
+within the window.

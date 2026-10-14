@@ -6166,3 +6166,122 @@ over too — what the old rule already allowed until then — and it stops at th
 mutations that never carry over or ignore `drop` fail it. Not yet live: the EC2 database is at 17
 with server `2c14c91`; migration 018 and this build go up with the next EC2 session, and the
 carry-over itself is verified on the gate only so far.
+
+**Addendum, 2026-10-14 — the carry-over verified live.** On the EC2 PostgreSQL after migrations 018
+and 019: an approval upgraded a limited phone (acceptance `362f5ea1…`, route `approval`); its refresh
+row's `acceptance_id` was then cleared, the shape of an approval granted before 016. The next refresh
+answered 200, scope `full`, acceptance `5eaf93ce-73c4-5720-82f6-2d2a76724476` — `uuid5` of the family,
+as designed — with a `legacy` record of the same causes and five reasons, and `/v1/account/me` passed
+with `accepted_by_upgrade`. PASS.
+
+## 77. The server's own observations: cross-checks, measured always, scored where enabled (2026-10-14)
+
+**Why.** Item 1 of the long-term list the owner approved on 2026-10-14 ("I want to fix any hole and
+breach in our defenses"), and recommendation 2 of the 2026-10-13 review: corroboration that survives a
+fabricated clean report, collected where this server handles the events, with counter outages recorded
+as degraded evidence rather than a rate of zero. A phone can fake a clean scan; it cannot hide what the
+server sees when it refuses or changes something.
+
+**Reproduced first** on `60da827`, the build before: a wrong password raised 401 and left nothing
+behind; failed step-up proofs and exhausted approval budgets were log lines; a phone with a faked
+clean report signing in to an account just after five wrong passwords from other phones got a decision
+with no trace of them; and `_key_request_rate` read an unreachable Redis as a rate of 0. The eight new
+gate checks all fail on that build.
+
+**Recorded** (migration 019, `server_observations`: kind, refusal code, the account when there is one,
+the phone and installation whose key made the request — opaque IDs only; no handle, no address):
+
+| kind | when |
+|---|---|
+| `sign_in_failed` | a wrong password at sign-in, or at step-up re-enrolment |
+| `sign_in_unknown_account` | a sign-in to a handle no account has (no account recorded; the same 401) |
+| `stepup_failed` | a step-up proof that did not verify, from any of `_verify_step_up`'s three callers; a request without a proof (the ordinary first leg) or the key's own state is not one |
+| `approval_budget_exhausted` | an approval request refused by the account's hourly budget — recorded after the refused transaction (which held the account row's lock) has rolled back |
+| `stepup_reenrolled` | a step-up key replaced, in the same transaction as the change |
+| denials | already rows of `session_upgrade_requests`; counted per requesting phone (new index) |
+
+A standalone record is evidence, not a gate: if it cannot be written, that is logged and the 401 stays
+a 401. Rate-limit 429s are not recorded: the attempts behind them are, in the database, which a Redis
+outage does not touch.
+
+**Measured always, scored where the DBA enables it.** Every decision's `context.server_observations`
+carries the counts over `cross_check_window_hours` (24) for the phone (every account) and the account
+(every phone), plus `newcomer` and `scored`; the business graph carries them per account and phone
+(1/7/30 days). Scoring is `cross_checks_enabled`, **0 by default — observe first**; the counts and
+points are proposals for the owner, seeded by 019, each `<code>_count` / `<code>_points`:
+
+| reason | default | counts |
+|---|---|---|
+| `account_sign_in_failures_elsewhere` | 5 / +30 | wrong passwords from **other** installations in the window **before this phone joined the account**; only for a phone joining now or within the window |
+| `device_sign_in_failures_many_accounts` | 3 / +60 | different accounts this phone failed a password on |
+| `device_sign_in_unknown_accounts` | 5 / +30 | this phone's sign-ins to accounts that do not exist |
+| `device_stepup_failures` | 3 / +30 | this phone's step-up proofs that did not verify |
+| `device_approvals_denied` | 1 / +60 | this phone's approval requests denied by the account's other phone |
+| `device_approval_budget_exhausted` | 1 / +30 | this phone's requests refused by the spent budget |
+| `device_stepup_reenrolments` | 2 / +30 | step-up keys re-enrolled on this phone |
+
+**False positives, the owner's standing test.**
+- A genuine user mistyping on their own phone is never counted against anyone: the account rule counts
+  other installations only; a phone's own rules need several accounts or unknown accounts.
+- Failures someone causes on an account never restrict a phone that was there before them — a
+  long-standing phone or the one that opened the account that morning — so a password guesser cannot
+  degrade the owner's phones. This was refined during the work (`051f0c5`): the first version judged
+  every phone linked within the window, which would have held the opener of a new account.
+- Clock skew: a phone whose clock is far off fails every step-up (`stepup_timestamp_outside_window`)
+  and would reach `device_stepup_failures`; its step-ups fail anyway.
+- **Interplay the owner should decide before enabling:** a phone limited at sign-in usually already sits
+  in review, so a denial's +60 takes it to block: it can no longer prompt the account's other phone for
+  the window. That ends prompt-bombing — and one mistaken "deny" holds a genuine new phone for 24 hours.
+  Found by the suite (below). A lower `device_approvals_denied_points` keeps such a phone limited
+  instead.
+- These are velocity signals: each lapses with its window. A lasting mark is the business's (DBA
+  settings, or its own engine over the graph and the context) — the owner's rule, *"Measurements we
+  have to guarantee, leave business decisions for them."*
+
+**Approvals** cover a counted reason only up to the count the approver saw (`count` on the reason); the
+R1 rule for counts, applied to these.
+
+**Degraded, not zero.** With `rate_anomaly_enabled` on and its counter unreadable (Redis down, or no
+Redis configured), the decision records `request_rate: {"state": "unavailable"}` and lists
+`request_rate_unavailable` at **0 points** — an outage must not restrict everyone — and a request
+whose rate limiter could not run carries `context.rate_limiter = "unavailable"`.
+
+**Cost.** Writes only on refusals and re-enrolments. Each decision runs two more indexed queries without
+an account, four with one, five for a phone that joined it within the window. `server_observations` is
+evidence and the server never deletes from it; its growth under a sustained guessing attack is bounded
+by bcrypt and the rate limiter, and archiving it is the DBA's call.
+
+| Change | Commit | Verified |
+|---|---|---|
+| Migration 019 (both engines), measurement into every decision | `9a0f0cc` | gate; live |
+| Recording at login, step-up, re-enrolment, the approval budget | `18700a4` | gate (unit-of-work depth checked: each refusal's record is its own unit) |
+| Scoring when enabled; degraded counters; count-bounded coverage | `e9752fb` | gate |
+| Gate: eight checks (80) | `e529f10` | all eight fail on `60da827`; ten mutations caught |
+| Business graph carries the observations | `5367de3` | gate (81); two mutations caught; live |
+| A newcomer judged by the failures before it joined | `051f0c5` | gate; three more mutations caught |
+| Suite: `check_server_observations` (any mode), `check_server_observations_scored` | `66d8dec` | live |
+| Suite route 2: budget before the denial; the denial rule checked live | `3be29d7` | live |
+
+**Live, EC2 PostgreSQL 16.15, schema 19, server `051f0c5` (md5 `48743e5d…`).**
+
+| Run | Result |
+|---|---|
+| observe / observe, owner defaults, full suite (78) | **61 passed, 0 failed, 17 skipped** |
+| both enforce, cross-checks **on**, full suite | first **70 / 1 / 7**: route 2's budget assertion came after its denial, and the denial now blocked the phone (403 `risk_policy_blocked`, not 429) — the interplay above. Reordered (`3be29d7`): **71 / 0 / 7** |
+| both enforce, owner defaults (cross-checks off), full suite | **70 / 0 / 8** |
+| cross-checks on, rate anomaly on (max 15), targeted | 3 / 3 |
+| Redis stopped (nonce store briefly on the database) | decisions recorded `rate_limiter: unavailable`, `request_rate: unavailable`, `request_rate_unavailable` at 0; sign-up 201, sign-in 200, score unchanged (10). Restored |
+| `tools/race_admission.py` | 2 links (1 linked, 3 `relationship_changed`) — PASS |
+| business graph | an account's `server_observations` live (2 failures) |
+| offline gate | **81 / 81** |
+
+Errors in the journal over the session: only the deliberate Redis outage (07:45–07:47 UTC); no 500s.
+
+**Not done.** A SQL Server round for migrations 015–019 — the hard rule: none ships without the suite
+on both engines; it needs one RDS create-test-delete, the owner's go. The graph lists only linked
+phones, so a phone that only failed sign-ins on an account is visible in that account's counts, not
+as a node. Not recorded: rate-limit 429s and `relationship_changed`.
+
+**State.** EC2 `i-0559685f02c4013b1` stopped; PostgreSQL 16.15 at schema 19 (`server_observations`
+granted `SELECT, INSERT` to `dtadmin`); server `051f0c5`; observe / observe, every setting at the
+owner's defaults (`cross_checks_enabled` 0), nonce store on Redis, business-token drop-in removed (404).
