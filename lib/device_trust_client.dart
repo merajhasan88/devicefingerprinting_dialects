@@ -1511,6 +1511,7 @@ class DeviceApi {
     required Map<String, dynamic> body,
     String? stepUpFactor,
     Future<String> Function(String payload)? signStepUp,
+    String? appPin,
   }) {
     return _postWithStepUp(
       path: '/v1/account/sensitive-echo',
@@ -1519,12 +1520,14 @@ class DeviceApi {
       body: body,
       stepUpFactor: stepUpFactor,
       signStepUp: signStepUp,
+      appPin: appPin,
     );
   }
 
   /// A protected POST that may also carry a step-up proof v2 over exactly
   /// this request -- the sensitive path, a session upgrade, or approving
-  /// another phone's upgrade.
+  /// another phone's upgrade -- and the app PIN the server checks
+  /// (DESIGN.md 78), as the DBA's stepup_method asks.
   Future<Map<String, dynamic>> _postWithStepUp({
     required String path,
     required String accessToken,
@@ -1532,6 +1535,7 @@ class DeviceApi {
     required Map<String, dynamic> body,
     String? stepUpFactor,
     Future<String> Function(String payload)? signStepUp,
+    String? appPin,
   }) async {
     final List<int> nonceBytes = _freshNonce();
     final String encodedBody = jsonEncode(body);
@@ -1582,7 +1586,25 @@ class DeviceApi {
         'X-Access-Proof': fixture.proofPayload,
         'X-Access-Signature': fixture.signature,
         ...stepUp,
+        if (appPin != null && appPin.isNotEmpty) 'X-App-PIN': appPin,
       },
+    );
+  }
+
+  /// Sets or replaces this account's app PIN (DESIGN.md 78): a full session
+  /// and the account password; the server keeps only a verifier.
+  Future<Map<String, dynamic>> setAppPin({
+    required String accessToken,
+    required InstallationIdentity signingIdentity,
+    required String password,
+    required String pin,
+  }) {
+    return _protectedRequest(
+      'POST',
+      '/v1/account/app-pin',
+      bearerToken: accessToken,
+      signingIdentity: signingIdentity,
+      body: <String, dynamic>{'password': password, 'pin': pin},
     );
   }
 
@@ -1648,6 +1670,7 @@ class DeviceApi {
     String? requestId,
     String? stepUpFactor,
     Future<String> Function(String payload)? signStepUp,
+    String? appPin,
   }) async {
     final Map<String, dynamic> value = await _postWithStepUp(
       path: '/v1/auth/upgrade',
@@ -1659,6 +1682,7 @@ class DeviceApi {
       },
       stepUpFactor: stepUpFactor,
       signStepUp: signStepUp,
+      appPin: appPin,
     );
     return AccountSession.fromApi(value);
   }
@@ -1699,13 +1723,15 @@ class DeviceApi {
   }
 
   /// Approves another installation's upgrade; the server requires a step-up
-  /// proof over this very request.
+  /// over this very request -- the screen-lock key's proof, the app PIN, or
+  /// both, as the DBA's stepup_method says (DESIGN.md 78).
   Future<Map<String, dynamic>> approveUpgrade({
     required String accessToken,
     required InstallationIdentity signingIdentity,
     required String requestId,
     required String? stepUpFactor,
-    required Future<String> Function(String payload) signStepUp,
+    Future<String> Function(String payload)? signStepUp,
+    String? appPin,
   }) {
     return _postWithStepUp(
       path: '/v1/auth/approvals/$requestId/approve',
@@ -1714,6 +1740,7 @@ class DeviceApi {
       body: <String, dynamic>{},
       stepUpFactor: stepUpFactor,
       signStepUp: signStepUp,
+      appPin: appPin,
     );
   }
 
@@ -3296,6 +3323,101 @@ class DeviceRecognitionController extends ChangeNotifier {
     });
   }
 
+  /// The app PIN typed into the harness (DESIGN.md 78). Sent with every
+  /// step-up -- sensitive op, approval, route-1 upgrade -- when filled; the
+  /// server checks it where the DBA's stepup_method or app_pin_required_paths
+  /// ask, and verifies an offered one anywhere.
+  String appPinEntry = '';
+
+  String? get _appPinOrNull => appPinEntry.isEmpty ? null : appPinEntry;
+
+  void updateAppPinEntry(String value) {
+    appPinEntry = value.trim();
+    notifyListeners();
+  }
+
+  /// Sets or replaces the account's app PIN with the account password.
+  Future<void> setAppPin(String password) {
+    stepUpTestResult = null;
+    return _run('Setting the app PIN…', () async {
+      final InstallationIdentity? currentIdentity = identity;
+      if (accountSession == null || currentIdentity == null) {
+        throw ApiException('Log in first: the app PIN belongs to the account.');
+      }
+      if (appPinEntry.isEmpty) {
+        throw ApiException('Type the new app PIN first.');
+      }
+      try {
+        final Map<String, dynamic> value = await _withAccessToken(
+          (String accessToken) => _api.setAppPin(
+            accessToken: accessToken,
+            signingIdentity: currentIdentity,
+            password: password,
+            pin: appPinEntry,
+          ),
+        );
+        _recordStepUp(<String>[
+          'PASS: app PIN set',
+          'POST /v1/account/app-pin: 200',
+          'Server: ${value['step_up']}',
+        ]);
+      } on ApiException catch (error) {
+        _recordStepUp(<String>[
+          'NOT SET: ${error.code}',
+          'POST /v1/account/app-pin: ${error.statusCode} ${error.code}',
+        ]);
+      }
+    });
+  }
+
+  /// The app PIN alone (stepup_method app_pin, or a path the DBA lists in
+  /// app_pin_required_paths): no screen-lock prompt.
+  Future<void> testSensitiveWithAppPin() {
+    stepUpTestResult = null;
+    return _run('Calling the sensitive operation with the app PIN…', () async {
+      final AccountSession? session = accountSession;
+      final InstallationIdentity? currentIdentity = identity;
+      if (session == null || currentIdentity == null) {
+        throw ApiException('Create or log in to an account first.');
+      }
+      if (appPinEntry.isEmpty) {
+        throw ApiException('Type the app PIN first.');
+      }
+      final String deviceProofToken = await _freshDeviceToken();
+      deviceToken = deviceProofToken;
+      await _collectIntegrityWithToken(deviceProofToken, currentIdentity);
+      try {
+        final Map<String, dynamic> value = await _api.sensitiveEcho(
+          accessToken: session.accessToken,
+          signingIdentity: currentIdentity,
+          body: <String, dynamic>{
+            'operation': 'transfer',
+            'probe_id': Uuid().v4(),
+          },
+          appPin: appPinEntry,
+        );
+        _recordStepUp(<String>[
+          value['app_pin'] == 'verified'
+              ? 'PASS: app PIN verified, sensitive operation allowed'
+              : 'INFO: 200, but the app PIN was not needed here',
+          'POST /v1/account/sensitive-echo: 200 step_up=${value['step_up']} '
+              'app_pin=${value['app_pin']}',
+        ]);
+      } on ApiException catch (error) {
+        final Object? left = error.details?['attempts_left'];
+        final Object? stepUp = error.details?['step_up'];
+        _recordStepUp(<String>[
+          'REFUSED: ${error.code}',
+          'POST /v1/account/sensitive-echo: ${error.statusCode} ${error.code}',
+          if (left != null) 'Attempts left: $left',
+          if (stepUp != null) 'Needs: $stepUp',
+          if (error.code == 'app_pin_locked')
+            'Set a new PIN with the account password to unlock it.',
+        ]);
+      }
+    });
+  }
+
   /// The legitimate path: the user authenticates, the step-up key signs this
   /// exact request (proof v2: token, method, path, body digest and the access
   /// proof's nonce), and the server allows it.
@@ -3335,6 +3457,7 @@ class DeviceRecognitionController extends ChangeNotifier {
             prompt.stop();
             return signature;
           },
+          appPin: _appPinOrNull,
         );
         final Map<String, dynamic>? seen = value['step_up_key'] is Map
             ? Map<String, dynamic>.from(value['step_up_key'] as Map)
@@ -3521,10 +3644,11 @@ class DeviceRecognitionController extends ChangeNotifier {
       if (session == null || currentIdentity == null) {
         throw ApiException('Log in first.');
       }
-      if (withStepUp && (key == null || !stepUpUsable)) {
+      final bool withKey = withStepUp && key != null && stepUpUsable;
+      if (withStepUp && !withKey && _appPinOrNull == null) {
         throw ApiException(
-          'No bound step-up key on this phone: '
-          '${stepUpUnavailable ?? 're-enrol it first'}',
+          'No bound step-up key on this phone, and no app PIN typed: '
+          '${stepUpUnavailable ?? 're-enrol the key, or type the PIN'}',
         );
       }
       // A fresh scan first, so the server judges the phone as it is now.
@@ -3537,13 +3661,14 @@ class DeviceRecognitionController extends ChangeNotifier {
           signingIdentity: currentIdentity,
           route: route,
           requestId: requestId,
-          stepUpFactor: withStepUp ? key!.factor : null,
-          signStepUp: withStepUp
+          stepUpFactor: withKey ? key.factor : null,
+          signStepUp: withKey
               ? (String payload) => _stepUpKeyProvider.sign(
                     payload,
                     reason: 'Upgrade this limited session',
                   )
               : null,
+          appPin: withStepUp ? _appPinOrNull : null,
         );
         accountSession = upgraded;
         latestPolicy = upgraded.policy ?? latestPolicy;
@@ -3787,10 +3912,11 @@ class DeviceRecognitionController extends ChangeNotifier {
         ]);
         return;
       }
-      if (key == null || !stepUpUsable) {
+      final bool withKey = key != null && stepUpUsable;
+      if (!withKey && _appPinOrNull == null) {
         throw ApiException(
-          'Approving needs this phone\'s bound step-up key: '
-          '${stepUpUnavailable ?? 're-enrol it first'}',
+          'Approving needs this phone\'s bound step-up key or the app PIN: '
+          '${stepUpUnavailable ?? 're-enrol the key, or type the PIN'}',
         );
       }
       // The approver must itself be clean: a fresh scan first.
@@ -3803,11 +3929,14 @@ class DeviceRecognitionController extends ChangeNotifier {
             accessToken: accessToken,
             signingIdentity: currentIdentity,
             requestId: requestId,
-            stepUpFactor: key.factor,
-            signStepUp: (String payload) => _stepUpKeyProvider.sign(
-              payload,
-              reason: 'Approve a sign-in on another phone',
-            ),
+            stepUpFactor: withKey ? key.factor : null,
+            signStepUp: withKey
+                ? (String payload) => _stepUpKeyProvider.sign(
+                      payload,
+                      reason: 'Approve a sign-in on another phone',
+                    )
+                : null,
+            appPin: _appPinOrNull,
           ),
         );
         await _reloadApprovalRequests(currentIdentity);
@@ -3954,6 +4083,9 @@ class _DeviceRecognitionPageState extends State<DeviceRecognitionPage> {
 
   final TextEditingController _stepUpPasswordController =
       TextEditingController();
+  final TextEditingController _appPinController = TextEditingController();
+  final TextEditingController _appPinPasswordController =
+      TextEditingController();
   final TextEditingController _stolenAccessController =
       TextEditingController(text: injectedStolenAccessToken);
 
@@ -3992,6 +4124,8 @@ class _DeviceRecognitionPageState extends State<DeviceRecognitionPage> {
     _stolenRefreshController.dispose();
     _stolenAccessController.dispose();
     _stepUpPasswordController.dispose();
+    _appPinController.dispose();
+    _appPinPasswordController.dispose();
     super.dispose();
   }
 
@@ -4607,6 +4741,67 @@ class _DeviceRecognitionPageState extends State<DeviceRecognitionPage> {
                 ),
               ],
             ),
+            if (_controller.accountSession != null) ...<Widget>[
+              const SizedBox(height: 12),
+              const Text(
+                'App PIN, checked by the server (DESIGN.md 78). Sent with '
+                'every step-up while filled; the DBA decides where it is '
+                'needed.',
+              ),
+              const SizedBox(height: 8),
+              TextField(
+                controller: _appPinController,
+                enabled: !_controller.busy,
+                obscureText: !_showPasswords,
+                keyboardType: TextInputType.number,
+                autocorrect: false,
+                enableSuggestions: false,
+                onChanged: _controller.updateAppPinEntry,
+                decoration: InputDecoration(
+                  labelText: 'App PIN',
+                  border: const OutlineInputBorder(),
+                  suffixIcon: _showPasswordToggle(),
+                ),
+              ),
+              const SizedBox(height: 8),
+              TextField(
+                controller: _appPinPasswordController,
+                enabled: !_controller.busy,
+                obscureText: !_showPasswords,
+                autocorrect: false,
+                enableSuggestions: false,
+                onChanged: (_) => setState(() {}),
+                decoration: InputDecoration(
+                  labelText: 'Account password (to set the app PIN)',
+                  border: const OutlineInputBorder(),
+                  suffixIcon: _showPasswordToggle(),
+                ),
+              ),
+              const SizedBox(height: 8),
+              Wrap(
+                spacing: 10,
+                runSpacing: 10,
+                children: <Widget>[
+                  FilledButton(
+                    onPressed: _controller.busy ||
+                            _appPinPasswordController.text.isEmpty ||
+                            _controller.appPinEntry.isEmpty
+                        ? null
+                        : () => _controller.setAppPin(
+                              _appPinPasswordController.text,
+                            ),
+                    child: const Text('Set app PIN'),
+                  ),
+                  FilledButton.tonal(
+                    onPressed: _controller.busy ||
+                            _controller.appPinEntry.isEmpty
+                        ? null
+                        : _controller.testSensitiveWithAppPin,
+                    child: const Text('Sensitive op with app PIN'),
+                  ),
+                ],
+              ),
+            ],
             if (_controller.accountSession != null &&
                 !_controller.stepUpUsable) ...<Widget>[
               const SizedBox(height: 12),
