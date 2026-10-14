@@ -6216,9 +6216,9 @@ points are proposals for the owner, seeded by 019, each `<code>_count` / `<code>
 | `device_sign_in_failures_many_accounts` | 3 / +60 | different accounts this phone failed a password on |
 | `device_sign_in_unknown_accounts` | 5 / +30 | this phone's sign-ins to accounts that do not exist |
 | `device_stepup_failures` | 3 / +30 | this phone's step-up proofs that did not verify |
-| `device_approvals_denied` | 1 / +30, **held at review** | this phone's approval requests denied by the account's other phone (owner decision below) |
-| `device_approval_budget_exhausted` | 1 / +30 | this phone's requests refused by the spent budget |
-| `device_stepup_reenrolments` | 2 / +30 | step-up keys re-enrolled on this phone |
+| `device_approvals_denied` | 1 / +30, **held at review** | this account's approval requests from this phone, denied by its other phone (owner decision below) |
+| `device_approval_budget_exhausted` | 1 / +30 | this account's requests from this phone refused by its spent budget |
+| `device_stepup_reenrolments` | 2 / +30 | this account's step-up keys re-enrolled on this phone |
 
 **False positives, the owner's standing test.**
 - A genuine user mistyping on their own phone is never counted against anyone, even after reinstalling
@@ -6228,6 +6228,20 @@ points are proposals for the owner, seeded by 019, each `<code>_count` / `<code>
   long-standing phone or the one that opened the account that morning — so a password guesser cannot
   degrade the owner's phones. This was refined during the work (`051f0c5`): the first version judged
   every phone linked within the window, which would have held the opener of a new account.
+- **A shared phone: what one account did never counts against another** (found in review, `e289a65`).
+  The three approval-flow and re-enrolment rules counted the whole phone, so when one person's new
+  sign-in on a phone two people share was denied, the other person — long established there — was held
+  at review too, and after a screen-lock change two users each re-enrolling made two re-enrolments.
+  They now count this account on this phone (`context.server_observations.device_account`); the
+  phone-wide figures stay in the context and the graph as measurements. The rules about the phone
+  itself — wrong passwords to several accounts, unknown accounts, failed step-up proofs — stay
+  phone-wide.
+- **Where review could refuse a held phone.** Every evaluation but one names the account; the one that
+  does not — `/v1/device/me`, the `device_check` event — returns its decision without enforcing it, and
+  with the per-account counting an account-less decision carries no hold at all.
+- **Reading stored decisions** (for item 7's metrics): a held phone's row can show a score in the block
+  band with `recommended_action` = `review` and `held_by_denial` true. Read the action, not the band
+  of the score.
 - Clock skew: a phone whose clock is far off fails every step-up (`stepup_timestamp_outside_window`)
   and would reach `device_stepup_failures`; its step-ups fail anyway.
 - **A denied phone stays limited — owner decision, 2026-10-14.** The suite found that a phone limited at
@@ -6261,7 +6275,7 @@ Redis configured), the decision records `request_rate: {"state": "unavailable"}`
 whose rate limiter could not run carries `context.rate_limiter = "unavailable"`.
 
 **Cost.** Writes only on refusals and re-enrolments. Each decision runs two more indexed queries without
-an account, four with one, five for a phone that joined it within the window. `server_observations` is
+an account, five with one, six for a phone that joined it within the window. `server_observations` is
 evidence and the server never deletes from it. Under a sustained guessing attack it grows by one row
 per refused attempt — each attempt needs a proven installation key and an access proof, and the rate
 limiters (when Redis is up) cap it per installation, handle and source; a wrong password also costs a
@@ -6277,6 +6291,7 @@ bcrypt check, an unknown handle does not. Archiving it is the DBA's call.
 | A newcomer judged by the failures before it joined | `051f0c5` | gate; three more mutations caught |
 | Other **phones'** failures, not other installations' (a reinstall on the user's own phone is not "elsewhere"); `approval_denied` in the context as in the graph | `53b4097` | gate (the mistype check includes a reinstall; a mutation back to installations fails it); live |
 | A denied phone held at review (limited), never blocked by the denial; points 30; `device_approvals_denied_effect` | `0a77436` | gate 82 (a new check; three mutations caught); live |
+| Per account on the phone: a denial, an exhausted budget, a re-enrolment never count against another account sharing it | `e289a65` | gate 83 (a shared-phone check; four mutations back to phone-wide caught); live script on EC2 (enforce, cross-checks on): Alice, limited on a shared phone, denied by her own phone, signs in again held at review; Bob on the same phone: no cross-check reason, `device_account.approval_denied` 0 beside the phone-wide 1, protected request 200; targeted suite 6 / 6 |
 | A mistaken deny, undone (script, live): denied → the phone signs in limited (`held_by_denial`, score 115, review) → asks again → the approver sees `device_approvals_denied` → approves → full; a protected request passes as accepted; a refresh stays full | — | live, PASS |
 | Suite route 2: deny, then the budget; the denied phone stays limited and may ask again | `9f5ab0c` | live: enforce with cross-checks on, full suite **71 / 0 / 7** (a first run that kept the budget before the denial failed 70 / 1 / 7: the exhausted-budget rule blocked the phone, as above); off, targeted 3 / 3 |
 | Suite: `check_server_observations` (any mode), `check_server_observations_scored` | `66d8dec` | live |
@@ -6304,7 +6319,7 @@ as a node. Not recorded: rate-limit 429s and `relationship_changed`.
 
 **State.** EC2 `i-0559685f02c4013b1` stopped; PostgreSQL 16.15 at schema 19 (`server_observations`
 granted `SELECT, INSERT` to `dtadmin`; migration 019 was edited after it first went on, so its rows
-were brought to the file by hand — the effect row added, the denial points 60 → 30, two descriptions);
-server `0a77436` (md5 `2dbd143e…`); observe / observe, every setting at the owner's defaults
+were brought to the file by hand — the effect row added, the denial points 60 → 30, five descriptions);
+server `e289a65` (md5 `058e052b…`); observe / observe, every setting at the owner's defaults
 (`cross_checks_enabled` 0), nonce store on Redis, business-token drop-in removed (404); no errors in
 the journal since boot.

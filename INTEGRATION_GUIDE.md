@@ -575,9 +575,11 @@ installation whose key made the request.
 `sign_in_failed_accounts` — how many different accounts, `sign_in_unknown_account`, `stepup_failed`,
 `approval_denied`, `approval_budget_exhausted`, `stepup_reenrolled`); for the account, from every
 phone (`sign_in_failed`, `sign_in_failed_installations`, `sign_in_failed_elsewhere` — from
-phones other than the one asking, and the other kinds); `newcomer`, for a phone joining the
-account now or within the window (`joined_at`, `sign_in_failed_elsewhere_before`), else null;
-`window_hours`; and `scored`. The graph (section 10) carries them per account and phone.
+phones other than the one asking, and the other kinds); for this account on this phone
+(`device_account`: `approval_denied`, `approval_budget_exhausted`, `stepup_reenrolled`); `newcomer`,
+for a phone joining the account now or within the window (`joined_at`,
+`sign_in_failed_elsewhere_before`), else null; `window_hours`; and `scored`. The graph (section 10)
+carries them per account and phone.
 
 **Scored only where your DBA switches them on** (`cross_checks_enabled`, default 0 — observe first).
 Then each rule adds its points once its count is reached; `0` as a count switches a rule off. The
@@ -589,12 +591,14 @@ counts and points below are the defaults migration 019 seeds — proposals for y
 | `device_sign_in_failures_many_accounts` | 3 / 60 | different accounts this phone sent a wrong password to |
 | `device_sign_in_unknown_accounts` | 5 / 30 | this phone's sign-ins to accounts that do not exist |
 | `device_stepup_failures` | 3 / 30 | this phone's step-up proofs that did not verify |
-| `device_approvals_denied` | 1 / 30 | this phone's approval requests the account's other phone denied — and, with `device_approvals_denied_effect` = `limit` (default), the phone is held at review (below) |
-| `device_approval_budget_exhausted` | 1 / 30 | this phone's approval requests refused by the spent budget |
-| `device_stepup_reenrolments` | 2 / 30 | step-up keys re-enrolled on this phone |
+| `device_approvals_denied` | 1 / 30 | this account's approval requests from this phone, denied by its other phone — and, with `device_approvals_denied_effect` = `limit` (default), the phone is held at review for this account (below) |
+| `device_approval_budget_exhausted` | 1 / 30 | this account's approval requests from this phone refused by its spent budget |
+| `device_stepup_reenrolments` | 2 / 30 | this account's step-up keys re-enrolled on this phone |
 
 What they do not do, by design:
 
+- **On a shared phone, what one account did never counts against another**: a denial, an exhausted
+  budget or a re-enrolment is counted for that account on that phone only.
 - **A user mistyping on their own phone is never counted against anyone**, even after reinstalling the
   app there: the account's rule counts other phones only, and a phone's own rules need several accounts
   or unknown accounts.
@@ -624,5 +628,8 @@ in the database, so a Redis outage does not touch them.
 
 **Database.** Migration 019 adds `server_observations` (grant `SELECT, INSERT` — the server never
 updates or deletes it), an index for denied approvals per phone, and the settings above. Each decision
-runs more indexed queries: two without an account, four with one, five for a phone that joined it
+runs more indexed queries: two without an account, five with one, six for a phone that joined it
 within the window.
+
+**Reading stored decisions.** A phone held by a denial can show a score in the block band with
+`recommended_action` = `review` and `held_by_denial` true: read the action, not the band of the score.

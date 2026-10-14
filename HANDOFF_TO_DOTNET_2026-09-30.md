@@ -446,9 +446,12 @@ default, 0. Pull DESIGN.md §77 and migration 019. What you may see, and what to
 
 - **Decision `context`** gains `server_observations` (counts of what the server itself saw: wrong
   passwords, sign-ins to unknown accounts, failed step-up proofs, denied approval requests, exhausted
-  approval budgets, step-up re-enrolments — for the phone, the account and a `newcomer`),
-  `request_rate` (`off` / `measured` / `unavailable`) and, when this request's rate limiter could not
-  run, `rate_limiter: "unavailable"`. Read them if your harness shows the context; never require them.
+  approval budgets, step-up re-enrolments — for the phone, the account, this account on this phone
+  (`device_account`, which the approval-flow rules count, `e289a65`) and a `newcomer`), plus
+  `held_by_denial`: when true, `recommended_action` is `review` even if the score is in the block
+  band — read the action; `request_rate` (`off` / `measured` / `unavailable`); and, when this
+  request's rate limiter could not run, `rate_limiter: "unavailable"`. Read them if your harness shows
+  the context; never require them.
 - **Relationship reasons may carry `count`.** With cross-checks enabled, seven codes can appear —
   `account_sign_in_failures_elsewhere`, `device_sign_in_failures_many_accounts`,
   `device_sign_in_unknown_accounts`, `device_stepup_failures`, `device_approvals_denied`,
