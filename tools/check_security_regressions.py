@@ -3538,7 +3538,7 @@ def a_phones_own_observations_score_against_that_phone():
         "device_sign_in_failures_many_accounts": (60, 3),
         "device_sign_in_unknown_accounts": (30, 5),
         "device_stepup_failures": (30, 3),
-        "device_approvals_denied": (60, 1),
+        "device_approvals_denied": (30, 1),
         "device_approval_budget_exhausted": (30, 1),
         "device_stepup_reenrolments": (30, 2)},
         "each of the phone's own rules at the owner's defaults: %s" % decision["reasons"])
@@ -3546,6 +3546,39 @@ def a_phones_own_observations_score_against_that_phone():
            "together they are well past the block band: %s" % decision["score"])
     expect(not _cross(store.decide(clean_phone, cross_checks_enabled=1)),
            "another phone is untouched")
+
+
+@check
+def a_denied_phone_is_held_limited_and_never_blocked_by_the_denial_alone():
+    """Owner decision of 2026-10-14 (DESIGN.md 77). With the default effect,
+    limit, a phone the account's other phone denied is held at review -- a
+    limited session -- for the window: scoring low, it is raised to review;
+    scoring high, the denial's points never take it to block. Whatever blocks
+    without the denial still blocks. With effect points the points are simply
+    added, and can block."""
+    store = ObservationStore()
+    quiet, busy, blocked = store.phone(), store.phone(), store.phone()
+    for phone in (quiet, busy, blocked):
+        store.denied(phone)
+    store.observe("sign_in_unknown_account", busy, times=5)
+    store.observe("stepup_failed", busy, str(uuid.uuid4()), times=3)
+    for victim in (str(uuid.uuid4()) for _ in range(3)):
+        store.observe("sign_in_failed", blocked, victim)
+    store.observe("sign_in_unknown_account", blocked, times=5)
+    for phone, action, score, held in ((quiet, "review", 30, True), (busy, "review", 90, True),
+                                       (blocked, "block", 120, False)):
+        decision = store.decide(phone, cross_checks_enabled=1)
+        expect(decision["recommended_action"] == action and decision["score"] == score
+               and decision["context"]["held_by_denial"] is held
+               and _cross(decision).get("device_approvals_denied") == (30, 1),
+               "limit: expected %s at %d (held %s), got %s at %s: %s"
+               % (action, score, held, decision["recommended_action"], decision["score"],
+                  decision["reasons"]))
+    for phone, action in ((quiet, "step_up"), (busy, "block")):
+        decision = store.decide(phone, cross_checks_enabled=1, device_approvals_denied_effect="points")
+        expect(decision["recommended_action"] == action
+               and decision["context"]["held_by_denial"] is False,
+               "points: expected %s, got %s" % (action, decision["recommended_action"]))
 
 
 @check

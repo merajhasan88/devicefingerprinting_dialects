@@ -2243,14 +2243,22 @@ def check_upgrade_route_approval(api, ctx):
                        {"route": "approval", "request_id": req["request_id"]})
     expect(st == 403 and _details(up).get("state") == "denied",
            "a denied request must not upgrade, got %s %s" % (st, up))
-    points = int(settings.get("device_approvals_denied_points", "60") or "0")
-    if (_setting_on(settings, "cross_checks_enabled") and points > 0
+    points = int(settings.get("device_approvals_denied_points", "30") or "0")
+    if (_setting_on(settings, "cross_checks_enabled")
             and int(settings.get("device_approvals_denied_count", "1") or "0") == 1):
+        # DESIGN.md 77: the denied phone's next decision carries the denial;
+        # with the owner's effect, limit, the phone stays limited -- never
+        # blocked by the denial alone.
         st, pl = sign_in(api, phone, phone_token, handle)
         reason = reason_for(_decision_of(pl), "device_approvals_denied")
         expect(reason is not None and reason.get("points") == points and reason.get("count") == 1,
                "with cross-checks on, the denied phone's next decision must carry "
                "device_approvals_denied +%d: %s %s" % (points, st, _decision_of(pl).get("reasons")))
+        if settings.get("device_approvals_denied_effect", "limit") == "limit":
+            expect(st == 200 and pl.get("scope") == "limited"
+                   and (pl.get("policy") or {}).get("context", {}).get("held_by_denial") is True,
+                   "a denied phone must stay limited, not blocked: %s %s"
+                   % (st, error_code(pl) or pl.get("scope")))
     blocked = submit_report(api, phone, phone_token,
                             lambda probes: probes["runtime_maps"].update({"suspicious_tokens": ["frida"]}))
     expect(blocked["verdict"] == "block", "setup: expected block, got %s" % blocked)

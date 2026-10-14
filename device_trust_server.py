@@ -1314,7 +1314,7 @@ _CROSS_CHECK_RULES = (
      "%d sign-ins to accounts that do not exist came from this phone in the last %d hours."),
     ("device_stepup_failures", "device", "stepup_failed", 3, 30,
      "%d step-up proofs from this phone did not verify in the last %d hours."),
-    ("device_approvals_denied", "device", "approval_denied", 1, 60,
+    ("device_approvals_denied", "device", "approval_denied", 1, 30,
      "%d approval requests from this phone were denied in the last %d hours."),
     ("device_approval_budget_exhausted", "device", "approval_budget_exhausted", 1, 30,
      "%d approval requests from this phone found the account's hourly budget spent in the "
@@ -1378,6 +1378,7 @@ _RISK_SETTING_KINDS = {
     "legacy_acceptances": ("carry", "drop"),
     "cross_checks_enabled": "bool",
     "cross_check_window_hours": "int",
+    "device_approvals_denied_effect": ("limit", "points"),
 }
 _RISK_SETTING_KINDS.update(
     ("%s_%s" % (rule[0], part), "int")
@@ -3813,6 +3814,7 @@ def _evaluate_risk_policy(
     # other phones sent before it joined -- so failures someone causes
     # on an account never restrict a phone that was there before them.
     cross_checks_scored = _risk_setting_bool("cross_checks_enabled", False)
+    denial_hold = None
     if cross_checks_scored:
         for code, scope, key, default_count, default_points, message in _CROSS_CHECK_RULES:
             measured = observations.get(scope)
@@ -3823,10 +3825,27 @@ def _evaluate_risk_policy(
             if threshold <= 0 or count < threshold:
                 continue
             points = _risk_setting_int(code + "_points", default_points)
-            _policy_reason(reasons, code, points, message % (count, window_hours), count=count)
+            message = message % (count, window_hours)
+            if code == "device_approvals_denied" and _risk_setting_str(
+                "device_approvals_denied_effect", "limit"
+            ) == "limit":
+                denial_hold = points
+                message += " A denial alone holds the phone at review (limited) for that time."
+            _policy_reason(reasons, code, points, message, count=count)
             score += points
 
     recommended_action = _policy_action(score, hard_block=hard_block)
+    held_by_denial = False
+    if denial_hold is not None:
+        # Owner decision of 2026-10-14 (DESIGN.md 77): a phone the account's
+        # other phone denied is held at review -- a limited session -- for
+        # the window, even if its first cause clears, and a denial alone never
+        # blocks it: its points could not promise either, being added to
+        # whatever else the phone scores. Whatever blocks without the denial
+        # still blocks. device_approvals_denied_effect = points turns this off.
+        if _policy_action(score - denial_hold, hard_block=hard_block) != "block":
+            recommended_action = "review"
+            held_by_denial = True
     effective_action = (
         recommended_action if DEVICE_POLICY_MODE == "enforce" else "allow"
     )
@@ -3871,6 +3890,7 @@ def _evaluate_risk_policy(
             observations, window_hours=window_hours, scored=cross_checks_scored
         ),
         "request_rate": request_rate,
+        "held_by_denial": held_by_denial,
     }
     if has_request_context() and g.get("rate_limiter_unavailable"):
         context["rate_limiter"] = "unavailable"
