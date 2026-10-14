@@ -223,7 +223,7 @@ def stepup_proof(installation, method, path, bearer, body_text, nonce, factor, o
 
 
 def stepup_call(api, installation, stepup_priv, method, path, bearer, body_obj, factor,
-                approve_body=None, overrides=None):
+                approve_body=None, overrides=None, app_pin=None):
     """A protected call that also carries a step-up proof over this exact
     request, signed by the separate step-up key. approve_body signs an approval
     for a DIFFERENT body than the one sent, which is the retargeting attack."""
@@ -235,6 +235,8 @@ def stepup_call(api, installation, stepup_priv, method, path, bearer, body_obj, 
     sig = stepup_priv.sign(b64u_decode(proof_b64), ec.ECDSA(hashes.SHA256()))
     headers["X-Step-Up-Proof"] = proof_b64
     headers["X-Step-Up-Signature"] = b64u(sig)
+    if app_pin is not None:
+        headers["X-App-PIN"] = app_pin
     return api.call(method, path, body_text=body_text, bearer=bearer, headers=headers)
 
 
@@ -1936,6 +1938,244 @@ def check_server_observations_scored(api, ctx):
            % (points, threshold, st, _decision_of(pl).get("reasons")))
 
 
+def _skip_unless_screen_lock(settings):
+    """These checks prove the screen-lock key's step-up (DESIGN.md 63, 70).
+    Under the DBA's other step-up methods (DESIGN.md 78) the app PIN checks
+    cover the same flows."""
+    method = settings.get("stepup_method") or "screen_lock"
+    if method != "screen_lock":
+        raise Skip("stepup_method is %s; this check proves the screen-lock key, the app PIN "
+                   "checks cover the same flows" % method)
+
+
+SENSITIVE_PATH = "/v1/account/sensitive-echo"
+
+
+def _pin_factors(settings, path=SENSITIVE_PATH):
+    """(the screen-lock key, the app PIN): what `path` needs under the live
+    settings (DESIGN.md 78)."""
+    method = settings.get("stepup_method") or "screen_lock"
+    required = path in _setting_words(settings, "stepup_required_paths", "")
+    return (required and method != "app_pin",
+            path in _setting_words(settings, "app_pin_required_paths", "")
+            or (required and method != "screen_lock"))
+
+
+def pin_call(api, installation, path, bearer, body, pin=None, stepup=None):
+    """A protected POST with the app PIN, and a screen-lock proof when
+    `stepup` = (step-up private key, factor)."""
+    if stepup is not None:
+        return stepup_call(api, installation, stepup[0], "POST", path, bearer, body, stepup[1],
+                           app_pin=pin)
+    headers, body_text = build_proof(installation, "POST", path, bearer, body)
+    if pin is not None:
+        headers["X-App-PIN"] = pin
+    return api.call("POST", path, body_text=body_text, bearer=bearer, headers=headers)
+
+
+def _pin_phone(api, settings, with_key):
+    """A fresh phone -- with a step-up key when `with_key` -- and a full
+    account on it: (installation, device token, handle, access token, step-up)."""
+    inst = Installation()
+    factor = settings.get("stepup_factor", "passcode")
+    stepup, extra = None, {}
+    if with_key:
+        priv, jwk = stepup_jwk_pair()
+        stepup = (priv, factor)
+        extra = {"stepup_public_key": jwk,
+                 "stepup_key_auth": {"factor": factor, "mode": "per_use", "window_seconds": 0}}
+    st, pl = enrol(api, inst, fresh_hint(), **extra)
+    expect(st in (200, 201), "enrol failed: %s %s" % (st, pl))
+    token = device_token(api, inst)
+    submit_report(api, inst, token)
+    handle = "pin-%s" % secrets.token_hex(4)
+    st, pl = open_account(api, inst, token, handle)
+    expect(st in (200, 201) and pl.get("scope") == "full",
+           "setup: a full account: %s %s" % (st, pl))
+    return inst, token, handle, pl["access_token"], stepup
+
+
+def _set_pin(api, inst, access, pin, password="Passw0rd123"):
+    return protected(api, inst, "POST", "/v1/account/app-pin", access,
+                     {"password": password, "pin": pin})
+
+
+def _two_pins(settings):
+    length = int(settings.get("app_pin_length", "6") or "6")
+    pin = "".join(secrets.choice("0123456789") for _ in range(length))
+    return pin, ("1" if pin[0] != "1" else "2") + pin[1:]
+
+
+@check("step-up: the app PIN the server checks -- set, wrong, right, locked, reset")
+def check_app_pin(api, ctx):
+    """DESIGN.md 78. Runs where the sensitive path needs the app PIN
+    (stepup_method app_pin or screen_lock_and_app_pin with the path in
+    stepup_required_paths, or the path in app_pin_required_paths). A new
+    account has none; asking costs no attempt; a wrong password cannot set
+    one; a wrong PIN counts down, the right one passes and clears the count;
+    app_pin_max_failures wrong ones lock it -- the right one is then refused
+    too -- until a new PIN is set with the password. Each wrong PIN is
+    counted for the account on the phone."""
+    settings = live_settings(api)
+    need_key, need_pin = _pin_factors(settings)
+    if not need_pin:
+        raise Skip("the sensitive path needs no app PIN here (stepup_method, "
+                   "stepup_required_paths, app_pin_required_paths)")
+    max_failures = int(settings.get("app_pin_max_failures", "5") or "5")
+    if max_failures > 10:
+        raise Skip("app_pin_max_failures=%s is too high for a bounded run" % max_failures)
+    inst, _, _, access, stepup = _pin_phone(api, settings, need_key)
+    stepup = stepup if need_key else None
+    pin, wrong = _two_pins(settings)
+    body = {"amount": 1}
+    st, me = protected(api, inst, "GET", "/v1/account/me", access)
+    expect(st == 200 and me["step_up"]["app_pin_set"] is False,
+           "a new account has no app PIN: %s %s" % (st, me.get("step_up")))
+    st, pl = pin_call(api, inst, SENSITIVE_PATH, access, body, stepup=stepup)
+    expect(st == 403 and error_code(pl) == "app_pin_required"
+           and "app_pin" in _details(pl)["step_up"]["needs"],
+           "without the PIN: app_pin_required, got %s %s" % (st, pl))
+    st, pl = pin_call(api, inst, SENSITIVE_PATH, access, body, pin=pin, stepup=stepup)
+    expect(st == 403 and error_code(pl) == "app_pin_not_set",
+           "before one is set: app_pin_not_set, got %s %s" % (st, pl))
+    st, pl = _set_pin(api, inst, access, pin, password="Wrong-Passw0rd")
+    expect(st == 401 and error_code(pl) == "invalid_credentials",
+           "a wrong password must not set a PIN: %s %s" % (st, pl))
+    st, pl = _set_pin(api, inst, access, pin)
+    expect(st == 200 and pl["step_up"]["app_pin_set"] is True, "setting the PIN: %s %s" % (st, pl))
+    st, pl = pin_call(api, inst, SENSITIVE_PATH, access, body, pin=wrong, stepup=stepup)
+    expect(st == 403 and error_code(pl) == "app_pin_invalid"
+           and _details(pl).get("attempts_left") == max_failures - 1,
+           "a wrong PIN counts down: %s %s" % (st, pl))
+    st, pl = pin_call(api, inst, SENSITIVE_PATH, access, body, pin=pin, stepup=stepup)
+    expect(st == 200 and pl.get("app_pin") == "verified", "the right PIN passes: %s %s" % (st, pl))
+    answers = [error_code(pin_call(api, inst, SENSITIVE_PATH, access, body, pin=wrong,
+                                   stepup=stepup)[1]) for _ in range(max_failures)]
+    expect(answers == ["app_pin_invalid"] * (max_failures - 1) + ["app_pin_locked"],
+           "the right PIN cleared the count; then %d wrong ones lock it: %s"
+           % (max_failures, answers))
+    st, pl = pin_call(api, inst, SENSITIVE_PATH, access, body, pin=pin, stepup=stepup)
+    expect(st == 403 and error_code(pl) == "app_pin_locked",
+           "a locked PIN refuses the right PIN too: %s %s" % (st, pl))
+    st, pl = _set_pin(api, inst, access, pin)
+    expect(st == 200 and pl["step_up"]["app_pin_locked"] is False,
+           "a new PIN with the password unlocks: %s %s" % (st, pl))
+    st, pl = pin_call(api, inst, SENSITIVE_PATH, access, body, pin=pin, stepup=stepup)
+    expect(st == 200, "and the PIN works again: %s %s" % (st, pl))
+    st, pl = protected(api, inst, "GET", "/v1/policy/me", access)
+    counted = pl["policy"]["context"]["server_observations"]["device_account"]["app_pin_failed"]
+    expect(counted == max_failures + 1, "each wrong PIN is counted: %s" % counted)
+
+
+@check("step-up: concurrent wrong app PINs never pass the attempt limit", db_sensitive=True)
+def check_app_pin_concurrent(api, ctx):
+    """DESIGN.md 78. Each attempt is claimed by one atomic UPDATE before the
+    PIN is compared, so wrong PINs sent at the same moment count exactly up to
+    app_pin_max_failures -- one fewer answered app_pin_invalid, the rest
+    app_pin_locked -- and no more are compared."""
+    settings = live_settings(api)
+    need_key, need_pin = _pin_factors(settings)
+    if not need_pin:
+        raise Skip("the sensitive path needs no app PIN here")
+    max_failures = int(settings.get("app_pin_max_failures", "5") or "5")
+    if max_failures > 10:
+        raise Skip("app_pin_max_failures=%s is too high for a bounded run" % max_failures)
+    inst, _, _, access, stepup = _pin_phone(api, settings, need_key)
+    stepup = stepup if need_key else None
+    pin, wrong = _two_pins(settings)
+    st, pl = _set_pin(api, inst, access, pin)
+    expect(st == 200, "setting the PIN: %s %s" % (st, pl))
+    count = max_failures + 4
+    barrier, lock, results = threading.Barrier(count), threading.Lock(), []
+
+    def guess():
+        client = Api(api.base_url)
+        try:
+            barrier.wait(timeout=30)
+            outcome = error_code(pin_call(client, inst, SENSITIVE_PATH, access, {"amount": 1},
+                                          pin=wrong, stepup=stepup)[1])
+        except BaseException as error:  # a thread must report, never vanish
+            outcome = str(error)[:80]
+        with lock:
+            results.append(outcome)
+
+    threads = [threading.Thread(target=guess) for _ in range(count)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    expect(results.count("app_pin_invalid") == max_failures - 1
+           and results.count("app_pin_locked") == count - (max_failures - 1),
+           "%d wrong PINs at once against a limit of %d: %s"
+           % (count, max_failures, sorted(results)))
+    st, pl = protected(api, inst, "GET", "/v1/policy/me", access)
+    counted = pl["policy"]["context"]["server_observations"]["device_account"]["app_pin_failed"]
+    expect(counted == max_failures, "exactly the claimed attempts were compared: %s" % counted)
+
+
+@check("limited session: approving and route 1 prove the app PIN where the DBA chose it",
+       db_sensitive=True)
+def check_app_pin_approval(api, ctx):
+    """DESIGN.md 78. Under stepup_method app_pin or screen_lock_and_app_pin,
+    approving another phone's request needs the app PIN (and the screen-lock
+    key where the method names both), and so does route 1 where it is on; the
+    phone that asked then upgrades."""
+    settings = live_settings(api)
+    method = settings.get("stepup_method") or "screen_lock"
+    if method == "screen_lock":
+        raise Skip("stepup_method is screen_lock; the route 2 check proves the screen-lock key")
+    if ctx["mode"] != "enforce":
+        raise Skip("server is in observe mode; limited sessions exist only in enforce mode")
+    if not _setting_on(settings, "upgrade_other_device_approval") and \
+            "upgrade_other_device_approval" in settings:
+        raise Skip("upgrade_other_device_approval is off on this server")
+    integrity_context(ctx)
+    with_key = method != "app_pin"
+    approver, _, handle, approver_access, stepup = _pin_phone(api, settings, with_key)
+    pin, _ = _two_pins(settings)
+    st, pl = _set_pin(api, approver, approver_access, pin)
+    expect(st == 200, "setting the PIN: %s %s" % (st, pl))
+    phone = Installation()
+    factor = settings.get("stepup_factor", "passcode")
+    phone_key, extra = None, {}
+    if with_key:
+        phone_priv, jwk = stepup_jwk_pair()
+        phone_key = (phone_priv, factor)
+        extra = {"stepup_public_key": jwk,
+                 "stepup_key_auth": {"factor": factor, "mode": "per_use", "window_seconds": 0}}
+    st, pl = enrol(api, phone, fresh_hint(), **extra)
+    expect(st in (200, 201), "enrol failed: %s %s" % (st, pl))
+    phone_token = device_token(api, phone)
+    submit_report(api, phone, phone_token, _elevate)
+    st, pl = sign_in(api, phone, phone_token, handle)
+    expect(st == 200 and pl.get("scope") == "limited", "a limited session: %s %s" % (st, pl))
+    limited = pl["access_token"]
+    st, req = protected(api, phone, "POST", "/v1/auth/upgrade/request", limited,
+                        {"route": "approval"})
+    expect(st == 201, "approval request: %s %s" % (st, req))
+    path = "/v1/auth/approvals/%s/approve" % req["request_id"]
+    st, pl = pin_call(api, approver, path, approver_access, {}, stepup=stepup)
+    expect(st == 403 and error_code(pl) == "app_pin_required",
+           "approving without the PIN must be refused: %s %s" % (st, pl))
+    st, pl = pin_call(api, approver, path, approver_access, {}, pin=pin, stepup=stepup)
+    expect(st == 200 and pl.get("approved") is True, "approving with the PIN: %s %s" % (st, pl))
+    st, up = protected(api, phone, "POST", "/v1/auth/upgrade", limited,
+                       {"route": "approval", "request_id": req["request_id"]})
+    expect(st == 200 and up.get("scope") == "full", "the approved phone upgrades: %s %s" % (st, up))
+    if _setting_on(settings, "upgrade_stepup_same_device"):
+        st, pl = sign_in(api, phone, phone_token, handle)
+        limited = pl["access_token"]
+        if pl.get("scope") == "limited" and "stepup" in (pl.get("upgrade_routes") or []):
+            st, up = pin_call(api, phone, "/v1/auth/upgrade", limited, {"route": "stepup"},
+                              stepup=phone_key)
+            expect(st == 403 and error_code(up) == "app_pin_required",
+                   "route 1 without the PIN: %s %s" % (st, up))
+            st, up = pin_call(api, phone, "/v1/auth/upgrade", limited, {"route": "stepup"},
+                              pin=pin, stepup=phone_key)
+            expect(st == 200 and up.get("scope") == "full", "route 1 with the PIN: %s %s"
+                   % (st, up))
+
+
 @check("observations: a stolen token and a replayed request are recorded once each")
 def check_stolen_token_recorded(api, ctx):
     """DESIGN.md 77, owner decision of 2026-10-14. A fresh account's access
@@ -2113,6 +2353,7 @@ def check_upgrade_route_stepup(api, ctx):
     """DESIGN.md 70. Off by default; when on, it upgrades only a session whose
     causes are all integrity-related, with a step-up proof v2 over the upgrade
     request itself."""
+    _skip_unless_screen_lock(live_settings(api))
     settings = live_settings(api)
     if not _setting_on(settings, "upgrade_stepup_same_device"):
         raise Skip("upgrade_stepup_same_device is off (the owner's default); set it to 1 "
@@ -2176,6 +2417,7 @@ def check_upgrade_route_approval(api, ctx):
     session, lists the request (no hardware attributes), approves it with its
     own step-up proof, and the limited session upgrades once. Without step-up,
     or denied, it does not; requests per account are budgeted."""
+    _skip_unless_screen_lock(live_settings(api))
     settings = live_settings(api)
     if not _setting_on(settings, "upgrade_other_device_approval") and \
             "upgrade_other_device_approval" in settings:
@@ -2301,6 +2543,7 @@ def check_upgrade_request_supersedes(api, ctx):
     """DESIGN.md 75. A phone that asks for approval again replaces its own
     pending request: the approver lists only the newest, the older one can be
     neither approved nor used, and the newest upgrades as usual."""
+    _skip_unless_screen_lock(live_settings(api))
     settings = live_settings(api)
     if not _setting_on(settings, "upgrade_other_device_approval") and \
             "upgrade_other_device_approval" in settings:
@@ -2435,6 +2678,7 @@ def check_elevated_step_up(api, ctx):
     integrity_step_up_required although no step-up proof could satisfy it. On
     an authenticated account request a valid proof for that request now does;
     without one the refusal stands."""
+    _skip_unless_screen_lock(live_settings(api))
     if ctx["mode"] != "enforce":
         raise Skip("server is in observe mode")
     _, health = api.call("GET", "/health/ready")
@@ -2833,6 +3077,7 @@ def check_step_up(api, ctx):
     F1) -> 403 stepup_binding_mismatch; a v1 proof -> 403
     stepup_proof_version_unsupported; a key registered with another factor ->
     403 stepup_factor_mismatch."""
+    _skip_unless_screen_lock(live_settings(api))
     _, health = api.call("GET", "/health/ready")
     scoring = health.get("scoring_flags", {}) if isinstance(health, dict) else {}
     settings = scoring.get("risk_policy_settings", {})
@@ -3062,6 +3307,7 @@ def check_stepup_reenrol(api, ctx):
     only with the access proof, the account password and a signature by the new
     key bound to this request. A wrong password or a proof signed by another key
     is refused and changes nothing; the right one replaces the bound key."""
+    _skip_unless_screen_lock(live_settings(api))
     auth = {"factor": "passcode", "mode": "per_use", "window_seconds": 0}
     inst = Installation()
     old_priv, old_jwk = stepup_jwk_pair()
