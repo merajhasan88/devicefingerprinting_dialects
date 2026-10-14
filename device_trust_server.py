@@ -1189,7 +1189,7 @@ def _get_backend_identity():
 # against a schema it does not understand. /health/* still answers so operators
 # can see why.
 
-REQUIRED_SCHEMA_VERSION = 20
+REQUIRED_SCHEMA_VERSION = 21
 
 _schema_state = None
 _schema_lock = threading.Lock()
@@ -1396,6 +1396,26 @@ _RISK_SETTING_KINDS = {
     "app_pin_required_paths": "paths",
     "app_pin_length": "int",
     "app_pin_max_failures": "int",
+    # Migration 021 (DESIGN.md 79): the relationship rules, scan freshness and
+    # the hardware-backing policy, session lifetimes, support for app PINs.
+    "new_device_points": "int",
+    "new_device_hours": "int",
+    "known_device_new_installation_points": "int",
+    "reinstall_window_hours": "int",
+    "reinstall_elevated_count": "int",
+    "reinstall_elevated_points": "int",
+    "reinstall_high_count": "int",
+    "reinstall_high_points": "int",
+    "reinstall_block_count": "int",
+    "integrity_report_missing_points": "int",
+    "integrity_report_stale_points": "int",
+    "integrity_freshness_seconds": "int",
+    "device_integrity_history_block_points": "int",
+    "hardware_backing_policy": ("off", "advisory", "required"),
+    "refresh_idle_days": "int",
+    "session_max_days": "int",
+    "app_pin_support": ("off", "unlock", "unlock_and_reset"),
+    "app_pin_support_reset_minutes": "int",
 }
 _RISK_SETTING_KINDS.update(
     ("%s_%s" % (rule[0], part), "int")
@@ -1415,10 +1435,20 @@ _RISK_SETTING_MINIMUMS = {
     "app_pin_length": 4,
     # Unlimited guesses at a 4-12 digit PIN is no setting: at least one.
     "app_pin_max_failures": 1,
+    "reinstall_window_hours": 1,
+    "integrity_freshness_seconds": 30,
+    "refresh_idle_days": 1,
+    "app_pin_support_reset_minutes": 1,
 }
-# Upper bounds a value must also meet.
+# Upper bounds a value must also meet. The session limits are ours (DESIGN.md
+# 79): a refresh token idle for more than 90 days, or a session older than a
+# year, is not a business choice.
 _RISK_SETTING_MAXIMUMS = {
     "app_pin_length": 12,
+    "integrity_freshness_seconds": 86400,
+    "refresh_idle_days": 90,
+    "session_max_days": 365,
+    "app_pin_support_reset_minutes": 1440,
 }
 _RISK_SETTING_BOOL_WORDS = ("0", "1", "true", "false", "yes", "no", "on", "off")
 # Rows whose absence would silently weaken a gate instead of restoring the
@@ -1558,6 +1588,18 @@ def _risk_setting_bool(key, default=False):
     if value is None:
         return default
     return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _integrity_freshness_seconds():
+    """How old the latest scan may be and still count (DESIGN.md 79): the
+    DBA's setting; INTEGRITY_FRESHNESS_SECONDS answers only a missing row."""
+    return _risk_setting_int("integrity_freshness_seconds", INTEGRITY_FRESHNESS_SECONDS)
+
+
+def _hardware_backing_policy():
+    """The hardware-backing policy (DESIGN.md 50, 79): the DBA's setting;
+    INTEGRITY_HARDWARE_BACKING_POLICY answers only a missing row."""
+    return _risk_setting_str("hardware_backing_policy", INTEGRITY_HARDWARE_BACKING_POLICY)
 
 
 def _risk_setting_words(key, default):
@@ -2371,7 +2413,8 @@ def _apply_hardware_backing_policy(cursor, installation_id, scored):
     """Fold the per-deployment hardware-backing policy into an integrity result.
 
     A software-backed installation key is only ever a client claim, never proof,
-    so it is applied per INTEGRITY_HARDWARE_BACKING_POLICY. key_hardware_backed is
+    so it is applied per the DBA's hardware_backing_policy (DESIGN.md 79;
+    INTEGRITY_HARDWARE_BACKING_POLICY only for a missing row). key_hardware_backed is
     NULL when the client did not report it (old clients, the Kotlin and .NET
     collectors); an absent measurement must never be read as software, so
     "advisory" acts only on an explicit False. "required" demands a claim, and no
@@ -2380,7 +2423,8 @@ def _apply_hardware_backing_policy(cursor, installation_id, scored):
     "proven". The score is re-derived from the reasons so it stays the sum of
     advertised points, as _score_integrity does.
     """
-    if INTEGRITY_HARDWARE_BACKING_POLICY == "off":
+    policy = _hardware_backing_policy()
+    if policy == "off":
         return
     cursor.execute(
         "SELECT key_hardware_backed FROM app_installations WHERE installation_id = %s",
@@ -2390,7 +2434,7 @@ def _apply_hardware_backing_policy(cursor, installation_id, scored):
     stored = row[0] if row else None
     if stored is not None and bool(stored):
         return
-    if stored is None and INTEGRITY_HARDWARE_BACKING_POLICY != "required":
+    if stored is None and policy != "required":
         return
     if stored is None:
         _integrity_reason(
@@ -2402,7 +2446,7 @@ def _apply_hardware_backing_policy(cursor, installation_id, scored):
             hard=True,
         )
         scored["hard_block"] = True
-    elif INTEGRITY_HARDWARE_BACKING_POLICY == "required":
+    elif policy == "required":
         _integrity_reason(
             scored["reasons"],
             "key_software_backed",
@@ -3010,7 +3054,7 @@ def _latest_integrity_state(installation_id):
         "reasons": _as_list(DIALECT.json_value(row[4])),
         "created_at": _iso_z(row[5]),
         "age_seconds": age_seconds,
-        "fresh": age_seconds <= INTEGRITY_FRESHNESS_SECONDS,
+        "fresh": age_seconds <= _integrity_freshness_seconds(),
         # Reports stored before migration 015 carry neither.
         "evidence_quality": row[6],
         "finding_score": int(row[7]) if row[7] is not None else None,
@@ -3226,7 +3270,7 @@ def _require_complete_evidence(state):
         return
     if request.path not in _risk_setting_words("complete_evidence_paths", ""):
         return
-    max_age = _risk_setting_int("complete_evidence_max_age_seconds", INTEGRITY_FRESHNESS_SECONDS)
+    max_age = _risk_setting_int("complete_evidence_max_age_seconds", _integrity_freshness_seconds())
     quality = (state or {}).get("evidence_quality")
     age = (state or {}).get("age_seconds")
     if quality == "complete" and isinstance(age, int) and age <= max_age:
@@ -3593,9 +3637,10 @@ def _evaluate_risk_policy(
         )
         device_installation_count = int(cursor.fetchone()[0])
 
-        reinstall_cutoff = _utc_now() - timedelta(
-            hours=POLICY_REINSTALL_WINDOW_HOURS
+        reinstall_window_hours = _risk_setting_int(
+            "reinstall_window_hours", POLICY_REINSTALL_WINDOW_HOURS
         )
+        reinstall_cutoff = _utc_now() - timedelta(hours=reinstall_window_hours)
         cursor.execute(
             """
             SELECT COUNT(*)
@@ -3677,23 +3722,32 @@ def _evaluate_risk_policy(
         )
         hard_block = True
 
+    # A new phone, and a known phone's new installation: DBA settings since
+    # migration 021 (DESIGN.md 79), at the values the code used before.
     device_age = _utc_now() - device_created_at
-    if registration_method == "new_device" and device_age <= timedelta(hours=24):
+    new_device_hours = _risk_setting_int("new_device_hours", 24)
+    new_device_points = _risk_setting_int("new_device_points", 10)
+    reinstall_points = _risk_setting_int("known_device_new_installation_points", 15)
+    if (
+        registration_method == "new_device"
+        and new_device_points > 0
+        and device_age <= timedelta(hours=new_device_hours)
+    ):
         _policy_reason(
             reasons,
             "new_device",
-            10,
-            "This recognized device was first seen less than 24 hours ago.",
+            new_device_points,
+            "This recognized device was first seen less than %d hours ago." % new_device_hours,
         )
-        score += 10
-    elif registration_method == "reinstall_hint":
+        score += new_device_points
+    elif registration_method == "reinstall_hint" and reinstall_points > 0:
         _policy_reason(
             reasons,
             "known_device_new_installation",
-            15,
+            reinstall_points,
             "A new installation was correlated to a previously recognized device.",
         )
-        score += 15
+        score += reinstall_points
 
     # Accounts sharing one recognized physical device. DBA-tunable in
     # risk_policy_settings; the owner's defaults (DESIGN.md 54) treat a phone
@@ -3744,8 +3798,12 @@ def _evaluate_risk_policy(
         score += points
         hard_block = hard_block or blocked
 
-    # Reinstall velocity on one server-recognized device.
-    if recent_reinstall_count >= POLICY_REINSTALL_BLOCK_COUNT:
+    # Reinstall velocity on one server-recognized device; DBA settings since
+    # migration 021, 0 switching a step off.
+    reinstall_block = _risk_setting_int("reinstall_block_count", POLICY_REINSTALL_BLOCK_COUNT)
+    reinstall_high = _risk_setting_int("reinstall_high_count", 4)
+    reinstall_elevated = _risk_setting_int("reinstall_elevated_count", 3)
+    if reinstall_block > 0 and recent_reinstall_count >= reinstall_block:
         _policy_reason(
             reasons,
             "rapid_reinstall_block_threshold",
@@ -3753,41 +3811,46 @@ def _evaluate_risk_policy(
             "The device exceeded the configured reinstall count in the policy window.",
         )
         hard_block = True
-    elif recent_reinstall_count >= 4:
+    elif reinstall_high > 0 and recent_reinstall_count >= reinstall_high:
+        points = _risk_setting_int("reinstall_high_points", 60)
         _policy_reason(
             reasons,
             "rapid_reinstall_high",
-            60,
-            "Four or more correlated reinstalls occurred inside the policy window.",
+            points,
+            "%d or more correlated reinstalls occurred inside the policy window."
+            % reinstall_high,
         )
-        score += 60
-    elif recent_reinstall_count >= 3:
+        score += points
+    elif reinstall_elevated > 0 and recent_reinstall_count >= reinstall_elevated:
+        points = _risk_setting_int("reinstall_elevated_points", 35)
         _policy_reason(
             reasons,
             "rapid_reinstall_elevated",
-            35,
-            "Three correlated reinstalls occurred inside the policy window.",
+            points,
+            "%d correlated reinstalls occurred inside the policy window." % reinstall_elevated,
         )
-        score += 35
+        score += points
 
     # Latest server-scored native integrity result. Missing/stale measurements
     # are themselves risk, while a fresh report contributes its server-owned score.
     if integrity_state is None:
+        points = _risk_setting_int("integrity_report_missing_points", 40)
         _policy_reason(
             reasons,
             "integrity_report_missing",
-            40,
+            points,
             "No signed native integrity report exists for this installation.",
         )
-        score += 40
+        score += points
     elif not integrity_state.get("fresh"):
+        points = _risk_setting_int("integrity_report_stale_points", 35)
         _policy_reason(
             reasons,
             "integrity_report_stale",
-            35,
+            points,
             "The latest native integrity report is older than the freshness window.",
         )
-        score += 35
+        score += points
     else:
         integrity_score = min(int(integrity_state.get("score", 0)), 100)
         if integrity_score > 0:
@@ -3809,14 +3872,15 @@ def _evaluate_risk_policy(
         device_integrity_memory.get("finding_verdict") == "block"
     ):
         if device_integrity_memory.get("installation_id") != str(installation_id):
+            points = _risk_setting_int("device_integrity_history_block_points", 50)
             _policy_reason(
                 reasons,
                 "device_integrity_history_block",
-                50,
+                points,
                 "Another installation on this device was blocked by native "
                 "integrity inside the device memory window.",
             )
-            score += 50
+            score += points
 
     # Server-side request-rate anomaly (DESIGN.md 51.6): opt-in, advisory, and
     # device-unfalsifiable. Only counts when the DBA has enabled it, so it costs
@@ -3944,10 +4008,10 @@ def _evaluate_risk_policy(
         ),
         "account_already_linked_to_device": link_exists if account_id is not None else None,
         "recent_reinstall_count": recent_reinstall_count,
-        "reinstall_window_hours": POLICY_REINSTALL_WINDOW_HOURS,
+        "reinstall_window_hours": reinstall_window_hours,
         "integrity": integrity_state,
         "integrity_mode": INTEGRITY_MODE,
-        "integrity_freshness_seconds": INTEGRITY_FRESHNESS_SECONDS,
+        "integrity_freshness_seconds": _integrity_freshness_seconds(),
         "device_integrity_memory": device_integrity_memory,
         "device_integrity_memory_hours": _risk_setting_int(
             "integrity_device_memory_hours", INTEGRITY_DEVICE_MEMORY_HOURS
@@ -5741,8 +5805,10 @@ def _issue_account_tokens(
     proof accepted ride along until accepted_until (DESIGN.md 72): protected
     requests and refreshes honour exactly those causes, and nothing else.
     """
+    new_family = family_id is None
     family_id = family_id or str(uuid.uuid4())
     session_id = str(uuid.uuid4())
+    refresh_lifetime = _refresh_lifetime(cursor, family_id, new_family)
     limited = sorted(set(limited_causes))
     scope = "limited" if limited else "full"
     claims = {
@@ -5771,7 +5837,7 @@ def _issue_account_tokens(
     refresh_token = create_refresh_token(
         identity=account_id,
         additional_claims=claims,
-        expires_delta=REFRESH_TOKEN_LIFETIME,
+        expires_delta=refresh_lifetime,
     )
     cursor.execute(
         """
@@ -5787,7 +5853,7 @@ def _issue_account_tokens(
             account_id,
             device_id,
             installation_id,
-            _utc_now() + REFRESH_TOKEN_LIFETIME,
+            _utc_now() + refresh_lifetime,
             scope,
             ",".join(limited) or None,
             ",".join(accepted) or None,
@@ -5816,6 +5882,28 @@ def _issue_account_tokens(
         if acceptance_id:
             tokens["acceptance_id"] = acceptance_id
     return tokens
+
+
+def _family_started_at(cursor, family_id):
+    """When this session family began: its first refresh-session row."""
+    cursor.execute(
+        "SELECT MIN(created_at) FROM refresh_sessions WHERE family_id = %s", (family_id,)
+    )
+    row = cursor.fetchone()
+    return row[0] if row and row[0] is not None else None
+
+
+def _refresh_lifetime(cursor, family_id, new_family):
+    """How long the refresh token issued now may live (DESIGN.md 79): the DBA's
+    refresh_idle_days, each refresh starting it again, and never past the
+    session_max_days the DBA may set from the session's first sign-in."""
+    lifetime = timedelta(days=_risk_setting_int("refresh_idle_days", 30))
+    max_days = _risk_setting_int("session_max_days", 0)
+    if max_days <= 0:
+        return lifetime
+    started = None if new_family else _family_started_at(cursor, family_id)
+    remaining = (started or _utc_now()) + timedelta(days=max_days) - _utc_now()
+    return max(timedelta(seconds=0), min(lifetime, remaining))
 
 
 def _refresh_session(cursor, claims, lock=False):
@@ -5878,6 +5966,17 @@ def _refresh_session(cursor, claims, lock=False):
         raise ApiProblem(
             "The refresh session has expired.", 401, "refresh_session_expired"
         )
+    # A session older than the DBA's session_max_days ends, however often it
+    # refreshed -- also for tokens issued before the DBA lowered it (DESIGN.md 79).
+    max_days = _risk_setting_int("session_max_days", 0)
+    if max_days > 0:
+        started = _family_started_at(cursor, family_id)
+        if started is not None and started + timedelta(days=max_days) <= _utc_now():
+            raise ApiProblem(
+                "This session reached its maximum age; sign in again.",
+                401,
+                "session_max_age_reached",
+            )
     return {
         "revoked": revoked_at is not None,
         "session_id": session_id,
@@ -5948,7 +6047,12 @@ def health_ready():
             "access_proof_versions": list(range(ACCESS_PROOF_MIN_VERSION, 3)),
             "device_policy_mode": DEVICE_POLICY_MODE,
             "integrity_mode": INTEGRITY_MODE,
-            "integrity_freshness_seconds": INTEGRITY_FRESHNESS_SECONDS,
+            # The effective values: the DBA's rows, or the environment's for a
+            # missing row (DESIGN.md 79). Never raises: no policy, no rows.
+            "integrity_freshness_seconds": int(
+                (policy_values or {}).get("integrity_freshness_seconds")
+                or INTEGRITY_FRESHNESS_SECONDS
+            ),
             # Which signals are live versus shipped report-only. An operator
             # reading a low score needs to know whether a rule was absent or
             # merely inert, and the conformance suite asserts against this.
@@ -5956,7 +6060,8 @@ def health_ready():
                 "extended_libs": INTEGRITY_SCORE_EXTENDED_LIBS,
                 "ios_fake_signature": INTEGRITY_SCORE_IOS_FAKE_SIGNATURE,
                 "ios_code_integrity": INTEGRITY_SCORE_IOS_CODE_INTEGRITY,
-                "hardware_backing_policy": INTEGRITY_HARDWARE_BACKING_POLICY,
+                "hardware_backing_policy": (policy_values or {}).get(
+                    "hardware_backing_policy") or INTEGRITY_HARDWARE_BACKING_POLICY,
                 "android_wx_baselines": len(ANDROID_WX_BASELINES),
                 "risk_policy_settings": policy_values or {},
                 "limited_sessions": {
@@ -6665,7 +6770,7 @@ def integrity_report():
         "finding_score": scored["finding_score"],
         "reasons": scored["reasons"],
         "mode": INTEGRITY_MODE,
-        "fresh_for_seconds": INTEGRITY_FRESHNESS_SECONDS,
+        "fresh_for_seconds": _integrity_freshness_seconds(),
         "remote_attestation": "not_used",
         "created_at": _iso_z(_utc_now()),
     }
@@ -7466,7 +7571,9 @@ def upgrade_session():
         # lifetime) -- not any other cause, and never past the refresh lifetime
         # (DESIGN.md 72). A recheck needed no proof and accepts nothing.
         hours = _risk_setting_int("upgrade_acceptance_hours", 720)
-        accepted_until = _utc_now() + min(timedelta(hours=hours), REFRESH_TOKEN_LIFETIME)
+        accepted_until = _utc_now() + min(
+            timedelta(hours=hours), timedelta(days=_risk_setting_int("refresh_idle_days", 30))
+        )
         acceptance_id = None
         if causes and hours > 0:
             acceptance_id = _insert_acceptance(

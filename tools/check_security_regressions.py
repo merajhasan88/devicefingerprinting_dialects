@@ -101,6 +101,7 @@ class Rows(object):
         self.budget_oldest = None
         self.app_pins = {}
         self.password_hash = None
+        self.family_started = None
 
     def execute(self, sql, params=None):
         q = " ".join(sql.split())
@@ -237,6 +238,8 @@ class Rows(object):
                 raise s.DIALECT._driver.errors.UniqueViolation("duplicate app pin")
             self.app_pins[params[0]] = {"hash": params[1], "failures": 0, "locked_at": None,
                                         "by": params[2]}
+        elif q.startswith("SELECT MIN(created_at) FROM refresh_sessions WHERE family_id"):
+            self.result = (self.family_started,)
         elif q.startswith("SELECT password_hash FROM demo_accounts WHERE account_id"):
             self.result = (self.password_hash,) if self.password_hash else None
         elif q.startswith("INSERT INTO session_upgrade_requests"):
@@ -577,6 +580,12 @@ def hardware_backing_required_needs_a_claim():
         status, payload = send_report("android", clean("android"))
         expect(payload["integrity"]["score"] == 0,
                "advisory mode must not penalise an unreported claim, got %s" % payload)
+        # DESIGN.md 79: the DBA's row decides; the environment only answers a
+        # missing row.
+        with policy(hardware_backing_policy="required"):
+            status, payload = send_report("android", clean("android"))
+        expect(payload["integrity"]["verdict"] == "block",
+               "the DBA's required must apply over the environment's advisory: %s" % payload)
     finally:
         s.INTEGRITY_HARDWARE_BACKING_POLICY = saved
         db.hardware_backed = None
@@ -3456,8 +3465,11 @@ class ObservationStore(object):
                                     (str(uuid.uuid4()), phone[0], account_id,
                                      self.now - timedelta(hours=1)))
 
-    def decide(self, phone, account_id=None, pending=False, **settings):
-        """The real _evaluate_risk_policy, not persisted, under these settings."""
+    def decide(self, phone, account_id=None, pending=False, scan="fresh", memory=None,
+               **settings):
+        """The real _evaluate_risk_policy, not persisted, under these settings,
+        with the latest scan fresh and clean (or "missing", or "stale") and
+        the device memory given."""
         values = dict(db.settings, **{key: str(value) for key, value in settings.items()})
         saved = (s._cursor, s._latest_integrity_state, s._device_integrity_memory)
         connection = self.connection
@@ -3469,8 +3481,10 @@ class ObservationStore(object):
 
         s._risk_settings_cache.update(values=values, at=time.monotonic(), failed_at=None, error=None)
         s._cursor = lite_cursor
-        s._latest_integrity_state = lambda iid: {"score": 0, "verdict": "trusted", "fresh": True}
-        s._device_integrity_memory = lambda did, iid: None
+        s._latest_integrity_state = lambda iid: (
+            None if scan == "missing"
+            else {"score": 0, "verdict": "trusted", "fresh": scan == "fresh"})
+        s._device_integrity_memory = lambda did, iid: memory
         try:
             return s._evaluate_risk_policy("account_login", phone[0], phone[1], account_id=account_id,
                                            account_link_pending=pending, persist=False)
@@ -4021,6 +4035,152 @@ def approving_and_the_same_phone_route_follow_the_method():
             expect(not offered(), "under screen_lock a phone without a key is not offered route 1")
     finally:
         db.app_pins, db.refresh_row, db.step_jwk = {}, None, step.jwk
+
+
+@check
+def the_relationship_rules_are_the_dbas():
+    """DESIGN.md 79 (owner: "put them under DBA"). A new phone, a known
+    phone's new installation, reinstall velocity, a missing or stale scan and
+    another installation blocked on the phone score the DBA's points, at the
+    values the code used before by default; 0 switches a rule off."""
+    store = ObservationStore()
+
+    def points(decision):
+        return {r["code"]: r["points"] for r in decision["reasons"]}
+
+    fresh_phone = store.phone(age_days=0)
+    expect(points(store.decide(fresh_phone)).get("new_device") == 10, "a new phone: +10")
+    expect(points(store.decide(fresh_phone, new_device_points=25)).get("new_device") == 25,
+           "the DBA's points for a new phone")
+    expect("new_device" not in points(store.decide(fresh_phone, new_device_points=0)),
+           "0 switches the new-phone rule off")
+    expect("new_device" not in points(store.decide(store.phone(age_days=2), new_device_hours=24))
+           and points(store.decide(store.phone(age_days=2), new_device_hours=72)).get("new_device")
+           == 10, "how long a phone counts as new is the DBA's")
+    busy = store.phone()
+    for _ in range(3):
+        store.reinstall(busy)
+    expect(points(store.decide(busy)).get("rapid_reinstall_elevated") == 35,
+           "three proven reinstalls: +35 by default")
+    tuned = points(store.decide(busy, reinstall_elevated_points=20, reinstall_high_count=3,
+                                reinstall_high_points=70))
+    expect(tuned.get("rapid_reinstall_high") == 70 and "rapid_reinstall_elevated" not in tuned,
+           "the DBA's counts and points: %s" % tuned)
+    expect(store.decide(busy, reinstall_block_count=3)["recommended_action"] == "block",
+           "the DBA's block count")
+    quiet = store.phone()
+    expect(points(store.decide(quiet, scan="missing")).get("integrity_report_missing") == 40
+           and points(store.decide(quiet, scan="missing", integrity_report_missing_points=20))
+           .get("integrity_report_missing") == 20, "a missing scan: the DBA's points")
+    expect(points(store.decide(quiet, scan="stale")).get("integrity_report_stale") == 35
+           and points(store.decide(quiet, scan="stale", integrity_report_stale_points=10))
+           .get("integrity_report_stale") == 10, "a stale scan: the DBA's points")
+    blocked_elsewhere = {"finding_verdict": "block", "installation_id": str(uuid.uuid4())}
+    expect(points(store.decide(quiet, memory=blocked_elsewhere))
+           .get("device_integrity_history_block") == 50
+           and points(store.decide(quiet, memory=blocked_elsewhere,
+                                   device_integrity_history_block_points=80))
+           .get("device_integrity_history_block") == 80,
+           "another installation blocked: the DBA's points")
+
+
+@check
+def a_scan_is_fresh_for_as_long_as_the_dba_says():
+    """DESIGN.md 79. The latest scan's freshness follows the DBA's
+    integrity_freshness_seconds; the environment's value only answers a
+    missing row."""
+    connection = sqlite3.connect(":memory:", detect_types=sqlite3.PARSE_DECLTYPES)
+    connection.executescript(LITE_SCHEMA)
+    installation = str(uuid.uuid4())
+    connection.execute(
+        "INSERT INTO integrity_reports (report_id, installation_id, device_id, score, verdict, "
+        "hard_block, created_at) VALUES (?, ?, ?, 0, 'trusted', 0, ?)",
+        (str(uuid.uuid4()), installation, str(uuid.uuid4()),
+         s._utc_now() - timedelta(seconds=700)))
+    connection.execute("ALTER TABLE integrity_reports ADD COLUMN reasons TEXT DEFAULT '[]'")
+
+    @contextmanager
+    def lite_cursor(commit=False):
+        yield LiteCursor(connection)
+
+    saved = s._cursor
+    s._cursor = lite_cursor
+    try:
+        for seconds, fresh in ((None, False), (900, True), (600, False)):
+            values = dict(db.settings)
+            if seconds is not None:
+                values["integrity_freshness_seconds"] = str(seconds)
+            s._risk_settings_cache.update(values=values, at=time.monotonic(), failed_at=None,
+                                          error=None)
+            state = s._latest_integrity_state(installation)
+            expect(state["fresh"] is fresh, "a 700-second-old scan with freshness %s: fresh=%s"
+                   % (seconds, state["fresh"]))
+    finally:
+        s._cursor = saved
+        s._risk_settings_cache.update(values=dict(db.settings), at=time.monotonic(),
+                                      failed_at=None, error=None)
+        connection.close()
+
+
+@check
+def a_session_lives_as_long_as_the_dba_says():
+    """DESIGN.md 79 (owner: G8 DBA-configurable, 30 days the default). Each
+    refresh token lives refresh_idle_days (the session ends after that many
+    idle days); session_max_days, off by default, ends a session that many
+    days after its first sign-in however often it refreshed -- also for
+    tokens issued before the DBA set it. The bounds are ours: idle 1-90, cap
+    0 or up to 365."""
+    import base64
+
+    def expiry_days(tokens):
+        payload = tokens["refresh_token"].split(".")[1]
+        claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+        return (claims["exp"] - time.time()) / 86400.0
+
+    with s.app.app_context():
+        with policy():
+            fresh = s._issue_account_tokens(db, account, inst.device_id, inst.installation_id)
+            expect(29.9 < expiry_days(fresh) <= 30.0, "the default idle lifetime is 30 days")
+        with policy(refresh_idle_days=7):
+            tokens = s._issue_account_tokens(db, account, inst.device_id, inst.installation_id)
+            expect(6.9 < expiry_days(tokens) <= 7.0, "the DBA's idle lifetime: 7 days")
+        with policy(session_max_days=10):
+            db.family_started = s._utc_now() - timedelta(days=8)
+            tokens = s._issue_account_tokens(db, account, inst.device_id, inst.installation_id,
+                                             family_id=str(uuid.uuid4()))
+            expect(1.9 < expiry_days(tokens) <= 2.0,
+                   "a session capped at 10 days that began 8 days ago refreshes for 2 more")
+    family, session = str(uuid.uuid4()), str(uuid.uuid4())
+    claims = {"sid": session, "family": family, "did": inst.device_id, "iid": inst.installation_id}
+    db.refresh_row = (family, account, inst.device_id, inst.installation_id,
+                      s._utc_now() + timedelta(days=20), None, "full", None, None, None)
+    real_identity = s.get_jwt_identity
+    try:
+        with s.app.test_request_context("/v1/auth/refresh", method="POST"):
+            s.get_jwt_identity = lambda: account
+            for started_days, cap, refused in ((40, 0, False), (40, 30, True), (20, 30, False)):
+                db.family_started = s._utc_now() - timedelta(days=started_days)
+                with policy(session_max_days=cap):
+                    code = None
+                    try:
+                        s._refresh_session(db, claims)
+                    except s.ApiProblem as problem:
+                        code = problem.code
+                expect((code == "session_max_age_reached") is refused,
+                       "a session %d days old under a %d-day cap: refused=%s (%s)"
+                       % (started_days, cap, code is not None, code))
+    finally:
+        db.refresh_row, db.family_started = None, None
+        s.get_jwt_identity = real_identity
+    for values, valid in (({"refresh_idle_days": "90"}, True), ({"refresh_idle_days": "91"}, False),
+                          ({"refresh_idle_days": "0"}, False), ({"session_max_days": "365"}, True),
+                          ({"session_max_days": "366"}, False)):
+        try:
+            s._validate_risk_settings(dict(SETTINGS, **values))
+            accepted = True
+        except ValueError:
+            accepted = False
+        expect(accepted is valid, "%s: accepted=%s" % (values, accepted))
 
 
 @check
