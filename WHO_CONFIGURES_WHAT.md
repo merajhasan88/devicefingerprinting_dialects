@@ -37,12 +37,16 @@ even if the same people wear two hats.
 
 ## 2. DBA and business analysts — every policy value, with its default
 
-All 71 settings, generated from migrations 003–020 with each row's own description. The server
-re-reads the table every 30 seconds; a value that does not parse makes the snapshot invalid, and the
-server keeps its last good one for five minutes, then refuses rather than run without a policy. A
-count of `0` switches a rule off. `POLICY_*` environment variables answer only for a missing row.
+Every setting, generated from the migrations by `tools/settings_reference.py` and checked by the
+gate. The server re-reads the table every 30 seconds; a value that does not parse makes the snapshot
+invalid, and the server keeps its last good one for five minutes, then refuses rather than run
+without a policy. A count of `0` switches a rule off. Environment variables answer only for a
+missing row.
 
-**Step-up and opt-in behavioural signals** (migration 003)
+<!-- settings-reference:begin (tools/settings_reference.py --write; do not edit by hand) -->
+89 settings, seeded by migrations 003-021 with the owner's defaults; each row's own description.
+
+**Migration 003** — DBA-tunable risk policy settings
 
 | Setting | Default | What it decides |
 |---|---|---|
@@ -59,7 +63,7 @@ count of `0` switches a rule off. `POLICY_*` environment variables answer only f
 | `population_baseline_threshold` | `10` | Advisory when the chosen metric exceeds this consumer-set base. |
 | `population_points` | `30` | Advisory risk points added when the population signal trips. |
 
-**Relationships: accounts per phone, phones per account, the bands** (migration 006, 012)
+**Migration 006** — DBA-tunable accounts-per-device policy
 
 | Setting | Default | What it decides |
 |---|---|---|
@@ -69,29 +73,16 @@ count of `0` switches a rule off. `POLICY_*` environment variables answer only f
 | `device_accounts_review_points` | `60` | Risk points at the review account count. |
 | `device_accounts_block_count` | `4` | Accounts on one device that are blocked outright. |
 | `elevated_risk_refuses` | `0` | In enforce mode, 1 = an elevated (step-up band) decision refuses the request; 0 = recorded, not refused. |
-| `policy_step_up_score` | `30` | Relationship-risk score from which a decision is step_up (recorded, allowed unless elevated_risk_refuses=1). Must be below policy_review_score. |
-| `policy_review_score` | `60` | Relationship-risk score from which a decision is review (refused in enforce mode, or a limited session where listed). Must be below policy_block_score. |
-| `policy_block_score` | `90` | Relationship-risk score from which a decision is block (always refused). |
-| `account_devices_elevated_count` | `2` | Devices one account may use before its decisions are raised (elevated band). 0 = off. |
-| `account_devices_elevated_points` | `35` | Risk points at the elevated devices-per-account count. |
-| `account_devices_review_count` | `3` | Devices one account may use before its decisions are held for review. 0 = off. |
-| `account_devices_review_points` | `60` | Risk points at the review devices-per-account count. |
-| `account_devices_block_count` | `5` | Devices one account may use before it is blocked. 0 = off. |
 
-**Integrity policy choices and sensitive operations** (migration 010, 015)
+**Migration 010** — DBA-tunable W^X growth allowance and eligibility rules
 
 | Setting | Default | What it decides |
 |---|---|---|
 | `wx_far_above_baseline_percent` | `200` | W^X memory above this percentage of the build's pinned baseline scores +40 (android_wx_far_above_baseline); between the baseline and this percentage it is expected runtime growth, advisory. 200 = twice the baseline. Minimum 100. |
 | `developer_options_refuses` | `0` | Eligibility rule. 1 = in enforce mode an installation whose latest scan reports Developer options on is refused (integrity_device_ineligible) until they are off and a new scan is sent; 0 = advisory only. |
 | `adb_enabled_refuses` | `0` | Eligibility rule. 1 = in enforce mode an installation whose latest scan reports USB debugging (ADB) on is refused (integrity_device_ineligible) until it is off and a new scan is sent; 0 = advisory only. |
-| `collection_problems_block` | `0` | 1 = each failed or incomplete probe adds +30, three make a block, and that block is remembered for the device (every account on the phone) like a finding. 0 (owner default) = collection problems add +30 once and never enter the device memory. |
-| `integrity_device_memory_hours` | `24` | Hours a blocked finding stays with the physical device across reinstalls. 0 = off. |
-| `complete_evidence_paths` | *(empty)* | Paths that need a fresh, complete integrity scan (no failed, incomplete, contradictory or legacy evidence), comma-separated. Empty: none. |
-| `complete_evidence_max_age_seconds` | `600` | How fresh that scan must be on complete_evidence_paths, in seconds. Minimum 30. |
-| `incomplete_evidence_review_after` | `3` | Consecutive incomplete or invalid scans of one installation, with no complete scan between them, that escalate the verdict to review. 0 = off. Legacy collectors never count. |
 
-**Limited sessions, upgrades and approvals** (migration 011, 013, 016, 018)
+**Migration 011** — limited sessions and their upgrade
 
 | Setting | Default | What it decides |
 |---|---|---|
@@ -103,11 +94,43 @@ count of `0` switches a rule off. `POLICY_*` environment variables answer only f
 | `upgrade_mfa_assertion` | `0` | 1 = a limited session may upgrade with an ES256 assertion signed by your identity backend (keys in UPGRADE_ASSERTION_JWKS_FILE). As strong as your MFA. |
 | `upgrade_request_ttl_seconds` | `300` | Seconds an upgrade request (an approval request or an assertion nonce) stays valid. Minimum 30. |
 | `upgrade_approvals_per_hour` | `3` | Approval requests one account may raise per hour, against prompt fatigue. 0 = none. |
-| `upgrade_acceptance_hours` | `720` | Hours an upgrade keeps accepting the soft causes its proof covered (never past the 30-day refresh lifetime). 0 = none: protected requests and refreshes judge them again. |
-| `acceptance_auto_cover_reasons` | *(empty)* | Reason codes an approved session accepts automatically even if they appear after the approval, comma-separated. A business decision; empty (owner default) = every new reason needs a new decision. Collection problems are never covered. |
-| `legacy_acceptances` | `carry` | Approvals granted before migration 016: carry (owner default) = keep each as what it covers at its first use, until its expiry; drop = they cover nothing and their users re-confirm. |
 
-**Business API** (migration 017)
+**Migration 012** — DBA-tunable relationship-risk bands and devices-per-account policy
+
+| Setting | Default | What it decides |
+|---|---|---|
+| `policy_step_up_score` | `30` | Relationship-risk score from which a decision is step_up (recorded, allowed unless elevated_risk_refuses=1). Must be below policy_review_score. |
+| `policy_review_score` | `60` | Relationship-risk score from which a decision is review (refused in enforce mode, or a limited session where listed). Must be below policy_block_score. |
+| `policy_block_score` | `90` | Relationship-risk score from which a decision is block (always refused). |
+| `account_devices_elevated_count` | `2` | Devices one account may use before its decisions are raised (elevated band). 0 = off. |
+| `account_devices_elevated_points` | `35` | Risk points at the elevated devices-per-account count. |
+| `account_devices_review_count` | `3` | Devices one account may use before its decisions are held for review. 0 = off. |
+| `account_devices_review_points` | `60` | Risk points at the review devices-per-account count. |
+| `account_devices_block_count` | `5` | Devices one account may use before it is blocked. 0 = off. |
+
+**Migration 013** — an upgrade's acceptance, kept with the session
+
+| Setting | Default | What it decides |
+|---|---|---|
+| `upgrade_acceptance_hours` | `720` | Hours an upgrade keeps accepting the soft causes its proof covered (never past the 30-day refresh lifetime). 0 = none: protected requests and refreshes judge them again. |
+
+**Migration 015** — evidence quality kept apart from findings
+
+| Setting | Default | What it decides |
+|---|---|---|
+| `collection_problems_block` | `0` | 1 = each failed or incomplete probe adds +30, three make a block, and that block is remembered for the device (every account on the phone) like a finding. 0 (owner default) = collection problems add +30 once and never enter the device memory. |
+| `integrity_device_memory_hours` | `24` | Hours a blocked finding stays with the physical device across reinstalls. 0 = off. |
+| `complete_evidence_paths` | *(empty)* | Paths that need a fresh, complete integrity scan (no failed, incomplete, contradictory or legacy evidence), comma-separated. Empty: none. |
+| `complete_evidence_max_age_seconds` | `600` | How fresh that scan must be on complete_evidence_paths, in seconds. Minimum 30. |
+| `incomplete_evidence_review_after` | `3` | Consecutive incomplete or invalid scans of one installation, with no complete scan between them, that escalate the verdict to review. 0 = off. Legacy collectors never count. |
+
+**Migration 016** — an upgrade accepts exactly what was approved
+
+| Setting | Default | What it decides |
+|---|---|---|
+| `acceptance_auto_cover_reasons` | *(empty)* | Reason codes an approved session accepts automatically even if they appear after the approval, comma-separated. A business decision; empty (owner default) = every new reason needs a new decision. Collection problems are never covered. |
+
+**Migration 017** — business events, combined with the phone-account graph
 
 | Setting | Default | What it decides |
 |---|---|---|
@@ -115,7 +138,13 @@ count of `0` switches a rule off. `POLICY_*` environment variables answer only f
 | `business_graph_depth` | `2` | Hops the phone-account graph API follows from its starting account or phone (account to phones is one hop). 1-4. |
 | `business_graph_max_nodes` | `200` | Most accounts and phones the graph API returns; a larger component is cut and marked truncated. |
 
-**Cross-checks: the server's own observations** (migration 019)
+**Migration 018** — approvals granted before migration 016 are carried over
+
+| Setting | Default | What it decides |
+|---|---|---|
+| `legacy_acceptances` | `carry` | Approvals granted before migration 016: carry (owner default) = keep each as what it covers at its first use, until its expiry; drop = they cover nothing and their users re-confirm. |
+
+**Migration 019** — the server's own observations, measured into every decision
 
 | Setting | Default | What it decides |
 |---|---|---|
@@ -137,7 +166,7 @@ count of `0` switches a rule off. `POLICY_*` environment variables answer only f
 | `device_stepup_reenrolments_count` | `2` | Step-up keys one account re-enrolled on this phone in the window (after a screen-lock change each user of a shared phone re-enrols once). |
 | `device_stepup_reenrolments_points` | `30` | Points for device_stepup_reenrolments. |
 
-**Step-up method and the app PIN** (migration 020)
+**Migration 020** — an app PIN the server checks, beside the screen-lock key
 
 | Setting | Default | What it decides |
 |---|---|---|
@@ -147,6 +176,30 @@ count of `0` switches a rule off. `POLICY_*` environment variables answer only f
 | `app_pin_max_failures` | `5` | Wrong app PINs in a row before the PIN locks; the user then sets a new one with the account password. At least 1. |
 | `device_app_pin_failures_count` | `3` | Wrong app PINs for one account from this phone in the window (DESIGN.md 77). |
 | `device_app_pin_failures_points` | `30` | Points for device_app_pin_failures. |
+
+**Migration 021** — the rest of the policy in the DBA's hands; session lifetimes; support unlock and reset of an app PIN; the integrity-report feed
+
+| Setting | Default | What it decides |
+|---|---|---|
+| `new_device_points` | `10` | Points for a phone first seen less than new_device_hours ago. 0 switches the rule off. |
+| `new_device_hours` | `24` | How long a newly recognized phone counts as new. |
+| `known_device_new_installation_points` | `15` | Points for a new installation correlated to a phone already recognized (a reinstall). 0 switches the rule off. |
+| `reinstall_window_hours` | `24` | Hours over which proven reinstalls on one phone are counted. |
+| `reinstall_elevated_count` | `3` | Reinstalls in the window that add reinstall_elevated_points. 0 switches the rule off. |
+| `reinstall_elevated_points` | `35` | Points at reinstall_elevated_count. |
+| `reinstall_high_count` | `4` | Reinstalls in the window that add reinstall_high_points. 0 switches the rule off. |
+| `reinstall_high_points` | `60` | Points at reinstall_high_count. |
+| `reinstall_block_count` | `5` | Reinstalls in the window that block the phone. 0 switches the rule off. |
+| `integrity_report_missing_points` | `40` | Points when an installation has never sent a signed integrity scan. |
+| `integrity_report_stale_points` | `35` | Points when the latest scan is older than integrity_freshness_seconds. |
+| `integrity_freshness_seconds` | `600` | How old the latest integrity scan may be and still count as fresh. |
+| `device_integrity_history_block_points` | `50` | Points when another installation on the same phone was blocked by integrity within integrity_device_memory_hours. |
+| `hardware_backing_policy` | `off` | off, advisory or required: how a software-backed installation key is scored (it is only ever the phone's claim). This one adds integrity points. |
+| `refresh_idle_days` | `30` | A session ends after this many days without a refresh; each refresh extends it (owner default 30). 1-90. |
+| `session_max_days` | `0` | A session ends this many days after its first sign-in, however often it refreshes. 0 = no limit (owner default). Up to 365. |
+| `app_pin_support` | `off` | What support staff may do to a customer's app PIN through the business API, after verifying the customer: off, unlock, or unlock_and_reset. |
+| `app_pin_support_reset_minutes` | `15` | After a support reset, minutes within which the customer may set a new PIN, once, even from a limited session, with the password. |
+<!-- settings-reference:end -->
 
 ## 3. Platform / operations — running the server
 
