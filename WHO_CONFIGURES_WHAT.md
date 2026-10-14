@@ -4,10 +4,11 @@ The owner's division of labour (2026-10-14): *"Leave it to them to figure out bu
 job is 1) give them defaults, 2) give them every possible measurement from app, 3) a means to apply
 logic on servers and the app that may differ from defaults."* This map checks the project against that
 rule, item by item: what the product fixes, what a company's DBA and business analysts set, what its
-platform team runs, what its app developers build, and where we have not delivered yet (section 7).
+DevOps team runs, what its app developers build, and where we have not delivered yet (section 7).
 
-Checked against the code at schema 20 (`device_trust_server.py`, migrations 001–020, the Flutter
-client and the Android and iOS native code). Where a row says a value is in the code, it is.
+Checked against the code at schema 21 (`device_trust_server.py`, migrations 001–021, the Flutter
+client and the Android and iOS native code). Where a row says a value is in the code, it is. First
+written at schema 20; the gaps the owner answered on 2026-10-14 are marked in section 7.
 
 ## The parties
 
@@ -17,10 +18,10 @@ even if the same people wear two hats.
 | Party | Decides | Where it lives | Documented today |
 |---|---|---|---|
 | **Us**, the product | how phones are measured and how much each finding weighs; the protocol | code | `DESIGN.md` (internal) |
-| **DBA and business analysts** | what is refused, limited, counted, for how long | `risk_policy_settings`, 71 rows | `INTEGRATION_GUIDE.md` §5, §7–§12; the rows' own descriptions |
-| **Platform / operations** | running the server: database, Redis, TLS, secrets, rollout modes, the app's identity pins | about 60 environment variables | guide §2–§4, §6 |
-| **App developers** | the app: native keys and collector, SDK calls, the screens users see, release values handed to operations | build settings, native modules, UI | scattered through the guide — **no app-developer guide** (gap G3) |
-| **Backend developers** | business events in, the graph and lapse feed out; route-3 assertions from their identity system | business API, JWKS file | guide §10, §7 |
+| **DBA and business analysts** | what is refused, limited, counted, for how long; what support staff may do to a PIN | `risk_policy_settings`, 89 rows | `INTEGRATION_GUIDE.md` §5 (every row, generated), §7–§13; the rows' own descriptions |
+| **DevOps** | running the server: database, Redis, TLS, secrets, rollout modes, the app's identity pins | about 60 environment variables | guide §2–§4, §6 |
+| **App developers** | the app: native keys and collector, SDK calls, the screens users see, release values handed to DevOps | build settings, native modules, UI | scattered through the guide — **no app-developer guide** (gap G3) |
+| **Backend developers** | business events in; the graph, the lapse feed and every integrity report out; the support tool's PIN unlock and reset; route-3 assertions from their identity system | business API, JWKS file | guide §10, §12, §7; [MEASUREMENTS.md](MEASUREMENTS.md) |
 
 ## 1. What we fix — measurement and protocol
 
@@ -31,9 +32,9 @@ even if the same people wear two hats.
 | How evidence quality is judged | complete, partial, incomplete, invalid, legacy; collection problems +30 once; evidence contracts Android 3, iOS 2 | Our measurement rules |
 | The probe plan | fourteen mandatory Android probes plus `emulator` drawn at random (`INTEGRITY_RANDOM_OPTIONAL_PROBES`); six mandatory iOS probes | Collection design |
 | The protocol | ES256 installation key, access-proof v2 over the whole request, single-use nonces, step-up proof v2, MACed challenges, replay defence | Security; changing it breaks every client |
-| Lifetimes | access token 10 min, device token 10 min, **refresh 30 days**, challenge 2 min, proof clock skew ±120 s, nonce retention 10 min | Security parameters. The refresh lifetime is the one a business may reasonably want to choose (gap G8) |
+| Lifetimes | access token 10 min, device token 10 min, challenge 2 min, proof clock skew ±120 s, nonce retention 10 min | Security parameters. How long a session lives is the DBA's since migration 021: `refresh_idle_days` (30, 1–90) and `session_max_days` (0, up to 365) — G8, done |
 | Invariants | links and observations are never deleted; a block always refuses; a limited session never sets a PIN; neither the PIN nor the key is ever required to replace itself; PIN attempts are claimed before they are compared; a stolen token is recorded once | The guarantees the product makes |
-| **Still in the code, but policy** | a new phone +10 for 24 h; a known phone's new installation +15; reinstalls 3 → +35, 4 → +60 (the block count and the window are environment variables); no scan yet +40; a stale scan +35; another installation on the phone blocked +50 (`_evaluate_risk_policy`) | **Not ours** by the owner's own rule — every policy value is a DBA setting with the owner's default. Gap G1 |
+| Relationship rules — **moved to the DBA** | a new phone, a known phone's new installation, reinstall velocity, no scan or a stale one, another installation blocked, scan freshness, the hardware-backing policy | DBA settings since migration 021, seeded at the values the code used (G1, done); the gate fails if the server reads a setting no migration seeds |
 
 ## 2. DBA and business analysts — every policy value, with its default
 
@@ -201,7 +202,7 @@ missing row.
 | `app_pin_support_reset_minutes` | `15` | After a support reset, minutes within which the customer may set a new PIN, once, even from a limited session, with the password. |
 <!-- settings-reference:end -->
 
-## 3. Platform / operations — running the server
+## 3. DevOps — running the server
 
 | Area | Variables | Notes |
 |---|---|---|
@@ -209,14 +210,14 @@ missing row.
 | Redis and throttles | `REDIS_URL`, `NONCE_BACKEND`, `RATE_LIMIT_ENABLED`, `RATE_LIMIT_MAX_ATTEMPTS`, `RATE_LIMIT_WINDOW_SECONDS`, `RATE_LIMIT_SOURCE_MAX_ATTEMPTS` | A Redis outage is recorded as degraded evidence (DESIGN.md 77) |
 | HTTP | `REQUIRE_HTTPS`, `TRUSTED_PROXY_COUNT`, `MAX_REQUEST_BYTES`, `FLASK_HOST`, `FLASK_PORT`, `LOG_LEVEL` | Never log `X-App-PIN` (guide §12) |
 | Secrets | `DEVICE_ID_MASTER_SECRET` or `DEVICE_ID_MASTER_SECRET_FILE`, `BUSINESS_API_TOKEN_SHA256` | The root secret keys the JWTs, the hint and handle lookups and the app-PIN verifiers |
-| Rollout | `INTEGRITY_MODE`, `DEVICE_POLICY_MODE` (observe / enforce) | A business decision that operations carries out |
-| The app's identity — **values from the app's release pipeline** | `INTEGRITY_ANDROID_CERT_SHA256`, `INTEGRITY_ANDROID_APK_SHA256`, `INTEGRITY_ANDROID_PACKAGE`, `INTEGRITY_ANDROID_WX_BASELINES`, `INTEGRITY_IOS_TEAM_ID`, `INTEGRITY_IOS_BUNDLE_ID`, `INTEGRITY_IOS_SIGNING_ID`, `INTEGRITY_IOS_EXECUTABLE_SHA256` | App developers produce them per release; operations sets them (guide §3) |
+| Rollout | `INTEGRITY_MODE`, `DEVICE_POLICY_MODE` (observe / enforce) | A business decision that DevOps carries out |
+| The app's identity — **values from the app's release pipeline** | `INTEGRITY_ANDROID_CERT_SHA256`, `INTEGRITY_ANDROID_APK_SHA256`, `INTEGRITY_ANDROID_PACKAGE`, `INTEGRITY_ANDROID_WX_BASELINES`, `INTEGRITY_IOS_TEAM_ID`, `INTEGRITY_IOS_BUNDLE_ID`, `INTEGRITY_IOS_SIGNING_ID`, `INTEGRITY_IOS_EXECUTABLE_SHA256` | App developers produce them per release; DevOps sets them (guide §3) |
 | Lab only — 0 in production | `INTEGRITY_ALLOW_DEBUG`, `INTEGRITY_ALLOW_EMULATOR`, `INTEGRITY_ALLOW_USERDEBUG` | |
 | Scoring switches, ours | `INTEGRITY_SCORE_EXTENDED_LIBS`, `INTEGRITY_SCORE_IOS_CODE_INTEGRITY`, `INTEGRITY_SCORE_IOS_FAKE_SIGNATURE`, `INTEGRITY_RANDOM_OPTIONAL_PROBES` | Staged rollout of rules not yet baselined on hardware |
 | Protocol transitions | `ACCESS_PROOF_MIN_VERSION`, `INTEGRITY_MIN_COLLECTOR_VERSION`, `INTEGRITY_CHALLENGE_LIFETIME_SECONDS`, `INTEGRITY_REPORT_MAX_SKEW_SECONDS` | Raise a floor to retire an old client |
 | Route 3 | `UPGRADE_ASSERTION_JWKS_FILE`, `UPGRADE_ASSERTION_ISSUER` | The customer's identity backend's public keys |
 | Housekeeping | `MAINTENANCE_INTERVAL_SECONDS`, `RISK_SETTINGS_CACHE_TTL_SECONDS`, `RISK_SETTINGS_MAX_STALE_SECONDS` | |
-| **Policy that sits here, but is the DBA's** | `INTEGRITY_FRESHNESS_SECONDS` (600), `INTEGRITY_HARDWARE_BACKING_POLICY` (off / advisory / required), `POLICY_REINSTALL_WINDOW_HOURS` (24), `POLICY_REINSTALL_BLOCK_COUNT` (5) | Gap G1 |
+| Fallbacks only, since migration 021 | `INTEGRITY_FRESHNESS_SECONDS`, `INTEGRITY_HARDWARE_BACKING_POLICY`, `POLICY_REINSTALL_WINDOW_HOURS`, `POLICY_REINSTALL_BLOCK_COUNT` | The DBA's settings decide; these answer only a missing row (G1, done) |
 | Fallbacks only | `POLICY_STEP_UP_SCORE`, `POLICY_REVIEW_SCORE`, `POLICY_BLOCK_SCORE`, `POLICY_DEVICE_ACCOUNT_BLOCK_COUNT`, `POLICY_ACCOUNT_DEVICE_BLOCK_COUNT`, `INTEGRITY_DEVICE_MEMORY_HOURS` | Used only when the settings row is missing |
 
 ## 4. App developers — the app
@@ -225,10 +226,10 @@ missing row.
 
 | Setting | Default | Meets |
 |---|---|---|
-| `API_BASE_URL` | none: a build without it fails fast | operations' endpoint |
+| `API_BASE_URL` | none: a build without it fails fast | DevOps' endpoint |
 | `STEPUP_ENABLED` | `true` in the reference harness | the DBA's `stepup_method` (needed for `screen_lock` and both) |
-| `STEPUP_FACTOR` | `passcode`; `biometric` possible | the DBA's `stepup_factor` — **they must agree**, or every step-up fails `stepup_factor_mismatch` (gap G4) |
-| `STEPUP_MODE`, `STEPUP_WINDOW_SECONDS` | `per_use`, 0 | the DBA's `stepup_mode`, `stepup_window_seconds` |
+| `STEPUP_FACTOR` | `passcode`; `biometric` possible | only the fallback: the app reads the DBA's `stepup_factor` from `GET /v1/policy/step-up` before it creates the key, and replaces or asks to re-enrol a key of another factor (G4, done; analysed, not yet run on a phone) |
+| `STEPUP_MODE`, `STEPUP_WINDOW_SECONDS` | `per_use`, 0 | only the fallback for the DBA's `stepup_mode`, `stepup_window_seconds`, read the same way |
 
 **Native code they embed** — Android: `InstallationKeyManager.kt` (the non-exportable installation key),
 `StepUpKeyManager.kt` (the screen-lock key: passcode, or `BIOMETRIC_STRONG` from Android 9; per-use or
@@ -247,47 +248,49 @@ prompt when the server asks for a complete or fresh scan; sign-out; re-enrolling
 the screen lock changed (only under `screen_lock` or both); and a message for each refusal code the
 guide lists.
 
-**Values they hand to operations, per release**: the signing certificate's SHA-256, the APK SHA-256
+**Values they hand to DevOps, per release**: the signing certificate's SHA-256, the APK SHA-256
 and its W^X baseline (DESIGN.md 62), the iOS team, bundle and signing identifiers and executable hash.
 
 ## 5. Measurements — what they get
 
 | Measurement | Where | Reachable by |
 |---|---|---|
-| Every probe's raw result from every scan | `integrity_reports.probe_results` | SQL only (gap G5) |
+| Every probe's raw result from every scan | `integrity_reports.probe_results` | `GET /v1/business/integrity-reports`, paged, filtered by phone, installation or account (G5, done) |
 | Each scan's reasons, points, verdict, evidence quality, finding score | the scan response; `integrity_reports` | the app; SQL |
 | Each decision: relationship counts, integrity state, device memory, the server's own observations, request rate, business-event counts, reasons, action | `risk_policy_decisions`; returned on sign-in, refresh and `/v1/policy/me` | the app; SQL |
 | What the server itself saw (wrong passwords, unknown accounts, failed step-ups and PINs, denials, exhausted budgets, re-enrolments, stolen tokens, replays) | `server_observations` | decisions; the business graph; SQL |
 | The phone–account graph with business events and observations | `GET /v1/business/graph` | the customer's backend |
 | When an approval stopped covering, and why | `GET /v1/business/acceptance-lapses` | the customer's backend |
-| A catalog of every reason code, observation kind and context field | — | **missing** (gap G5) |
+| A catalog of every reason code, observation kind, probe field and context field | [MEASUREMENTS.md](MEASUREMENTS.md) | the gate fails if the source can emit a code it does not name (G5, done) |
 
 ## 6. Answers to the owner's four questions
 
-1. **What we fix** — the integrity weights and bands, measurement rules, the protocol and its
-   lifetimes, the invariants. Except the relationship rules in section 1's last row, which are policy
-   and should move to the DBA (G1); the refresh lifetime is arguable (G8).
-2. **The DBA's and business analysts' domain** — 71 settings, each with the owner's default and a
-   description in the row; a handful of policy values are still in code or environment (G1); the guide
-   lists only "notable keys" (G7).
-3. **The app developers' domain** — the native code and a working reference client exist, but there is
-   no package to depend on (G2), no guide written for them (G3), and the step-up factor is fixed at build
-   time rather than read from the server (G4).
-4. **Options, defaults and documentation** — on the server side, largely yes; on the app side, no; the
-   integration documents miss a front page (G6), a measurement catalog (G5) and a complete settings
-   reference (G7).
+1. **What we fix** — the integrity weights and bands, measurement rules, the protocol and its token
+   lifetimes, the invariants. The relationship rules and how long a session lives moved to the DBA in
+   migration 021 (G1, G8).
+2. **The DBA's and business analysts' domain** — 89 settings, each with the owner's default and a
+   description in the row, all of them in the guide, generated from the migrations (G7).
+3. **The app developers' domain** — the native code and a working reference client exist, and the
+   client now follows the server's step-up policy (G4); there is still no package to depend on (G2) and
+   no guide written for them (G3), both deferred by the owner until testing is finished.
+4. **Options, defaults and documentation** — on the server side, yes, with a measurement catalog (G5)
+   and a complete settings reference (G7); on the app side, not yet (G2, G3); the front page (G6) comes
+   after G3.
 
 ## 7. Gaps, most important first
 
-| # | Gap | Proposed fix | Owner decision |
+The owner's answers of 2026-10-14 are quoted; `DESIGN.md` §79 records what was built.
+
+| # | Gap | Owner's answer | Status |
 |---|---|---|---|
-| G1 | Relationship policy still in code or environment: new phone +10/24 h, a known phone's new installation +15, reinstall velocity (3 → +35, 4 → +60, block at 5, 24 h), no scan +40, stale scan +35, another installation blocked +50, scan freshness 600 s, hardware-backing policy | Migration 021 seeding each as a DBA setting at today's value; the code reads them like the others | No (the owner's standing rule); confirm the list |
-| G2 | No Flutter package: an app developer copies code out of the harness | Extract a Flutter plugin package — the Dart API, models and the Android and iOS native code — and make the harness depend on it | Yes: package name, versioning, where it is published |
-| G3 | No guide for app developers | An app-developer guide: installing the package, the calls and their order, the screens, every refusal code and its remedy, the release values for operations | No |
-| G4 | The app's step-up factor and mode are fixed at build time; the server's choice cannot be read at runtime | `/v1/account/me` also returns factor, mode and window; the SDK creates the matching key itself; the build setting stays as a fallback | Yes |
-| G5 | No catalog of measurements; raw probe results only by SQL | A catalog of every reason code, observation kind and context field; optionally `GET /v1/business/integrity-reports` for raw measurements | Yes, for the endpoint |
-| G6 | `README.md` is the Flutter template | An orientation page for the four parties | No |
-| G7 | Guide §5 lists "notable" settings, not all | A settings reference generated from the migrations, as in section 2, checked by the gate | No |
-| G8 | The refresh lifetime (30 days) is fixed | A DBA setting within a floor and ceiling we fix | Yes |
-| G9 | Python is named as a client SDK; there is none beyond the conformance suite's reference client | Build one, or correct the claim | Yes |
-| G10 | Migrations 015–020 have not run on SQL Server | One RDS round | Already asked |
+| G1 | Relationship policy still in code or environment | *"put them under DBA"* | **Done** — migration 021, seeded at the values the code used (`b714b88`) |
+| G2 | No Flutter package: an app developer copies code out of the harness | *"defer it to later after we have finished testing. It will be done. Note it down. Just not now."* | **Deferred** — after testing; a Flutter plugin package with the Dart API, models and the Android and iOS native code, the harness depending on it. Package name, versioning and where it is published are the owner's to decide then |
+| G3 | No guide for app developers | *"do after G2"* | **Deferred** — after G2 |
+| G4 | The app's step-up factor and mode were fixed at build time | *"modify it so it can follow DBA choice"* | **Done** — `GET /v1/policy/step-up`, `step_up` in `/v1/account/me`, the Dart client creates the key to match (`493fc5c`, `5e269c5`); analysed, **not yet run on a phone** |
+| G5 | No catalog of measurements; raw probe results only by SQL | *"build it"* | **Done** — `GET /v1/business/integrity-reports` (`598e610`) and [MEASUREMENTS.md](MEASUREMENTS.md), checked by the gate (`651791e`) |
+| G6 | `README.md` is the Flutter template | *"after G3"* | **Deferred** — after G3 |
+| G7 | Guide §5 listed "notable" settings, not all | *"update it now"* | **Done** — generated from the migrations by `tools/settings_reference.py`, checked by the gate (`7dda77b`) |
+| G8 | The refresh lifetime (30 days) was fixed | *"make it DBA configurable. 30-day is default but to check with /advisor"* | **Done** — `refresh_idle_days` 30 (1–90), each refresh extending it, the default the advisor confirmed; `session_max_days` 0 (off, up to 365) caps a session from its first sign-in (`b714b88`) |
+| G9 | Python is named as a client SDK; there is none beyond the conformance suite's test client | *"can you elaborate?"* | **Asked** — explained; the owner chooses between narrowing the claim and building one |
+| G10 | Migrations 015–021 have not run on SQL Server | *"fill the gaps, we will do that afterwards"* | **Deferred** — one RDS round, afterwards |
+| — | Support staff could not unlock a PIN | *"Support unlock: build the mechanism. Add this to one of the options available to the relevant team."* | **Done** — `POST /v1/business/app-pin/unlock` and `/reset`, the DBA's `app_pin_support`, off by default (`68393c5`); guide §12 |
