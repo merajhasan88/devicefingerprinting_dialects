@@ -1,6 +1,6 @@
 -- Device Trust schema, SQL Server 2016+
 -- Migration 021: the rest of the policy in the DBA's hands; session
--- lifetimes; support unlock and reset of an app PIN
+-- lifetimes; support unlock and reset of an app PIN; the integrity-report feed
 --
 -- See the PostgreSQL counterpart for the rationale (DESIGN.md 79). MERGE never
 -- overwrites a tuned value.
@@ -15,6 +15,10 @@ IF COL_LENGTH('dbo.app_pins', 'reset_until') IS NULL
 GO
 
 ALTER TABLE dbo.app_pins ALTER COLUMN pin_hash varbinary(255) NULL;
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'integrity_reports_created_idx')
+    CREATE INDEX integrity_reports_created_idx ON dbo.integrity_reports(created_at, report_id);
 GO
 
 MERGE dbo.risk_policy_settings AS t

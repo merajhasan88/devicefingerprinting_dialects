@@ -8907,6 +8907,78 @@ def business_acceptance_lapses():
     })
 
 
+_REPORT_FILTERS = ("device_id", "installation_id", "account_id")
+
+
+@app.get("/v1/business/integrity-reports")
+def business_integrity_reports():
+    """Every integrity report as stored, measurements included (DESIGN.md 79):
+    what the phone measured (probe_results), the reasons and score this server
+    derived from it, and when. Oldest first, after ?since=<ISO time>, then page
+    with ?cursor=<next_cursor>, like the lapse feed. At most one filter:
+    ?device_id=, ?installation_id=, or ?account_id= -- the reports of every
+    phone linked to the account, from before the link too, since a report
+    describes the phone, not the account. probe_results identify a phone
+    (model, build, installed tools): the business holds them as such."""
+    _require_business_caller()
+    given = [name for name in _REPORT_FILTERS if request.args.get(name)]
+    if len(given) > 1:
+        raise ApiProblem("Give at most one of device_id, installation_id or account_id.", 400,
+                         "invalid_filter", details={"field": given[1]})
+    after_report = "ffffffff-ffff-ffff-ffff-ffffffffffff"
+    cursor_text = request.args.get("cursor")
+    if cursor_text:
+        parts = cursor_text.split("|")
+        if len(parts) != 2:
+            raise ApiProblem("cursor is not one this server issued.", 400, "invalid_cursor")
+        since = _parse_business_time(parts[0], 0, "cursor")
+        after_report = _uuid_text(parts[1], "cursor")
+    elif request.args.get("since"):
+        since = _parse_business_time(request.args.get("since"), 0, "since")
+    else:
+        since = datetime(1970, 1, 1, tzinfo=timezone.utc)
+    try:
+        limit = min(200, max(1, int(request.args.get("limit", "50"))))
+    except ValueError:
+        raise ApiProblem("limit must be a whole number.", 400, "invalid_limit")
+    where, values = "", []
+    if given:
+        value = _uuid_text(request.args.get(given[0]), given[0])
+        where = ("device_id IN (SELECT device_id FROM device_account_links "
+                 "WHERE account_id = %s) AND " if given[0] == "account_id"
+                 else given[0] + " = %s AND ")
+        values.append(value)
+    with _cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT report_id, installation_id, device_id, platform, collector_version,
+                   score, verdict, hard_block, evidence_quality, finding_score,
+                   reasons, probe_results, report_sha256, created_at
+            FROM integrity_reports
+            WHERE """ + where + """(created_at > %s OR (created_at = %s AND report_id > %s))
+            ORDER BY created_at, report_id
+            LIMIT """ + str(limit),
+            tuple(values) + (since, since, after_report),
+        )
+        rows = cursor.fetchall() or []
+    reports = [
+        {"report_id": str(r[0]), "installation_id": str(r[1]), "device_id": str(r[2]),
+         "platform": r[3], "collector_version": int(r[4]), "score": int(r[5]),
+         "verdict": r[6], "hard_block": bool(r[7]), "evidence_quality": r[8],
+         "finding_score": None if r[9] is None else int(r[9]),
+         "reasons": _as_list(DIALECT.json_value(r[10])),
+         "probe_results": DIALECT.json_value(r[11]), "report_sha256": r[12],
+         "created_at": _iso_z(r[13])}
+        for r in rows
+    ]
+    last = reports[-1] if reports else None
+    return jsonify({
+        "reports": reports,
+        "next_cursor": ("%s|%s" % (last["created_at"], last["report_id"])) if last
+        else cursor_text,
+    })
+
+
 if __name__ == "__main__":
     app.run(
         host=os.environ.get("FLASK_HOST", "0.0.0.0"),

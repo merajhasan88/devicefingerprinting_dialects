@@ -1,6 +1,6 @@
 -- Device Trust schema, PostgreSQL 13+
 -- Migration 021: the rest of the policy in the DBA's hands; session
--- lifetimes; support unlock and reset of an app PIN
+-- lifetimes; support unlock and reset of an app PIN; the integrity-report feed
 --
 -- DESIGN.md 79 (owner decisions of 2026-10-14).
 --
@@ -22,12 +22,19 @@
 -- app_pins.reset_until holds the grant, and pin_hash may now be empty for an
 -- account granted a reset before it ever had a PIN.
 --
+-- The business feed of every integrity report (/v1/business/integrity-reports)
+-- pages through them in time order; one index serves it. On a large table a
+-- DBA may build it first with CREATE INDEX CONCURRENTLY, outside this script.
+--
 --   psql "host=... dbname=... user=... sslmode=verify-full" -v ON_ERROR_STOP=1 -f 021_relationship_settings_sessions_support.sql
 
 BEGIN;
 
 ALTER TABLE app_pins ADD COLUMN IF NOT EXISTS reset_until TIMESTAMPTZ;
 ALTER TABLE app_pins ALTER COLUMN pin_hash DROP NOT NULL;
+
+CREATE INDEX IF NOT EXISTS integrity_reports_created_idx
+    ON integrity_reports(created_at, report_id);
 
 INSERT INTO risk_policy_settings (setting_key, setting_value, description) VALUES
     ('new_device_points', '10', 'Points for a phone first seen less than new_device_hours ago. 0 switches the rule off.'),
