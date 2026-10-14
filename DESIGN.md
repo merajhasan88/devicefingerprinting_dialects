@@ -6323,3 +6323,97 @@ were brought to the file by hand — the effect row added, the denial points 60 
 server `e289a65` (md5 `058e052b…`); observe / observe, every setting at the owner's defaults
 (`cross_checks_enabled` 0), nonce store on Redis, business-token drop-in removed (404); no errors in
 the journal since boot.
+
+**Addendum, 2026-10-14 (later) — stolen tokens and replays recorded.** Owner: *"Stolen-token refusals:
+record them."* An access or refresh token presented with a proof its installation's key did not sign
+(`invalid_installation_signature`) is recorded as `token_without_key`, and a signed request sent again
+(`access_proof_replay`) as `request_replayed`, against the account and the phone the token belongs to
+(`529b7ed`). Each is written **once per token or per request** — its ID derived from the token's `jti` or
+the request's nonce, a duplicate quietly refused by the database — so a stolen token cannot flood the
+table. Only where the server's own token names the phone: never on the public installation verify
+step, where anyone may name any installation. Measured into decisions and the graph; not scored —
+scoring the victim's phone would be wrong, and revoking the family on first use is a lever the holder
+of the token already has; both are business decisions. Gate 84 at the time (fails on `e289a65`; three
+mutations caught); suite `check_stolen_token_recorded`, live PASS: three wrong-key tries and two
+replays left one row each.
+
+## 78. Step-up by screen lock, by an app PIN the server checks, or both — the DBA's choice (2026-10-14)
+
+**Why.** The owner, comparing today's step-up (a key the phone's screen lock unlocks) with a
+server-checked app PIN as seen at a bank: *"build every option but make the screenlock and app PIN
+checked by server as DBA configurable. Let me think about which one of these should be default."*
+
+**A correction recorded first.** Asked *"wont a malware also observe your phone passcode as you type
+it?"* — yes. I had said the screen-lock key could not sign unless the user unlocked the hardware each
+time; against Android malware holding the Accessibility permission that was too strong. Such
+trojans keylog the passcode and can tap it in themselves — ThreatFabric reported Chameleon turning
+fingerprint and face unlock off to force the PIN and then capturing it (December 2023); Vultur logs
+every keystroke; overlay trojans collect PINs. So against on-device malware a passcode-bound key and
+an app PIN are both defeated, and in both cases the attacker still has to act through the infected
+phone (its keys never leave it). What still differs: a **biometric**-bound key (`stepup_factor` =
+`biometric`) cannot be observed or replayed, only the user tricked into a real scan; the **app PIN** is
+a secret apart from the phone's passcode (the shoulder-surfing thief) and the server sees, counts and
+locks every attempt; the **screen lock** stores nothing on the server. The §51 boundary stands: a
+fully compromised OS defeats either.
+
+**What was built** (`d6e294f`, migration 020, schema 20):
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `stepup_method` | `screen_lock` — **interim, the owner decides** | how a step-up is proven wherever one is required (the step-up paths, approving another phone, route 1, an elevated scan): `screen_lock`, `app_pin`, `screen_lock_and_app_pin` |
+| `app_pin_required_paths` | '' | paths that need the app PIN on top of anything else — the hybrid recommended to the owner: the screen lock everywhere, the PIN on payee changes and large transfers |
+| `app_pin_length` | 6 | 4–12 digits |
+| `app_pin_max_failures` | 5 | wrong PINs in a row before the PIN locks; at least 1 |
+| `device_app_pin_failures_count` / `_points` | 3 / +30 | a cross-check rule (§77): wrong PINs for one account from one phone |
+
+- **One PIN per account** (`app_pins`), stored only as bcrypt over an HMAC of the account and the PIN,
+  keyed by a secret derived from the root secret: a copy of the table alone cannot be searched. The
+  residual, stated plainly: with the table **and** the root secret, 10⁶ bcrypt guesses per account
+  take hours, not seconds — that is the pepper's whole job. This is the first credential verifier the
+  server holds besides the password.
+- **Setting or replacing** it: `POST /v1/account/app-pin` with a current **full** session and the account
+  password; a limited session never sets one, even where a DBA lists the path for limited sessions.
+  A new PIN clears the count and the lock — the way back from a forgotten or locked PIN is the
+  password (a user without the password needs route 3, not built). The PIN is never required on that
+  path, or a locked one could never be replaced. Recorded as `app_pin_set`.
+- **Checking** it (`X-App-PIN`): one atomic `UPDATE … failures = failures + 1 … WHERE failures < max`
+  claims the attempt **before** the PIN is compared, so concurrent guesses can never pass the limit;
+  bcrypt runs outside any unit of work (on SQL Server a unit holds the worker's lock). The last wrong
+  PIN locks it; a locked PIN refuses even the right PIN. Each wrong PIN is recorded (`app_pin_failed`).
+  Refusals name what is needed: `app_pin_required` / `stepup_required` carry
+  `details.step_up.needs`; `app_pin_invalid` carries `attempts_left`; `app_pin_locked`;
+  `app_pin_not_set`. `/v1/account/me` reports the method and whether a PIN is set or locked.
+- **The header is not signed** by the access proof. Acceptable — TLS, a single-use nonce, and the PIN is
+  the secret — but it must never reach a log: on the test server gunicorn's default access format and
+  Caddy (no access log configured) write no headers, checked live with a known PIN.
+- **Route 1** is offered when the phone can give what the method asks (`17f07dc`, found live: under
+  `app_pin` a phone without a step-up key was offered nothing). Under `app_pin` route 1 proves a secret
+  the attacker's own phone does not hold — unlike the screen lock of a phone the attacker controls — so
+  it becomes a candidate recovery for single-phone users (item 3), with the lockout as its cost.
+
+**Harness** (`a430f30`): Set app PIN, Sensitive op with app PIN; the PIN is sent with every step-up
+while typed. `flutter analyze` adds nothing; the release APK builds; **not yet on a phone**.
+
+**Verified.** Gate **88/88**: four PIN checks — the method dispatch, the claim before the compare with
+bcrypt outside units, the full-session and password rule with the stored verifier, approving and
+route 1 per method; six mutations caught (bcrypt inside a unit; no claim; a limited session setting a
+PIN; the method ignored; a PIN required to set one; the PIN hashed without the key). Live, EC2
+PostgreSQL 16.15, schema 20, server `17f07dc` (md5 `627e96a8…`):
+
+| Run | Result |
+|---|---|
+| observe / observe, owner defaults, full suite (82) | **62 / 0 / 20** |
+| both enforce, cross-checks on, screen_lock, a step-up path, route 1 on, full suite | **74 / 0 / 8** |
+| `app_pin` method: PIN lifecycle, concurrent guesses, approval and route 1 with the PIN | 4 / 4 (the screen-lock checks skip, naming why) |
+| `screen_lock_and_app_pin` | 4 / 4 |
+| `screen_lock` + `app_pin_required_paths` on the sensitive path (the hybrid) | 7 / 7, two skips |
+| 9 wrong PINs at once against a limit of 5 | 4 `app_pin_invalid`, 5 `app_pin_locked`, exactly 5 compared — on each method |
+| a known PIN sent, then the journal and /var/log searched | not present anywhere |
+
+**Not done.** SQL Server for 015–020 (the owner's go). A handset round with the harness build. The
+.NET SDK (handoff §21).
+
+**State.** EC2 stopped; PostgreSQL 16.15 at schema 20 (`app_pins` granted `SELECT, INSERT, UPDATE` to
+`dtadmin`); server `17f07dc`; observe / observe; every setting at the owner's defaults —
+`stepup_method` `screen_lock`, no step-up or PIN paths, route 1 off, cross-checks off; no errors in
+the journal since boot.
