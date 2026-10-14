@@ -6248,8 +6248,10 @@ whose rate limiter could not run carries `context.rate_limiter = "unavailable"`.
 
 **Cost.** Writes only on refusals and re-enrolments. Each decision runs two more indexed queries without
 an account, four with one, five for a phone that joined it within the window. `server_observations` is
-evidence and the server never deletes from it; its growth under a sustained guessing attack is bounded
-by bcrypt and the rate limiter, and archiving it is the DBA's call.
+evidence and the server never deletes from it. Under a sustained guessing attack it grows by one row
+per refused attempt — each attempt needs a proven installation key and an access proof, and the rate
+limiters (when Redis is up) cap it per installation, handle and source; a wrong password also costs a
+bcrypt check, an unknown handle does not. Archiving it is the DBA's call.
 
 | Change | Commit | Verified |
 |---|---|---|
