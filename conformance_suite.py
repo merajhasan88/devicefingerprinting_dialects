@@ -1861,7 +1861,7 @@ def check_server_observations(api, ctx):
     """DESIGN.md 77, measured whatever the DBA's switch. An account on one
     phone; a second phone sends it two wrong passwords and tries a handle no
     account has; a third sends one. The account's decisions count three
-    failures from two other installations; the second phone's own decision
+    failures from two other phones; the second phone's own decision
     counts two failures on one account and one unknown account; a phone
     joining the account now is judged by the three. Every 401 is the same."""
     owner, owner_token = _observing_phone(api)

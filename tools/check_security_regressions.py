@@ -3379,6 +3379,14 @@ class ObservationStore(object):
             (installation, device, created, created))
         return device, installation
 
+    def reinstall(self, phone):
+        """Another installation of the app on the same phone."""
+        installation = str(uuid.uuid4())
+        self.connection.execute(
+            "INSERT INTO app_installations VALUES (?, ?, 'active', 'reinstall_hint', 'hint', ?, ?, NULL)",
+            (installation, phone[0], self.now, self.now))
+        return phone[0], installation
+
     def link(self, device, account_id, age_days):
         self.connection.execute("INSERT INTO device_account_links VALUES (?, ?, ?)",
                                 (device, account_id, self.now - timedelta(days=age_days)))
@@ -3473,8 +3481,8 @@ def what_the_server_saw_is_measured_always_and_scored_only_when_enabled():
 @check
 def an_accounts_failures_judge_a_newcomer_never_a_phone_it_already_used():
     """DESIGN.md 77, the false-positive rule first. A user mistyping on their
-    own phone is not counted against anyone: the account's rule counts other
-    installations only. Failures someone causes on an account never restrict a
+    own phone is not counted against anyone -- nor after reinstalling the app
+    there: the account's rule counts other phones only. Failures someone causes on an account never restrict a
     phone that was there before them -- long-standing, or the phone that opened
     the account this morning. Only a phone that joined after them, or is
     joining now, is judged, by the failures in the window before it joined."""
@@ -3484,11 +3492,13 @@ def an_accounts_failures_judge_a_newcomer_never_a_phone_it_already_used():
                                     store.phone(age_days=0))
     store.link(owner[0], acct, age_days=200)
     store.link(opener[0], acct, age_days=0.5)
-    store.observe("sign_in_failed", joining, acct, times=9)
+    store.observe("sign_in_failed", store.reinstall(joining), acct, times=4)
+    store.observe("sign_in_failed", joining, acct, times=5)
     mine = store.decide(joining, acct, pending=True, cross_checks_enabled=1)
     expect(mine["context"]["server_observations"]["newcomer"]["sign_in_failed_elsewhere_before"]
            == 0 and not _cross(mine),
-           "nine mistypes on the phone now signing in must not count: %s" % mine["reasons"])
+           "nine mistypes on the phone now signing in, four of them before a reinstall, must "
+           "not count: %s" % mine["reasons"])
     for _ in range(5):
         store.observe("sign_in_failed", store.phone(), acct, age_hours=2)
     store.link(late[0], acct, age_days=1.0 / 24)

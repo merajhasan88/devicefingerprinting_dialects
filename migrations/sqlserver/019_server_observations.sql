@@ -43,7 +43,7 @@ MERGE dbo.risk_policy_settings AS t
 USING (VALUES
     ('cross_checks_enabled', '0', 'Score the server''s own observations with the rules below (DESIGN.md 77). 0 (owner default: observe first) = counted into every decision''s context, scored nowhere; 1 = each rule adds its points once its count is reached.'),
     ('cross_check_window_hours', '24', 'Hours the server''s observations are counted over, for the context and every rule below.'),
-    ('account_sign_in_failures_elsewhere_count', '5', 'Wrong-password sign-ins to the account from OTHER installations in the window before a phone joined it. Judges only a phone joining now or within the window, never one there before them; a user mistyping on their own phone is not counted.'),
+    ('account_sign_in_failures_elsewhere_count', '5', 'Wrong-password sign-ins to the account from OTHER phones in the window before a phone joined it. Judges only a phone joining now or within the window, never one there before them; a user mistyping on their own phone is not counted.'),
     ('account_sign_in_failures_elsewhere_points', '30', 'Points for account_sign_in_failures_elsewhere.'),
     ('device_sign_in_failures_many_accounts_count', '3', 'Different accounts with a wrong-password sign-in from this phone in the window.'),
     ('device_sign_in_failures_many_accounts_points', '60', 'Points for device_sign_in_failures_many_accounts.'),

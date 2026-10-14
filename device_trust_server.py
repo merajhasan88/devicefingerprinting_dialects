@@ -1299,14 +1299,14 @@ _risk_settings_lock = threading.Lock()
 # <code>_count and <code>_points, seeded by migration 019 with the defaults
 # below (0 switches a rule off); none adds points unless cross_checks_enabled.
 # A phone's rules count what that phone did. The account's rule judges only a
-# phone new to the account, by the wrong passwords OTHER installations sent in
-# the window before it joined.
+# phone new to the account, by the wrong passwords OTHER phones sent in the
+# window before it joined.
 #   (code, scope, measured key, default count, default points, message)
 _CROSS_CHECK_RULES = (
     ("account_sign_in_failures_elsewhere", "newcomer", "sign_in_failed_elsewhere_before",
      5, 30,
-     "%d wrong-password sign-ins to this account came from other installations in the "
-     "%d hours before this phone joined it."),
+     "%d wrong-password sign-ins to this account came from other phones in the %d hours "
+     "before this phone joined it."),
     ("device_sign_in_failures_many_accounts", "device", "sign_in_failed_accounts", 3, 60,
      "Wrong-password sign-ins to %d different accounts came from this phone in the last "
      "%d hours."),
@@ -1314,7 +1314,7 @@ _CROSS_CHECK_RULES = (
      "%d sign-ins to accounts that do not exist came from this phone in the last %d hours."),
     ("device_stepup_failures", "device", "stepup_failed", 3, 30,
      "%d step-up proofs from this phone did not verify in the last %d hours."),
-    ("device_approvals_denied", "device", "approvals_denied", 1, 60,
+    ("device_approvals_denied", "device", "approval_denied", 1, 60,
      "%d approval requests from this phone were denied in the last %d hours."),
     ("device_approval_budget_exhausted", "device", "approval_budget_exhausted", 1, 30,
      "%d approval requests from this phone found the account's hourly budget spent in the "
@@ -3372,7 +3372,7 @@ def _server_observation_counts(cursor, device_id, installation_id, account_id, n
     """What this server observed in the `window` before `now`: on this phone,
     for every account, and on this account, from every phone (DESIGN.md 77).
     With `joined_at` -- this phone is new to the account -- also the wrong
-    passwords other installations sent in the window before it joined."""
+    passwords other phones sent in the window before it joined."""
     since = now - window
     device = dict.fromkeys(_OBSERVATION_KINDS, 0)
     device["sign_in_failed_accounts"] = 0
@@ -3397,9 +3397,9 @@ def _server_observation_counts(cursor, device_id, installation_id, account_id, n
         """,
         (device_id, since),
     )
-    device["approvals_denied"] = int(cursor.fetchone()[0])
+    device["approval_denied"] = int(cursor.fetchone()[0])
     if account_id is None:
-        return {"device": device, "account": None}
+        return {"device": device, "account": None, "newcomer": None}
     account = dict.fromkeys(
         (kind for kind in _OBSERVATION_KINDS if kind != "sign_in_unknown_account"), 0
     )
@@ -3418,15 +3418,16 @@ def _server_observation_counts(cursor, device_id, installation_id, account_id, n
             account[str(kind)] = int(count)
         if kind == "sign_in_failed":
             account["sign_in_failed_installations"] = int(installations)
-    # A user mistyping on their own phone is not evidence against anyone: the
-    # account's rule counts only the failures of other installations.
+    # A user mistyping on their own phone is not evidence against anyone --
+    # nor after reinstalling the app there: the account's rule counts only the
+    # failures of other phones.
     cursor.execute(
         """
         SELECT COUNT(*) FROM server_observations
         WHERE account_id = %s AND occurred_at >= %s
-          AND kind = 'sign_in_failed' AND installation_id <> %s
+          AND kind = 'sign_in_failed' AND device_id <> %s
         """,
-        (account_id, since, installation_id),
+        (account_id, since, device_id),
     )
     account["sign_in_failed_elsewhere"] = int(cursor.fetchone()[0])
     newcomer = None
@@ -3439,9 +3440,9 @@ def _server_observation_counts(cursor, device_id, installation_id, account_id, n
                 """
                 SELECT COUNT(*) FROM server_observations
                 WHERE account_id = %s AND occurred_at >= %s AND occurred_at <= %s
-                  AND kind = 'sign_in_failed' AND installation_id <> %s
+                  AND kind = 'sign_in_failed' AND device_id <> %s
                 """,
-                (account_id, joined_at - window, joined_at, installation_id),
+                (account_id, joined_at - window, joined_at, device_id),
             )
             before = int(cursor.fetchone()[0])
         newcomer = {"joined_at": _iso_z(joined_at), "sign_in_failed_elsewhere_before": before}
@@ -3809,7 +3810,7 @@ def _evaluate_risk_policy(
     # The server's own observations (DESIGN.md 77), scored only where the DBA
     # has switched them on. A phone's rules count what that phone did. The
     # account's rule judges only a phone new to the account, by the failures
-    # other installations sent before it joined -- so failures someone causes
+    # other phones sent before it joined -- so failures someone causes
     # on an account never restrict a phone that was there before them.
     cross_checks_scored = _risk_setting_bool("cross_checks_enabled", False)
     if cross_checks_scored:
