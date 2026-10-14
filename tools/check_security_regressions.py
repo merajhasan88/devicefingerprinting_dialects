@@ -4439,6 +4439,53 @@ def the_measurement_catalog_lists_every_code():
 
 
 @check
+def the_settings_reference_matches_the_migrations():
+    """DESIGN.md 79 (G7). The settings reference in the guide and the audit map
+    is what tools/settings_reference.py renders from the migrations; both
+    engines' migrations seed the same rows; every setting the server reads is
+    seeded, and every seeded one is read; and a missing row falls back to the
+    seeded default, never to another value."""
+    sys.path.insert(0, str(DOCS / "tools"))
+    try:
+        import settings_reference as reference
+    finally:
+        sys.path.pop(0)
+    rendered = reference.render()
+    for name in reference.DOCUMENTS:
+        block = reference.block_in((DOCS / name).read_text(encoding="utf-8"))
+        expect(block == rendered, "%s's settings reference is not what the migrations say; "
+               "run python3 tools/settings_reference.py --write" % name)
+    engines = {engine: {key: (number, value, description)
+                        for number, _, rows in reference.seeded_settings(engine)
+                        for key, value, description in rows}
+               for engine in ("postgresql", "sqlserver")}
+    differ = sorted(key for key in set(engines["postgresql"]) | set(engines["sqlserver"])
+                    if engines["postgresql"].get(key) != engines["sqlserver"].get(key))
+    expect(not differ, "the engines' migrations seed these differently: %s" % differ)
+    seeded = {key: value for key, (_, value, _) in engines["postgresql"].items()}
+    tree = ast.parse(Path(s.__file__).read_text(encoding="utf-8"))
+    read, fallbacks = set(), []
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id.startswith("_risk_setting_") and node.args
+                and isinstance(node.args[0], ast.Constant)):
+            read.add(node.args[0].value)
+            if len(node.args) > 1 and not isinstance(node.args[1], ast.Call):
+                fallbacks.append((node.args[0].value, eval(ast.unparse(node.args[1]), vars(s))))
+    read |= {"%s_%s" % (rule[0], part) for rule in s._CROSS_CHECK_RULES
+             for part in ("count", "points")}
+    read |= {rule[0] for rule in s._ELIGIBILITY_RULES}
+    expect(not read - set(seeded), "read by the server but seeded by no migration: %s"
+           % sorted(read - set(seeded)))
+    expect(not set(seeded) - read, "seeded but never read: %s" % sorted(set(seeded) - read))
+    wrong = sorted("%s: code %r, seeded %r" % (key, default, seeded[key])
+                   for key, default in fallbacks
+                   if ({True: "1", False: "0"}.get(default, default)
+                       if isinstance(default, bool) else str(default)) != seeded[key])
+    expect(not wrong, "a missing row would fall back to another value: %s" % wrong)
+
+
+@check
 def the_relationship_rules_are_the_dbas():
     """DESIGN.md 79 (owner: "put them under DBA"). A new phone, a known
     phone's new installation, reinstall velocity, a missing or stale scan and
