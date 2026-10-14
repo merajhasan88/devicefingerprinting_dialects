@@ -25,7 +25,7 @@ GO
 
 MERGE dbo.risk_policy_settings AS t
 USING (VALUES
-    ('stepup_method', 'screen_lock', 'How a step-up is proven wherever one is required (the step-up paths, approving another phone, the same-phone upgrade, an elevated scan): screen_lock, app_pin (checked by the server) or screen_lock_and_app_pin. Interim default.'),
+    ('stepup_method', 'app_pin', 'How a step-up is proven wherever one is required (the step-up paths, approving another phone, the same-phone upgrade, an elevated scan): app_pin (owner default, checked by the server), screen_lock or screen_lock_and_app_pin.'),
     ('app_pin_required_paths', '', 'Paths that need the app PIN in addition to anything else, comma-separated (for example payee changes, large transfers). Empty: none.'),
     ('app_pin_length', '6', 'Digits in an app PIN, 4-12.'),
     ('app_pin_max_failures', '5', 'Wrong app PINs in a row before the PIN locks; the user then sets a new one with the account password. At least 1.'),

@@ -6,8 +6,7 @@
 -- operation -- can be the phone's screen-lock key (as before), an app PIN the
 -- server checks, or both, per deployment (stepup_method), and the app PIN can
 -- be required in addition on chosen paths (app_pin_required_paths). The
--- interim default, screen_lock, is today's behaviour; the owner decides the
--- final default.
+-- owner's default (2026-10-14) is the app PIN.
 --
 -- One PIN per account. Only a verifier is stored: bcrypt over an HMAC of the
 -- account and the PIN, keyed by a secret derived from the server's root
@@ -31,7 +30,7 @@ CREATE TABLE IF NOT EXISTS app_pins (
 );
 
 INSERT INTO risk_policy_settings (setting_key, setting_value, description) VALUES
-    ('stepup_method', 'screen_lock', 'How a step-up is proven wherever one is required (the step-up paths, approving another phone, the same-phone upgrade, an elevated scan): screen_lock, app_pin (checked by the server) or screen_lock_and_app_pin. Interim default.'),
+    ('stepup_method', 'app_pin', 'How a step-up is proven wherever one is required (the step-up paths, approving another phone, the same-phone upgrade, an elevated scan): app_pin (owner default, checked by the server), screen_lock or screen_lock_and_app_pin.'),
     ('app_pin_required_paths', '', 'Paths that need the app PIN in addition to anything else, comma-separated (for example payee changes, large transfers). Empty: none.'),
     ('app_pin_length', '6', 'Digits in an app PIN, 4-12.'),
     ('app_pin_max_failures', '5', 'Wrong app PINs in a row before the PIN locks; the user then sets a new one with the account password. At least 1.'),

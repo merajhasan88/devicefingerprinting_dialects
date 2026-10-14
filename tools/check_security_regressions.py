@@ -64,6 +64,9 @@ SETTINGS = {
     "stepup_required_paths": SENSITIVE,
     "stepup_factor": "passcode",
     "stepup_mode": "per_use",
+    # The checks of the screen-lock key run under that method; the owner's
+    # default is the app PIN (DESIGN.md 78), checked on its own below.
+    "stepup_method": "screen_lock",
 }
 
 
@@ -3775,7 +3778,12 @@ def the_step_up_method_is_the_dbas_choice():
     pin_store()
     try:
         with isolated_stepup():
-            expect(s._stepup_factors() == (True, False), "the interim default is screen_lock")
+            expect(s._stepup_factors() == (True, False), "the fixture runs under screen_lock")
+            with real_policy_reader():
+                db.settings.pop("stepup_method")
+                s._risk_settings_cache.update(at=0.0, values=None, failed_at=None, error=None)
+                expect(s._stepup_factors() == (False, True),
+                       "without the row the owner's default, the app PIN, applies")
             for method, factors, outcome in (
                     ("screen_lock", {"stepup": True}, 200),
                     ("screen_lock", {"pin": PIN}, ("stepup_required", ["screen_lock"])),

@@ -4163,6 +4163,11 @@ def _app_pin_required_paths():
     return {p.strip() for p in raw.replace(";", ",").split(",") if p.strip()}
 
 
+# The owner's default step-up method (DESIGN.md 78, owner decision of
+# 2026-10-14): the app PIN the server checks. A DBA chooses another per
+# deployment; this only answers a missing row.
+STEPUP_METHOD_DEFAULT = "app_pin"
+
 # Where a PIN is set or replaced (DESIGN.md 78). The PIN is never required
 # there: a locked or forgotten PIN could otherwise never be replaced. Nor is
 # the screen-lock key required where it is re-enrolled: a dead key could
@@ -4174,7 +4179,7 @@ _STEPUP_KEY_PATH = "/v1/installations/stepup-key"
 def _stepup_factors():
     """(the screen-lock key, the app PIN): which factors a step-up needs under
     the DBA's stepup_method, wherever one is required (DESIGN.md 78)."""
-    method = _risk_setting_str("stepup_method", "screen_lock")
+    method = _risk_setting_str("stepup_method", STEPUP_METHOD_DEFAULT)
     return method != "app_pin", method != "screen_lock"
 
 
@@ -4188,7 +4193,7 @@ def _prove_step_up(installation_id, account_id, need_key, need_pin, required=Non
     needs = required if required is not None else [
         name for name, needed in (("screen_lock", need_key), ("app_pin", need_pin)) if needed
     ]
-    details = {"step_up": {"method": _risk_setting_str("stepup_method", "screen_lock"),
+    details = {"step_up": {"method": _risk_setting_str("stepup_method", STEPUP_METHOD_DEFAULT),
                            "needs": needs}}
     if need_pin and not request.headers.get("X-App-PIN"):
         raise ApiProblem("This operation needs the app PIN.", 403, "app_pin_required",
@@ -4255,7 +4260,7 @@ def _enforce_step_up(installation_id, account_id):
         "key_auth": key_auth,
         "policy_downgrade": downgrade,
         "app_pin": need_pin,
-        "method": _risk_setting_str("stepup_method", "screen_lock"),
+        "method": _risk_setting_str("stepup_method", STEPUP_METHOD_DEFAULT),
     }
     logger.info(
         "Step-up verified: installation=%s path=%s method=%s factor=%s key_mode=%s "
@@ -4373,7 +4378,7 @@ def _app_pin_state(account_id):
         )
         row = cursor.fetchone()
     return {
-        "method": _risk_setting_str("stepup_method", "screen_lock"),
+        "method": _risk_setting_str("stepup_method", STEPUP_METHOD_DEFAULT),
         "app_pin_set": row is not None,
         "app_pin_locked": bool(row is not None and row[0] is not None),
         "app_pin_length": _risk_setting_int("app_pin_length", 6),
