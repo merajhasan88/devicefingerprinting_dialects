@@ -5509,15 +5509,28 @@ def _upgrade_routes(cursor, account_id, installation_id, causes):
     routes = []
     enabled = _enabled_upgrade_routes(causes)
     if "stepup" in enabled:
-        cursor.execute(
-            "SELECT stepup_key_account_id, stepup_public_key_jwk "
-            "FROM app_installations WHERE installation_id = %s",
-            (installation_id,),
-        )
-        row = cursor.fetchone()
-        if row is not None and row[1] is not None and (
-            row[0] is None or str(row[0]) == str(account_id)
-        ):
+        # Open when this phone can give what the DBA's stepup_method asks
+        # (DESIGN.md 78): a step-up key bound here, and/or an app PIN that is
+        # set and not locked.
+        need_key, need_pin = _stepup_factors()
+        open_now = True
+        if need_key:
+            cursor.execute(
+                "SELECT stepup_key_account_id, stepup_public_key_jwk "
+                "FROM app_installations WHERE installation_id = %s",
+                (installation_id,),
+            )
+            row = cursor.fetchone()
+            open_now = row is not None and row[1] is not None and (
+                row[0] is None or str(row[0]) == str(account_id)
+            )
+        if open_now and need_pin:
+            cursor.execute(
+                "SELECT locked_at FROM app_pins WHERE account_id = %s", (str(account_id),)
+            )
+            row = cursor.fetchone()
+            open_now = row is not None and row[0] is None
+        if open_now:
             routes.append("stepup")
     if "approval" in enabled and _has_other_full_session(
         cursor, account_id, installation_id

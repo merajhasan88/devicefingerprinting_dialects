@@ -3978,8 +3978,18 @@ def approving_and_the_same_phone_route_follow_the_method():
             reply = pin_call("/v1/auth/upgrade", {"route": "stepup"}, bearer=limited, pin=PIN)
             expect(reply.status_code == 200 and (reply.get_json() or {}).get("scope") == "full",
                    "route 1 with the PIN upgrades, got %s %s" % (reply.status_code, reply.get_json()))
+            # Offered to a phone without a step-up key when the method is the PIN
+            # and one is set and not locked -- never otherwise.
+            db.step_jwk = None
+            offered = lambda: "stepup" in s._upgrade_routes(db, account, inst.installation_id,
+                                                            ["integrity_elevated"])
+            expect(offered(), "route 1 must be offered on the PIN alone under app_pin")
+            db.app_pins[account]["locked_at"] = s._utc_now()
+            expect(not offered(), "nor while the PIN is locked")
+        with policy(upgrade_stepup_same_device=1):
+            expect(not offered(), "under screen_lock a phone without a key is not offered route 1")
     finally:
-        db.app_pins, db.refresh_row = {}, None
+        db.app_pins, db.refresh_row, db.step_jwk = {}, None, step.jwk
 
 
 @check
