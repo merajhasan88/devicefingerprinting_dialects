@@ -491,7 +491,9 @@ deployment can now turn on, and what the SDK needs for it:
   "set a new PIN with your password"), `app_pin_not_set` (403). `/v1/account/me` carries `step_up`
   (method, `app_pin_set`, `app_pin_locked`, `app_pin_length`) so the UI can ask up front. Never log the
   header.
-- **Approving without a step-up key** works under `app_pin`: send the PIN alone. Route 1 is now listed in
+- **Approving without a step-up key** works under `app_pin`: send the PIN alone — the reference
+  client's `approveUpgrade` now takes `signStepUp` as optional and an `appPin`; mirror that signature,
+  and give the approver UI a PIN entry for deployments that choose `app_pin`. Route 1 is now listed in
   `upgrade_routes` when the phone can give what the method asks (a bound key and/or a set, unlocked PIN).
 - **New observation kinds** in `context.server_observations`: `token_without_key` and `request_replayed`
   (once per token / per request), `app_pin_failed`, `app_pin_set`; `device_account.app_pin_failed` feeds

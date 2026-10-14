@@ -6375,7 +6375,8 @@ fully compromised OS defeats either.
   password; a limited session never sets one, even where a DBA lists the path for limited sessions.
   A new PIN clears the count and the lock — the way back from a forgotten or locked PIN is the
   password (a user without the password needs route 3, not built). The PIN is never required on that
-  path, or a locked one could never be replaced. Recorded as `app_pin_set`.
+  path, or a locked one could never be replaced — nor the screen-lock key on its re-enrolment path,
+  or a dead key could never be (`24ca162`, found in review). Recorded as `app_pin_set`.
 - **Checking** it (`X-App-PIN`): one atomic `UPDATE … failures = failures + 1 … WHERE failures < max`
   claims the attempt **before** the PIN is compared, so concurrent guesses can never pass the limit;
   bcrypt runs outside any unit of work (on SQL Server a unit holds the worker's lock). The last wrong
@@ -6407,7 +6408,7 @@ PostgreSQL 16.15, schema 20, server `17f07dc` (md5 `627e96a8…`):
 | `app_pin` method: PIN lifecycle, concurrent guesses, approval and route 1 with the PIN | 4 / 4 (the screen-lock checks skip, naming why) |
 | `screen_lock_and_app_pin` | 4 / 4 |
 | `screen_lock` + `app_pin_required_paths` on the sensitive path (the hybrid) | 7 / 7, two skips |
-| 9 wrong PINs at once against a limit of 5 | 4 `app_pin_invalid`, 5 `app_pin_locked`, exactly 5 compared — on each method |
+| 9 wrong PINs at once against a limit of 5 | 4 `app_pin_invalid`, 5 `app_pin_locked`, exactly 5 compared — under each of the three configurations that need the PIN |
 | a known PIN sent, then the journal and /var/log searched | not present anywhere |
 
 **Not done.** SQL Server for 015–020 (the owner's go). A handset round with the harness build. The

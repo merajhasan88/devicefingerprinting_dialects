@@ -664,7 +664,9 @@ screen lock. The screen lock keeps nothing on your server; the app PIN keeps a v
 **Setting the PIN.** `POST /v1/account/app-pin` with `{"password": …, "pin": "123456"}` — a current full
 session (a limited one is refused) and the account password. `app_pin_length` digits. It replaces any
 earlier PIN and clears its count and lock; this is also how a user with a forgotten or locked PIN gets
-back in. Don't list this path in `app_pin_required_paths`: the server never requires a PIN to set one.
+back in. The server never requires the PIN to set one, nor the screen-lock key to re-enrol one
+(`/v1/installations/stepup-key`), whatever the paths list: a locked PIN or a dead key could otherwise
+never be replaced.
 
 **Sending it.** The `X-App-PIN` header, on the request it approves. Never log it — check your proxies
 (the reference server's gunicorn and Caddy write no headers). Refusals:
