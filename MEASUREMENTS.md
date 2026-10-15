@@ -38,9 +38,14 @@ phone never sends a score. The signed report:
 | `version` | the report format, 1 | checked |
 
 The server adds `report_id`, `device_id`, the SHA-256 of the signed bytes (`report_sha256`), its
-reasons, score, verdict, evidence quality and `created_at`. The native collector also tells the app
-the OS version (`sdk_int` on Android, `os_version` on iOS) and the name of any debug fixture; the app
-checks the nonce echo and does not send these, so they are not stored.
+reasons, score, verdict, evidence quality and `created_at`. The native collector hands the app its
+`probes` with `collector_version`, `platform`, `challenge_nonce_echo`, the OS version (`sdk_int` on
+Android, `os_version` on iOS) and `test_fixture_applied`; the app checks the nonce echo and the
+platform, sends the probes as `probe_results`, and does not send the rest, so the OS version is not
+stored.
+
+Checked against the test database on 2026-10-15: the latest report from a real Android phone (15
+probes, 87 fields) and from the real iPhone (9 probes, 47 fields) use only the fields named below.
 
 Every probe answers `status`: `ok`, `error` (with `error`, and on Android `error_type`) or
 `unsupported` (with `reason`). An `error` is a collection problem, never a clean result (§2,
@@ -81,14 +86,14 @@ it unasked). Optional: `environment`, `simulator`.
 | Probe | Fields | What it measures |
 |---|---|---|
 | `app_identity` | **`bundle_id`**, **`executable_sha256`**, `version_name`, `version_code`, `executable_bytes` | the installed app and its main executable's SHA-256 |
-| `code_signing` | **`signing_identifier`**, **`team_identifier`**, **`get_task_allow`**, `signed`, `signature_absent` | the executable's own code signature, parsed from the Mach-O |
+| `code_signing` | **`signing_identifier`**, **`team_identifier`**, **`get_task_allow`**, `signed`, `signature_absent`, `signature_parse_error`, `code_directory_flags`, `entitlement_count` | the executable's own code signature, parsed from the Mach-O |
 | `debugger` | **`traced`** | `P_TRACED` on the process |
 | `jailbreak_files` | **`found_paths`**, `checked_count` | known jailbreak paths that exist |
 | `sandbox` | **`write_outside_sandbox_succeeded`**, `probe_path` | whether the app can write outside its sandbox |
 | `dyld_images` | **`suspicious_tokens`**, `suspicious_image_count`, `image_count` | Frida, Substrate and jailbreak names among the loaded images |
 | `environment` | **`dyld_insert_libraries`** | the `DYLD_INSERT_LIBRARIES` variable |
 | `simulator` | **`is_simulator`**, `model` | the simulator, and the hardware model identifier |
-| `code_integrity` | **`checked`**, **`app_diff_bytes`**, **`app_compared_bytes`**, `diff_bytes`, `core_compared_bytes`, `core_diff_bytes`, `ext_compared_bytes`, `ext_diff_bytes`, `ext_libs_diff`, `app_libs_diff`, `diffed_libs`, `system_images_unreadable`, `system_bucket_reason` | the app's own code in memory against its file |
+| `code_integrity` | **`checked`**, **`app_diff_bytes`**, **`app_compared_bytes`**, `diff_bytes`, `core_compared_bytes`, `core_diff_bytes`, `ext_compared_bytes`, `ext_diff_bytes`, `ext_libs_diff`, `app_libs_diff`, `app_images_compared`, `diffed_libs`, `system_images_unreadable`, `system_bucket_reason`, `app_segment_compared_bytes`, `app_segment_diff_bytes` (the last two telemetry, never scored) | the app's own code in memory against its file |
 
 ---
 
