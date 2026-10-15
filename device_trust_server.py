@@ -2712,15 +2712,16 @@ def _score_wx_memory(reasons, exec_maps, apk_hash):
 # password managers, smartwatch apps and company phone management use the same
 # capabilities. A deployment that wants one off sets its eligibility rule.
 _ACCESS_HOLDERS = (
-    # (probe, field, code when sideloaded, code when not the system's, what holds it)
+    # (probe, field, code when sideloaded, code when not the system's, what holds
+    # it -- "%s" is "no app store installed" or "that is not part of the system")
     ("accessibility", "services", "android_accessibility_sideloaded",
-     "android_accessibility_non_system", "An Accessibility service is on"),
+     "android_accessibility_non_system", "An Accessibility service is on in an app %s"),
     ("accessibility", "keyboard", "android_keyboard_sideloaded",
-     "android_keyboard_non_system", "The keyboard in use"),
+     "android_keyboard_non_system", "The keyboard in use is an app %s"),
     ("notification_access", "listeners", "android_notification_access_sideloaded",
-     "android_notification_access_non_system", "An app can read notifications"),
+     "android_notification_access_non_system", "An app %s can read notifications"),
     ("other_access", "device_admins", "android_device_admin_sideloaded",
-     "android_device_admin_non_system", "A device-administrator app is active"),
+     "android_device_admin_non_system", "A device-administrator app %s is active"),
 )
 _MAX_LISTED_APPS = 64
 
@@ -2770,12 +2771,12 @@ def _score_access_holders(reasons, probes):
         not_system = [e for e in entries if e.get("system") is False]
         if sideloaded:
             _integrity_reason(reasons, sideloaded_code, 0,
-                              "%s from an app not installed by an app store: %s (advisory)."
-                              % (what, _package_names(sideloaded)))
+                              "%s: %s (advisory)." % (what % "no app store installed",
+                                                     _package_names(sideloaded)))
         if not_system:
             _integrity_reason(reasons, non_system_code, 0,
-                              "%s from an app that is not part of the system: %s (advisory)."
-                              % (what, _package_names(not_system)))
+                              "%s: %s (advisory)." % (what % "that is not part of the system",
+                                                     _package_names(not_system)))
     remote = _listed_apps(_probe(probes, "other_access").get("remote_access_apps"))
     if remote:
         _integrity_reason(reasons, "android_remote_access_app", 0,
@@ -2791,9 +2792,10 @@ def _score_capture_and_location(reasons, probes, platform):
         _integrity_reason(reasons,
                           "android_screen_captured" if platform == "android" else "ios_screen_captured",
                           0,
-                          "The app's screen was %s during the scan (advisory)."
-                          % ("being recorded or mirrored" if _as_bool(screen.get("recording"))
-                             else "shown on %d other display(s)" % displays))
+                          ("The app's screen was being recorded or mirrored during the scan "
+                           "(advisory)." if _as_bool(screen.get("recording")) else
+                           "%d display(s) besides the phone's own were on during the scan: "
+                           "casting, mirroring or an external screen (advisory)." % displays))
     if _as_bool(_probe(probes, "mock_location").get("mock")):
         _integrity_reason(reasons,
                           "android_mock_location" if platform == "android" else "ios_mock_location",
