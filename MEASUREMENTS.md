@@ -17,8 +17,8 @@ server source uses appears in this file, so the catalog cannot fall behind the c
 
 **`probe_results` identify a phone** — its model, OS build, installed tools, the app's install source. A
 business that reads them holds device-identifying data and treats it as such. The server stores no name,
-e-mail or telephone number with them, and no network address unless the DBA and the app both turn one on
-(§6).
+e-mail or telephone number with them, and no network address or location unless the DBA and the app both
+turn it on (§6).
 
 ---
 
@@ -35,7 +35,7 @@ challenge lists in `optional_probes` (§6). The phone never sends a score. The s
 | `challenge_id`, `challenge_nonce` | the challenge it answers; each answers once | `integrity_reports.challenge_id` |
 | `installation_id` | the installation whose key signed it | yes |
 | `platform` | `android` or `ios` | yes |
-| `collector_version` | the native collector's version (Android 4, iOS 3 today) | yes |
+| `collector_version` | the native collector's version (Android 5, iOS 4 today) | yes |
 | `collected_at` | the phone's clock, which must be within the allowed skew | checked, not stored |
 | `probe_results` | one object per probe, below | yes, as sent — except an optional measurement the DBA does not request, which is dropped |
 | `version` | the report format, 1 | checked |
@@ -61,7 +61,9 @@ Every probe answers `status`: `ok`, `error` (with `error`, and on Android `error
 
 Mandatory: `app_identity`, `debug_state`, `root_files`, `system_properties`, `runtime_maps`,
 `tracer`, `root_shell`, `selinux`, `mounts`, `frida_ports`, `instrumentation_threads`,
-`exec_mappings`, `code_integrity`, `developer_settings`. Optional: `emulator`.
+`exec_mappings`, `code_integrity`, `developer_settings`. Optional: `emulator`. Optional measurements
+(§6), from collector 5: `local_addresses`, `accessibility`, `notification_access`, `other_access`,
+`screen_capture`, `location`, `mock_location`.
 
 | Probe | Fields | What it measures |
 |---|---|---|
@@ -83,12 +85,20 @@ Mandatory: `app_identity`, `debug_state`, `root_files`, `system_properties`, `ru
 | `device` (volunteered, collector 4) | *`release`*, *`sdk_int`*, *`security_patch`*, *`manufacturer`*, *`brand`*, *`model`*, *`device`*, *`build_id`*, *`fingerprint`* | the OS version and API level, **the security patch level** (how current the phone's patches are), the hardware model, the build |
 | `network` (volunteered, collector 4) | *`vpn_active`*, *`http_proxy_configured`*, *`transports`* (`wifi`, `cellular`, `ethernet`, `vpn`), *`interfaces`* (names only) | whether a VPN is up — the system's connectivity service is asked about every network, not only the default — and whether an HTTP proxy is set; needs `ACCESS_NETWORK_STATE`, a normal permission granted at install |
 | `local_addresses` (optional, §6) | *`addresses`*: a list of `interface`, `address` | the phone's own IP addresses per interface, link-local ones left out |
+| `accessibility` (optional, §6; collector 5) | *`services`*: a list of apps; *`keyboard`*: one app; *`settings_only`*: component names | every Accessibility service that is on, and the keyboard in use (the default input method). Each app is `package`, `service` (its component class), `system` (part of the phone's system) and `installer` (the package that installed it, empty for none); `system` and `installer` are left out where Android hides the app from this one. `settings_only` lists services the system settings name but the Accessibility manager does not report — an Android bug let a service hide that way until the December 2022 patch |
+| `notification_access` (optional, §6; collector 5) | *`listeners`*: a list of apps | every app allowed to read the phone's notifications (one-time codes among them) |
+| `other_access` (optional, §6; collector 5) | *`device_admins`*, *`remote_access_apps`*: lists of apps | the active device-administrator apps, and which known remote-control apps are installed: AnyDesk, TeamViewer QuickSupport, RustDesk, AirDroid — a list compiled into the app, which Android lets it check without seeing other apps |
+| `screen_capture` (optional, §6; collector 5) | *`recording`*, *`external_displays`* | whether the app's window was being recorded at the scan (Android 15 and later; left out before), and how many displays besides the phone's own show content (casting, mirroring, an external screen) |
+| `location` (optional, §6; collector 5) | *`permission`* (`precise`, `approximate`, `none`), *`latitude`*, *`longitude`*, *`accuracy_m`*, *`age_seconds`*, *`provider`* | the last location the phone already knows — never a fresh fix, never a prompt; coordinates only where the app holds the location permission and the phone has a fix |
+| `mock_location` (optional, §6; collector 5) | *`permission`*, *`mock`*, *`age_seconds`* | whether that last location came from a mock-location app; no coordinates |
 
 ### iOS
 
 Mandatory: `app_identity`, `code_signing`, `debugger`, `jailbreak_files`, `sandbox`, `dyld_images`
 (and `code_integrity` once `INTEGRITY_SCORE_IOS_CODE_INTEGRITY` is on; until then the collector sends
-it unasked). Optional: `environment`, `simulator`.
+it unasked). Optional: `environment`, `simulator`. Optional measurements (§6), from collector 4:
+`local_addresses`, `screen_capture`, `location`, `mock_location`; iOS shows an app no other app, so
+`accessibility`, `notification_access` and `other_access` answer `unsupported`.
 
 | Probe | Fields | What it measures |
 |---|---|---|
@@ -101,9 +111,12 @@ it unasked). Optional: `environment`, `simulator`.
 | `environment` | **`dyld_insert_libraries`** | the `DYLD_INSERT_LIBRARIES` variable |
 | `simulator` | **`is_simulator`**, `model` | the simulator, and the hardware model identifier |
 | `code_integrity` | **`checked`**, **`app_diff_bytes`**, **`app_compared_bytes`**, `diff_bytes`, `core_compared_bytes`, `core_diff_bytes`, `ext_compared_bytes`, `ext_diff_bytes`, `ext_libs_diff`, `app_libs_diff`, `app_images_compared`, `diffed_libs`, `system_images_unreadable`, `system_bucket_reason`, `app_segment_compared_bytes`, `app_segment_diff_bytes` (the last two telemetry, never scored) | the app's own code in memory against its file |
-| `device` (volunteered, collector 3) | *`os_version`*, *`model_identifier`* (for example `iPhone9,3`) | the OS version and the hardware model |
+| `device` (volunteered, collector 3) | *`os_version`*, *`os_build`* (collector 4), *`model_identifier`* (for example `iPhone9,3`) | the OS version and build — iOS has no separate security patch level: its security fixes ship as OS versions, and the build tells a Rapid Security Response apart — and the hardware model |
 | `network` (volunteered, collector 3) | *`vpn_active`*, *`http_proxy_configured`*, *`scoped_interfaces`* | iOS gives other apps no VPN API: a VPN is **inferred** from the interfaces the system proxy settings are scoped to (`utun`, `ipsec`, `ppp`, `tun`, `tap`) — a heuristic, so the names are sent with it; the proxy from the system proxy settings |
 | `local_addresses` (optional, §6) | *`addresses`*: a list of `interface`, `address` | as on Android |
+| `screen_capture` (optional, §6; collector 4) | *`recording`*, *`external_displays`* | whether the screen is being recorded, mirrored or sent to AirPlay (`UIScreen.isCaptured`), and how many other screens are attached |
+| `location` (optional, §6; collector 4) | *`permission`*, *`latitude`*, *`longitude`*, *`accuracy_m`*, *`age_seconds`* | as on Android |
+| `mock_location` (optional, §6; collector 4) | *`permission`*, *`mock`*, *`accessory`*, *`age_seconds`* | iOS 15 and later: whether that location was simulated by software, or produced by an accessory |
 
 ---
 
@@ -186,6 +199,28 @@ incomplete scans in a row, under either setting.
 | `ios_app_code_modified` | 90 |  | until enabled | iOS | The application's own code differs in memory from its packaged image. |
 | `ios_vpn_active` | 0 |  |  | iOS | A VPN appears to be active on this phone (advisory, inferred). Eligibility rule: `vpn_active_refuses`. |
 | `ios_http_proxy` | 0 |  |  | iOS | An HTTP proxy is configured on this phone (advisory). Eligibility rule: `http_proxy_refuses`. |
+| `android_accessibility_sideloaded` | 0 |  |  | Android | An Accessibility service is on from an app no app store installed (advisory). Eligibility rule: `accessibility_sideloaded_refuses`. |
+| `android_accessibility_non_system` | 0 |  |  | Android | An Accessibility service is on from an app that is not part of the system, store apps included (advisory). Eligibility rule: `accessibility_non_system_refuses`. |
+| `android_keyboard_sideloaded` | 0 |  |  | Android | The keyboard in use is an app no app store installed (advisory). Eligibility rule: `keyboard_sideloaded_refuses`. |
+| `android_keyboard_non_system` | 0 |  |  | Android | The keyboard in use is not part of the system (advisory). Eligibility rule: `keyboard_non_system_refuses`. |
+| `android_notification_access_sideloaded` | 0 |  |  | Android | An app no app store installed can read notifications (advisory). Eligibility rule: `notification_access_sideloaded_refuses`. |
+| `android_notification_access_non_system` | 0 |  |  | Android | An app that is not part of the system can read notifications (advisory). Eligibility rule: `notification_access_non_system_refuses`. |
+| `android_device_admin_sideloaded` | 0 |  |  | Android | A device-administrator app no app store installed is active (advisory). Eligibility rule: `device_admin_sideloaded_refuses`. |
+| `android_device_admin_non_system` | 0 |  |  | Android | A device-administrator app that is not part of the system is active (advisory). Eligibility rule: `device_admin_non_system_refuses`. |
+| `android_remote_access_app` | 0 |  |  | Android | A remote-control app is installed (advisory). Eligibility rule: `remote_access_app_refuses`. |
+| `android_screen_captured` | 0 |  |  | Android | The app's screen was being recorded, or shown on another display, during the scan (advisory). Eligibility rule: `screen_capture_refuses`. |
+| `ios_screen_captured` | 0 |  |  | iOS | The same on iOS (advisory). Eligibility rule: `screen_capture_refuses`. |
+| `android_mock_location` | 0 |  |  | Android | The phone's last location came from a mock-location app (advisory). Eligibility rule: `mock_location_refuses`. |
+| `ios_mock_location` | 0 |  |  | iOS | The phone's last location was simulated by software (advisory). Eligibility rule: `mock_location_refuses`. |
+| `android_security_patch_outdated` | 0 |  |  | Android | The security patch level is older than `security_patch_max_age_days` (owner default 0: never) (advisory). Eligibility rule: `security_patch_outdated_refuses`. |
+
+An app's source, for the `_sideloaded` rules (DESIGN.md 82): **system** where the phone marks it part of
+the system; **store** where its installer is one of `app_store_installers` (owner default: Google Play,
+Samsung Galaxy Store, Huawei AppGallery, the HeyTap and OPPO markets, Xiaomi GetApps, Amazon Appstore —
+add your market's own); **sideloaded** where anything else or nothing installed it — a browser, a file
+manager, `adb`, another app's installer, as malware droppers do; **unknown** where Android hid the app's
+details, which is never evidence. A phone maker's preloaded app that is not a system app and has no
+installer counts as sideloaded: look at your phones' reports before turning a `_sideloaded` rule on.
 
 *Until enabled*: report-only until the environment switch `INTEGRITY_SCORE_IOS_FAKE_SIGNATURE`
 (the two signing rules) or `INTEGRITY_SCORE_IOS_CODE_INTEGRITY` turns it on.
@@ -295,8 +330,14 @@ stay optional, and the parties who answer for them switch them on.
 | `source_ip` — the address a request came from, as the server sees it (behind the configured proxies) | the DBA: `record_source_ip` | each risk decision's context |
 | `user_agent` — the request's User-Agent header, cut at 256 characters | the DBA: `record_user_agent`. The Flutter client sends `Dart/<version> (dart:io)` unless the app sets its own | each risk decision's context |
 | `vpn_active`, `http_proxy_configured` | always measured by current collectors (a yes/no, no address) | the `network` probe; reasons at 0 points; eligibility rules `vpn_active_refuses`, `http_proxy_refuses` |
+| `accessibility`, `notification_access`, `other_access` — which apps can read the screen, the keyboard, the notifications, or administer or remotely control the phone (Android) | **both**, as for `local_addresses`: the DBA lists it, the app enables it (the reference app: `MEASURE_ACCESSIBILITY`, `MEASURE_NOTIFICATION_ACCESS`, `MEASURE_OTHER_ACCESS`). A person's Accessibility services can reveal a disability | the report's `probe_results`; reasons at 0 points with eligibility rules (§2) |
+| `screen_capture` — the screen recorded, cast or mirrored during the scan | **both** (`MEASURE_SCREEN_CAPTURE`); Android 15 and later also need the app to declare `DETECT_SCREEN_RECORDING`, a normal permission | as above |
+| `location` — the last location the phone knows; `mock_location` — whether it was simulated | **both** (`MEASURE_LOCATION`, `MEASURE_MOCK_LOCATION`), **and** the person grants the app the OS location permission, which only the app asks for. Without it the probe answers `permission: none` and nothing else | the report's `probe_results`; `mock_location` has its reason and eligibility rule |
 
 Kept as long as the decisions and reports are: the business's retention policy applies to them.
+
+Location was outside the platform until the owner asked for it on 2026-10-15 (DESIGN.md 82); it is
+the most identifying measurement here, so it needs the person's own permission on top of both keys.
 
 **Not collected — dropped by the owner (2026-10-15).** Neither is measurable by an ordinary app on
 current phones:

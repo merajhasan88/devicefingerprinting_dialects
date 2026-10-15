@@ -4435,6 +4435,7 @@ def _source_measurements():
                     found["integrity reason"].add(text[:-2] + "<probe>")
     found["cross-check rule"] = {rule[0] for rule in s._CROSS_CHECK_RULES}
     found["relationship reason"] |= {rule[0] for rule in s._SOURCE_NETWORK_RULES}
+    found["integrity reason"] |= {code for rule in s._ACCESS_HOLDERS for code in rule[2:4]}
     found["observation kind"] = set(s._OBSERVATION_KINDS)
     fields = set()
     for contract in (s._PROBE_REQUIRED_FIELDS, s._PROBE_OPTIONAL_FIELDS):
@@ -4511,7 +4512,7 @@ def the_settings_reference_matches_the_migrations():
     finally:
         sys.path.pop(0)
     rendered = reference.render()
-    total = sum(len(rows) for _, _, rows in reference.seeded_settings())
+    total = reference.setting_count()
     for name in reference.DOCUMENTS:
         text = (DOCS / name).read_text(encoding="utf-8")
         block = reference.block_in(text)

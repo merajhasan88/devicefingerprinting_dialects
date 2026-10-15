@@ -43,6 +43,7 @@ import hmac
 import ipaddress
 import json
 import logging
+import math
 import os
 import re
 import secrets
@@ -1191,7 +1192,7 @@ def _get_backend_identity():
 # against a schema it does not understand. /health/* still answers so operators
 # can see why.
 
-REQUIRED_SCHEMA_VERSION = 23
+REQUIRED_SCHEMA_VERSION = 24
 
 _schema_state = None
 _schema_lock = threading.Lock()
@@ -1342,8 +1343,20 @@ CROSS_CHECK_WINDOW_HOURS = 24
 # Measurements a business may want and the OS allows, but which identify a
 # person's phone or network: collected only where the DBA lists them in
 # optional_measurements AND the app's developers enabled them; anything else
-# is dropped before a report is stored (DESIGN.md 80).
-_OPTIONAL_MEASUREMENTS = ("local_addresses",)
+# is dropped before a report is stored (DESIGN.md 80). Migration 024 added what
+# can read or drive the phone -- Accessibility and the keyboard, notification
+# access, device administrators and remote-control apps -- screen capture, the
+# location and whether it is mocked (DESIGN.md 82).
+_OPTIONAL_MEASUREMENTS = ("local_addresses", "accessibility", "notification_access",
+                          "other_access", "screen_capture", "location", "mock_location")
+# The app stores an app counts as "from a store" when one of them installed it
+# (migration 024's default; the DBA's app_store_installers replaces it). Each
+# was checked against published installer tables, 2026-10-15; a store missing
+# here -- vivo's, Honor's -- counts as sideloading until the DBA adds it.
+APP_STORE_INSTALLERS_DEFAULT = (
+    "com.android.vending,com.sec.android.app.samsungapps,com.huawei.appmarket,"
+    "com.heytap.market,com.oppo.market,com.xiaomi.mipicks,com.amazon.venezia"
+)
 
 # What each known setting must parse as. A value that does not is a DBA typo;
 # substituting the default would hide it, so the snapshot is refused instead.
@@ -1386,6 +1399,21 @@ _RISK_SETTING_KINDS = {
     "source_hosting_points": "int",
     "source_vpn_observed_points": "int",
     "source_vpn_observed_non_hosting_points": "int",
+    # Migration 024 (DESIGN.md 82).
+    "app_store_installers": "packages",
+    "accessibility_sideloaded_refuses": "bool",
+    "accessibility_non_system_refuses": "bool",
+    "keyboard_sideloaded_refuses": "bool",
+    "keyboard_non_system_refuses": "bool",
+    "notification_access_sideloaded_refuses": "bool",
+    "notification_access_non_system_refuses": "bool",
+    "device_admin_sideloaded_refuses": "bool",
+    "device_admin_non_system_refuses": "bool",
+    "remote_access_app_refuses": "bool",
+    "screen_capture_refuses": "bool",
+    "mock_location_refuses": "bool",
+    "security_patch_max_age_days": "int",
+    "security_patch_outdated_refuses": "bool",
     "limited_session_paths": "paths",
     "limited_session_integrity_verdicts": "list:elevated,review",
     "limited_session_policy_actions": "list:step_up,review",
@@ -1478,6 +1506,7 @@ _RISK_SETTING_MAXIMUMS = {
     "app_pin_support_reset_minutes": 1440,
     "vpn_exit_min_share_percent": 100,
     "vpn_exit_window_days": 365,
+    "security_patch_max_age_days": 3650,
 }
 _RISK_SETTING_BOOL_WORDS = ("0", "1", "true", "false", "yes", "no", "on", "off")
 # Rows whose absence would silently weaken a gate instead of restoring the
@@ -1503,6 +1532,15 @@ def _validate_risk_settings(values):
                 path.strip().startswith("/")
                 for path in value.replace(";", ",").split(",")
                 if path.strip()
+            )
+        elif kind == "packages":
+            # Android package names, comma-separated; empty is a valid choice
+            # (then no installer is a store, DESIGN.md 82).
+            valid = all(
+                re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z0-9_]+)+", item.strip()) is not None
+                and len(item.strip()) <= 128
+                for item in value.replace(";", ",").split(",")
+                if item.strip()
             )
         elif kind == "codes":
             # Reason codes, comma-separated; empty is a valid choice.
@@ -2143,6 +2181,19 @@ _PROBE_REQUIRED_FIELDS = {
         "code_integrity": {"checked": bool, "app_diff_bytes": int, "app_compared_bytes": int},
     },
 }
+class _Number(object):
+    """A probe field that is a finite JSON number within bounds -- never a bool
+    (DESIGN.md 82: coordinates are the first fields that may be negative)."""
+
+    def __init__(self, name, low, high):
+        self.__name__ = name
+        self.low = low
+        self.high = high
+
+
+_LATITUDE = _Number("latitude", -90.0, 90.0)
+_LONGITUDE = _Number("longitude", -180.0, 180.0)
+_METRES = _Number("distance in metres", 0.0, 1.0e7)
 # Fields a scorer reads when present but that not every collector sends; only
 # their type is checked.
 _PROBE_OPTIONAL_FIELDS = {
@@ -2156,6 +2207,15 @@ _PROBE_OPTIONAL_FIELDS = {
                     "interfaces": list},
         # Only where the DBA requests it and the app's developers enabled it.
         "local_addresses": {"addresses": list},
+        # The same two keys (DESIGN.md 82). The apps in each list are judged
+        # by _app_source, which reads only well-formed entries.
+        "accessibility": {"services": list, "keyboard": dict, "settings_only": list},
+        "notification_access": {"listeners": list},
+        "other_access": {"device_admins": list, "remote_access_apps": list},
+        "screen_capture": {"recording": bool, "external_displays": int},
+        "location": {"permission": str, "latitude": _LATITUDE, "longitude": _LONGITUDE,
+                     "accuracy_m": _METRES, "age_seconds": int, "provider": str},
+        "mock_location": {"permission": str, "mock": bool, "age_seconds": int},
         "exec_mappings": {"wx_bytes": int, "wx_size_classes": str,
                           "wx_smallest_bytes": int, "wx_largest_bytes": int,
                           "deleted_exec_own_code": int, "deleted_exec_jit": int,
@@ -2174,10 +2234,15 @@ _PROBE_OPTIONAL_FIELDS = {
         ),
     },
     "ios": {
-        "device": {"os_version": str, "model_identifier": str},
+        "device": {"os_version": str, "os_build": str, "model_identifier": str},
         "network": {"vpn_active": bool, "http_proxy_configured": bool,
                     "scoped_interfaces": list},
         "local_addresses": {"addresses": list},
+        "screen_capture": {"recording": bool, "external_displays": int},
+        "location": {"permission": str, "latitude": _LATITUDE, "longitude": _LONGITUDE,
+                     "accuracy_m": _METRES, "age_seconds": int},
+        "mock_location": {"permission": str, "mock": bool, "accessory": bool,
+                          "age_seconds": int},
     },
 }
 _CODE_BUCKETS = ("core", "ext", "app")
@@ -2214,6 +2279,9 @@ _MAX_PROBE_INT = 1 << 53
 
 
 def _probe_field_ok(value, kind):
+    if isinstance(kind, _Number):
+        return (isinstance(value, (int, float)) and not isinstance(value, bool)
+                and math.isfinite(value) and kind.low <= value <= kind.high)
     if kind is int:
         return (isinstance(value, int) and not isinstance(value, bool)
                 and 0 <= value <= _MAX_PROBE_INT)
@@ -2635,6 +2703,126 @@ def _score_wx_memory(reasons, exec_maps, apk_hash):
     return points
 
 
+# What can read or drive the phone (DESIGN.md 82). Banking trojans capture what
+# is typed through Accessibility, a replacement keyboard, notification access or
+# screen capture: Chameleon, Vultur and RemControl all work through
+# Accessibility. The phone reports which apps hold each of these and who
+# installed them; the server judges the source, so the DBA's app_store_installers
+# decides what a store is. Every finding is advisory (0 points): screen readers,
+# password managers, smartwatch apps and company phone management use the same
+# capabilities. A deployment that wants one off sets its eligibility rule.
+_ACCESS_HOLDERS = (
+    # (probe, field, code when sideloaded, code when not the system's, what holds it)
+    ("accessibility", "services", "android_accessibility_sideloaded",
+     "android_accessibility_non_system", "An Accessibility service is on"),
+    ("accessibility", "keyboard", "android_keyboard_sideloaded",
+     "android_keyboard_non_system", "The keyboard in use"),
+    ("notification_access", "listeners", "android_notification_access_sideloaded",
+     "android_notification_access_non_system", "An app can read notifications"),
+    ("other_access", "device_admins", "android_device_admin_sideloaded",
+     "android_device_admin_non_system", "A device-administrator app is active"),
+)
+_MAX_LISTED_APPS = 64
+
+
+def _app_source(entry, stores):
+    """system, store, sideloaded or unknown for one app the phone listed.
+
+    system: the phone's own (FLAG_SYSTEM, updates included). store: installed by
+    one of the stores. sideloaded: installed by anything else -- a browser, a
+    file manager, adb, another app's installer, as droppers do -- or by nothing.
+    unknown: the phone could not see the app's details; unknown is never
+    evidence, as with SELinux.
+    """
+    if not isinstance(entry, dict):
+        return "unknown"
+    system = entry.get("system")
+    if system is True:
+        return "system"
+    installer = entry.get("installer")
+    if system is False and isinstance(installer, str):
+        return "store" if installer in stores else "sideloaded"
+    return "unknown"
+
+
+def _listed_apps(entries):
+    """The well-formed app entries of a list, at most _MAX_LISTED_APPS."""
+    return [entry for entry in _as_list(entries)[:_MAX_LISTED_APPS]
+            if isinstance(entry, dict) and isinstance(entry.get("package"), str)]
+
+
+def _package_names(entries):
+    """Package names for a reason's message: plain characters only, five at most."""
+    names = sorted({re.sub(r"[^A-Za-z0-9._]", "", entry["package"])[:100] for entry in entries})
+    names = [name for name in names if name]
+    shown = ", ".join(names[:5])
+    return shown + (" and %d more" % (len(names) - 5) if len(names) > 5 else "")
+
+
+def _score_access_holders(reasons, probes):
+    """Advisory reasons for the apps that hold Accessibility, the keyboard,
+    notification access or device administration, and remote-control apps."""
+    stores = _risk_setting_words("app_store_installers", APP_STORE_INSTALLERS_DEFAULT)
+    for probe, field, sideloaded_code, non_system_code, what in _ACCESS_HOLDERS:
+        value = _probe(probes, probe).get(field)
+        entries = _listed_apps([value] if isinstance(value, dict) else value)
+        sideloaded = [e for e in entries if _app_source(e, stores) == "sideloaded"]
+        not_system = [e for e in entries if e.get("system") is False]
+        if sideloaded:
+            _integrity_reason(reasons, sideloaded_code, 0,
+                              "%s from an app not installed by an app store: %s (advisory)."
+                              % (what, _package_names(sideloaded)))
+        if not_system:
+            _integrity_reason(reasons, non_system_code, 0,
+                              "%s from an app that is not part of the system: %s (advisory)."
+                              % (what, _package_names(not_system)))
+    remote = _listed_apps(_probe(probes, "other_access").get("remote_access_apps"))
+    if remote:
+        _integrity_reason(reasons, "android_remote_access_app", 0,
+                          "A remote-control app is installed: %s (advisory)." % _package_names(remote))
+
+
+def _score_capture_and_location(reasons, probes, platform):
+    """Advisory reasons for a screen being recorded or mirrored during the scan,
+    and for a location that came from a mock-location app (DESIGN.md 82)."""
+    screen = _probe(probes, "screen_capture")
+    displays = _as_int(screen.get("external_displays"))
+    if _as_bool(screen.get("recording")) or displays > 0:
+        _integrity_reason(reasons,
+                          "android_screen_captured" if platform == "android" else "ios_screen_captured",
+                          0,
+                          "The app's screen was %s during the scan (advisory)."
+                          % ("being recorded or mirrored" if _as_bool(screen.get("recording"))
+                             else "shown on %d other display(s)" % displays))
+    if _as_bool(_probe(probes, "mock_location").get("mock")):
+        _integrity_reason(reasons,
+                          "android_mock_location" if platform == "android" else "ios_mock_location",
+                          0,
+                          "The phone's last location was simulated by an app (advisory).")
+
+
+def _security_patch_age_days(device):
+    """Days since the Android security patch level the phone reports, or None
+    where it reports none or nothing readable (collectors before 4, Android 5)."""
+    text = _as_text(device.get("security_patch"))
+    try:
+        patched = datetime.strptime(text, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+    return max(0, (_utc_now() - patched).days)
+
+
+def _score_security_patch(reasons, probes):
+    """The security patch level, sent by every collector from Android 4, against
+    the DBA's security_patch_max_age_days (owner default 0: never)."""
+    limit = _risk_setting_int("security_patch_max_age_days", 0)
+    age = _security_patch_age_days(_probe(probes, "device"))
+    if limit > 0 and age is not None and age > limit:
+        _integrity_reason(reasons, "android_security_patch_outdated", 0,
+                          "The security patch level is %d days old, more than the %d allowed "
+                          "(advisory)." % (age, limit))
+
+
 def _score_android_integrity(probes):
     reasons = []
     score = 0
@@ -2908,6 +3096,12 @@ def _score_android_integrity(probes):
         _integrity_reason(reasons, "android_http_proxy", 0,
                           "An HTTP proxy is configured on this phone (advisory).")
 
+    # Optional measurements and the patch level (DESIGN.md 82): advisory, each
+    # with an eligibility rule the DBA turns on.
+    _score_access_holders(reasons, probes)
+    _score_capture_and_location(reasons, probes, "android")
+    _score_security_patch(reasons, probes)
+
     return score, hard_block, reasons
 
 
@@ -3076,6 +3270,9 @@ def _score_ios_integrity(probes):
         _integrity_reason(reasons, "ios_http_proxy", 0,
                           "An HTTP proxy is configured on this phone (advisory).")
 
+    # iOS shows an app no other app, so only these two (DESIGN.md 82).
+    _score_capture_and_location(reasons, probes, "ios")
+
     return score, hard_block, reasons
 
 
@@ -3214,6 +3411,42 @@ _ELIGIBILITY_RULES = (
      "Remove the HTTP proxy from the network settings, then send a new integrity scan."),
     ("http_proxy_refuses", "ios_http_proxy",
      "Remove the HTTP proxy from the network settings, then send a new integrity scan."),
+    # DESIGN.md 82. Each needs its measurement requested by the DBA and enabled
+    # by the app; a phone that does not send it is never refused by its rule.
+    ("accessibility_sideloaded_refuses", "android_accessibility_sideloaded",
+     "Turn off Accessibility for apps that did not come from an app store, then send a new "
+     "integrity scan."),
+    ("accessibility_non_system_refuses", "android_accessibility_non_system",
+     "Turn off Accessibility for apps that are not part of the phone's system, then send a new "
+     "integrity scan."),
+    ("keyboard_sideloaded_refuses", "android_keyboard_sideloaded",
+     "Switch to a keyboard from an app store or the phone's own, then send a new integrity scan."),
+    ("keyboard_non_system_refuses", "android_keyboard_non_system",
+     "Switch to the phone's own keyboard, then send a new integrity scan."),
+    ("notification_access_sideloaded_refuses", "android_notification_access_sideloaded",
+     "Turn off notification access for apps that did not come from an app store, then send a new "
+     "integrity scan."),
+    ("notification_access_non_system_refuses", "android_notification_access_non_system",
+     "Turn off notification access for apps that are not part of the phone's system, then send a "
+     "new integrity scan."),
+    ("device_admin_sideloaded_refuses", "android_device_admin_sideloaded",
+     "Deactivate device-administrator apps that did not come from an app store, then send a new "
+     "integrity scan."),
+    ("device_admin_non_system_refuses", "android_device_admin_non_system",
+     "Deactivate device-administrator apps that are not part of the phone's system, then send a "
+     "new integrity scan."),
+    ("remote_access_app_refuses", "android_remote_access_app",
+     "Uninstall remote-control apps, then send a new integrity scan."),
+    ("screen_capture_refuses", "android_screen_captured",
+     "Stop recording, casting or mirroring the screen, then send a new integrity scan."),
+    ("screen_capture_refuses", "ios_screen_captured",
+     "Stop recording, casting or mirroring the screen, then send a new integrity scan."),
+    ("mock_location_refuses", "android_mock_location",
+     "Turn off the mock-location app, then send a new integrity scan."),
+    ("mock_location_refuses", "ios_mock_location",
+     "Stop simulating the location, then send a new integrity scan."),
+    ("security_patch_outdated_refuses", "android_security_patch_outdated",
+     "Install the latest security update, then send a new integrity scan."),
 )
 
 

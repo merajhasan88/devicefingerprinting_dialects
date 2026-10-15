@@ -18,7 +18,7 @@ even if the same people wear two hats.
 | Party | Decides | Where it lives | Documented today |
 |---|---|---|---|
 | **Us**, the product | how phones are measured and how much each finding weighs; the protocol | code | `DESIGN.md` (internal) |
-| **DBA and business analysts** | what is refused, limited, counted, for how long; what support staff may do to a PIN | `risk_policy_settings`, 103 rows | `INTEGRATION_GUIDE.md` §5 (every row, generated), §7–§13; the rows' own descriptions |
+| **DBA and business analysts** | what is refused, limited, counted, for how long; what support staff may do to a PIN | `risk_policy_settings`, 117 rows | `INTEGRATION_GUIDE.md` §5 (every row, generated), §7–§13; the rows' own descriptions |
 | **DevOps** | running the server: database, Redis, TLS, secrets, rollout modes, the app's identity pins | about 60 environment variables | guide §2–§4, §6 |
 | **App developers** | the app: native keys and collector, SDK calls, the screens users see, release values handed to DevOps | build settings, native modules, UI | scattered through the guide — **no app-developer guide** (gap G3) |
 | **Backend developers** | business events in; the graph, the lapse feed and every integrity report out; the support tool's PIN unlock and reset; route-3 assertions from their identity system | business API, JWKS file | guide §10, §12, §7; [MEASUREMENTS.md](MEASUREMENTS.md) |
@@ -45,7 +45,7 @@ without a policy. A count of `0` switches a rule off. Environment variables answ
 missing row.
 
 <!-- settings-reference:begin (tools/settings_reference.py --write; do not edit by hand) -->
-103 settings, seeded by migrations 003-023 with the owner's defaults; each row's own description.
+117 settings, seeded by migrations 003-024 with the owner's defaults; each row's own description.
 
 **Migration 003** — DBA-tunable risk policy settings
 
@@ -207,7 +207,6 @@ missing row.
 |---|---|---|
 | `vpn_active_refuses` | `0` | Eligibility rule: 1 refuses a phone whose latest scan reports a VPN active (android_vpn_active, ios_vpn_active), with its own code and remedy; 0 (owner default) = recorded at 0 points. A phone whose app predates the network probe reports none. |
 | `http_proxy_refuses` | `0` | Eligibility rule: 1 refuses a phone whose latest scan reports an HTTP proxy configured (android_http_proxy, ios_http_proxy); 0 (owner default) = recorded at 0 points. |
-| `optional_measurements` | *(empty)* | Optional measurements the server asks each scan for, comma-separated: local_addresses = the phone's own IP addresses. Empty (owner default) = none. Sent only if the app enables it too; anything not listed is dropped, never stored. |
 | `record_source_ip` | `0` | 1 = keep the IP address each request came from in its risk decision's context (source_ip); 0 (owner default) = not kept. Personal data: kept as long as the decisions are. |
 | `record_user_agent` | `0` | 1 = keep each request's User-Agent header in its risk decision's context (user_agent); 0 (owner default) = not kept. |
 
@@ -224,6 +223,26 @@ missing row.
 | `source_hosting_points` | `0` | Points when a request comes from a hosting or data-centre network not known as a VPN. 0 (owner default) = recorded only. |
 | `source_vpn_observed_points` | `0` | Points when a request comes from an address learned as a VPN exit in a hosting network, or of unknown kind. 0 (owner default) = recorded only. |
 | `source_vpn_observed_non_hosting_points` | `0` | Points when a request comes from an address learned as a VPN exit outside hosting networks: a home or office VPN. 0 (owner default) = recorded only. |
+
+**Migration 024** — what can read or drive the phone (Accessibility, the keyboard, notification access, device administrators, remote-control apps), screen capture, location and mock locations, and the age of the security patch
+
+| Setting | Default | What it decides |
+|---|---|---|
+| `optional_measurements` | *(empty)* | Optional measurements asked for on each scan, comma-separated: local_addresses, accessibility, notification_access, other_access, screen_capture, location, mock_location (guide 14). Empty (owner default) = none. Sent only where the app enables it too. *(Seeded by migration 022; this migration describes it.)* |
+| `app_store_installers` | `com.android.vending,com.sec.android.app.samsungapps,com.huawei.appmarket,com.heytap.market,com.oppo.market,com.xiaomi.mipicks,com.amazon.venezia` | App stores by installer package, comma-separated: an app one of them installed is from a store; installed by anything else, sideloaded; a system app is the system's. Add your market's store. |
+| `accessibility_sideloaded_refuses` | `0` | Eligibility rule. 1 = in enforce mode a phone with an Accessibility service on from a sideloaded app is refused (integrity_device_ineligible) until it is off and a new scan is sent; 0 (owner default) = advisory. |
+| `accessibility_non_system_refuses` | `0` | Eligibility rule. 1 = the same for an Accessibility service from any app that is not part of the system, store apps included (screen readers and password managers among them). 0 (owner default) = advisory. |
+| `keyboard_sideloaded_refuses` | `0` | Eligibility rule. 1 = in enforce mode a phone whose keyboard in use is a sideloaded app is refused until another keyboard is chosen and a new scan is sent; 0 (owner default) = advisory. |
+| `keyboard_non_system_refuses` | `0` | Eligibility rule. 1 = the same for a keyboard from any app that is not part of the system, store apps included. 0 (owner default) = advisory. |
+| `notification_access_sideloaded_refuses` | `0` | Eligibility rule. 1 = in enforce mode a phone where a sideloaded app reads notifications is refused until its access is off and a new scan is sent; 0 (owner default) = advisory. |
+| `notification_access_non_system_refuses` | `0` | Eligibility rule. 1 = the same for any app reading notifications that is not part of the system, store apps included (smartwatch apps among them). 0 (owner default) = advisory. |
+| `device_admin_sideloaded_refuses` | `0` | Eligibility rule. 1 = in enforce mode a phone with a sideloaded device-administrator app is refused until it is deactivated and a new scan is sent; 0 (owner default) = advisory. |
+| `device_admin_non_system_refuses` | `0` | Eligibility rule. 1 = the same for any device-administrator app that is not part of the system, store apps included (company phone management among them). 0 (owner default) = advisory. |
+| `remote_access_app_refuses` | `0` | Eligibility rule. 1 = in enforce mode a phone with a remote-control app installed (AnyDesk, TeamViewer QuickSupport, RustDesk, AirDroid) is refused until it is removed and a new scan is sent; 0 (owner default) = advisory. |
+| `screen_capture_refuses` | `0` | Eligibility rule. 1 = in enforce mode a phone whose screen was being recorded or mirrored during the scan is refused until that stops and a new scan is sent; 0 (owner default) = advisory. |
+| `mock_location_refuses` | `0` | Eligibility rule. 1 = in enforce mode a phone whose last location came from a mock-location app is refused until a real location and a new scan are sent; 0 (owner default) = advisory. |
+| `security_patch_max_age_days` | `0` | Days an Android phone's security patch level may age before android_security_patch_outdated (0 points) is recorded. 0 (owner default) = never. 0-3650. |
+| `security_patch_outdated_refuses` | `0` | Eligibility rule. 1 = in enforce mode a phone whose security patch is older than security_patch_max_age_days is refused until it is updated and a new scan is sent; 0 (owner default) = advisory. |
 <!-- settings-reference:end -->
 
 ## 3. DevOps — running the server
@@ -300,7 +319,7 @@ and its W^X baseline (DESIGN.md 62), the iOS team, bundle and signing identifier
 1. **What we fix** — the integrity weights and bands, measurement rules, the protocol and its token
    lifetimes, the invariants. The relationship rules and how long a session lives moved to the DBA in
    migration 021 (G1, G8).
-2. **The DBA's and business analysts' domain** — 103 settings, each with the owner's default and a
+2. **The DBA's and business analysts' domain** — 117 settings, each with the owner's default and a
    description in the row, all of them in the guide, generated from the migrations (G7).
 3. **The app developers' domain** — the native code and a working reference client exist, and the
    client now follows the server's step-up policy (G4); there is still no package to depend on (G2) and

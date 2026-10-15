@@ -1,7 +1,9 @@
 """The settings reference, rendered from the migrations (DESIGN.md 79, G7).
 
 Every risk_policy_settings row a migration seeds -- its key, the owner's
-default and the row's own description -- grouped by migration. The documents
+default and the row's own description -- grouped by migration. A row a later
+migration seeds again (for a new description: migrations never overwrite a
+tuned value) is shown once, as the later migration describes it. The documents
 carry it between two markers; nobody edits it by hand.
 
     python3 tools/settings_reference.py            # print it
@@ -57,20 +59,41 @@ def seeded_settings(engine="postgresql"):
     return migrations
 
 
+def effective_settings(engine="postgresql"):
+    """seeded_settings with each key kept only where it was last seeded:
+    [(migration number, title, [(key, default, description, first seeded by), ...]), ...]"""
+    migrations = seeded_settings(engine)
+    first, last = {}, {}
+    for number, _, rows in migrations:
+        for key, _, _ in rows:
+            first.setdefault(key, number)
+            last[key] = number
+    return [(number, title, [(key, value, description, first[key])
+                             for key, value, description in rows if last[key] == number])
+            for number, title, rows in migrations]
+
+
+def setting_count(engine="postgresql"):
+    return len({key for _, _, rows in seeded_settings(engine) for key, _, _ in rows})
+
+
 def _cell(text):
     return text.replace("|", "\\|")
 
 
 def render():
-    migrations = seeded_settings()
-    total = sum(len(rows) for _, _, rows in migrations)
+    migrations = effective_settings()
     out = ["%d settings, seeded by migrations %03d-%03d with the owner's defaults; each row's own "
-           "description." % (total, migrations[0][0], migrations[-1][0]), ""]
+           "description." % (setting_count(), migrations[0][0], migrations[-1][0]), ""]
     for number, title, rows in migrations:
+        if not rows:
+            continue
         out += ["**Migration %03d** — %s" % (number, title), "",
                 "| Setting | Default | What it decides |", "|---|---|---|"]
-        for key, value, description in rows:
+        for key, value, description, first in rows:
             shown = "`%s`" % value if value != "" else "*(empty)*"
+            if first != number:
+                description += " *(Seeded by migration %03d; this migration describes it.)*" % first
             out.append("| `%s` | %s | %s |" % (key, _cell(shown), _cell(description)))
         out.append("")
     return "\n".join(out).rstrip() + "\n"
