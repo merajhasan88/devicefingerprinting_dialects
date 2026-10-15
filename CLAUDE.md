@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this repository is
 
-An open-source device-trust platform that customers — financial apps, games, government services —
+An open-source device-trust platform that customers — financial apps, games, government mobile apps —
 embed in their own stack: **client SDKs** (native Android in Kotlin, native iOS in Swift, Flutter/Dart,
 .NET and React Native — owner decision of 2026-10-15, each built in a session of its own; Python is not
 an app SDK), one **server implementation**, and **database setup scripts**, so that *their app + this

@@ -6662,8 +6662,9 @@ not built.
   address named once by its most specific kind.
 - **Five client SDKs** (G9 decided): native Android (Kotlin), native iOS (Swift), Flutter, .NET and
   React Native, each built in a session of its own; Python is not an app SDK. For games a Unity (C#)
-  wrapper over the native SDKs would be the next; protecting **government websites** needs a browser
-  SDK — a different build, with keys from WebCrypto or passkeys and none of the native integrity probes.
+  wrapper over the native SDKs would be the next. Government means government **mobile apps**, which
+  these SDKs serve — the owner, correcting a reading of "govt site" as websites: *"I didnt mean
+  government websites but government mobile apps."* No browser SDK is planned.
 - **No single customer.** The owner: *"Leave payactiv out of it as this is a broad platform now and I
   want to include games and govt site protection alongside financial apps."* `CLAUDE.md`, the guide, the
   .NET brief and two code comments now speak of customers; the sections above are history and keep
