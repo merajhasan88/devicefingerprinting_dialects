@@ -538,6 +538,8 @@ The server requires **schema 21**. What the SDK must do:
 - **Suite:** 86 checks — `check_step_up_policy`, `check_business_integrity_reports`,
   `check_app_pin_support_unlock`, `check_app_pin_support_reset`.
 
-**Verified on our side:** gate 97/97. The Dart client's policy reading is analysed, not yet run on a
-phone. **Not run:** migrations 015–021 on SQL Server.
+**Verified on our side:** gate 97/97; EC2 PostgreSQL 16.15 at schema 21: observe 66/0/20, enforce
+with support reset on 80/0/6 (the reset used once by a limited session), `session_max_age_reached` on
+refresh and on a full-session request, a refresh token living `refresh_idle_days`. The Dart client's
+policy reading is analysed, not yet run on a phone. **Not run:** migrations 015–021 on SQL Server.
 

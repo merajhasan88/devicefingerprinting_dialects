@@ -6518,3 +6518,28 @@ mechanism, four of the report feed, four of the policy endpoint, three of the ca
 removed from it), four of the settings reference. Suite **86** checks (four new: the step-up policy,
 the report feed, support unlock, support reset; the business ones need the business token).
 
+**Live**, EC2 PostgreSQL 16.15: migration 021 applied as `postgres` (18 settings, the index, `pin_hash`
+nullable; no new table, so no new grant), then the server as committed in `493fc5c` (md5
+`b065ac97…`); a throwaway business token for the session only.
+
+| Run | Result |
+|---|---|
+| observe / observe, owner defaults, full suite (86) | **66 / 0 / 20** — the report feed, the policy endpoint and "support off answers `app_pin_support_disabled`" pass; the reset check skips (support off) |
+| both enforce, cross-checks on, a step-up path, route 1 on, `app_pin_support` = `unlock_and_reset`, the default `app_pin` | **80 / 0 / 6** — support unlock of a PIN locked by wrong attempts, then the reset used once by a **limited** session on the real database |
+| `app_pin_support` = `unlock` | unlock passes; the reset check skips, the unlock check finds the reset refused |
+| `session_max_days` 1 | a new refresh token lives 86,400 s; a refresh inside the limit gets the time left (86,398 s); after the synthetic session's rows were backdated two days on the test database, the refresh and a full-session request both answer 401 `session_max_age_reached` |
+| `refresh_idle_days` 7 | a new refresh token lives 604,800 s |
+| `GET /v1/policy/step-up` through Caddy | `Cache-Control: no-store` |
+| the stored rows | support unlocks and resets recorded with the ticket reference and no phone; `app_pin_set_after_support_reset` with the phone that used the reset; no traceback or error in the journal |
+| the catalog against stored reports | the latest real Android phone's report (15 probes, 87 fields) uses only catalogued fields; the real iPhone's (9, 47) had six the catalog missed — named in `11768ef`, and the gate now reads the collectors' keys as well (`6714eb0`) |
+
+The full enforce suite now needs about ten minutes, past the session's 600-second command limit: it
+was run as two batches with the same checks and order, the second one re-running the four setup
+checks first (unbuffered output, so a cut run still shows how far it got).
+
+**State.** EC2 stopped at 07:33 UTC on 2026-10-15 — it had stayed up about sixteen hours across a
+usage-limit pause in the session; PostgreSQL 16.15 at schema 21; server `493fc5c` (md5 `b065ac97…`);
+observe / observe; every setting at the owner's defaults (`stepup_method` `app_pin`, no step-up or PIN
+paths, route 1 off, cross-checks off, `app_pin_support` off, `refresh_idle_days` 30,
+`session_max_days` 0); the business token removed (the business API answers 404).
+
