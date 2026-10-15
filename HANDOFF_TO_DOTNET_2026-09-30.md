@@ -584,3 +584,36 @@ not "some VPN is up somewhere". Decisions now carry `source_network` and may car
 `source_vpn_listed`, `source_tor_exit`, `source_hosting`, `source_vpn_observed`,
 `source_vpn_observed_non_hosting` (0 points unless the DBA sets them): tolerate them. Suite: 90 checks
 (`check_source_network`).
+
+## 25. Added 2026-10-15 (latest) — access, capture, location; the PIN entry (DESIGN.md §82, schema 24)
+
+The server requires **schema 24**. Nothing breaks for an older SDK: the new measurements are optional
+probes, listed in `optional_probes` only where the DBA requests them, never required.
+
+- **Optional measurements** an SDK may answer (each an SDK option, off by default; answer
+  `not_enabled` when the app did not enable it, `unsupported` where the platform cannot):
+  `accessibility` — `services` (list), `keyboard` (one), `settings_only` (component names);
+  `notification_access` — `listeners`; `other_access` — `device_admins`, `remote_access_apps`. Each app
+  is `{"package", "service", "system", "installer"}`; leave `system` and `installer` out where the OS
+  hides the app (the server then calls it unknown) and send `""` for an app no installer installed.
+  `screen_capture` — `recording` (only where measured), `external_displays`; `location` — `permission`
+  (`precise`, `approximate`, `none`), `latitude`, `longitude`, `accuracy_m`, `age_seconds`, `provider`;
+  `mock_location` — `permission`, `mock` (iOS also `accessory`), `age_seconds`. Never prompt from a scan;
+  location only from the last known fix. MEASUREMENTS.md §1 has the exact shapes.
+- **iOS** answers `unsupported` for the three Android-only ones, and its `device` probe may add
+  `os_build`.
+- **New reasons** at 0 points with eligibility refusals (403 `integrity_device_ineligible`, show
+  `details.eligibility[].remedy`): `android_accessibility_sideloaded`/`_non_system`,
+  `android_keyboard_sideloaded`/`_non_system`, `android_notification_access_sideloaded`/`_non_system`,
+  `android_device_admin_sideloaded`/`_non_system`, `android_remote_access_app`,
+  `android_screen_captured`, `ios_screen_captured`, `android_mock_location`, `ios_mock_location`,
+  `android_security_patch_outdated`. Tolerate them.
+- **The PIN entry**: protect the window while the app PIN is typed — Android `FLAG_SECURE`,
+  `setHideOverlayWindows(true)` (12+, `HIDE_OVERLAY_WINDOWS`), touches through another window dropped;
+  iOS a cover while `UIScreen.isCaptured`. The reference is `MainActivity.protectScreen` and
+  `AppDelegate.setScreenProtection`.
+- **Suite:** 91 checks — `check_access_holders`; `check_optional_measurements` covers all seven names;
+  suite reports now say collector 5 / 4.
+
+**Verified on our side** (DESIGN.md §82): gate 110/110; EC2 at schema 24, observe 68/0/23; every new
+measurement live on the Android emulator (API 36) against real holders; the Swift is not compiled yet.

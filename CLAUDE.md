@@ -94,8 +94,8 @@ processes** from the systemd drop-in, with a per-process connection pool (`DB_PO
 `DB_POOL_RECHECK_SECONDS`) and, on SQL Server, a 15 s statement timeout (`DB_QUERY_TIMEOUT`) —
 DESIGN.md 55 and 60. Serve SQL Server with processes, never threads.
 
-**Schema is migrations, DBA-applied.** `migrations/<dialect>/001…023`, applied in order; the server
-refuses to serve unless `schema_migrations` holds the version it requires (currently **23**). A new
+**Schema is migrations, DBA-applied.** `migrations/<dialect>/001…024`, applied in order; the server
+refuses to serve unless `schema_migrations` holds the version it requires (currently **24**). A new
 table needs its grant (`GRANT`/`ALTER DEFAULT PRIVILEGES` on PostgreSQL). Risk and step-up policy
 values live in `risk_policy_settings`, seeded by the migrations with the owner's defaults, which a DBA
 may change — never hard-code a policy value; the gate fails when the server reads a setting no
@@ -158,7 +158,12 @@ not jailbroken). The emulator AVD `integrity_root_lab` is the disposable root la
 
 ## Current point of work
 
-See the end of DESIGN.md: section 81 records the source-network signals — public VPN, data-centre and
+See the end of DESIGN.md: section 82 records six optional measurements — the apps holding
+Accessibility, the keyboard, notification access and device administration with their source (system,
+store by the DBA's `app_store_installers`, sideloaded), remote-control apps, screen capture, the location
+and mock locations — each finding 0 points with an eligibility rule, the security patch age rule, the
+protected app PIN entry, and that deleting VPN sightings is the DBA's job (schema 24; collectors
+Android 5, iOS 4 — the Swift not yet compiled); section 81 records the source-network signals — public VPN, data-centre and
 Tor lists shipped with the server, and VPN exits learned from the deployment's own Android phones
 (`vpn_exit_learning`, off by default), all at 0 points (schema 23) — and the platform scope; section 80
 records the device and network probes (the OS version and

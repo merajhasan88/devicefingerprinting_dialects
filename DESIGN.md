@@ -6688,3 +6688,83 @@ from it got `vpn_observed` and `vpn_observed_non_hosting` true and the reason
 machine's address. **State:** EC2 stopped; schema 23; observe / observe; learning off; every new
 setting at its default.
 
+
+---
+
+## 82. What can read or drive the phone, screen capture, location, the patch age, and the PIN entry (2026-10-15)
+
+**The owner's decisions.** After the malware discussion (Chameleon, Vultur and RemControl all work
+through Android's Accessibility permission; no app can list every installed app, so measure the
+capabilities malware must switch on rather than named malware): *"Deletion should be DBA job. Just
+mention it in integration document very clearly. Build mechanism to store these and make it
+configurable by relevant teams: accessibility services, fake gps, screen recording or mirroring,
+location, access to notifications, other access. Also start sending phone's security update level.
+Build App pin screen proposal too."*
+
+- **Deleting VPN sightings is the DBA's job** (guide §15): the server never deletes
+  `vpn_exit_sightings`; the window bounds counting, not retention. The guide gives the daily DELETE for
+  both engines, reading the window from the setting. Dry-run live on PostgreSQL 16.15 inside a
+  rolled-back transaction: a sighting aged past the window was deleted, one with a recent direct
+  sighting kept.
+- **Six optional measurements**, behind the two keys of §80 (the DBA's `optional_measurements`, the
+  app's build flag; the two location ones also need the person's OS permission, which only the app asks
+  for, from its own button): `accessibility` (every Accessibility service on, compared with the system
+  setting — `settings_only` names a service the manager hides, as CVE-2022-20495 allowed — and the
+  keyboard in use), `notification_access`, `other_access` (device administrators; AnyDesk, TeamViewer
+  QuickSupport, RustDesk, AirDroid through `<queries>`), `screen_capture` (the window recorded, Android
+  15+ `addScreenRecordingCallback`; iOS `UIScreen.isCaptured`; displays besides the phone's own),
+  `location` and `mock_location` (the last known fix only — never a fresh one, never a prompt;
+  `isMock`, iOS 15 `isSimulatedBySoftware`). iOS answers `unsupported` for the three Android-only ones.
+- **Sources judged by the server**: each app comes with its system flag and installer; system, store
+  (the DBA's `app_store_installers`, owner default seven verified store packages), sideloaded (any other
+  installer or none — adb, browsers, malware droppers) or unknown (hidden; never evidence).
+- **Every finding 0 points with an eligibility rule** (14 new, all off): `_sideloaded` and
+  `_non_system` for Accessibility, the keyboard, notification access and device administration;
+  `android_remote_access_app`; `*_screen_captured`; `*_mock_location`; and
+  `android_security_patch_outdated` under `security_patch_max_age_days` (0 = never). The patch level
+  itself has been in every Android scan since collector 4; iOS sends `os_build` from collector 4.
+- **Migration 024** seeds 14 settings and re-describes `optional_measurements` — descriptions are ours,
+  values the DBA's (`ON CONFLICT … DO UPDATE SET description`, `WHEN MATCHED … UPDATE SET description`);
+  the settings reference shows a re-seeded row once (117 settings).
+- **The PIN entry** (`devicefingerprinting/secure_screen_v1`): while the app PIN section has focus,
+  Android sets `FLAG_SECURE`, `setHideOverlayWindows(true)` (12+) and drops touches that passed through
+  another window; iOS covers the window while the screen is captured. The keyboard is its own window;
+  the system's screen-lock prompt needs nothing from the app.
+- Collectors: Android **5**, iOS **4** (uncompiled until Codemagic).
+
+**Verified offline.** Gate **110/110** — five new checks (the two keys for the new names; sources of
+apps; capture, mock locations and bounded coordinates; the patch rule; the fourteen rules); thirteen
+deliberate breakages, each caught. Suite **91** (`check_access_holders`; every optional name kept only
+while requested). Release APK builds (Kotlin compiles).
+
+**Live**, EC2 PostgreSQL 16.15, 2026-10-15, 18:16:51–19:02:29 UTC (about 46 minutes): migration 024
+applied, server `69a6ebb` (md5 `c7b7a55b…`), the emulator `integrity_root_lab` (AOSP, API 36, patch
+2025-07-05) running the release harness with all six flags, a test-only holder app built with the SDK
+tools (an Accessibility service, a keyboard, a notification listener, a device admin, a mock-location
+provider) and a code-free stand-in under TeamViewer QuickSupport's package name, both installed by adb.
+
+- Baseline: every probe stored as specified; the system keyboard `system: true`; the stand-in found
+  through `<queries>` (`android_remote_access_app`); `permission: none` for both location probes;
+  `recording: false` (the Android 15 callback answered); `security_patch_max_age_days` 365 →
+  `android_security_patch_outdated`, "467 days old".
+- Holders on: all eight `_sideloaded`/`_non_system` findings named the holder; the "Allow location"
+  button raised the system dialog and returned `precise`; `location` stored the mock fix (48.8584,
+  2.2945, 5 m, gps) and `mock_location` `mock: true` → `android_mock_location`.
+- **Configurable live:** the holder reinstalled with installer `com.android.shell` was sideloaded under
+  the default stores; with the DBA adding `com.android.shell` to `app_store_installers`, only the four
+  `_non_system` findings remained.
+- A simulated secondary display → `external_displays: 1` → `android_screen_captured`. **Not detected:**
+  `adb shell screenrecord` during a scan left `recording: false` — the callback reports recordings the
+  system attributes to an app; a MediaProjection recorder was not tested.
+- PIN entry: focus on the app PIN field → `secure, overlays_hidden, obscured_touches_dropped` all true,
+  the window flags `SECURE` and `HIDE_NON_SYSTEM_OVERLAY_WINDOWS`, a screenshot black; focus elsewhere →
+  all cleared.
+- Suite, enforce with `accessibility_sideloaded_refuses` 1: `check_access_holders` refused a sideloaded
+  Accessibility service with `integrity_device_ineligible` and cleared after a clean scan. Full suite in
+  observe with the six requested, no business token: **68 / 0 / 23**.
+
+**Not verified:** the Swift (uncompiled); a real phone (none was attached; the owner said to use the
+emulator); a Play-installed app as `store` (the AOSP image has no Play Store); a MediaProjection
+recording; SQL Server (migration 024 and the guide's T-SQL DELETE are unrun). **State:** EC2 stopped;
+schema 24; observe / observe; every setting at the owner's default; the emulator stopped, the test apps
+and their access removed (the harness stays installed).
