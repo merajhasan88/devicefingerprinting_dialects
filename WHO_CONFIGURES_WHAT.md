@@ -275,13 +275,16 @@ missing row.
 | `STEPUP_FACTOR` | `passcode`; `biometric` possible | only the fallback: the app reads the DBA's `stepup_factor` from `GET /v1/policy/step-up` before it creates the key, and replaces or asks to re-enrol a key of another factor (G4, done; analysed, not yet run on a phone) |
 | `STEPUP_MODE`, `STEPUP_WINDOW_SECONDS` | `per_use`, 0 | only the fallback for the DBA's `stepup_mode`, `stepup_window_seconds`, read the same way |
 | `MEASURE_LOCAL_ADDRESSES` | `false` | the app's key to the optional measurement `local_addresses`; the DBA holds the other (`optional_measurements`). Both must be on (DESIGN.md 80) |
+| `MEASURE_ACCESSIBILITY`, `MEASURE_NOTIFICATION_ACCESS`, `MEASURE_OTHER_ACCESS`, `MEASURE_SCREEN_CAPTURE`, `MEASURE_LOCATION`, `MEASURE_MOCK_LOCATION` | `false` | the app's keys to the six measurements of DESIGN.md 82; the DBA holds the other key. The two location ones also need the person's OS permission, which only the app asks for |
 
 **Native code they embed** — Android: `InstallationKeyManager.kt` (the non-exportable installation key),
 `StepUpKeyManager.kt` (the screen-lock key: passcode, or `BIOMETRIC_STRONG` from Android 9; per-use or
-windowed), `IntegrityProbeManager.kt` (the collector, contract 3). iOS: `InstallationKeyManager.swift`
-(Secure Enclave keys, including the step-up key: `.devicePasscode` or `.biometryCurrentSet`),
-`IntegrityProbeManager.swift` (contract 2). Method channels: `devicefingerprinting/installation_key_v2`,
-`devicefingerprinting/stepup_key_v1`, `devicefingerprinting/integrity_v1`.
+windowed), `IntegrityProbeManager.kt` (the collector, version 5, contract 3). iOS:
+`InstallationKeyManager.swift` (Secure Enclave keys, including the step-up key: `.devicePasscode` or
+`.biometryCurrentSet`), `IntegrityProbeManager.swift` (version 4, contract 2). Method channels:
+`devicefingerprinting/installation_key_v2`, `devicefingerprinting/stepup_key_v1`,
+`devicefingerprinting/integrity_v1` (with `requestLocationPermission`), and
+`devicefingerprinting/secure_screen_v1` — the window protected while the app PIN is typed (DESIGN.md 82).
 
 **The Dart client** — `DeviceApi`, the `Native*` wrappers, `SecureIdentityStore` and the models — lives
 in `lib/device_trust_client.dart` together with the 3,000-line reference harness (gap G2).
@@ -294,7 +297,12 @@ the screen lock changed (only under `screen_lock` or both); and a message for ea
 guide lists.
 
 **Permissions they declare**: `ACCESS_NETWORK_STATE` on Android (normal, no prompt) for the network
-probe — whether a VPN or a proxy is in use (DESIGN.md 80).
+probe — whether a VPN or a proxy is in use (DESIGN.md 80). For the measurements they enable (DESIGN.md
+82): `ACCESS_COARSE_LOCATION`/`ACCESS_FINE_LOCATION` (asked from their own screen) and the iOS
+`NSLocationWhenInUseUsageDescription`; `DETECT_SCREEN_RECORDING`; `<queries>` for the Accessibility,
+input-method, notification-listener and device-admin actions and the remote-control packages; and
+`HIDE_OVERLAY_WINDOWS` for the protected PIN entry. Their store disclosures (Google Play's Data safety,
+Apple's privacy details) declare what they collect (guide §14).
 
 **Values they hand to DevOps, per release**: the signing certificate's SHA-256, the APK SHA-256
 and its W^X baseline (DESIGN.md 62), the iOS team, bundle and signing identifiers and executable hash.
@@ -312,6 +320,8 @@ and its W^X baseline (DESIGN.md 62), the iOS team, bundle and signing identifier
 | A catalog of every reason code, observation kind, probe field and context field | [MEASUREMENTS.md](MEASUREMENTS.md) | the gate fails if the source can emit a code it does not name (G5, done) |
 | The OS version and security patch level, a VPN, an HTTP proxy | the `device` and `network` probes, every scan (collectors Android 4, iOS 3) | the report feed; reasons at 0 points (DESIGN.md 80) |
 | Optional: the phone's own IP addresses; the request's source address and User-Agent | `local_addresses` (DBA + app); `source_ip`, `user_agent` in decisions (DBA) | the report feed; SQL (DESIGN.md 80) |
+| Optional: the apps holding Accessibility, the keyboard, notification access, device administration; remote-control apps; screen capture; the last location and whether it was mocked | `accessibility`, `notification_access`, `other_access`, `screen_capture`, `location`, `mock_location` (DBA + app); each app's source judged by the DBA's `app_store_installers` | the report feed; reasons at 0 points with eligibility rules (DESIGN.md 82) |
+| An Android security patch older than the DBA allows | `android_security_patch_outdated` under `security_patch_max_age_days` | reasons; eligibility rule (DESIGN.md 82) |
 | Where each request came from: a listed VPN, a Tor exit, a hosting network, a VPN exit learned from the deployment's own Android phones | `source_network` in every decision; `vpn_exit_sightings` (learning, DBA) | decisions; SQL (DESIGN.md 81) |
 
 ## 6. Answers to the owner's four questions

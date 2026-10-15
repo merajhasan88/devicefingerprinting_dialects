@@ -910,6 +910,23 @@ short, and check afterwards which phone set the PIN.
 | `app_pin_locked` (403) | after `app_pin_max_failures` wrong PINs in a row; even the right PIN is refused until a new one is set |
 | `app_pin_not_set` (403) | the account has none yet |
 | `invalid_app_pin` (400) | setting a PIN of the wrong length or with non-digits |
+
+**Protecting the PIN entry** (`DESIGN.md` §82). Malware on the phone can watch a PIN being typed:
+recording the screen, drawing a fake screen over the app, or reading the keyboard. While the PIN is
+typed, the reference client turns on `SecureScreen.protect` (the native channel
+`devicefingerprinting/secure_screen_v1`), and off when the PIN fields lose focus:
+
+- **Android:** the window cannot be captured in screenshots, recordings or casts (`FLAG_SECURE`); other
+  apps' windows are not drawn over it (Android 12 and later; `HIDE_OVERLAY_WINDOWS`, a normal permission
+  your manifest declares); and a touch that passed through another app's window is dropped. The
+  keyboard is the keyboard app's own window, which `FLAG_SECURE` does not cover.
+- **iOS:** no app can block screenshots, so the window is covered while the screen is recorded, mirrored
+  or on AirPlay. A secure (obscured) text field already keeps third-party keyboards out.
+- **Both:** the PIN field tells keyboards not to learn what is typed. An Accessibility service with full
+  control can still read a PIN; that is what the `accessibility` measurement and its rules (section 14)
+  are for.
+
+The phone's own screen-lock prompt is the system's window, which apps cannot and need not protect.
 | `app_pin_reset_lapsed` (403) | a limited session tried to use a support reset that lapsed or was used in the meantime |
 
 **Your app follows the DBA's policy.** `GET /v1/policy/step-up` needs no token — the app creates its
@@ -951,7 +968,7 @@ effective values.
 
 ## 14. The phone's OS and network, and measurements you switch on
 
-`DESIGN.md` §80. Every measurement is listed in [MEASUREMENTS.md](MEASUREMENTS.md).
+`DESIGN.md` §80 and §82. Every measurement is listed in [MEASUREMENTS.md](MEASUREMENTS.md).
 
 **On every scan** (collectors from Android 4 and iOS 3): the **`device`** probe — the OS version, on
 Android also the API level and **the security patch level**, the manufacturer, model and build — and
@@ -968,19 +985,89 @@ sets the eligibility rules `vpn_active_refuses` and/or `http_proxy_refuses` to 1
 developer-options rule in section 5: in enforce mode 403 `integrity_device_ineligible` with a remedy
 your app shows ("Turn off the VPN, then send a new integrity scan"). A phone whose app predates the
 network probe reports neither, and a modified app can hide them: a policy for honest phones, not a
-compromise check. Known VPN exit addresses are a separate matter: record the source address (below)
-and match it against your own list.
+compromise check. Known VPN exit addresses are a separate matter: section 15.
+
+**The security patch level.** Every Android scan's `device` probe carries it (`security_patch`, the
+date of the phone's last security update) — sent since Android collector 4 and stored with each report.
+Your DBA decides how old is too old: `security_patch_max_age_days` (owner default 0: never) records
+`android_security_patch_outdated` at 0 points once the patch is older, and the eligibility rule
+`security_patch_outdated_refuses` refuses it in enforce mode ("Install the latest security update…").
+iOS has no separate patch level — its fixes ship as OS versions — so an iPhone's `device` probe carries
+`os_version` and, from iOS collector 4, `os_build`.
 
 **Optional measurements, two keys.** A measurement that identifies a person's phone or network is
 collected only where **your DBA** asks for it **and your app's developers** enabled it:
 
-| Name | DBA | App (reference client) | What |
+| Name | DBA lists in `optional_measurements` | App (reference client `--dart-define`) | What |
 |---|---|---|---|
-| `local_addresses` | `optional_measurements` = `local_addresses` | `--dart-define=MEASURE_LOCAL_ADDRESSES=true` | the phone's own IP addresses per interface |
+| `local_addresses` | `local_addresses` | `MEASURE_LOCAL_ADDRESSES=true` | the phone's own IP addresses per interface |
+| `accessibility` | `accessibility` | `MEASURE_ACCESSIBILITY=true` | Android: every Accessibility service that is on, and the keyboard in use, each with who installed it |
+| `notification_access` | `notification_access` | `MEASURE_NOTIFICATION_ACCESS=true` | Android: every app allowed to read notifications |
+| `other_access` | `other_access` | `MEASURE_OTHER_ACCESS=true` | Android: active device-administrator apps; AnyDesk, TeamViewer QuickSupport, RustDesk or AirDroid installed |
+| `screen_capture` | `screen_capture` | `MEASURE_SCREEN_CAPTURE=true` | the app's screen recorded (Android 15+; iOS: recorded, mirrored or on AirPlay) or shown on another display during the scan |
+| `location` | `location` | `MEASURE_LOCATION=true`, **and** the person's location permission | the last location the phone already knows: coordinates, accuracy, age |
+| `mock_location` | `mock_location` | `MEASURE_MOCK_LOCATION=true`, **and** the person's location permission | whether that location was simulated by an app; no coordinates (iOS 15 and later) |
+
+iOS shows an app no other app, so `accessibility`, `notification_access` and `other_access` answer
+`unsupported` there.
 
 Each challenge lists what the DBA asks for in `optional_probes`; it is never required. An app that did
 not enable one answers `not_enabled`, at no cost. Whatever the DBA does not ask for is dropped before
 a report is stored, even if a phone sends it.
+
+**What can read or drive the phone** (`DESIGN.md` §82). Banking trojans that capture what a person
+types work through Android's Accessibility, a replacement keyboard, notification access (one-time
+codes) or screen capture; Chameleon, Vultur and RemControl all use Accessibility. No app can see every
+installed app (Google Play restricts that permission), so the collector measures these capabilities
+instead of looking for named malware: it lists the apps holding each, with the package that installed
+them, and the server judges each app's source:
+
+- **system** — part of the phone's system;
+- **store** — installed by an app store your DBA lists in `app_store_installers` (owner default: Google
+  Play, Samsung Galaxy Store, Huawei AppGallery, the HeyTap and OPPO markets, Xiaomi GetApps, Amazon
+  Appstore; add your market's own — vivo's and Honor's are not in the default);
+- **sideloaded** — installed by anything else or by nothing: a browser, a file manager, `adb`, or
+  another app's installer, which is how malware droppers deliver their payload;
+- **unknown** — Android hid the app's details; never evidence.
+
+Each finding costs **0 points** and has an eligibility rule your DBA may turn on, working like the
+developer-options rule (in enforce mode 403 `integrity_device_ineligible` with a remedy your app shows):
+
+| Finding | When | Eligibility rule |
+|---|---|---|
+| `android_accessibility_sideloaded` / `_non_system` | an Accessibility service is on from a sideloaded app / from any app not part of the system | `accessibility_sideloaded_refuses` / `accessibility_non_system_refuses` |
+| `android_keyboard_sideloaded` / `_non_system` | the keyboard in use | `keyboard_sideloaded_refuses` / `keyboard_non_system_refuses` |
+| `android_notification_access_sideloaded` / `_non_system` | an app can read notifications | `notification_access_sideloaded_refuses` / `notification_access_non_system_refuses` |
+| `android_device_admin_sideloaded` / `_non_system` | a device-administrator app is active | `device_admin_sideloaded_refuses` / `device_admin_non_system_refuses` |
+| `android_remote_access_app` | a remote-control app is installed | `remote_access_app_refuses` |
+| `android_screen_captured`, `ios_screen_captured` | the screen was recorded or mirrored during the scan | `screen_capture_refuses` |
+| `android_mock_location`, `ios_mock_location` | the last location was simulated | `mock_location_refuses` |
+
+**Before turning a rule on, read your phones' reports.** Legitimate people hold every one of these:
+screen readers and other assistive tools use Accessibility (and a person's list can reveal a disability),
+password managers and automation apps too; people choose their own keyboards; smartwatch apps read
+notifications; company phone management is a device administrator; support staff use remote-control
+apps. The `_sideloaded` rules are the narrow ones — the model of OCBC's anti-malware feature in
+Singapore, which since August 2023 restricts its app on a phone with a sideloaded app holding
+Accessibility. A phone maker's preloaded app that is not a system app and has no installer counts as
+sideloaded. An Android bug let an Accessibility service hide from the list until the December 2022
+patch: the probe reports services the system setting names but the list omits (`settings_only`), and
+the patch level is in every scan.
+
+**What your app's developers add** for these measurements — only for those they enable:
+
+- Android manifest: `ACCESS_COARSE_LOCATION` and `ACCESS_FINE_LOCATION` (location, mock_location);
+  `DETECT_SCREEN_RECORDING` (screen_capture on Android 15+, a normal permission); and `<queries>` for
+  the actions `android.accessibilityservice.AccessibilityService`, `android.view.InputMethod`,
+  `android.service.notification.NotificationListenerService` and
+  `android.app.action.DEVICE_ADMIN_ENABLED`, and for the remote-control packages — without them
+  Android hides those apps' installers and the server sees `unknown`.
+- iOS `Info.plist`: `NSLocationWhenInUseUsageDescription`.
+- **The location permission is the person's, asked from your app's own screen** (the reference app's
+  "Allow location" button). A scan never prompts; without the permission it reports `permission: none`
+  and no location.
+- **Store disclosures**: Google Play's Data safety form and Apple's privacy details must declare what
+  you collect — location, and on Android information about other apps.
 
 **Recorded by the server** — no app change: `record_source_ip` keeps the address each request came from
 (as seen through your configured proxies, `TRUSTED_PROXY_COUNT`) and `record_user_agent` its
