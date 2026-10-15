@@ -6661,8 +6661,10 @@ not built.
   `vpn_observed_non_hosting`); each kind is a reason at 0 points until the DBA gives it points, an
   address named once by its most specific kind.
 - **Five client SDKs** (G9 decided): native Android (Kotlin), native iOS (Swift), Flutter, .NET and
-  React Native, each built in a session of its own; Python is not an app SDK. For games a Unity (C#)
-  wrapper over the native SDKs would be the next. Government means government **mobile apps**, which
+  React Native, each built in a session of its own; Python is not an app SDK. For games the owner asked
+  for *"a comprehensive list of bot and other exploitative attacks that may be specific for games
+  especially multiplayer like Asphalt 9 Legends"* — `GAME_THREATS.md`, each attack against what is
+  measured and what stays with the game's server. Government means government **mobile apps**, which
   these SDKs serve — the owner, correcting a reading of "govt site" as websites: *"I didnt mean
   government websites but government mobile apps."* No browser SDK is planned.
 - **No single customer.** The owner: *"Leave payactiv out of it as this is a broad platform now and I

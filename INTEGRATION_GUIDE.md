@@ -33,6 +33,10 @@ Be precise about what that proves:
   counts (accounts per device, reinstall velocity) key on installation keys and reinstall hints, which a
   farm can regenerate for every account, so they will not catch it on their own.
 
+**Games.** [GAME_THREATS.md](GAME_THREATS.md) catalogs the bot and exploit attacks mobile games face,
+multiplayer ones in particular, with what this platform measures against each one and what stays with
+the game's own server.
+
 ## 2. The root secret — `DEVICE_ID_MASTER_SECRET`
 
 One high-entropy secret, set as `DEVICE_ID_MASTER_SECRET` (or in the file named by

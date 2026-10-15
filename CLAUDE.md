@@ -102,7 +102,8 @@ may change — never hard-code a policy value; the gate fails when the server re
 migration seeds, or falls back to a value other than the seeded one. The settings reference in
 `INTEGRATION_GUIDE.md` §5 and `WHO_CONFIGURES_WHAT.md` §2 is generated: after changing a migration's
 settings run `python3 tools/settings_reference.py --write`. Every reason code, observation kind and
-probe field the server can emit must be named in `MEASUREMENTS.md` (also gated).
+probe field the server can emit must be named in `MEASUREMENTS.md` (also gated). `GAME_THREATS.md` maps game
+bots and exploits onto those codes.
 
 **A new probe is volunteered, never planned.** The server refuses a report that lacks a planned probe,
 so adding one to `_integrity_probe_plan` breaks every older client, the .NET collectors included. New
