@@ -127,7 +127,7 @@ python3 conformance_suite.py --base-url https://<endpoint>
 #   check_parallel_clients (4 concurrent flows) must pass on any new backend BEFORE handset
 #   or paid-database time is spent on it.
 
-# Offline security regression gate (105 checks; DESIGN.md 63, 76-81): no database needed
+# Offline security regression gate (110 checks; DESIGN.md 63, 76-82): no database needed
 python3 tools/check_security_regressions.py
 # The generated settings reference (G7): print, or rewrite it in the two documents
 python3 tools/settings_reference.py [--write]

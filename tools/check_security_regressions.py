@@ -4696,6 +4696,251 @@ def optional_measurements_need_both_keys():
         expect(refused, "optional_measurements=%r must invalidate the snapshot" % bad)
 
 
+# ---------------------------------------------------------------------------
+# What can read or drive the phone, screen capture, location, the patch level
+# (DESIGN.md 82)
+# ---------------------------------------------------------------------------
+
+_ALL_OPTIONAL = ",".join(s._OPTIONAL_MEASUREMENTS)
+
+
+def _app(package, system=None, installer=None, service=None):
+    entry = {"package": package}
+    if service is not None:
+        entry["service"] = service
+    if system is not None:
+        entry["system"] = system
+    if installer is not None:
+        entry["installer"] = installer
+    return entry
+
+
+def _reasons_by_code(payload):
+    return {r["code"]: r for r in (payload.get("integrity") or {}).get("reasons", [])}
+
+
+@check
+def the_new_optional_measurements_follow_the_two_keys():
+    """DESIGN.md 82. accessibility, notification_access, other_access,
+    screen_capture, location and mock_location join local_addresses: asked for
+    only when the DBA lists them, never required, dropped before storing when
+    not listed -- before scoring too, so an unrequested one costs nothing --
+    and not_enabled, unsupported (an iPhone asked for an Android-only one) or
+    error is no collection problem."""
+    new = [name for name in s._OPTIONAL_MEASUREMENTS if name != "local_addresses"]
+    expect(new == ["accessibility", "notification_access", "other_access", "screen_capture",
+                   "location", "mock_location"], "the six measurements: %s" % new)
+    path = "/v1/integrity/challenge"
+    sideloaded = {"status": "ok", "services": [_app("com.evil.reader", False, "", "x.Svc")]}
+    with policy():
+        db.writes = []
+        status, payload = send_report("android", dict(clean("android"), accessibility=sideloaded))
+        expect(status == 200 and "accessibility" not in (_stored_probes() or {})
+               and not {c for c in codes(payload) if c.startswith("android_accessibility")},
+               "unrequested: dropped before scoring and storing: %s %s" % (status, codes(payload)))
+    with policy(optional_measurements=_ALL_OPTIONAL):
+        reply = client.post(path, data=b"{}", headers=access_headers("POST", path, b"{}", device_token))
+        asked = reply.get_json() or {}
+        expect(reply.status_code == 200 and asked.get("optional_probes") == list(s._OPTIONAL_MEASUREMENTS)
+               and not set(new) & set(asked.get("required_probes", [])),
+               "all asked for, none required: %s" % asked)
+        for platform in ("android", "ios"):
+            for answer in ({"status": "not_enabled"}, {"status": "unsupported", "reason": "iOS"},
+                           {"status": "error", "error": "SecurityException"}):
+                probes = dict(clean(platform), **{name: answer for name in new})
+                status, payload = send_report(platform, probes)
+                expect(status == 200 and payload["integrity"]["verdict"] == "trusted"
+                       and not {c for c in codes(payload) if c.startswith("integrity_")},
+                       "%s: %s is no collection problem: %s %s"
+                       % (platform, answer["status"], status, codes(payload)))
+        db.writes = []
+        status, payload = send_report("android", dict(clean("android"), accessibility=sideloaded))
+        expect(status == 200 and (_stored_probes() or {}).get("accessibility") == sideloaded,
+               "requested and enabled: stored as sent: %s" % status)
+
+
+@check
+def apps_holding_access_are_judged_by_their_source():
+    """DESIGN.md 82. The phone lists the apps holding Accessibility, the
+    keyboard, notification access and device administration with their
+    installers; the server judges each: the system's, from a store (the DBA's
+    app_store_installers), sideloaded, or unknown -- never evidence. Every
+    finding is advisory: the score and verdict do not move."""
+    system = _app("com.android.talkback", True, "com.android.vending", "a.TalkBack")
+    store = _app("com.bitwarden.app", False, "com.android.vending", "b.Autofill")
+    dropped = _app("com.evil.reader", False, "com.cleaner.dropper", "c.Svc")
+    by_adb = _app("com.test.sideloaded", False, "", "d.Svc")
+    hidden = _app("com.hidden.app", service="e.Svc")
+    lists = [system, store, dropped, by_adb, hidden, "not an app", {"package": 7}]
+    probes = dict(clean("android"),
+                  accessibility={"status": "ok", "services": lists, "keyboard": by_adb,
+                                 "settings_only": []},
+                  notification_access={"status": "ok", "listeners": lists},
+                  other_access={"status": "ok", "device_admins": lists,
+                                "remote_access_apps": [_app("com.anydesk.anydeskandroid", False,
+                                                            "com.android.vending")]})
+    with policy(optional_measurements=_ALL_OPTIONAL):
+        status, plain = send_report("android", clean("android"))
+        status, payload = send_report("android", probes)
+        found = _reasons_by_code(payload)
+        expect(status == 200 and payload["integrity"]["score"] == plain["integrity"]["score"]
+               and payload["integrity"]["verdict"] == plain["integrity"]["verdict"]
+               and all(found[code]["points"] == 0 for code in found if code not in codes(plain)),
+               "advisory only: %s %s" % (status, payload.get("integrity")))
+        for prefix in ("android_accessibility", "android_notification_access",
+                       "android_device_admin", "android_keyboard"):
+            side, wide = found.get(prefix + "_sideloaded"), found.get(prefix + "_non_system")
+            expect(side is not None and wide is not None, "%s: both reasons: %s" % (prefix, sorted(found)))
+            if prefix != "android_keyboard":
+                expect("com.evil.reader" in side["message"] and "com.test.sideloaded" in side["message"]
+                       and "com.bitwarden.app" not in side["message"]
+                       and "talkback" not in side["message"] and "com.hidden.app" not in side["message"],
+                       "%s: sideloaded names the two only: %s" % (prefix, side["message"]))
+                expect("com.bitwarden.app" in wide["message"] and "talkback" not in wide["message"]
+                       and "com.hidden.app" not in wide["message"],
+                       "%s: not the system's names store apps too: %s" % (prefix, wide["message"]))
+        expect("com.anydesk.anydeskandroid" in (found.get("android_remote_access_app") or {}).get("message", ""),
+               "a remote-control app is named: %s" % sorted(found))
+    # The DBA decides what a store is.
+    with policy(optional_measurements=_ALL_OPTIONAL,
+                app_store_installers="com.android.vending,com.cleaner.dropper"):
+        status, payload = send_report("android", probes)
+        side = _reasons_by_code(payload)["android_accessibility_sideloaded"]["message"]
+        expect("com.evil.reader" not in side and "com.test.sideloaded" in side,
+               "a listed installer is a store: %s" % side)
+    with policy(optional_measurements=_ALL_OPTIONAL, app_store_installers=""):
+        status, payload = send_report("android", probes)
+        side = _reasons_by_code(payload)["android_accessibility_sideloaded"]["message"]
+        expect("com.bitwarden.app" in side and "talkback" not in side,
+               "no stores: every app outside the system is sideloaded: %s" % side)
+    only_system = dict(clean("android"), accessibility={"status": "ok", "services": [system, hidden],
+                                                        "keyboard": system})
+    with policy(optional_measurements=_ALL_OPTIONAL):
+        status, payload = send_report("android", only_system)
+        expect(status == 200 and not {c for c in codes(payload) if "accessibility" in c or "keyboard" in c},
+               "the system's and unknown apps are no finding: %s" % codes(payload))
+    for bad in ("not a package", "com.android.vending,bad name", "com.", "x" * 200 + ".y"):
+        try:
+            s._validate_risk_settings(dict(SETTINGS, app_store_installers=bad))
+            refused = False
+        except ValueError:
+            refused = True
+        expect(refused, "app_store_installers=%r must invalidate the snapshot" % bad[:40])
+    expect(s._app_source({"package": "a.b", "system": False}, {"x.y"}) == "unknown"
+           and s._app_source(None, set()) == "unknown",
+           "an app whose installer the phone could not see is unknown")
+
+
+@check
+def screen_capture_and_mock_locations_are_advisory_and_coordinates_bounded():
+    """DESIGN.md 82. A screen recorded, cast or mirrored during the scan, and a
+    location simulated by an app, are recorded at 0 points on both platforms.
+    Coordinates are stored as sent when requested; one outside its range, of
+    the wrong type, or not finite makes the report malformed."""
+    fix = {"status": "ok", "permission": "precise", "latitude": -33.8688, "longitude": 151.2093,
+           "accuracy_m": 12.5, "age_seconds": 40, "provider": "gps"}
+    with policy(optional_measurements=_ALL_OPTIONAL):
+        for platform in ("android", "ios"):
+            status, plain = send_report(platform, clean(platform))
+            for screen, expected in (({"status": "ok", "recording": True, "external_displays": 0}, True),
+                                     ({"status": "ok", "recording": False, "external_displays": 1}, True),
+                                     ({"status": "ok", "recording": False, "external_displays": 0}, False),
+                                     ({"status": "ok", "external_displays": 0}, False)):
+                status, payload = send_report(platform, dict(clean(platform), screen_capture=screen))
+                found = _reasons_by_code(payload).get("%s_screen_captured" % platform)
+                expect(status == 200 and bool(found) == expected and (not found or found["points"] == 0)
+                       and payload["integrity"]["score"] == plain["integrity"]["score"],
+                       "%s: %s -> captured=%s: %s" % (platform, screen, expected, codes(payload)))
+            for mock, expected in ((True, True), (False, False)):
+                status, payload = send_report(platform, dict(
+                    clean(platform), mock_location={"status": "ok", "permission": "precise", "mock": mock,
+                                                    "age_seconds": 5}))
+                found = _reasons_by_code(payload).get("%s_mock_location" % platform)
+                expect(status == 200 and bool(found) == expected,
+                       "%s: mock=%s: %s" % (platform, mock, codes(payload)))
+            status, payload = send_report(platform, dict(
+                clean(platform), mock_location={"status": "ok", "permission": "none"},
+                location={"status": "ok", "permission": "none"}))
+            expect(status == 200 and not {c for c in codes(payload) if "mock" in c},
+                   "%s: no permission, no finding: %s" % (platform, codes(payload)))
+        db.writes = []
+        status, payload = send_report("android", dict(clean("android"), location=fix))
+        expect(status == 200 and (_stored_probes() or {}).get("location") == fix,
+               "coordinates stored as sent: %s" % status)
+        for field, bad in (("latitude", 90.5), ("latitude", "51.5"), ("longitude", -180.01),
+                           ("longitude", True), ("latitude", float("nan")),
+                           ("accuracy_m", -1), ("age_seconds", -3)):
+            status, payload = send_report("android", dict(clean("android"), location=dict(fix, **{field: bad})))
+            expect(status == 400 and payload["error"]["code"] == "invalid_integrity_probe",
+                   "location.%s=%r must be refused: %s %s" % (field, bad, status, payload))
+
+
+@check
+def an_outdated_security_patch_is_the_dbas_rule():
+    """DESIGN.md 82. Android has sent its security patch level since
+    collector 4. Older than security_patch_max_age_days it is recorded at 0
+    points; the owner's default 0 never records it; an unreadable or future
+    level is no finding."""
+    def scan(level, **settings):
+        device = {"status": "ok", "release": "9", "sdk_int": 28, "security_patch": level}
+        with policy(**settings):
+            status, payload = send_report("android", dict(clean("android"), device=device))
+        expect(status == 200, "a scan with patch %r: %s" % (level, status))
+        return _reasons_by_code(payload).get("android_security_patch_outdated"), payload
+    old = (s._utc_now() - timedelta(days=400)).strftime("%Y-%m-%d")
+    recent = (s._utc_now() - timedelta(days=100)).strftime("%Y-%m-%d")
+    future = (s._utc_now() + timedelta(days=40)).strftime("%Y-%m-%d")
+    found, payload = scan(old)
+    expect(found is None, "owner default 0: never recorded")
+    found, payload = scan(old, security_patch_max_age_days=365)
+    expect(found is not None and found["points"] == 0 and "400 days" in found["message"]
+           and "365" in found["message"], "400 days > 365: %s" % found)
+    for level in (recent, future, "", "2020-13-45", "April 2020"):
+        found, payload = scan(level, security_patch_max_age_days=365)
+        expect(found is None, "patch %r: no finding" % level)
+    for bad in ("3651", "-1", "x"):
+        try:
+            s._validate_risk_settings(dict(SETTINGS, security_patch_max_age_days=bad))
+            refused = False
+        except ValueError:
+            refused = True
+        expect(refused, "security_patch_max_age_days=%s must invalidate the snapshot" % bad)
+
+
+@check
+def the_new_eligibility_rules_refuse_only_when_set():
+    """DESIGN.md 82. Each new finding refuses -- integrity_device_ineligible,
+    with its remedy -- only in enforce mode and only where the DBA turned its
+    rule on; every rule is off by default."""
+    rules = [(rule, code) for rule, code, _ in s._ELIGIBILITY_RULES
+             if rule not in ("developer_options_refuses", "adb_enabled_refuses",
+                             "vpn_active_refuses", "http_proxy_refuses")]
+    expect(len(rules) == 14, "fourteen new rule-reason pairs: %s" % rules)
+    saved = (s._latest_integrity_state, s._device_integrity_memory, s.INTEGRITY_MODE)
+    s._device_integrity_memory = lambda did, iid: None
+    s.INTEGRITY_MODE = "enforce"
+    try:
+        for rule, code in rules:
+            s._latest_integrity_state = lambda iid, code=code: {
+                "score": 0, "verdict": "trusted", "fresh": True,
+                "reasons": [{"code": code, "points": 0}]}
+            for value, refused in ((None, False), (0, False), (1, True)):
+                with policy(**({} if value is None else {rule: value})):
+                    try:
+                        s._enforce_integrity_gate(inst.device_id, inst.installation_id)
+                        problem = None
+                    except s.ApiProblem as error:
+                        problem = error
+                expect(bool(problem) == refused and (
+                    not refused or (problem.code == "integrity_device_ineligible"
+                                    and [e["reason"] for e in problem.details["eligibility"]] == [code]
+                                    and problem.details["eligibility"][0]["remedy"])),
+                       "%s=%s with %s: refused=%s, got %s" % (rule, value, code, refused,
+                                                             problem and problem.code))
+    finally:
+        s._latest_integrity_state, s._device_integrity_memory, s.INTEGRITY_MODE = saved
+
+
 @check
 def request_metadata_is_kept_only_where_the_dba_says():
     """DESIGN.md 80. The address a request came from and its User-Agent are
