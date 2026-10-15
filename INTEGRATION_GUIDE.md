@@ -1010,3 +1010,38 @@ phones. A learned exit outside the hosting networks — someone's home or office
 **Personal data.** The sightings keep an address per phone, even with `record_source_ip` off, for as long
 as you keep them; nothing in them is read by the business API or published. Turn learning on knowing
 that. Each deployment learns only from its own phones; no list is shared between deployments.
+
+**Deleting old sightings is the DBA's job — the server never deletes them.** `vpn_exit_window_days` limits
+which sightings are *counted*, not how long they are *kept*: a sighting older than the window is never
+read again, yet it stays in `vpn_exit_sightings` — an address tied to a phone — until your DBA deletes
+it. Data-protection law generally expects personal data to be deleted once its purpose has passed, and
+the table only grows: a carrier gives a phone a new address often, and each one adds a row. So once
+learning is on, your DBA schedules a daily job (cron with `psql`, or a SQL Server Agent job) that deletes
+every sighting outside the current window. Run it under the DBA's own login: the application's login
+has no `DELETE` on this table, and should not get one.
+
+PostgreSQL:
+
+```sql
+WITH w AS (
+    SELECT NOW() - make_interval(days => CAST(setting_value AS integer)) AS cutoff
+    FROM risk_policy_settings WHERE setting_key = 'vpn_exit_window_days'
+)
+DELETE FROM vpn_exit_sightings s USING w
+WHERE (s.last_via_vpn_at IS NULL OR s.last_via_vpn_at < w.cutoff)
+  AND (s.last_direct_at IS NULL OR s.last_direct_at < w.cutoff);
+```
+
+SQL Server:
+
+```sql
+DECLARE @days int = (SELECT CAST(setting_value AS int) FROM dbo.risk_policy_settings
+                     WHERE setting_key = 'vpn_exit_window_days');
+DELETE FROM dbo.vpn_exit_sightings
+WHERE (last_via_vpn_at IS NULL OR last_via_vpn_at < DATEADD(day, -@days, SYSDATETIMEOFFSET()))
+  AND (last_direct_at IS NULL OR last_direct_at < DATEADD(day, -@days, SYSDATETIMEOFFSET()));
+```
+
+Both read the window from the setting, so the job follows it when the DBA changes it; a deleted sighting
+was no longer counted, so learning answers exactly as before. Turning learning off stops new sightings
+but deletes nothing: delete the table's rows too if you will not turn it back on.

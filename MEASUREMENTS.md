@@ -337,7 +337,8 @@ traffic, even where an ad blocker or firewall app uses Android's VPN interface a
 from the phone's own address; a VPN server's address carries only VPN traffic. iOS cannot say where its
 traffic goes, so an iPhone is never a witness — and is recognised by the address it shares with them.
 The sightings are personal data (an address per phone), kept even when `record_source_ip` is off, never
-read by the business API and never published.
+read by the business API and never published. The server never deletes them: deleting those outside the
+window is the DBA's job ([INTEGRATION_GUIDE.md](INTEGRATION_GUIDE.md) §15 gives the statements).
 
 The lists are refreshed by DevOps with `tools/fetch_network_lists.py` (daily); the server re-reads a
 changed file within a minute. Their sources and licences are in `data/network_lists/SOURCES.md`. The
