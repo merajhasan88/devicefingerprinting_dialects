@@ -568,3 +568,8 @@ volunteered, never planned. What the SDK should do to match the reference collec
 - **Suite:** 89 checks — `check_network_probe`, `check_optional_measurements`, `check_request_metadata`;
   every suite report now carries the two probes as collector 4 / 3 would.
 
+**Verified on our side** (DESIGN.md §80): gate 101/101; EC2 PostgreSQL 16.15 at schema 22, observe
+69/0/20, enforce with every new setting on 83/0/6, the VPN eligibility rule refusing and clearing
+live. The Kotlin collector builds into the release APK; the Swift is not compiled yet; neither
+has run on a phone.
+

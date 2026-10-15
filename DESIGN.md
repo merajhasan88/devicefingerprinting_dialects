@@ -6600,3 +6600,23 @@ suite report answers like collector 4/3; three new checks. The release APK build
 `flutter analyze` adds nothing. **The Swift is not compiled** — it needs a Codemagic build — and
 neither collector has run on a phone.
 
+**Live**, EC2 PostgreSQL 16.15, 2026-10-15, 08:18–08:40 UTC. The first try of migration 022 failed:
+`optional_measurements`' description was 261 characters against the column's 256, so the migration's
+transaction rolled back and nothing was applied — shortened (`456f546`), and the gate now checks every
+seeded row against the columns (`025f76e`). Then 022 applied, server `556e249` (md5 `54591ba8…`), a
+throwaway business token for the session:
+
+| Run | Result |
+|---|---|
+| observe / observe, owner defaults, full suite (89) | **69 / 0 / 20** — every suite report now carries the volunteered probes as collector 4 / 3; the three new checks pass |
+| both enforce, cross-checks, a step-up path, route 1, support reset, `optional_measurements` = `local_addresses`, `record_source_ip` and `record_user_agent` on | **83 / 0 / 6** (two batches) — `local_addresses` stored only while requested |
+| `vpn_active_refuses` = 1 | a scan reporting a VPN scores 0 points, then `/v1/account/me` answers 403 `integrity_device_ineligible` with the rule's remedy; a new scan without it passes |
+| the recorded `source_ip` | the test machine's public address, through Caddy (`TRUSTED_PROXY_COUNT` 1), not the loopback; `user_agent` the suite's `Python-urllib/3.14` |
+
+No traceback or error in the journal. The test database keeps the test machine's address in the 124
+decisions recorded while `record_source_ip` was on.
+
+**State.** EC2 stopped; PostgreSQL 16.15 at schema 22; server `556e249` (md5 `54591ba8…`); observe /
+observe; every setting at the owner's defaults, the five new ones off or empty; the business token
+removed.
+
