@@ -240,6 +240,7 @@ missing row.
 | `STEPUP_ENABLED` | `true` in the reference harness | the DBA's `stepup_method` (needed for `screen_lock` and both) |
 | `STEPUP_FACTOR` | `passcode`; `biometric` possible | only the fallback: the app reads the DBA's `stepup_factor` from `GET /v1/policy/step-up` before it creates the key, and replaces or asks to re-enrol a key of another factor (G4, done; analysed, not yet run on a phone) |
 | `STEPUP_MODE`, `STEPUP_WINDOW_SECONDS` | `per_use`, 0 | only the fallback for the DBA's `stepup_mode`, `stepup_window_seconds`, read the same way |
+| `MEASURE_LOCAL_ADDRESSES` | `false` | the app's key to the optional measurement `local_addresses`; the DBA holds the other (`optional_measurements`). Both must be on (DESIGN.md 80) |
 
 **Native code they embed** — Android: `InstallationKeyManager.kt` (the non-exportable installation key),
 `StepUpKeyManager.kt` (the screen-lock key: passcode, or `BIOMETRIC_STRONG` from Android 9; per-use or
@@ -258,6 +259,9 @@ prompt when the server asks for a complete or fresh scan; sign-out; re-enrolling
 the screen lock changed (only under `screen_lock` or both); and a message for each refusal code the
 guide lists.
 
+**Permissions they declare**: `ACCESS_NETWORK_STATE` on Android (normal, no prompt) for the network
+probe — whether a VPN or a proxy is in use (DESIGN.md 80).
+
 **Values they hand to DevOps, per release**: the signing certificate's SHA-256, the APK SHA-256
 and its W^X baseline (DESIGN.md 62), the iOS team, bundle and signing identifiers and executable hash.
 
@@ -272,6 +276,8 @@ and its W^X baseline (DESIGN.md 62), the iOS team, bundle and signing identifier
 | The phone–account graph with business events and observations | `GET /v1/business/graph` | the customer's backend |
 | When an approval stopped covering, and why | `GET /v1/business/acceptance-lapses` | the customer's backend |
 | A catalog of every reason code, observation kind, probe field and context field | [MEASUREMENTS.md](MEASUREMENTS.md) | the gate fails if the source can emit a code it does not name (G5, done) |
+| The OS version and security patch level, a VPN, an HTTP proxy | the `device` and `network` probes, every scan (collectors Android 4, iOS 3) | the report feed; reasons at 0 points (DESIGN.md 80) |
+| Optional: the phone's own IP addresses; the request's source address and User-Agent | `local_addresses` (DBA + app); `source_ip`, `user_agent` in decisions (DBA) | the report feed; SQL (DESIGN.md 80) |
 
 ## 6. Answers to the owner's four questions
 
@@ -301,6 +307,6 @@ The owner's answers of 2026-10-14 are quoted; `DESIGN.md` §79 records what was 
 | G6 | `README.md` is the Flutter template | *"after G3"* | **Deferred** — after G3 |
 | G7 | Guide §5 listed "notable" settings, not all | *"update it now"* | **Done** — generated from the migrations by `tools/settings_reference.py`, checked by the gate (`7dda77b`) |
 | G8 | The refresh lifetime (30 days) was fixed | *"make it DBA configurable. 30-day is default but to check with /advisor"* | **Done** — `refresh_idle_days` 30 (1–90), each refresh extending it, the default the advisor confirmed; `session_max_days` 0 (off, up to 365) caps a session from its first sign-in (`b714b88`) |
-| G9 | Python is named as a client SDK; there is none beyond the conformance suite's test client | *"can you elaborate?"* | **Asked** — explained; the owner chooses between narrowing the claim and building one |
+| G9 | Python is named as a client SDK; there is none beyond the conformance suite's test client | *"can you elaborate?"*; then (2026-10-15) *"Should we include native android/kotlin instead? Or both? What other options are there?"* | **Recommended, awaiting the owner**: native Android (Kotlin) and iOS (Swift) SDKs as the base — the native code exists — with Flutter, .NET MAUI and React Native as thin wrappers; Python only as a server-side client of the business API. Packaging belongs with G2 |
 | G10 | Migrations 015–021 have not run on SQL Server | *"fill the gaps, we will do that afterwards"* | **Deferred** — one RDS round, afterwards |
 | — | Support staff could not unlock a PIN | *"Support unlock: build the mechanism. Add this to one of the options available to the relevant team."* | **Done** — `POST /v1/business/app-pin/unlock` and `/reset`, the DBA's `app_pin_support`, off by default (`68393c5`); guide §12 |
