@@ -4,8 +4,10 @@ package com.example.devicefingerprinting
 import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.view.WindowManager
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodCall
@@ -18,6 +20,7 @@ class MainActivity : FlutterActivity() {
         private const val KEY_CHANNEL = "devicefingerprinting/installation_key_v2"
         private const val INTEGRITY_CHANNEL = "devicefingerprinting/integrity_v1"
         private const val STEPUP_CHANNEL = "devicefingerprinting/stepup_key_v1"
+        private const val SECURE_SCREEN_CHANNEL = "devicefingerprinting/secure_screen_v1"
         private const val LOCATION_REQUEST = 4721
     }
 
@@ -132,6 +135,17 @@ class MainActivity : FlutterActivity() {
                 else -> result.notImplemented()
             }
         }
+
+        MethodChannel(
+            flutterEngine.dartExecutor.binaryMessenger,
+            SECURE_SCREEN_CHANNEL,
+        ).setMethodCallHandler { call, result ->
+            when (call.method) {
+                // On the main thread: it changes the window.
+                "protect" -> result.success(protectScreen(call.argument<Boolean>("on") == true))
+                else -> result.notImplemented()
+            }
+        }
     }
 
     private fun locationState(): String = when {
@@ -167,6 +181,32 @@ class MainActivity : FlutterActivity() {
             pendingLocationResult?.success(locationState())
             pendingLocationResult = null
         }
+    }
+
+    /**
+     * While the app PIN is typed (DESIGN.md 82): the window cannot be captured
+     * in screenshots, recordings or casts (FLAG_SECURE); other apps' windows
+     * are not drawn over it (Android 12 and later, HIDE_OVERLAY_WINDOWS, a
+     * normal permission); and a touch that passed through another app's window
+     * is dropped. Returns what applied. The phone's own screen-lock prompt is
+     * the system's window and needs none of this from the app.
+     */
+    private fun protectScreen(on: Boolean): Map<String, Any> {
+        if (on) {
+            window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
+        } else {
+            window.clearFlags(WindowManager.LayoutParams.FLAG_SECURE)
+        }
+        val overlays = Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
+            checkSelfPermission("android.permission.HIDE_OVERLAY_WINDOWS") ==
+            PackageManager.PERMISSION_GRANTED
+        if (overlays) window.setHideOverlayWindows(on)
+        window.decorView.filterTouchesWhenObscured = on
+        return mapOf(
+            "secure" to on,
+            "overlays_hidden" to (on && overlays),
+            "obscured_touches_dropped" to on,
+        )
     }
 
     // Delivers the confirm-credential result the step-up key uses on API < 30.
