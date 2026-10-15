@@ -749,6 +749,31 @@ IOS_CLEAN = {
 }
 
 
+# What a current collector volunteers on every scan, outside the server's plan
+# (DESIGN.md 80): the OS and its patch level, and neither a VPN nor a proxy.
+VOLUNTEERED_CLEAN = {
+    "android": {
+        "device": {"status": "ok", "release": "14", "sdk_int": 34,
+                   "security_patch": "2026-09-05", "manufacturer": "Conformance",
+                   "brand": "conformance", "model": "Suite", "device": "suite",
+                   "build_id": "SUITE.1",
+                   "fingerprint": "conformance/suite/suite:14/SUITE.1/1:user/release-keys"},
+        "network": {"status": "ok", "vpn_active": False, "http_proxy_configured": False,
+                    "transports": ["wifi"], "interfaces": ["wlan0"]},
+    },
+    "ios": {
+        "device": {"status": "ok", "os_version": "17.6.1", "model_identifier": "iPhone15,2"},
+        "network": {"status": "ok", "vpn_active": False, "http_proxy_configured": False,
+                    "scoped_interfaces": ["en0", "pdp_ip0"]},
+    },
+}
+# An optional measurement as an app that enabled it answers (DESIGN.md 80).
+OPTIONAL_CLEAN = {
+    "local_addresses": {"status": "ok",
+                        "addresses": [{"interface": "wlan0", "address": "192.0.2.10"}]},
+}
+
+
 def clean_probes(required, cert=None, platform="android"):
     """A pristine production device: every rule should score zero.
 
@@ -873,8 +898,12 @@ def clean_probes(required, cert=None, platform="android"):
     return {name: everything[name] for name in required if name in everything}
 
 
-def submit_report(api, installation, token, mutate=None, cert=None):
-    """Run one full integrity round trip and return the server's decision."""
+def submit_report(api, installation, token, mutate=None, cert=None, enabled=()):
+    """Run one full integrity round trip and return the server's decision.
+
+    Answers like a current collector: the plan, the volunteered device and
+    network probes, and each optional measurement the challenge asks for --
+    measured where `enabled` lists it, else not_enabled (DESIGN.md 80)."""
     status, challenge = protected(
         api, installation, "POST", "/v1/integrity/challenge", token, {}
     )
@@ -883,6 +912,12 @@ def submit_report(api, installation, token, mutate=None, cert=None):
     probes = clean_probes(
         challenge["required_probes"], cert=cert, platform=challenge["platform"]
     )
+    for name, value in VOLUNTEERED_CLEAN.get(challenge["platform"], {}).items():
+        probes.setdefault(name, copy.deepcopy(value))
+    for name in challenge.get("optional_probes") or []:
+        probes[name] = (copy.deepcopy(OPTIONAL_CLEAN[name])
+                        if name in enabled and name in OPTIONAL_CLEAN
+                        else {"status": "not_enabled"})
     if mutate:
         mutate(probes)
     report = {
@@ -890,9 +925,10 @@ def submit_report(api, installation, token, mutate=None, cert=None):
         "challenge_nonce": challenge["nonce"],
         "installation_id": installation.installation_id,
         "platform": challenge["platform"],
-        # The current collectors: Android meets evidence contract 3, iOS 2
-        # (DESIGN.md 76); an older version is scored but labelled legacy.
-        "collector_version": {"android": 3, "ios": 2}.get(challenge["platform"], 1),
+        # The current collectors, Android 4 and iOS 3 (DESIGN.md 80), meet
+        # evidence contracts 3 and 2 (DESIGN.md 76); an older version is
+        # scored but labelled legacy.
+        "collector_version": {"android": 4, "ios": 3}.get(challenge["platform"], 1),
         "collected_at": int(time.time()),
         "probe_results": probes,
         "version": 1,
@@ -1358,6 +1394,90 @@ def check_eligibility_rule(api, ctx):
     st, pl = protected(api, inst, "GET", "/v1/account/me", access)
     expect(st == 200 and not (pl.get("integrity") or {}).get("eligibility"),
            "a new scan with the settings off must clear it, got %s %s" % (st, error_code(pl)))
+
+@check("integrity: a VPN and an HTTP proxy are measured and cost no points")
+def check_network_probe(api, ctx):
+    """DESIGN.md 80. A current collector volunteers the network probe on every
+    scan; a VPN and an HTTP proxy are recorded (android_vpn_active,
+    android_http_proxy) at 0 points, so the verdict stays what it was."""
+    integrity_context(ctx)
+    settings = live_settings(api)
+    if _setting_on(settings, "vpn_active_refuses") or _setting_on(settings, "http_proxy_refuses"):
+        raise Skip("a network eligibility rule is set here; this check needs neither")
+    inst = Installation()
+    st, pl = enrol(api, inst, fresh_hint())
+    expect(st in (200, 201), "enrol failed: %s %s" % (st, pl))
+    token = device_token(api, inst)
+    plain = submit_report(api, inst, token)
+
+    def tunnel(probes):
+        probes["network"].update(vpn_active=True, http_proxy_configured=True,
+                                 transports=["wifi", "vpn"], interfaces=["wlan0", "tun0"])
+
+    decision = submit_report(api, inst, token, tunnel)
+    points = {r["code"]: r["points"] for r in decision.get("reasons", [])}
+    expect(points.get("android_vpn_active") == 0 and points.get("android_http_proxy") == 0
+           and decision["score"] == plain["score"] and decision["verdict"] == plain["verdict"],
+           "a VPN and a proxy are recorded at 0 points: %s, score %s -> %s"
+           % (points, plain["score"], decision["score"]))
+
+
+@check("integrity: optional measurements are asked for as the DBA lists them, kept only then")
+def check_optional_measurements(api, ctx):
+    """DESIGN.md 80. The challenge's optional_probes are the DBA's
+    optional_measurements, never required; an app that did not enable one
+    answers not_enabled at no cost. With the business token, a measurement
+    the app sends is stored only while the DBA requests it."""
+    integrity_context(ctx)
+    settings = live_settings(api)
+    requested = [name for name in ("local_addresses",)
+                 if name in _setting_words(settings, "optional_measurements", "")]
+    inst = Installation()
+    st, pl = enrol(api, inst, fresh_hint())
+    expect(st in (200, 201), "enrol failed: %s %s" % (st, pl))
+    token = device_token(api, inst)
+    st, challenge = protected(api, inst, "POST", "/v1/integrity/challenge", token, {})
+    expect(st == 200 and challenge.get("optional_probes") == requested
+           and not set(requested) & set(challenge.get("required_probes", [])),
+           "optional_probes must be the DBA's list, never required: %s %s"
+           % (challenge.get("optional_probes"), requested))
+    plain = submit_report(api, inst, token)
+    expect(plain["verdict"] == "trusted" and not {c for c in codes(plain)
+                                                  if c.startswith("integrity_")},
+           "not_enabled answers cost nothing: %s" % codes(plain))
+    business = os.environ.get("DEVICE_TRUST_BUSINESS_TOKEN", "")
+    if not business:
+        return
+    # The app enabled it; whether it is kept is the DBA's request alone.
+    submit_report(api, inst, token, lambda probes: probes.update(
+        local_addresses=copy.deepcopy(OPTIONAL_CLEAN["local_addresses"])))
+    st, feed = api.call("GET", "/v1/business/integrity-reports?" + urllib.parse.urlencode(
+        {"device_id": inst.device_id, "limit": "10"}),
+        headers={"Authorization": "Bearer " + business})
+    latest = (feed.get("reports") or [{}])[-1].get("probe_results") or {}
+    expect(st == 200 and ("local_addresses" in latest) == bool(requested),
+           "local_addresses must be stored exactly while requested (%s): %s"
+           % (requested, sorted(latest)))
+
+
+@check("risk: the source IP and User-Agent are kept only where the DBA says")
+def check_request_metadata(api, ctx):
+    """DESIGN.md 80. A decision's context carries source_ip only under
+    record_source_ip and user_agent only under record_user_agent."""
+    settings = live_settings(api)
+    inst, _, _, access, _ = _pin_phone(api, settings, False)
+    headers, _ = build_proof(inst, "GET", "/v1/policy/me", access, None)
+    headers["User-Agent"] = "conformance-suite/80"
+    st, pl = api.call("GET", "/v1/policy/me", bearer=access, headers=headers)
+    context = ((pl.get("policy") or {}).get("context")) or {}
+    expect(st == 200 and ("source_ip" in context) == _setting_on(settings, "record_source_ip")
+           and (context.get("user_agent") == "conformance-suite/80")
+           == _setting_on(settings, "record_user_agent")
+           and ("user_agent" in context) == _setting_on(settings, "record_user_agent"),
+           "context must follow record_source_ip=%s record_user_agent=%s: %s"
+           % (settings.get("record_source_ip"), settings.get("record_user_agent"),
+              {k: context.get(k) for k in ("source_ip", "user_agent")}))
+
 
 @check("integrity: the ART JIT code cache is not mistaken for injection")
 def check_jit_not_flagged(api, ctx):
