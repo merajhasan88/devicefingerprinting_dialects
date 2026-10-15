@@ -50,6 +50,17 @@ const String stepUpMode =
 const int stepUpWindowSeconds =
     int.fromEnvironment('STEPUP_WINDOW_SECONDS', defaultValue: 0);
 
+// Optional measurements this app's developers allow (DESIGN.md 80). Each is
+// collected only when the server's DBA also asks for it (optional_measurements)
+// -- two keys, because each identifies a person's phone or network. Off unless
+// a build turns it on:
+//   --dart-define=MEASURE_LOCAL_ADDRESSES=true   (the phone's own IP addresses)
+const bool measureLocalAddresses =
+    bool.fromEnvironment('MEASURE_LOCAL_ADDRESSES', defaultValue: false);
+const List<String> enabledMeasurements = <String>[
+  if (measureLocalAddresses) 'local_addresses',
+];
+
 const Duration _networkTimeout = Duration(seconds: 15);
 
 class NativeKeyException implements Exception {
@@ -469,6 +480,7 @@ class NativeIntegrityCollector {
     required List<String> requiredProbes,
     required String challengeNonce,
     String? testFixture,
+    List<String> optionalProbes = const <String>[],
   }) async {
     try {
       final Map<String, dynamic>? value =
@@ -477,6 +489,10 @@ class NativeIntegrityCollector {
         <String, dynamic>{
           'required_probes': requiredProbes,
           'challenge_nonce': challengeNonce,
+          // What the server asks for and what this app allows; the native
+          // collector measures only what is in both (DESIGN.md 80).
+          'optional_probes': optionalProbes,
+          'enabled_measurements': enabledMeasurements,
           if (testFixture != null && testFixture.isNotEmpty)
             'integrity_test_fixture': testFixture,
         },
@@ -2382,12 +2398,18 @@ class DeviceRecognitionController extends ChangeNotifier {
         .map((Object? item) => item.toString())
         .toList(growable: false);
     lastIntegrityProbes = requiredProbes;
+    // Absent from a server older than DESIGN.md 80.
+    final Object? optional = challenge['optional_probes'];
+    final List<String> optionalProbes = optional is List
+        ? optional.map((Object? item) => item.toString()).toList(growable: false)
+        : const <String>[];
 
     lastIntegrityTestFixture = testFixture;
     final Map<String, dynamic> native = await _integrityCollector.collect(
       requiredProbes: requiredProbes,
       challengeNonce: nonce,
       testFixture: testFixture,
+      optionalProbes: optionalProbes,
     );
     if (native['probes'] is! Map) {
       throw ApiException(
