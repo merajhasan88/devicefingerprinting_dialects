@@ -90,8 +90,8 @@ processes** from the systemd drop-in, with a per-process connection pool (`DB_PO
 `DB_POOL_RECHECK_SECONDS`) and, on SQL Server, a 15 s statement timeout (`DB_QUERY_TIMEOUT`) —
 DESIGN.md 55 and 60. Serve SQL Server with processes, never threads.
 
-**Schema is migrations, DBA-applied.** `migrations/<dialect>/001…021`, applied in order; the server
-refuses to serve unless `schema_migrations` holds the version it requires (currently **21**). A new
+**Schema is migrations, DBA-applied.** `migrations/<dialect>/001…022`, applied in order; the server
+refuses to serve unless `schema_migrations` holds the version it requires (currently **22**). A new
 table needs its grant (`GRANT`/`ALTER DEFAULT PRIVILEGES` on PostgreSQL). Risk and step-up policy
 values live in `risk_policy_settings`, seeded by the migrations with the owner's defaults, which a DBA
 may change — never hard-code a policy value; the gate fails when the server reads a setting no
@@ -100,10 +100,16 @@ migration seeds, or falls back to a value other than the seeded one. The setting
 settings run `python3 tools/settings_reference.py --write`. Every reason code, observation kind and
 probe field the server can emit must be named in `MEASUREMENTS.md` (also gated).
 
+**A new probe is volunteered, never planned.** The server refuses a report that lacks a planned probe,
+so adding one to `_integrity_probe_plan` breaks every older client, the .NET collectors included. New
+collectors send it unasked (`device`, `network`, iOS `code_integrity`); promote it to the plan only once
+every client sends it. Measurements that identify a person's phone or network go behind two keys: the
+DBA's `optional_measurements` and the app's build setting (DESIGN.md 80).
+
 ## Commands
 
 ```bash
-# Conformance suite — the gate. 86 checks; needs `cryptography` (harness only).
+# Conformance suite — the gate. 89 checks; needs `cryptography` (harness only).
 python3 conformance_suite.py --base-url https://<endpoint>
 #   Scoring checks need the server started with INTEGRITY_ANDROID_CERT_SHA256 set to the
 #   certificate the suite prints, or empty to disable the allow-list.
@@ -116,7 +122,7 @@ python3 conformance_suite.py --base-url https://<endpoint>
 #   check_parallel_clients (4 concurrent flows) must pass on any new backend BEFORE handset
 #   or paid-database time is spent on it.
 
-# Offline security regression gate (97 checks; DESIGN.md 63, 76-79): no database needed
+# Offline security regression gate (101 checks; DESIGN.md 63, 76-80): no database needed
 python3 tools/check_security_regressions.py
 # The generated settings reference (G7): print, or rewrite it in the two documents
 python3 tools/settings_reference.py [--write]
@@ -145,7 +151,10 @@ not jailbroken). The emulator AVD `integrity_root_lab` is the disposable root la
 
 ## Current point of work
 
-See the end of DESIGN.md: section 79 records the owner's answers to the who-configures-what audit
+See the end of DESIGN.md: section 80 records the device and network probes (the OS version and
+patch level, a VPN or proxy at 0 points with optional eligibility rules), optional measurements behind
+two keys (the DBA's `optional_measurements` and the app's build setting) and request metadata the DBA
+may record (schema 22; collectors Android 4, iOS 3 — the Swift not yet compiled); section 79 records the owner's answers to the who-configures-what audit
 (`WHO_CONFIGURES_WHAT.md`) and what was built — the relationship rules and session lifetimes as DBA
 settings, support unlock and reset of an app PIN, the step-up policy read by the app at runtime, the
 business feed of integrity reports, the measurement catalog and the generated settings reference

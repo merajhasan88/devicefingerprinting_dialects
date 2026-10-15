@@ -543,3 +543,28 @@ with support reset on 80/0/6 (the reset used once by a limited session), `sessio
 refresh and on a full-session request, a refresh token living `refresh_idle_days`. The Dart client's
 policy reading is analysed, not yet run on a phone. **Not run:** migrations 015–021 on SQL Server.
 
+## 23. Added 2026-10-15 — the device and network probes, optional measurements (DESIGN.md §80, schema 22)
+
+The server requires **schema 22**. Nothing breaks for an SDK that changes nothing: the new probes are
+volunteered, never planned. What the SDK should do to match the reference collectors (Android 4, iOS 3):
+
+- **Volunteer `device` and `network` on every scan**, beside the planned probes. Android: `device` —
+  `release`, `sdk_int`, `security_patch`, `manufacturer`, `brand`, `model`, `device`, `build_id`,
+  `fingerprint`; `network` — `vpn_active` (any network with `TRANSPORT_VPN`), `http_proxy_configured`
+  (`ConnectivityManager.getDefaultProxy()` or `http.proxyHost`), `transports`, `interfaces` (names
+  only); needs `ACCESS_NETWORK_STATE`. iOS: `device` — `os_version`, `model_identifier`; `network` —
+  `vpn_active` inferred from `CFNetworkCopySystemProxySettings()["__SCOPED__"]` keys starting `utun`,
+  `ipsec`, `ppp`, `tun` or `tap`, `http_proxy_configured` (`HTTPEnable`, `HTTPSEnable`,
+  `ProxyAutoConfigEnable`), `scoped_interfaces`. Report your collector version as 4 / 3 once you do.
+  Field types are checked: a wrong type is 400 `invalid_integrity_probe`.
+- **Read `optional_probes`** in the challenge (absent before schema 22). For each name your app's
+  configuration enables, add the measurement; for every other one, `{"status": "not_enabled"}`. Today
+  only `local_addresses`: `{"status": "ok", "addresses": [{"interface", "address"}, ...]}`, link-local
+  left out. Expose it as an SDK option, off by default.
+- **New reason codes** at 0 points, and a new eligibility refusal: `android_vpn_active`,
+  `ios_vpn_active`, `android_http_proxy`, `ios_http_proxy`; 403 `integrity_device_ineligible` where the
+  DBA sets `vpn_active_refuses` or `http_proxy_refuses` — show `details.eligibility[].remedy`.
+- **User-Agent**: the server can record it (`record_user_agent`); send a meaningful one.
+- **Suite:** 89 checks — `check_network_probe`, `check_optional_measurements`, `check_request_metadata`;
+  every suite report now carries the two probes as collector 4 / 3 would.
+

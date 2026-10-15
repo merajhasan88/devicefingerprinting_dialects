@@ -6543,3 +6543,60 @@ observe / observe; every setting at the owner's defaults (`stepup_method` `app_p
 paths, route 1 off, cross-checks off, `app_pin_support` off, `refresh_idle_days` 30,
 `session_max_days` 0); the business token removed (the business API answers 404).
 
+## 80. The OS version, a VPN or proxy, and measurements switched on by two keys (2026-10-15)
+
+**Why.** The owner, on the findings of §79: *"yes send the OS version. Other measurements such as MAC
+address, IMEI, IP address, user agent: keep them optional but provide a means for app team to enable
+them. Also see if a VPN could be detected and a bit turned on and sent to the server (we may start
+another project to keep track of known VPN IPs)."* And on G9: *"Should we include native
+android/kotlin instead? Or both? What other options are there?"*
+
+**G9, recommended, not built.** Python is not a language production mobile apps are written in (Kivy
+and BeeWare exist, and are niche); its place here is server-side, as the conformance suite already is.
+The SDKs a customer would embed are native Android (Kotlin) and iOS (Swift) — the native modules in this
+repository already are Kotlin and Swift, so that is packaging — with thin wrappers for the cross-platform
+frameworks: Flutter, .NET MAUI and React Native. Packaging belongs with G2, which the owner deferred.
+
+**What was built** (migration 022, schema 22; both engines):
+
+- **The OS version, and more, on every scan.** Collector versions Android 4 and iOS 3 volunteer two
+  probes the server never puts in its plan: the server refuses a report missing a planned probe, so a
+  new planned probe would break every older client, the .NET collectors among them (the iOS collector
+  already volunteered `code_integrity` for that reason). `device`: on Android the release, API level,
+  **security patch level**, manufacturer, brand, model, device, build id and fingerprint; on iOS the OS
+  version and the model identifier. `network`: whether a VPN is up and an HTTP proxy is set, with
+  interface names, never an address. On Android the connectivity service is asked about every network
+  (a VPN is a network of its own) — `ACCESS_NETWORK_STATE`, a normal permission, is now in the
+  manifest. On iOS, which gives other apps no VPN API, a VPN is **inferred** from the interfaces the
+  system proxy settings are scoped to (`utun`, `ipsec`, `ppp`, `tun`, `tap`): a heuristic, the names
+  sent with it. Fields are type-checked like any probe's (`_PROBE_OPTIONAL_FIELDS`).
+- **A VPN or a proxy costs nothing** (`android_vpn_active`, `ios_vpn_active`, `android_http_proxy`,
+  `ios_http_proxy`, 0 points): people use them for privacy and at work, and the owner's binding
+  constraint is no refusals of legitimate users. A deployment that refuses them sets the eligibility
+  rules `vpn_active_refuses`, `http_proxy_refuses` (0 by default), refused with their own remedy like
+  developer options (§69). Known VPN exit addresses — the owner's possible next project — need the
+  source address, below.
+- **Optional measurements, two keys.** `optional_measurements` (the DBA; empty by default) is listed in
+  each challenge as `optional_probes`, never required; the app measures only those its developers
+  enabled (the reference client: `--dart-define=MEASURE_LOCAL_ADDRESSES=true`) and answers
+  `not_enabled` for the rest, which is no collection problem. A measurement the DBA does not request is
+  dropped before a report is stored, whatever a phone sends; a name the server does not know
+  invalidates the settings snapshot. First and only member: `local_addresses`, the phone's own IP
+  addresses (link-local left out — they can carry the hardware address).
+- **Recorded by the server**: `record_source_ip` and `record_user_agent` (0 by default) keep the
+  request's address — through the configured proxies — and its User-Agent (cut at 256) in each risk
+  decision's context. Personal data, kept as long as the decisions.
+- **Not built: MAC and IMEI.** Not readable by an ordinary app on current phones: iOS answers every app
+  with a constant MAC and has no IMEI API; Android's Wi-Fi API answers a constant MAC since 6, Android 11
+  hides it from apps targeting it, Android 10 randomises it per network; the IMEI needs a system-only
+  privilege from Android 10, and up to 9 the "make and manage phone calls" prompt plus Google Play's
+  persistent-identifier disclosure. Told to the owner with the recommendation not to collect them;
+  either would be one more name in `optional_measurements` for the old phones that still give it.
+
+**Verified offline.** Gate **101/101** — four new checks (the network probe measured and advisory and
+out of the plan, its four eligibility pairs, optional measurements with both keys, request metadata);
+eight mutations, each caught. The catalog check now covers the new collector fields. Suite **89**: every
+suite report answers like collector 4/3; three new checks. The release APK builds (the Kotlin compiles);
+`flutter analyze` adds nothing. **The Swift is not compiled** — it needs a Codemagic build — and
+neither collector has run on a phone.
+
