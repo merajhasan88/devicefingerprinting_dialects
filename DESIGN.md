@@ -6768,3 +6768,35 @@ emulator); a Play-installed app as `store` (the AOSP image has no Play Store); a
 recording; SQL Server (migration 024 and the guide's T-SQL DELETE are unrun). **State:** EC2 stopped;
 schema 24; observe / observe; every setting at the owner's default; the emulator stopped, the test apps
 and their access removed (the harness stays installed).
+
+### 82.1 Default points (2026-10-15, later)
+
+The owner: *"Why 0 score? Put reasonable default scores."* Every finding of §82 now scores the DBA's
+`*_points`, seeded with these owner's defaults (integrity bands: 30 step-up, 60 review, 90 block):
+
+| Finding | Points | Why |
+|---|---|---|
+| `android_accessibility_sideloaded` | 45 | the banking-trojan signature (OCBC refuses on it), but a phone maker's preloaded app with no installer looks the same: a step-up alone, not a refusal |
+| `android_keyboard_sideloaded`, `android_notification_access_sideloaded`, `android_device_admin_sideloaded` | 30 each | a keyboard sees everything typed; one-time codes arrive as notifications; malware resists removal as an administrator — but F-Droid keyboards and Gadgetbridge are real users; two together reach review |
+| `android_remote_access_app` | 20 | installed, not necessarily running; with a sideloaded Accessibility service it reaches review — the scam pattern |
+| `android_screen_captured`, `ios_screen_captured` | 30 | screen-sharing scams, but also casting and recording on purpose |
+| `android_mock_location`, `ios_mock_location` | 40 | set up deliberately, and it defeats the check the business asked for by requesting location |
+| `android_security_patch_outdated` | 10 | unpatched phones are legitimate users too: it nudges, never decides; `security_patch_max_age_days` is now 365 by default (was 0, never) |
+| the four `_non_system` findings | 0 | screen readers, password managers, store keyboards, smartwatch apps and company management hold the same capabilities; a sideloaded app also counts as not the system's, so the two add up if the DBA gives both points |
+
+Migration 024 was unpushed and applied only to the test database, so its rows changed in place (12
+points rows; 129 settings). The collector now counts only displays that are on and public, so a
+foldable's other screen is not casting. Gate **110/110** with the defaults, the step-up and review sums
+(45 elevated, 65 review) and the DBA's overrides asserted; six deliberate breakages caught. The suite's
+clean phone carries a month-old patch, so it never ages into a finding.
+
+**Live**, EC2, 19:38:54–19:50:25 UTC (about 11 minutes): 024 re-run (idempotent) and
+`security_patch_max_age_days` set to its new default, server `e7c4b53` (md5 `d962d95d…`). The emulator's
+scan with the test holders on scored `android_accessibility_sideloaded` +45, the keyboard, notification and
+administrator findings +30 each, the four `_non_system` +0, `android_remote_access_app` +20,
+`android_mock_location` +40, `android_security_patch_outdated` +10 — capped at 100 with the emulator's own
+findings. A simulated second display, on and public, still scored `android_screen_captured` +30. Suite:
+`check_access_holders` in enforce with the rule off answered `integrity_step_up_required` (45 is elevated)
+and with it on `integrity_device_ineligible`; full suite in observe **68 / 0 / 23**. **State:** EC2
+stopped; every setting at the owner's default (now including the points and the 365-day patch age);
+the emulator stopped, the test apps removed.
