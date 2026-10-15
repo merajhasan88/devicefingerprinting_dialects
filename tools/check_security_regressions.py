@@ -4493,10 +4493,15 @@ def the_settings_reference_matches_the_migrations():
     finally:
         sys.path.pop(0)
     rendered = reference.render()
+    total = sum(len(rows) for _, _, rows in reference.seeded_settings())
     for name in reference.DOCUMENTS:
-        block = reference.block_in((DOCS / name).read_text(encoding="utf-8"))
+        text = (DOCS / name).read_text(encoding="utf-8")
+        block = reference.block_in(text)
         expect(block == rendered, "%s's settings reference is not what the migrations say; "
                "run python3 tools/settings_reference.py --write" % name)
+        # The prose counts them too, and once fell 14 behind.
+        stale = sorted(set(re.findall(r"\b(\d+) (?:settings|rows)\b", text)) - {str(total)})
+        expect(not stale, "%s counts %s settings; the migrations seed %d" % (name, stale, total))
     engines = {engine: {key: (number, value, description)
                         for number, _, rows in reference.seeded_settings(engine)
                         for key, value, description in rows}
