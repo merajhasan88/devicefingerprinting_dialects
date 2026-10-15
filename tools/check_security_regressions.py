@@ -4481,6 +4481,24 @@ def the_measurement_catalog_lists_every_code():
 
 
 @check
+def the_game_threat_catalog_cites_only_real_codes():
+    """GAME_THREATS.md maps game bots and exploits onto measurements: every
+    code, setting and field it names outside its example blocks exists in the
+    server, the measurement catalog or the migrations, so a renamed or removed
+    one fails here rather than leaving the catalog promising it."""
+    text = re.sub(r"```.*?```", "", (DOCS / "GAME_THREATS.md").read_text(encoding="utf-8"),
+                  flags=re.S)
+    cited = set(re.findall(r"`([a-z][a-z0-9_]*)`", text))
+    known = (Path(s.__file__).read_text(encoding="utf-8")
+             + (DOCS / "MEASUREMENTS.md").read_text(encoding="utf-8")
+             + "".join(path.read_text(encoding="utf-8")
+                       for path in sorted((DOCS / "migrations" / "postgresql").glob("*.sql"))))
+    expect(len(cited) >= 80, "GAME_THREATS.md cites only %d codes" % len(cited))
+    missing = sorted(code for code in cited if not re.search(r"\b%s\b" % re.escape(code), known))
+    expect(not missing, "GAME_THREATS.md names what nothing defines: %s" % missing)
+
+
+@check
 def the_settings_reference_matches_the_migrations():
     """DESIGN.md 79 (G7). The settings reference in the guide and the audit map
     is what tools/settings_reference.py renders from the migrations; both

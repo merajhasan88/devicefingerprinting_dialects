@@ -103,7 +103,7 @@ migration seeds, or falls back to a value other than the seeded one. The setting
 `INTEGRATION_GUIDE.md` §5 and `WHO_CONFIGURES_WHAT.md` §2 is generated: after changing a migration's
 settings run `python3 tools/settings_reference.py --write`. Every reason code, observation kind and
 probe field the server can emit must be named in `MEASUREMENTS.md` (also gated). `GAME_THREATS.md` maps game
-bots and exploits onto those codes.
+bots and exploits onto those codes; every code it names must exist (gated).
 
 **A new probe is volunteered, never planned.** The server refuses a report that lacks a planned probe,
 so adding one to `_integrity_probe_plan` breaks every older client, the .NET collectors included. New
@@ -127,7 +127,7 @@ python3 conformance_suite.py --base-url https://<endpoint>
 #   check_parallel_clients (4 concurrent flows) must pass on any new backend BEFORE handset
 #   or paid-database time is spent on it.
 
-# Offline security regression gate (104 checks; DESIGN.md 63, 76-81): no database needed
+# Offline security regression gate (105 checks; DESIGN.md 63, 76-81): no database needed
 python3 tools/check_security_regressions.py
 # The generated settings reference (G7): print, or rewrite it in the two documents
 python3 tools/settings_reference.py [--write]
