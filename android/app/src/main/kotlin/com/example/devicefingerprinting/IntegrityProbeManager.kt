@@ -157,7 +157,7 @@ class IntegrityProbeManager(private val context: Context) {
      * enforcement without rooting or instrumenting the known-good test phone.
      *
      * This is intentionally unavailable when the installed APK is not
-     * debuggable. A release Payactiv build therefore cannot request these
+     * debuggable. A release build therefore cannot request these
      * synthetic measurements through the Flutter method channel.
      */
     private fun applyDebugTestFixture(

@@ -4,11 +4,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this repository is
 
-A reusable device-trust framework that customers embed in their own stack: **client SDKs in
-Flutter/Dart, .NET and Python**, one **server implementation**, and **database setup scripts**, so
-that *their app + this server + their database* recognises devices across reinstalls, authenticates
-with non-exportable device-bound keys, makes stolen tokens useless on another device, and detects
-root, Frida, hooking frameworks and tampering.
+An open-source device-trust platform that customers — financial apps, games, government services —
+embed in their own stack: **client SDKs** (native Android in Kotlin, native iOS in Swift, Flutter/Dart,
+.NET and React Native — owner decision of 2026-10-15, each built in a session of its own; Python is not
+an app SDK), one **server implementation**, and **database setup scripts**, so that *their app + this
+server + their database* recognises devices across reinstalls, authenticates with non-exportable
+device-bound keys, makes stolen tokens useless on another device, and detects root, Frida, hooking
+frameworks and tampering. This repository holds the server, the Flutter client and its harness, and the
+native Android and iOS code the other SDKs package. It is meant to be published by the owner (planned:
+necessary.com or necessary.io); write for any customer, never one company.
 
 The server, not Google or Apple, owns the risk score. There is deliberately no Play Integrity,
 SafetyNet, App Attest or DeviceCheck, and — owner decision of 2026-10-06, DESIGN.md 66 — no local
@@ -16,8 +20,8 @@ verification of Android key-attestation chains either (Remote Key Provisioning i
 nothing relies on it). Phone signals are untrusted evidence; the server's own logic, with velocity
 and fraud signals, decides. Do not introduce attestation.
 
-The headline requirement is **database portability**. Payactiv runs mostly **SQL Server** with some
-**PostgreSQL**, so the same server must behave identically on both across a wide version range.
+The headline requirement is **database portability**: customers run **SQL Server** or **PostgreSQL**,
+so the same server must behave identically on both across a wide version range.
 Hence the repository name.
 
 **.NET is a client SDK, not a second server.** Two independent implementations of signature
@@ -63,8 +67,8 @@ none fails fast with `api_base_url_missing`. Never hardcode an environment into 
 
 | Engine | Syntax floor | Tested range | Role |
 |---|---|---|---|
-| PostgreSQL | 13 | **13 - 18, all green** | Some Payactiv systems |
-| SQL Server | 2016 | **2017 - 2025** | The main Payactiv target. 2016 is untestable (no RDS edition, no Linux build) so syntax compatibility is kept but the tested floor is 2017 |
+| PostgreSQL | 13 | **13 - 18, all green** | Customers on PostgreSQL |
+| SQL Server | 2016 | **2017 - 2025** | The engine most enterprise customers run. 2016 is untestable (no RDS edition, no Linux build) so syntax compatibility is kept but the tested floor is 2017 |
 
 SQL Server releases in range: 2017, 2019, 2022, 2025. There is no 2018, 2020 or 2021.
 Redis is in scope for the SQL Server phase - see DESIGN.md section 25.12.

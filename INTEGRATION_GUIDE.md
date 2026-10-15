@@ -1,9 +1,10 @@
 # Integration guide
 
 For the engineers, DBAs and security reviewers who put this device-trust server and its client SDKs
-into their own stack. `DESIGN.md` is the full design and test record; this guide is what you must
-decide and configure. The Flutter app in this repository is a **test harness**, not a product: your
-app embeds an SDK (Flutter/Dart, .NET, Python) and your deployment owns every secret and signing key.
+into their own stack — financial apps, games, government services. `DESIGN.md` is the full design and
+test record; this guide is what you must decide and configure. The Flutter app in this repository is a
+**test harness**, not a product: your app embeds an SDK (native Android or iOS, Flutter, .NET or React
+Native) and your deployment owns every secret and signing key.
 
 ## 1. What it gives you, and what it does not
 

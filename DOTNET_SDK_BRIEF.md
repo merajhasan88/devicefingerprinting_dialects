@@ -9,11 +9,11 @@ implementation) in this repository.
 ## 0. Scope — what to build and what NOT to build
 
 - **Build:** a .NET/C# **client SDK** plus a small console/MAUI test harness that exercises the same
-  flows the Flutter app does. Payactiv's app is .NET, so this SDK is what their app would embed.
+  flows the Flutter app does. Customers whose apps are .NET embed this SDK.
 - **Do NOT build a second server.** The server is `device_trust_server.py`; .NET is a client only.
   The SDK points at the existing HTTPS endpoint via config, exactly as the Flutter app uses
   `--dart-define=API_BASE_URL`.
-- Target framework: .NET 8/9 (Payactiv uses .NET releases of the last ~3 years). For device-bound
+- Target framework: .NET 8/9 (customers use .NET releases of the last ~3 years). For device-bound
   keys on mobile, **.NET MAUI** (Android + iOS) is the natural fit; a Windows/console build is fine
   for protocol testing against RDS but cannot provide a hardware-backed key (see §5).
 

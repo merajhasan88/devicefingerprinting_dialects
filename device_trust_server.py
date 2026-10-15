@@ -4965,7 +4965,7 @@ def _check_step_up(installation_id, account_id):
 
 
 def _require_trusted_account_request(event_type="protected_request"):
-    """One server-owned gate for normal authenticated Payactiv-style APIs.
+    """One server-owned gate for a customer's normal authenticated APIs.
 
     Order matters: first prove possession of the installation key for this exact
     HTTP request, then require a fresh integrity report, then calculate the
