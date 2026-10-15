@@ -9,6 +9,7 @@ import UIKit
   private static let keyChannelName = "devicefingerprinting/installation_key_v2"
   private static let integrityChannelName = "devicefingerprinting/integrity_v1"
   private static let stepUpChannelName = "devicefingerprinting/stepup_key_v1"
+  private static let secureScreenChannelName = "devicefingerprinting/secure_screen_v1"
 
   private var installationKeys: InstallationKeyManager?
   private var integrityProbes: IntegrityProbeManager?
@@ -17,6 +18,11 @@ import UIKit
   /// answered when the person chooses; a scan never asks.
   private var locationManager: CLLocationManager?
   private var pendingLocationResult: FlutterResult?
+  /// While the app PIN is typed (DESIGN.md 82): iOS lets no app block
+  /// screenshots, so the window is covered whenever the screen is recorded,
+  /// mirrored or sent to AirPlay.
+  private var screenProtected = false
+  private var captureCover: UIView?
 
   /// Keychain and Secure Enclave calls can block, so they run off the platform
   /// thread. FlutterResult must be invoked on the platform thread, hence the
@@ -38,6 +44,72 @@ import UIKit
     registerInstallationKeyChannel(with: engineBridge.pluginRegistry)
     registerIntegrityChannel(with: engineBridge.pluginRegistry)
     registerStepUpKeyChannel(with: engineBridge.pluginRegistry)
+    registerSecureScreenChannel(with: engineBridge.pluginRegistry)
+  }
+
+  private func registerSecureScreenChannel(with registry: FlutterPluginRegistry) {
+    guard let registrar = registry.registrar(forPlugin: "DeviceTrustSecureScreen") else {
+      return
+    }
+    let channel = FlutterMethodChannel(
+      name: AppDelegate.secureScreenChannelName,
+      binaryMessenger: registrar.messenger()
+    )
+    channel.setMethodCallHandler { [weak self] call, result in
+      guard let self = self else { return }
+      switch call.method {
+      case "protect":
+        let on = (call.arguments as? [String: Any])?["on"] as? Bool ?? false
+        self.setScreenProtection(on)
+        result([
+          "secure": false,
+          "covered_while_captured": on,
+        ])
+      default:
+        result(FlutterMethodNotImplemented)
+      }
+    }
+  }
+
+  private func setScreenProtection(_ on: Bool) {
+    screenProtected = on
+    NotificationCenter.default.removeObserver(
+      self, name: UIScreen.capturedDidChangeNotification, object: nil)
+    if on {
+      NotificationCenter.default.addObserver(
+        self, selector: #selector(screenCaptureChanged),
+        name: UIScreen.capturedDidChangeNotification, object: nil)
+    }
+    updateCaptureCover()
+  }
+
+  @objc private func screenCaptureChanged() {
+    updateCaptureCover()
+  }
+
+  private func updateCaptureCover() {
+    let cover = screenProtected && UIScreen.main.isCaptured
+    if !cover {
+      captureCover?.removeFromSuperview()
+      captureCover = nil
+      return
+    }
+    guard captureCover == nil, let window = activeWindow() else { return }
+    let view = UIView(frame: window.bounds)
+    view.backgroundColor = .black
+    view.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+    window.addSubview(view)
+    captureCover = view
+  }
+
+  private func activeWindow() -> UIWindow? {
+    if let window = self.window {
+      return window
+    }
+    return UIApplication.shared.connectedScenes
+      .compactMap { $0 as? UIWindowScene }
+      .flatMap { $0.windows }
+      .first { $0.isKeyWindow }
   }
 
   private func registerStepUpKeyChannel(with registry: FlutterPluginRegistry) {
