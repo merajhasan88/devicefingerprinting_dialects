@@ -27,6 +27,7 @@ import ast
 import json
 import os
 import random
+import re
 import sqlite3
 import sys
 import time
@@ -4414,6 +4415,19 @@ def _source_measurements():
                 fields.add(probe)
                 fields.update(names)
     found["probe or field"] = fields
+    # What the native collectors put in a report (their result keys), so the
+    # catalog cannot fall behind a collector either.
+    collectors = {
+        "android/app/src/main/kotlin/com/example/devicefingerprinting/IntegrityProbeManager.kt":
+            (r'"([a-z_]+)" to ', r'result\["([a-z_]+)"\]'),
+        "ios/Runner/IntegrityProbeManager.swift": (r'"([a-z_]+)":\s', r'result\["([a-z_]+)"\]'),
+    }
+    sent = set()
+    for path, patterns in collectors.items():
+        text = (DOCS / path).read_text(encoding="utf-8")
+        for pattern in patterns:
+            sent.update(re.findall(pattern, text))
+    found["collector field"] = sent - {"test_fixture"}  # a channel argument, not a measurement
     return found
 
 
