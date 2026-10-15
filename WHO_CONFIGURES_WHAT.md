@@ -18,7 +18,7 @@ even if the same people wear two hats.
 | Party | Decides | Where it lives | Documented today |
 |---|---|---|---|
 | **Us**, the product | how phones are measured and how much each finding weighs; the protocol | code | `DESIGN.md` (internal) |
-| **DBA and business analysts** | what is refused, limited, counted, for how long; what support staff may do to a PIN | `risk_policy_settings`, 117 rows | `INTEGRATION_GUIDE.md` §5 (every row, generated), §7–§13; the rows' own descriptions |
+| **DBA and business analysts** | what is refused, limited, counted, for how long; what support staff may do to a PIN | `risk_policy_settings`, 129 rows | `INTEGRATION_GUIDE.md` §5 (every row, generated), §7–§13; the rows' own descriptions |
 | **DevOps** | running the server: database, Redis, TLS, secrets, rollout modes, the app's identity pins | about 60 environment variables | guide §2–§4, §6 |
 | **App developers** | the app: native keys and collector, SDK calls, the screens users see, release values handed to DevOps | build settings, native modules, UI | scattered through the guide — **no app-developer guide** (gap G3) |
 | **Backend developers** | business events in; the graph, the lapse feed and every integrity report out; the support tool's PIN unlock and reset; route-3 assertions from their identity system | business API, JWKS file | guide §10, §12, §7; [MEASUREMENTS.md](MEASUREMENTS.md) |
@@ -45,7 +45,7 @@ without a policy. A count of `0` switches a rule off. Environment variables answ
 missing row.
 
 <!-- settings-reference:begin (tools/settings_reference.py --write; do not edit by hand) -->
-117 settings, seeded by migrations 003-024 with the owner's defaults; each row's own description.
+129 settings, seeded by migrations 003-024 with the owner's defaults; each row's own description.
 
 **Migration 003** — DBA-tunable risk policy settings
 
@@ -230,19 +230,31 @@ missing row.
 |---|---|---|
 | `optional_measurements` | *(empty)* | Optional measurements asked for on each scan, comma-separated: local_addresses, accessibility, notification_access, other_access, screen_capture, location, mock_location (guide 14). Empty (owner default) = none. Sent only where the app enables it too. *(Seeded by migration 022; this migration describes it.)* |
 | `app_store_installers` | `com.android.vending,com.sec.android.app.samsungapps,com.huawei.appmarket,com.heytap.market,com.oppo.market,com.xiaomi.mipicks,com.amazon.venezia` | App stores by installer package, comma-separated: an app one of them installed is from a store; installed by anything else, sideloaded; a system app is the system's. Add your market's store. |
-| `accessibility_sideloaded_refuses` | `0` | Eligibility rule. 1 = in enforce mode a phone with an Accessibility service on from a sideloaded app is refused (integrity_device_ineligible) until it is off and a new scan is sent; 0 (owner default) = advisory. |
-| `accessibility_non_system_refuses` | `0` | Eligibility rule. 1 = the same for an Accessibility service from any app that is not part of the system, store apps included (screen readers and password managers among them). 0 (owner default) = advisory. |
-| `keyboard_sideloaded_refuses` | `0` | Eligibility rule. 1 = in enforce mode a phone whose keyboard in use is a sideloaded app is refused until another keyboard is chosen and a new scan is sent; 0 (owner default) = advisory. |
-| `keyboard_non_system_refuses` | `0` | Eligibility rule. 1 = the same for a keyboard from any app that is not part of the system, store apps included. 0 (owner default) = advisory. |
-| `notification_access_sideloaded_refuses` | `0` | Eligibility rule. 1 = in enforce mode a phone where a sideloaded app reads notifications is refused until its access is off and a new scan is sent; 0 (owner default) = advisory. |
-| `notification_access_non_system_refuses` | `0` | Eligibility rule. 1 = the same for any app reading notifications that is not part of the system, store apps included (smartwatch apps among them). 0 (owner default) = advisory. |
-| `device_admin_sideloaded_refuses` | `0` | Eligibility rule. 1 = in enforce mode a phone with a sideloaded device-administrator app is refused until it is deactivated and a new scan is sent; 0 (owner default) = advisory. |
-| `device_admin_non_system_refuses` | `0` | Eligibility rule. 1 = the same for any device-administrator app that is not part of the system, store apps included (company phone management among them). 0 (owner default) = advisory. |
-| `remote_access_app_refuses` | `0` | Eligibility rule. 1 = in enforce mode a phone with a remote-control app installed (AnyDesk, TeamViewer QuickSupport, RustDesk, AirDroid) is refused until it is removed and a new scan is sent; 0 (owner default) = advisory. |
-| `screen_capture_refuses` | `0` | Eligibility rule. 1 = in enforce mode a phone whose screen was being recorded or mirrored during the scan is refused until that stops and a new scan is sent; 0 (owner default) = advisory. |
-| `mock_location_refuses` | `0` | Eligibility rule. 1 = in enforce mode a phone whose last location came from a mock-location app is refused until a real location and a new scan are sent; 0 (owner default) = advisory. |
-| `security_patch_max_age_days` | `0` | Days an Android phone's security patch level may age before android_security_patch_outdated (0 points) is recorded. 0 (owner default) = never. 0-3650. |
-| `security_patch_outdated_refuses` | `0` | Eligibility rule. 1 = in enforce mode a phone whose security patch is older than security_patch_max_age_days is refused until it is updated and a new scan is sent; 0 (owner default) = advisory. |
+| `accessibility_sideloaded_refuses` | `0` | Eligibility rule. 1 = in enforce mode a phone with an Accessibility service on from a sideloaded app is refused (integrity_device_ineligible) until it is off and a new scan is sent; 0 (owner default) = no refusal. |
+| `accessibility_non_system_refuses` | `0` | Eligibility rule. 1 = the same for an Accessibility service from any app that is not part of the system, store apps included (screen readers and password managers among them). 0 (owner default) = no refusal. |
+| `keyboard_sideloaded_refuses` | `0` | Eligibility rule. 1 = in enforce mode a phone whose keyboard in use is a sideloaded app is refused until another keyboard is chosen and a new scan is sent; 0 (owner default) = no refusal. |
+| `keyboard_non_system_refuses` | `0` | Eligibility rule. 1 = the same for a keyboard from any app that is not part of the system, store apps included. 0 (owner default) = no refusal. |
+| `notification_access_sideloaded_refuses` | `0` | Eligibility rule. 1 = in enforce mode a phone where a sideloaded app reads notifications is refused until its access is off and a new scan is sent; 0 (owner default) = no refusal. |
+| `notification_access_non_system_refuses` | `0` | Eligibility rule. 1 = the same for any app reading notifications that is not part of the system, store apps included (smartwatch apps among them). 0 (owner default) = no refusal. |
+| `device_admin_sideloaded_refuses` | `0` | Eligibility rule. 1 = in enforce mode a phone with a sideloaded device-administrator app is refused until it is deactivated and a new scan is sent; 0 (owner default) = no refusal. |
+| `device_admin_non_system_refuses` | `0` | Eligibility rule. 1 = the same for any device-administrator app that is not part of the system, store apps included (company phone management among them). 0 (owner default) = no refusal. |
+| `remote_access_app_refuses` | `0` | Eligibility rule. 1 = in enforce mode a phone with a remote-control app installed (AnyDesk, TeamViewer QuickSupport, RustDesk, AirDroid) is refused until it is removed and a new scan is sent; 0 (owner default) = no refusal. |
+| `screen_capture_refuses` | `0` | Eligibility rule. 1 = in enforce mode a phone whose screen was being recorded or mirrored during the scan is refused until that stops and a new scan is sent; 0 (owner default) = no refusal. |
+| `mock_location_refuses` | `0` | Eligibility rule. 1 = in enforce mode a phone whose last location came from a mock-location app is refused until a real location and a new scan are sent; 0 (owner default) = no refusal. |
+| `security_patch_max_age_days` | `365` | Days an Android phone's security patch level may age before android_security_patch_outdated is recorded. Owner default 365; 0 = never. 0-3650. |
+| `security_patch_outdated_refuses` | `0` | Eligibility rule. 1 = in enforce mode a phone whose security patch is older than security_patch_max_age_days is refused until it is updated and a new scan is sent; 0 (owner default) = no refusal. |
+| `accessibility_sideloaded_points` | `45` | Points for android_accessibility_sideloaded: the banking-trojan signature, though a phone maker's preloaded app with no installer looks the same. 0 = recorded only. |
+| `accessibility_non_system_points` | `0` | Points for android_accessibility_non_system: screen readers and password managers from a store hold it too. Owner default 0. Added to the sideloaded points. |
+| `keyboard_sideloaded_points` | `30` | Points for android_keyboard_sideloaded: a keyboard sees everything typed. 0 = recorded only. |
+| `keyboard_non_system_points` | `0` | Points for android_keyboard_non_system: keyboards from a store too. Owner default 0. Added to the sideloaded points. |
+| `notification_access_sideloaded_points` | `30` | Points for android_notification_access_sideloaded: one-time codes arrive as notifications. 0 = recorded only. |
+| `notification_access_non_system_points` | `0` | Points for android_notification_access_non_system: smartwatch apps from a store too. Owner default 0. Added to the sideloaded points. |
+| `device_admin_sideloaded_points` | `30` | Points for android_device_admin_sideloaded: malware uses it to resist removal. 0 = recorded only. |
+| `device_admin_non_system_points` | `0` | Points for android_device_admin_non_system: company phone management too. Owner default 0. Added to the sideloaded points. |
+| `remote_access_app_points` | `20` | Points for android_remote_access_app: installed, not necessarily running. With a sideloaded Accessibility service it reaches review. 0 = recorded only. |
+| `screen_capture_points` | `30` | Points for android_screen_captured and ios_screen_captured: recorded, cast or mirrored during the scan, or another display on. 0 = recorded only. |
+| `mock_location_points` | `40` | Points for android_mock_location and ios_mock_location: a location simulated by an app. 0 = recorded only. |
+| `security_patch_outdated_points` | `10` | Points for android_security_patch_outdated: unpatched phones are legitimate users too, so it nudges, never decides. 0 = recorded only. |
 <!-- settings-reference:end -->
 
 ## 3. DevOps — running the server
@@ -320,8 +332,8 @@ and its W^X baseline (DESIGN.md 62), the iOS team, bundle and signing identifier
 | A catalog of every reason code, observation kind, probe field and context field | [MEASUREMENTS.md](MEASUREMENTS.md) | the gate fails if the source can emit a code it does not name (G5, done) |
 | The OS version and security patch level, a VPN, an HTTP proxy | the `device` and `network` probes, every scan (collectors Android 4, iOS 3) | the report feed; reasons at 0 points (DESIGN.md 80) |
 | Optional: the phone's own IP addresses; the request's source address and User-Agent | `local_addresses` (DBA + app); `source_ip`, `user_agent` in decisions (DBA) | the report feed; SQL (DESIGN.md 80) |
-| Optional: the apps holding Accessibility, the keyboard, notification access, device administration; remote-control apps; screen capture; the last location and whether it was mocked | `accessibility`, `notification_access`, `other_access`, `screen_capture`, `location`, `mock_location` (DBA + app); each app's source judged by the DBA's `app_store_installers` | the report feed; reasons at 0 points with eligibility rules (DESIGN.md 82) |
-| An Android security patch older than the DBA allows | `android_security_patch_outdated` under `security_patch_max_age_days` | reasons; eligibility rule (DESIGN.md 82) |
+| Optional: the apps holding Accessibility, the keyboard, notification access, device administration; remote-control apps; screen capture; the last location and whether it was mocked | `accessibility`, `notification_access`, `other_access`, `screen_capture`, `location`, `mock_location` (DBA + app); each app's source judged by the DBA's `app_store_installers` | the report feed; reasons at the DBA's `*_points` (owner defaults: sideloaded holders 30-45, remote-control apps 20, screen capture 30, mock location 40, an old patch 10, the broad "not part of the system" ones 0) with eligibility rules (DESIGN.md 82) |
+| An Android security patch older than the DBA allows | `android_security_patch_outdated` under `security_patch_max_age_days` (owner default 365) | reasons, 10 points; eligibility rule (DESIGN.md 82) |
 | Where each request came from: a listed VPN, a Tor exit, a hosting network, a VPN exit learned from the deployment's own Android phones | `source_network` in every decision; `vpn_exit_sightings` (learning, DBA) | decisions; SQL (DESIGN.md 81) |
 
 ## 6. Answers to the owner's four questions
@@ -329,7 +341,7 @@ and its W^X baseline (DESIGN.md 62), the iOS team, bundle and signing identifier
 1. **What we fix** — the integrity weights and bands, measurement rules, the protocol and its token
    lifetimes, the invariants. The relationship rules and how long a session lives moved to the DBA in
    migration 021 (G1, G8).
-2. **The DBA's and business analysts' domain** — 117 settings, each with the owner's default and a
+2. **The DBA's and business analysts' domain** — 129 settings, each with the owner's default and a
    description in the row, all of them in the guide, generated from the migrations (G7).
 3. **The app developers' domain** — the native code and a working reference client exist, and the
    client now follows the server's step-up policy (G4); there is still no package to depend on (G2) and

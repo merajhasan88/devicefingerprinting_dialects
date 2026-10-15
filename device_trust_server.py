@@ -1414,6 +1414,18 @@ _RISK_SETTING_KINDS = {
     "mock_location_refuses": "bool",
     "security_patch_max_age_days": "int",
     "security_patch_outdated_refuses": "bool",
+    "accessibility_sideloaded_points": "int",
+    "accessibility_non_system_points": "int",
+    "keyboard_sideloaded_points": "int",
+    "keyboard_non_system_points": "int",
+    "notification_access_sideloaded_points": "int",
+    "notification_access_non_system_points": "int",
+    "device_admin_sideloaded_points": "int",
+    "device_admin_non_system_points": "int",
+    "remote_access_app_points": "int",
+    "screen_capture_points": "int",
+    "mock_location_points": "int",
+    "security_patch_outdated_points": "int",
     "limited_session_paths": "paths",
     "limited_session_integrity_verdicts": "list:elevated,review",
     "limited_session_policy_actions": "list:step_up,review",
@@ -2708,9 +2720,11 @@ def _score_wx_memory(reasons, exec_maps, apk_hash):
 # screen capture: Chameleon, Vultur and RemControl all work through
 # Accessibility. The phone reports which apps hold each of these and who
 # installed them; the server judges the source, so the DBA's app_store_installers
-# decides what a store is. Every finding is advisory (0 points): screen readers,
-# password managers, smartwatch apps and company phone management use the same
-# capabilities. A deployment that wants one off sets its eligibility rule.
+# decides what a store is. Each finding scores the DBA's *_points, seeded with
+# the owner's defaults: the sideloaded holders score, while what screen readers,
+# password managers, store keyboards, smartwatch apps and company phone
+# management also hold stays at 0. A deployment that wants one refused sets its
+# eligibility rule.
 _ACCESS_HOLDERS = (
     # (probe, field, code when sideloaded, code when not the system's, what holds
     # it -- "%s" is "no app store installed" or "that is not part of the system")
@@ -2760,47 +2774,78 @@ def _package_names(entries):
     return shown + (" and %d more" % (len(names) - 5) if len(names) > 5 else "")
 
 
+def _access_points():
+    """Each finding's points: the DBA's settings, the owner's defaults (migration
+    024, DESIGN.md 82)."""
+    return {
+        "android_accessibility_sideloaded": _risk_setting_int("accessibility_sideloaded_points", 45),
+        "android_accessibility_non_system": _risk_setting_int("accessibility_non_system_points", 0),
+        "android_keyboard_sideloaded": _risk_setting_int("keyboard_sideloaded_points", 30),
+        "android_keyboard_non_system": _risk_setting_int("keyboard_non_system_points", 0),
+        "android_notification_access_sideloaded":
+            _risk_setting_int("notification_access_sideloaded_points", 30),
+        "android_notification_access_non_system":
+            _risk_setting_int("notification_access_non_system_points", 0),
+        "android_device_admin_sideloaded": _risk_setting_int("device_admin_sideloaded_points", 30),
+        "android_device_admin_non_system": _risk_setting_int("device_admin_non_system_points", 0),
+        "android_remote_access_app": _risk_setting_int("remote_access_app_points", 20),
+    }
+
+
 def _score_access_holders(reasons, probes):
-    """Advisory reasons for the apps that hold Accessibility, the keyboard,
-    notification access or device administration, and remote-control apps."""
+    """Reasons for the apps that hold Accessibility, the keyboard, notification
+    access or device administration, and for remote-control apps; returns
+    their points."""
     stores = _risk_setting_words("app_store_installers", APP_STORE_INSTALLERS_DEFAULT)
+    points = _access_points()
+    total = 0
     for probe, field, sideloaded_code, non_system_code, what in _ACCESS_HOLDERS:
         value = _probe(probes, probe).get(field)
         entries = _listed_apps([value] if isinstance(value, dict) else value)
         sideloaded = [e for e in entries if _app_source(e, stores) == "sideloaded"]
         not_system = [e for e in entries if e.get("system") is False]
         if sideloaded:
-            _integrity_reason(reasons, sideloaded_code, 0,
-                              "%s: %s (advisory)." % (what % "no app store installed",
-                                                     _package_names(sideloaded)))
+            _integrity_reason(reasons, sideloaded_code, points[sideloaded_code],
+                              "%s: %s." % (what % "no app store installed",
+                                           _package_names(sideloaded)))
+            total += points[sideloaded_code]
         if not_system:
-            _integrity_reason(reasons, non_system_code, 0,
-                              "%s: %s (advisory)." % (what % "that is not part of the system",
-                                                     _package_names(not_system)))
+            _integrity_reason(reasons, non_system_code, points[non_system_code],
+                              "%s: %s." % (what % "that is not part of the system",
+                                           _package_names(not_system)))
+            total += points[non_system_code]
     remote = _listed_apps(_probe(probes, "other_access").get("remote_access_apps"))
     if remote:
-        _integrity_reason(reasons, "android_remote_access_app", 0,
-                          "A remote-control app is installed: %s (advisory)." % _package_names(remote))
+        _integrity_reason(reasons, "android_remote_access_app", points["android_remote_access_app"],
+                          "A remote-control app is installed: %s." % _package_names(remote))
+        total += points["android_remote_access_app"]
+    return total
 
 
 def _score_capture_and_location(reasons, probes, platform):
-    """Advisory reasons for a screen being recorded or mirrored during the scan,
-    and for a location that came from a mock-location app (DESIGN.md 82)."""
+    """Reasons for a screen recorded or mirrored during the scan, and for a
+    location simulated by an app (DESIGN.md 82); returns their points."""
+    total = 0
     screen = _probe(probes, "screen_capture")
     displays = _as_int(screen.get("external_displays"))
     if _as_bool(screen.get("recording")) or displays > 0:
+        points = _risk_setting_int("screen_capture_points", 30)
         _integrity_reason(reasons,
                           "android_screen_captured" if platform == "android" else "ios_screen_captured",
-                          0,
-                          ("The app's screen was being recorded or mirrored during the scan "
-                           "(advisory)." if _as_bool(screen.get("recording")) else
+                          points,
+                          ("The app's screen was being recorded or mirrored during the scan."
+                           if _as_bool(screen.get("recording")) else
                            "%d display(s) besides the phone's own were on during the scan: "
-                           "casting, mirroring or an external screen (advisory)." % displays))
+                           "casting, mirroring or an external screen." % displays))
+        total += points
     if _as_bool(_probe(probes, "mock_location").get("mock")):
+        points = _risk_setting_int("mock_location_points", 40)
         _integrity_reason(reasons,
                           "android_mock_location" if platform == "android" else "ios_mock_location",
-                          0,
-                          "The phone's last location was simulated by an app (advisory).")
+                          points,
+                          "The phone's last location was simulated by an app.")
+        total += points
+    return total
 
 
 def _security_patch_age_days(device):
@@ -2816,13 +2861,17 @@ def _security_patch_age_days(device):
 
 def _score_security_patch(reasons, probes):
     """The security patch level, sent by every collector from Android 4, against
-    the DBA's security_patch_max_age_days (owner default 0: never)."""
-    limit = _risk_setting_int("security_patch_max_age_days", 0)
+    the DBA's security_patch_max_age_days (owner default 365; 0 = never);
+    returns its points."""
+    limit = _risk_setting_int("security_patch_max_age_days", 365)
     age = _security_patch_age_days(_probe(probes, "device"))
     if limit > 0 and age is not None and age > limit:
-        _integrity_reason(reasons, "android_security_patch_outdated", 0,
-                          "The security patch level is %d days old, more than the %d allowed "
-                          "(advisory)." % (age, limit))
+        points = _risk_setting_int("security_patch_outdated_points", 10)
+        _integrity_reason(reasons, "android_security_patch_outdated", points,
+                          "The security patch level is %d days old, more than the %d allowed."
+                          % (age, limit))
+        return points
+    return 0
 
 
 def _score_android_integrity(probes):
@@ -3098,11 +3147,11 @@ def _score_android_integrity(probes):
         _integrity_reason(reasons, "android_http_proxy", 0,
                           "An HTTP proxy is configured on this phone (advisory).")
 
-    # Optional measurements and the patch level (DESIGN.md 82): advisory, each
-    # with an eligibility rule the DBA turns on.
-    _score_access_holders(reasons, probes)
-    _score_capture_and_location(reasons, probes, "android")
-    _score_security_patch(reasons, probes)
+    # Optional measurements and the patch level (DESIGN.md 82): the DBA's
+    # points, each with an eligibility rule the DBA turns on.
+    score += _score_access_holders(reasons, probes)
+    score += _score_capture_and_location(reasons, probes, "android")
+    score += _score_security_patch(reasons, probes)
 
     return score, hard_block, reasons
 
@@ -3273,7 +3322,7 @@ def _score_ios_integrity(probes):
                           "An HTTP proxy is configured on this phone (advisory).")
 
     # iOS shows an app no other app, so only these two (DESIGN.md 82).
-    _score_capture_and_location(reasons, probes, "ios")
+    score += _score_capture_and_location(reasons, probes, "ios")
 
     return score, hard_block, reasons
 

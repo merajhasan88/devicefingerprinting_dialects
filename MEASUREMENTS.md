@@ -199,22 +199,27 @@ incomplete scans in a row, under either setting.
 | `ios_app_code_modified` | 90 |  | until enabled | iOS | The application's own code differs in memory from its packaged image. |
 | `ios_vpn_active` | 0 |  |  | iOS | A VPN appears to be active on this phone (advisory, inferred). Eligibility rule: `vpn_active_refuses`. |
 | `ios_http_proxy` | 0 |  |  | iOS | An HTTP proxy is configured on this phone (advisory). Eligibility rule: `http_proxy_refuses`. |
-| `android_accessibility_sideloaded` | 0 |  |  | Android | An Accessibility service is on from an app no app store installed (advisory). Eligibility rule: `accessibility_sideloaded_refuses`. |
-| `android_accessibility_non_system` | 0 |  |  | Android | An Accessibility service is on from an app that is not part of the system, store apps included (advisory). Eligibility rule: `accessibility_non_system_refuses`. |
-| `android_keyboard_sideloaded` | 0 |  |  | Android | The keyboard in use is an app no app store installed (advisory). Eligibility rule: `keyboard_sideloaded_refuses`. |
-| `android_keyboard_non_system` | 0 |  |  | Android | The keyboard in use is not part of the system (advisory). Eligibility rule: `keyboard_non_system_refuses`. |
-| `android_notification_access_sideloaded` | 0 |  |  | Android | An app no app store installed can read notifications (advisory). Eligibility rule: `notification_access_sideloaded_refuses`. |
-| `android_notification_access_non_system` | 0 |  |  | Android | An app that is not part of the system can read notifications (advisory). Eligibility rule: `notification_access_non_system_refuses`. |
-| `android_device_admin_sideloaded` | 0 |  |  | Android | A device-administrator app no app store installed is active (advisory). Eligibility rule: `device_admin_sideloaded_refuses`. |
-| `android_device_admin_non_system` | 0 |  |  | Android | A device-administrator app that is not part of the system is active (advisory). Eligibility rule: `device_admin_non_system_refuses`. |
-| `android_remote_access_app` | 0 |  |  | Android | A remote-control app is installed (advisory). Eligibility rule: `remote_access_app_refuses`. |
-| `android_screen_captured` | 0 |  |  | Android | The app's screen was being recorded, or shown on another display, during the scan (advisory). Eligibility rule: `screen_capture_refuses`. |
-| `ios_screen_captured` | 0 |  |  | iOS | The same on iOS (advisory). Eligibility rule: `screen_capture_refuses`. |
-| `android_mock_location` | 0 |  |  | Android | The phone's last location came from a mock-location app (advisory). Eligibility rule: `mock_location_refuses`. |
-| `ios_mock_location` | 0 |  |  | iOS | The phone's last location was simulated by software (advisory). Eligibility rule: `mock_location_refuses`. |
-| `android_security_patch_outdated` | 0 |  |  | Android | The security patch level is older than `security_patch_max_age_days` (owner default 0: never) (advisory). Eligibility rule: `security_patch_outdated_refuses`. |
+| `android_accessibility_sideloaded` | `accessibility_sideloaded_points` 45 |  |  | Android | An Accessibility service is on in an app no app store installed: the banking-trojan signature, though a phone maker's preloaded app with no installer looks the same. Eligibility rule: `accessibility_sideloaded_refuses`. |
+| `android_accessibility_non_system` | `accessibility_non_system_points` 0 |  |  | Android | An Accessibility service is on in an app that is not part of the system, store apps included: screen readers and password managers too. Eligibility rule: `accessibility_non_system_refuses`. |
+| `android_keyboard_sideloaded` | `keyboard_sideloaded_points` 30 |  |  | Android | The keyboard in use is an app no app store installed; a keyboard sees everything typed. Eligibility rule: `keyboard_sideloaded_refuses`. |
+| `android_keyboard_non_system` | `keyboard_non_system_points` 0 |  |  | Android | The keyboard in use is not part of the system, store keyboards included. Eligibility rule: `keyboard_non_system_refuses`. |
+| `android_notification_access_sideloaded` | `notification_access_sideloaded_points` 30 |  |  | Android | An app no app store installed can read notifications, one-time codes among them. Eligibility rule: `notification_access_sideloaded_refuses`. |
+| `android_notification_access_non_system` | `notification_access_non_system_points` 0 |  |  | Android | An app that is not part of the system can read notifications: smartwatch apps too. Eligibility rule: `notification_access_non_system_refuses`. |
+| `android_device_admin_sideloaded` | `device_admin_sideloaded_points` 30 |  |  | Android | A device-administrator app no app store installed is active; malware uses it to resist removal. Eligibility rule: `device_admin_sideloaded_refuses`. |
+| `android_device_admin_non_system` | `device_admin_non_system_points` 0 |  |  | Android | A device-administrator app that is not part of the system is active: company phone management too. Eligibility rule: `device_admin_non_system_refuses`. |
+| `android_remote_access_app` | `remote_access_app_points` 20 |  |  | Android | A remote-control app is installed (not necessarily running). Eligibility rule: `remote_access_app_refuses`. |
+| `android_screen_captured` | `screen_capture_points` 30 |  |  | Android | The app's screen was being recorded, or another display was on, during the scan. Eligibility rule: `screen_capture_refuses`. |
+| `ios_screen_captured` | `screen_capture_points` 30 |  |  | iOS | The screen was recorded, mirrored or on AirPlay, or another screen attached, during the scan. Eligibility rule: `screen_capture_refuses`. |
+| `android_mock_location` | `mock_location_points` 40 |  |  | Android | The phone's last location came from a mock-location app. Eligibility rule: `mock_location_refuses`. |
+| `ios_mock_location` | `mock_location_points` 40 |  |  | iOS | The phone's last location was simulated by software. Eligibility rule: `mock_location_refuses`. |
+| `android_security_patch_outdated` | `security_patch_outdated_points` 10 |  |  | Android | The security patch level is older than `security_patch_max_age_days` (owner default 365; 0 = never). Eligibility rule: `security_patch_outdated_refuses`. |
 
-An app's source, for the `_sideloaded` rules (DESIGN.md 82): **system** where the phone marks it part of
+These fourteen score the DBA's `*_points` (owner defaults shown; DESIGN.md 82): the sideloaded holders and
+the deliberate manipulations score, while what screen readers, password managers, store keyboards,
+smartwatch apps and company phone management also hold stays at 0. A sideloaded app is also not part of
+the system, so its two findings add up.
+
+An app's source, for the `_sideloaded` findings (DESIGN.md 82): **system** where the phone marks it part of
 the system; **store** where its installer is one of `app_store_installers` (owner default: Google Play,
 Samsung Galaxy Store, Huawei AppGallery, the HeyTap and OPPO markets, Xiaomi GetApps, Amazon Appstore —
 add your market's own); **sideloaded** where anything else or nothing installed it — a browser, a file
@@ -330,7 +335,7 @@ stay optional, and the parties who answer for them switch them on.
 | `source_ip` — the address a request came from, as the server sees it (behind the configured proxies) | the DBA: `record_source_ip` | each risk decision's context |
 | `user_agent` — the request's User-Agent header, cut at 256 characters | the DBA: `record_user_agent`. The Flutter client sends `Dart/<version> (dart:io)` unless the app sets its own | each risk decision's context |
 | `vpn_active`, `http_proxy_configured` | always measured by current collectors (a yes/no, no address) | the `network` probe; reasons at 0 points; eligibility rules `vpn_active_refuses`, `http_proxy_refuses` |
-| `accessibility`, `notification_access`, `other_access` — which apps can read the screen, the keyboard, the notifications, or administer or remotely control the phone (Android) | **both**, as for `local_addresses`: the DBA lists it, the app enables it (the reference app: `MEASURE_ACCESSIBILITY`, `MEASURE_NOTIFICATION_ACCESS`, `MEASURE_OTHER_ACCESS`). A person's Accessibility services can reveal a disability | the report's `probe_results`; reasons at 0 points with eligibility rules (§2) |
+| `accessibility`, `notification_access`, `other_access` — which apps can read the screen, the keyboard, the notifications, or administer or remotely control the phone (Android) | **both**, as for `local_addresses`: the DBA lists it, the app enables it (the reference app: `MEASURE_ACCESSIBILITY`, `MEASURE_NOTIFICATION_ACCESS`, `MEASURE_OTHER_ACCESS`). A person's Accessibility services can reveal a disability | the report's `probe_results`; reasons at the DBA's points with eligibility rules (§2) |
 | `screen_capture` — the screen recorded, cast or mirrored during the scan | **both** (`MEASURE_SCREEN_CAPTURE`); Android 15 and later also need the app to declare `DETECT_SCREEN_RECORDING`, a normal permission | as above |
 | `location` — the last location the phone knows; `mock_location` — whether it was simulated | **both** (`MEASURE_LOCATION`, `MEASURE_MOCK_LOCATION`), **and** the person grants the app the OS location permission, which only the app asks for. Without it the probe answers `permission: none` and nothing else | the report's `probe_results`; `mock_location` has its reason and eligibility rule |
 

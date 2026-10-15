@@ -754,7 +754,10 @@ IOS_CLEAN = {
 VOLUNTEERED_CLEAN = {
     "android": {
         "device": {"status": "ok", "release": "14", "sdk_int": 34,
-                   "security_patch": "2026-09-05", "manufacturer": "Conformance",
+                   # A month old, always: an older one would score
+                   # android_security_patch_outdated (DESIGN.md 82).
+                   "security_patch": time.strftime("%Y-%m-%d", time.gmtime(time.time() - 30 * 86400)),
+                   "manufacturer": "Conformance",
                    "brand": "conformance", "model": "Suite", "device": "suite",
                    "build_id": "SUITE.1",
                    "fingerprint": "conformance/suite/suite:14/SUITE.1/1:user/release-keys"},
@@ -1483,10 +1486,12 @@ def check_optional_measurements(api, ctx):
 @check("integrity: an app holding Accessibility is judged by its source; its rule refuses")
 def check_access_holders(api, ctx):
     """DESIGN.md 82. Where the DBA requests accessibility, a sideloaded app with
-    an Accessibility service on is recorded as android_accessibility_sideloaded
-    at 0 points; with accessibility_sideloaded_refuses set it is refused in
-    enforce mode (integrity_device_ineligible, with a remedy) and reported in
-    observe mode; a scan without it clears it. Skips unless requested."""
+    an Accessibility service on scores android_accessibility_sideloaded at the
+    DBA's accessibility_sideloaded_points (owner default 45: a step-up), plus
+    accessibility_non_system_points (0); with accessibility_sideloaded_refuses
+    set it is refused in enforce mode (integrity_device_ineligible, with a
+    remedy) and reported in observe mode; a scan without it clears it. Skips
+    unless requested."""
     settings = live_settings(api)
     if "accessibility" not in _setting_words(settings, "optional_measurements", ""):
         raise Skip("the DBA does not request accessibility; add it to optional_measurements "
@@ -1506,19 +1511,27 @@ def check_access_holders(api, ctx):
 
     decision = submit_report(api, inst, token, trojan, enabled=("accessibility",))
     points = {r["code"]: r["points"] for r in decision.get("reasons", [])}
-    expect(points.get("android_accessibility_sideloaded") == 0
-           and points.get("android_accessibility_non_system") == 0
-           and decision["score"] == plain["score"] and decision["verdict"] == plain["verdict"],
-           "a sideloaded Accessibility service is recorded at 0 points: %s, score %s -> %s"
-           % (points, plain["score"], decision["score"]))
+    side = int(str(settings.get("accessibility_sideloaded_points", "45")).strip() or "45")
+    wide = int(str(settings.get("accessibility_non_system_points", "0")).strip() or "0")
+    expect(points.get("android_accessibility_sideloaded") == side
+           and points.get("android_accessibility_non_system") == wide
+           and decision["score"] == min(100, plain["score"] + side + wide),
+           "a sideloaded Accessibility service scores %d + %d: %s, score %s -> %s"
+           % (side, wide, points, plain["score"], decision["score"]))
     st, pl = protected(api, inst, "GET", "/v1/account/me", access)
     rule = "accessibility_sideloaded_refuses"
-    if _setting_on(settings, rule) and ctx["mode"] == "enforce":
+    if ctx["mode"] == "enforce" and decision["verdict"] in ("review", "block"):
+        expect(st == 403, "a %s verdict is refused, got %s %s"
+               % (decision["verdict"], st, error_code(pl)))
+    elif _setting_on(settings, rule) and ctx["mode"] == "enforce":
         found = ((pl.get("error") or {}).get("details") or {}).get("eligibility") or []
         expect(st == 403 and error_code(pl) == "integrity_device_ineligible"
                and rule in [e.get("rule") for e in found] and all(e.get("remedy") for e in found),
                "expected 403 integrity_device_ineligible naming %s, got %s %s %s"
                % (rule, st, error_code(pl), found))
+    elif ctx["mode"] == "enforce" and decision["verdict"] == "elevated":
+        expect(st == 403 and error_code(pl) == "integrity_step_up_required",
+               "an elevated verdict asks for a step-up, got %s %s" % (st, error_code(pl)))
     else:
         found = [e.get("rule") for e in (pl.get("integrity") or {}).get("eligibility") or []]
         expect(st == 200 and (rule in found) == _setting_on(settings, rule),

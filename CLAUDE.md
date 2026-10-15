@@ -161,7 +161,8 @@ not jailbroken). The emulator AVD `integrity_root_lab` is the disposable root la
 See the end of DESIGN.md: section 82 records six optional measurements — the apps holding
 Accessibility, the keyboard, notification access and device administration with their source (system,
 store by the DBA's `app_store_installers`, sideloaded), remote-control apps, screen capture, the location
-and mock locations — each finding 0 points with an eligibility rule, the security patch age rule, the
+and mock locations — each finding at the DBA's points (owner defaults: sideloaded holders 30-45, the broad
+ones 0) with an eligibility rule, the security patch age rule (365 days, 10 points), the
 protected app PIN entry, and that deleting VPN sightings is the DBA's job (schema 24; collectors
 Android 5, iOS 4 — the Swift not yet compiled); section 81 records the source-network signals — public VPN, data-centre and
 Tor lists shipped with the server, and VPN exits learned from the deployment's own Android phones

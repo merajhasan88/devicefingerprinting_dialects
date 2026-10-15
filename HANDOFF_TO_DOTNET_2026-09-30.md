@@ -602,7 +602,9 @@ probes, listed in `optional_probes` only where the DBA requests them, never requ
   location only from the last known fix. MEASUREMENTS.md §1 has the exact shapes.
 - **iOS** answers `unsupported` for the three Android-only ones, and its `device` probe may add
   `os_build`.
-- **New reasons** at 0 points with eligibility refusals (403 `integrity_device_ineligible`, show
+- **New reasons**, scored at the DBA's points (owner defaults: the `_sideloaded` holders 30-45, remote-control
+  apps 20, screen capture 30, mock location 40, an old patch 10, the `_non_system` ones 0), with eligibility
+  refusals (403 `integrity_device_ineligible`, show
   `details.eligibility[].remedy`): `android_accessibility_sideloaded`/`_non_system`,
   `android_keyboard_sideloaded`/`_non_system`, `android_notification_access_sideloaded`/`_non_system`,
   `android_device_admin_sideloaded`/`_non_system`, `android_remote_access_app`,

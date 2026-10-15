@@ -4582,7 +4582,8 @@ def the_network_probe_is_measured_and_advisory():
     measured = {
         "android": ({"status": "ok", "vpn_active": True, "http_proxy_configured": True,
                      "transports": ["wifi", "vpn"], "interfaces": ["wlan0", "tun0"]},
-                    {"status": "ok", "release": "9", "sdk_int": 28, "security_patch": "2020-04-05",
+                    {"status": "ok", "release": "9", "sdk_int": 28,
+                     "security_patch": (s._utc_now() - timedelta(days=30)).strftime("%Y-%m-%d"),
                      "manufacturer": "OPPO", "brand": "OPPO", "model": "CPH2083",
                      "device": "OP4BA5L1", "build_id": "PPR1.180610.011",
                      "fingerprint": "OPPO/CPH2083/OP4BA5L1:9/PPR1.180610.011/1:user/release-keys"}),
@@ -4764,8 +4765,11 @@ def apps_holding_access_are_judged_by_their_source():
     """DESIGN.md 82. The phone lists the apps holding Accessibility, the
     keyboard, notification access and device administration with their
     installers; the server judges each: the system's, from a store (the DBA's
-    app_store_installers), sideloaded, or unknown -- never evidence. Every
-    finding is advisory: the score and verdict do not move."""
+    app_store_installers), sideloaded, or unknown -- never evidence. Each
+    finding scores the DBA's points, seeded with the owner's defaults: the
+    sideloaded holders and remote-control apps score, the broad "not part of
+    the system" findings stay at 0; a sideloaded Accessibility service alone
+    asks for a step-up, with a remote-control app it reaches review."""
     system = _app("com.android.talkback", True, "com.android.vending", "a.TalkBack")
     store = _app("com.bitwarden.app", False, "com.android.vending", "b.Autofill")
     dropped = _app("com.evil.reader", False, "com.cleaner.dropper", "c.Svc")
@@ -4783,10 +4787,18 @@ def apps_holding_access_are_judged_by_their_source():
         status, plain = send_report("android", clean("android"))
         status, payload = send_report("android", probes)
         found = _reasons_by_code(payload)
-        expect(status == 200 and payload["integrity"]["score"] == plain["integrity"]["score"]
-               and payload["integrity"]["verdict"] == plain["integrity"]["verdict"]
-               and all(found[code]["points"] == 0 for code in found if code not in codes(plain)),
-               "advisory only: %s %s" % (status, payload.get("integrity")))
+        defaults = {"android_accessibility_sideloaded": 45, "android_accessibility_non_system": 0,
+                    "android_keyboard_sideloaded": 30, "android_keyboard_non_system": 0,
+                    "android_notification_access_sideloaded": 30,
+                    "android_notification_access_non_system": 0,
+                    "android_device_admin_sideloaded": 30, "android_device_admin_non_system": 0,
+                    "android_remote_access_app": 20}
+        expect(status == 200 and {code: found.get(code, {}).get("points") for code in defaults} == defaults
+               and payload["integrity"]["score"]
+               == min(100, plain["integrity"]["score"] + sum(defaults.values())),
+               "the owner's default points: %s, score %s" % (
+                   {code: found[code]["points"] for code in found if code not in codes(plain)},
+                   payload["integrity"]["score"]))
         for prefix in ("android_accessibility", "android_notification_access",
                        "android_device_admin", "android_keyboard"):
             side, wide = found.get(prefix + "_sideloaded"), found.get(prefix + "_non_system")
@@ -4801,6 +4813,23 @@ def apps_holding_access_are_judged_by_their_source():
                        "%s: not the system's names store apps too: %s" % (prefix, wide["message"]))
         expect("com.anydesk.anydeskandroid" in (found.get("android_remote_access_app") or {}).get("message", ""),
                "a remote-control app is named: %s" % sorted(found))
+    # Alone, a sideloaded Accessibility service asks for a step-up; with a
+    # remote-control app it reaches review. The DBA changes either weight.
+    alone = dict(clean("android"), accessibility={"status": "ok", "services": [by_adb]})
+    paired = dict(alone, other_access={"status": "ok", "device_admins": [],
+                                       "remote_access_apps": [_app("com.carriez.flutter_hbb", False, "")]})
+    with policy(optional_measurements=_ALL_OPTIONAL):
+        verdicts = [send_report("android", probes)[1]["integrity"] for probes in (alone, paired)]
+        expect([(v["score"], v["verdict"]) for v in verdicts] == [(45, "elevated"), (65, "review")],
+               "45 asks for a step-up, 65 reaches review: %s"
+               % [(v["score"], v["verdict"]) for v in verdicts])
+    with policy(optional_measurements=_ALL_OPTIONAL, accessibility_sideloaded_points=7,
+                accessibility_non_system_points=5, remote_access_app_points=0):
+        found = _reasons_by_code(send_report("android", paired)[1])
+        expect([found[c]["points"] for c in ("android_accessibility_sideloaded",
+                                             "android_accessibility_non_system",
+                                             "android_remote_access_app")] == [7, 5, 0],
+               "the DBA's points apply: %s" % {c: found[c]["points"] for c in found})
     # The DBA decides what a store is.
     with policy(optional_measurements=_ALL_OPTIONAL,
                 app_store_installers="com.android.vending,com.cleaner.dropper"):
@@ -4832,11 +4861,12 @@ def apps_holding_access_are_judged_by_their_source():
 
 
 @check
-def screen_capture_and_mock_locations_are_advisory_and_coordinates_bounded():
-    """DESIGN.md 82. A screen recorded, cast or mirrored during the scan, and a
-    location simulated by an app, are recorded at 0 points on both platforms.
-    Coordinates are stored as sent when requested; one outside its range, of
-    the wrong type, or not finite makes the report malformed."""
+def screen_capture_and_mock_locations_score_and_coordinates_are_bounded():
+    """DESIGN.md 82. A screen recorded, cast or mirrored during the scan scores
+    screen_capture_points (owner default 30), a location simulated by an app
+    mock_location_points (40), on both platforms. Coordinates are stored as
+    sent when requested; one outside its range, of the wrong type, or not
+    finite makes the report malformed."""
     fix = {"status": "ok", "permission": "precise", "latitude": -33.8688, "longitude": 151.2093,
            "accuracy_m": 12.5, "age_seconds": 40, "provider": "gps"}
     with policy(optional_measurements=_ALL_OPTIONAL):
@@ -4848,15 +4878,16 @@ def screen_capture_and_mock_locations_are_advisory_and_coordinates_bounded():
                                      ({"status": "ok", "external_displays": 0}, False)):
                 status, payload = send_report(platform, dict(clean(platform), screen_capture=screen))
                 found = _reasons_by_code(payload).get("%s_screen_captured" % platform)
-                expect(status == 200 and bool(found) == expected and (not found or found["points"] == 0)
-                       and payload["integrity"]["score"] == plain["integrity"]["score"],
+                expect(status == 200 and bool(found) == expected and (not found or found["points"] == 30)
+                       and payload["integrity"]["score"]
+                       == min(100, plain["integrity"]["score"] + (30 if expected else 0)),
                        "%s: %s -> captured=%s: %s" % (platform, screen, expected, codes(payload)))
             for mock, expected in ((True, True), (False, False)):
                 status, payload = send_report(platform, dict(
                     clean(platform), mock_location={"status": "ok", "permission": "precise", "mock": mock,
                                                     "age_seconds": 5}))
                 found = _reasons_by_code(payload).get("%s_mock_location" % platform)
-                expect(status == 200 and bool(found) == expected,
+                expect(status == 200 and bool(found) == expected and (not found or found["points"] == 40),
                        "%s: mock=%s: %s" % (platform, mock, codes(payload)))
             status, payload = send_report(platform, dict(
                 clean(platform), mock_location={"status": "ok", "permission": "none"},
@@ -4867,6 +4898,14 @@ def screen_capture_and_mock_locations_are_advisory_and_coordinates_bounded():
         status, payload = send_report("android", dict(clean("android"), location=fix))
         expect(status == 200 and (_stored_probes() or {}).get("location") == fix,
                "coordinates stored as sent: %s" % status)
+    with policy(optional_measurements=_ALL_OPTIONAL, screen_capture_points=0, mock_location_points=12):
+        found = _reasons_by_code(send_report("android", dict(
+            clean("android"), screen_capture={"status": "ok", "recording": True, "external_displays": 0},
+            mock_location={"status": "ok", "permission": "precise", "mock": True}))[1])
+        expect(found["android_screen_captured"]["points"] == 0
+               and found["android_mock_location"]["points"] == 12,
+               "the DBA's points apply: %s" % {c: found[c]["points"] for c in found})
+    with policy(optional_measurements=_ALL_OPTIONAL):
         for field, bad in (("latitude", 90.5), ("latitude", "51.5"), ("longitude", -180.01),
                            ("longitude", True), ("latitude", float("nan")),
                            ("accuracy_m", -1), ("age_seconds", -3)):
@@ -4878,9 +4917,9 @@ def screen_capture_and_mock_locations_are_advisory_and_coordinates_bounded():
 @check
 def an_outdated_security_patch_is_the_dbas_rule():
     """DESIGN.md 82. Android has sent its security patch level since
-    collector 4. Older than security_patch_max_age_days it is recorded at 0
-    points; the owner's default 0 never records it; an unreadable or future
-    level is no finding."""
+    collector 4. Older than security_patch_max_age_days (owner default 365; 0
+    = never) it scores security_patch_outdated_points (10); an unreadable or
+    future level is no finding."""
     def scan(level, **settings):
         device = {"status": "ok", "release": "9", "sdk_int": 28, "security_patch": level}
         with policy(**settings):
@@ -4891,10 +4930,14 @@ def an_outdated_security_patch_is_the_dbas_rule():
     recent = (s._utc_now() - timedelta(days=100)).strftime("%Y-%m-%d")
     future = (s._utc_now() + timedelta(days=40)).strftime("%Y-%m-%d")
     found, payload = scan(old)
-    expect(found is None, "owner default 0: never recorded")
-    found, payload = scan(old, security_patch_max_age_days=365)
-    expect(found is not None and found["points"] == 0 and "400 days" in found["message"]
-           and "365" in found["message"], "400 days > 365: %s" % found)
+    expect(found is not None and found["points"] == 10 and "400 days" in found["message"]
+           and "365" in found["message"], "owner defaults, 400 days > 365: 10 points: %s" % found)
+    found, payload = scan(old, security_patch_max_age_days=0)
+    expect(found is None, "0 = never recorded")
+    found, payload = scan(old, security_patch_max_age_days=500)
+    expect(found is None, "400 days within 500: no finding")
+    found, payload = scan(old, security_patch_outdated_points=0)
+    expect(found is not None and found["points"] == 0, "the DBA's points apply: %s" % found)
     for level in (recent, future, "", "2020-13-45", "April 2020"):
         found, payload = scan(level, security_patch_max_age_days=365)
         expect(found is None, "patch %r: no finding" % level)
