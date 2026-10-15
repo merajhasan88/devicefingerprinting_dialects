@@ -498,9 +498,10 @@ class IntegrityProbeManager(
     /**
      * Whether this app's window is being recorded (Android 15 and later, with
      * DETECT_SCREEN_RECORDING, a normal permission the app declares), and how
-     * many displays besides the phone's own show content: casting, mirroring,
-     * an external screen. Below Android 15 recording is left out - unknown,
-     * not "no".
+     * many displays besides the phone's own are on and public: casting,
+     * mirroring, an external screen - which this cannot tell apart. A display
+     * that is off (a foldable's other screen) or private to another app is
+     * not counted. Below Android 15 recording is left out - unknown, not "no".
      */
     private fun probeScreenCapture(): Map<String, Any> {
         val result = linkedMapOf<String, Any>("status" to "ok")
@@ -519,7 +520,10 @@ class IntegrityProbeManager(
         }
         val displays = (context.getSystemService(Context.DISPLAY_SERVICE) as? DisplayManager)?.displays
             ?: return unavailable("DisplayManager is not available")
-        result["external_displays"] = displays.count { it.displayId != Display.DEFAULT_DISPLAY }
+        result["external_displays"] = displays.count {
+            it.displayId != Display.DEFAULT_DISPLAY && it.state == Display.STATE_ON &&
+                (it.flags and Display.FLAG_PRIVATE) == 0
+        }
         return result
     }
 
