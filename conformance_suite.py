@@ -767,11 +767,30 @@ VOLUNTEERED_CLEAN = {
                     "scoped_interfaces": ["en0", "pdp_ip0"]},
     },
 }
-# An optional measurement as an app that enabled it answers (DESIGN.md 80).
+# An optional measurement as an app that enabled it answers (DESIGN.md 80, 82),
+# in the server's order. The phone's own keyboard and nothing else holding
+# access: a clean phone.
+OPTIONAL_NAMES = ("local_addresses", "accessibility", "notification_access", "other_access",
+                  "screen_capture", "location", "mock_location")
 OPTIONAL_CLEAN = {
     "local_addresses": {"status": "ok",
                         "addresses": [{"interface": "wlan0", "address": "192.0.2.10"}]},
+    "accessibility": {"status": "ok", "services": [], "settings_only": [],
+                      "keyboard": {"package": "com.google.android.inputmethod.latin",
+                                   "service": "com.android.inputmethod.latin.LatinIME",
+                                   "system": True, "installer": "com.android.vending"}},
+    "notification_access": {"status": "ok", "listeners": []},
+    "other_access": {"status": "ok", "device_admins": [], "remote_access_apps": []},
+    "screen_capture": {"status": "ok", "recording": False, "external_displays": 0},
+    "location": {"status": "ok", "permission": "approximate", "latitude": 51.5072,
+                 "longitude": -0.1276, "accuracy_m": 2000.0, "age_seconds": 120,
+                 "provider": "network"},
+    "mock_location": {"status": "ok", "permission": "approximate", "mock": False,
+                      "age_seconds": 120},
 }
+# A sideloaded app with an Accessibility service on: what banking trojans use.
+SIDELOADED_SERVICE = {"package": "com.conformance.reader", "service": "com.conformance.reader.Svc",
+                      "system": False, "installer": ""}
 
 
 def clean_probes(required, cert=None, platform="android"):
@@ -925,10 +944,10 @@ def submit_report(api, installation, token, mutate=None, cert=None, enabled=()):
         "challenge_nonce": challenge["nonce"],
         "installation_id": installation.installation_id,
         "platform": challenge["platform"],
-        # The current collectors, Android 4 and iOS 3 (DESIGN.md 80), meet
+        # The current collectors, Android 5 and iOS 4 (DESIGN.md 82), meet
         # evidence contracts 3 and 2 (DESIGN.md 76); an older version is
         # scored but labelled legacy.
-        "collector_version": {"android": 4, "ios": 3}.get(challenge["platform"], 1),
+        "collector_version": {"android": 5, "ios": 4}.get(challenge["platform"], 1),
         "collected_at": int(time.time()),
         "probe_results": probes,
         "version": 1,
@@ -1430,7 +1449,7 @@ def check_optional_measurements(api, ctx):
     the app sends is stored only while the DBA requests it."""
     integrity_context(ctx)
     settings = live_settings(api)
-    requested = [name for name in ("local_addresses",)
+    requested = [name for name in OPTIONAL_NAMES
                  if name in _setting_words(settings, "optional_measurements", "")]
     inst = Installation()
     st, pl = enrol(api, inst, fresh_hint())
@@ -1448,16 +1467,66 @@ def check_optional_measurements(api, ctx):
     business = os.environ.get("DEVICE_TRUST_BUSINESS_TOKEN", "")
     if not business:
         return
-    # The app enabled it; whether it is kept is the DBA's request alone.
+    # The app enabled them all; whether each is kept is the DBA's request alone.
     submit_report(api, inst, token, lambda probes: probes.update(
-        local_addresses=copy.deepcopy(OPTIONAL_CLEAN["local_addresses"])))
+        {name: copy.deepcopy(OPTIONAL_CLEAN[name]) for name in OPTIONAL_NAMES}))
     st, feed = api.call("GET", "/v1/business/integrity-reports?" + urllib.parse.urlencode(
         {"device_id": inst.device_id, "limit": "10"}),
         headers={"Authorization": "Bearer " + business})
     latest = (feed.get("reports") or [{}])[-1].get("probe_results") or {}
-    expect(st == 200 and ("local_addresses" in latest) == bool(requested),
-           "local_addresses must be stored exactly while requested (%s): %s"
+    expect(st == 200 and {name for name in OPTIONAL_NAMES if name in latest} == set(requested)
+           and all(latest[name] == OPTIONAL_CLEAN[name] for name in requested),
+           "each optional measurement must be stored exactly while requested (%s): %s"
            % (requested, sorted(latest)))
+
+
+@check("integrity: an app holding Accessibility is judged by its source; its rule refuses")
+def check_access_holders(api, ctx):
+    """DESIGN.md 82. Where the DBA requests accessibility, a sideloaded app with
+    an Accessibility service on is recorded as android_accessibility_sideloaded
+    at 0 points; with accessibility_sideloaded_refuses set it is refused in
+    enforce mode (integrity_device_ineligible, with a remedy) and reported in
+    observe mode; a scan without it clears it. Skips unless requested."""
+    settings = live_settings(api)
+    if "accessibility" not in _setting_words(settings, "optional_measurements", ""):
+        raise Skip("the DBA does not request accessibility; add it to optional_measurements "
+                   "to run this check")
+    integrity_context(ctx)
+    inst = Installation()
+    st, pl = enrol(api, inst, fresh_hint())
+    expect(st in (200, 201), "enrol failed: %s %s" % (st, pl))
+    token = device_token(api, inst)
+    plain = submit_report(api, inst, token, enabled=("accessibility",))
+    st, pl = open_account(api, inst, token, "a11y-%s" % secrets.token_hex(4))
+    expect(st in (200, 201), "account open failed: %s %s" % (st, pl))
+    access = pl["access_token"]
+
+    def trojan(probes):
+        probes["accessibility"]["services"].append(copy.deepcopy(SIDELOADED_SERVICE))
+
+    decision = submit_report(api, inst, token, trojan, enabled=("accessibility",))
+    points = {r["code"]: r["points"] for r in decision.get("reasons", [])}
+    expect(points.get("android_accessibility_sideloaded") == 0
+           and points.get("android_accessibility_non_system") == 0
+           and decision["score"] == plain["score"] and decision["verdict"] == plain["verdict"],
+           "a sideloaded Accessibility service is recorded at 0 points: %s, score %s -> %s"
+           % (points, plain["score"], decision["score"]))
+    st, pl = protected(api, inst, "GET", "/v1/account/me", access)
+    rule = "accessibility_sideloaded_refuses"
+    if _setting_on(settings, rule) and ctx["mode"] == "enforce":
+        found = ((pl.get("error") or {}).get("details") or {}).get("eligibility") or []
+        expect(st == 403 and error_code(pl) == "integrity_device_ineligible"
+               and rule in [e.get("rule") for e in found] and all(e.get("remedy") for e in found),
+               "expected 403 integrity_device_ineligible naming %s, got %s %s %s"
+               % (rule, st, error_code(pl), found))
+    else:
+        found = [e.get("rule") for e in (pl.get("integrity") or {}).get("eligibility") or []]
+        expect(st == 200 and (rule in found) == _setting_on(settings, rule),
+               "%s=%s: reported %s, got %s" % (rule, settings.get(rule), found, st))
+    submit_report(api, inst, token, enabled=("accessibility",))
+    st, pl = protected(api, inst, "GET", "/v1/account/me", access)
+    expect(st == 200 and not (pl.get("integrity") or {}).get("eligibility"),
+           "a scan without it must clear it, got %s %s" % (st, error_code(pl)))
 
 
 @check("risk: the source IP and User-Agent are kept only where the DBA says")
