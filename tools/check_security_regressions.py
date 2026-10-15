@@ -4480,6 +4480,11 @@ def the_settings_reference_matches_the_migrations():
     differ = sorted(key for key in set(engines["postgresql"]) | set(engines["sqlserver"])
                     if engines["postgresql"].get(key) != engines["sqlserver"].get(key))
     expect(not differ, "the engines' migrations seed these differently: %s" % differ)
+    # The columns' sizes on both engines (migration 003): a longer row fails
+    # the migration on the DBA's server, as one did live (DESIGN.md 80).
+    too_long = sorted(key for key, (_, value, description) in engines["postgresql"].items()
+                      if len(key) > 64 or len(value) > 256 or len(description) > 256)
+    expect(not too_long, "longer than risk_policy_settings' columns allow: %s" % too_long)
     seeded = {key: value for key, (_, value, _) in engines["postgresql"].items()}
     tree = ast.parse(Path(s.__file__).read_text(encoding="utf-8"))
     read, fallbacks = set(), []
