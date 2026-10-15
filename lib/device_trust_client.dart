@@ -560,6 +560,32 @@ class NativeIntegrityCollector {
   }
 }
 
+/// Protects the app's window while a secret is typed (DESIGN.md 82). Android:
+/// no screenshots, recordings or casts of the window, other apps' windows not
+/// drawn over it (Android 12 and later), and touches that passed through
+/// another app's window dropped. iOS cannot block screenshots; it covers the
+/// window while the screen is recorded or mirrored. Returns what applied; an
+/// older native host answers nothing, and the entry stays usable.
+class SecureScreen {
+  static const MethodChannel _channel = MethodChannel(
+    'devicefingerprinting/secure_screen_v1',
+  );
+
+  static Future<Map<String, dynamic>> protect(bool on) async {
+    try {
+      return await _channel.invokeMapMethod<String, dynamic>(
+            'protect',
+            <String, dynamic>{'on': on},
+          ) ??
+          const <String, dynamic>{};
+    } on MissingPluginException {
+      return const <String, dynamic>{};
+    } on PlatformException {
+      return const <String, dynamic>{};
+    }
+  }
+}
+
 class ApiException implements Exception {
   ApiException(
     this.message, {
@@ -4311,6 +4337,24 @@ class _DeviceRecognitionPageState extends State<DeviceRecognitionPage> {
   final TextEditingController _appPinController = TextEditingController();
   final TextEditingController _appPinPasswordController =
       TextEditingController();
+  // The app PIN section is protected while either of its fields has focus,
+  // that is while its keyboard is up (DESIGN.md 82).
+  final FocusNode _appPinFocus = FocusNode();
+  final FocusNode _appPinPasswordFocus = FocusNode();
+  bool _pinScreenProtected = false;
+
+  void _onPinFocusChanged() {
+    final bool protect = _appPinFocus.hasFocus || _appPinPasswordFocus.hasFocus;
+    if (protect == _pinScreenProtected) {
+      return;
+    }
+    _pinScreenProtected = protect;
+    unawaited(
+      SecureScreen.protect(protect).then((Map<String, dynamic> applied) {
+        debugPrint('SECURE_SCREEN: protect=$protect applied=$applied');
+      }),
+    );
+  }
   final TextEditingController _stolenAccessController =
       TextEditingController(text: injectedStolenAccessToken);
 
@@ -4319,6 +4363,8 @@ class _DeviceRecognitionPageState extends State<DeviceRecognitionPage> {
     super.initState();
     _controller = DeviceRecognitionController()..addListener(_onChanged);
     unawaited(_controller.bootstrap());
+    _appPinFocus.addListener(_onPinFocusChanged);
+    _appPinPasswordFocus.addListener(_onPinFocusChanged);
   }
 
   void _onChanged() {
@@ -4351,6 +4397,11 @@ class _DeviceRecognitionPageState extends State<DeviceRecognitionPage> {
     _stepUpPasswordController.dispose();
     _appPinController.dispose();
     _appPinPasswordController.dispose();
+    _appPinFocus.dispose();
+    _appPinPasswordFocus.dispose();
+    if (_pinScreenProtected) {
+      unawaited(SecureScreen.protect(false));
+    }
     super.dispose();
   }
 
@@ -4988,11 +5039,14 @@ class _DeviceRecognitionPageState extends State<DeviceRecognitionPage> {
               const SizedBox(height: 8),
               TextField(
                 controller: _appPinController,
+                focusNode: _appPinFocus,
                 enabled: !_controller.busy,
                 obscureText: !_showPasswords,
                 keyboardType: TextInputType.number,
                 autocorrect: false,
                 enableSuggestions: false,
+                // No keyboard may learn the PIN (DESIGN.md 82).
+                enableIMEPersonalizedLearning: false,
                 onChanged: _controller.updateAppPinEntry,
                 decoration: InputDecoration(
                   labelText: 'App PIN',
@@ -5003,10 +5057,12 @@ class _DeviceRecognitionPageState extends State<DeviceRecognitionPage> {
               const SizedBox(height: 8),
               TextField(
                 controller: _appPinPasswordController,
+                focusNode: _appPinPasswordFocus,
                 enabled: !_controller.busy,
                 obscureText: !_showPasswords,
                 autocorrect: false,
                 enableSuggestions: false,
+                enableIMEPersonalizedLearning: false,
                 onChanged: (_) => setState(() {}),
                 decoration: InputDecoration(
                   labelText: 'Account password (to set the app PIN)',
