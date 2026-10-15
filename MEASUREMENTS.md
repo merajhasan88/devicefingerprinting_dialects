@@ -221,6 +221,11 @@ a rule off.
 | `request_rate_unavailable` | 0 | The request-rate counter could not be read; the decision was made without it. |
 | `request_rate_anomaly` | `rate_anomaly_points` 30 | More than `rate_anomaly_max_requests` in `rate_anomaly_window_seconds` (only with `rate_anomaly_enabled`). |
 | `population_outlier` | `population_points` 30 | `population_baseline_metric` above `population_baseline_threshold` (only with `population_baseline_enabled`). |
+| `source_vpn_listed` | `source_vpn_listed_points` 0 | The request came from an address on the public VPN list (§7). |
+| `source_tor_exit` | `source_tor_exit_points` 0 | The request came from a Tor exit (§7). |
+| `source_hosting` | `source_hosting_points` 0 | The request came from a hosting or data-centre network not known as a VPN (§7). |
+| `source_vpn_observed` | `source_vpn_observed_points` 0 | The request came from an address this server's Android phones show to be a VPN exit, in a hosting network or where that is unknown (§7). |
+| `source_vpn_observed_non_hosting` | `source_vpn_observed_non_hosting_points` 0 | The same, outside hosting networks: a home or office VPN (§7). |
 
 The server's cross-checks (DESIGN.md 77) score only where the DBA sets `cross_checks_enabled`; their
 counts are in every decision's context either way. Each rule has `<code>_count` and `<code>_points`,
@@ -273,7 +278,7 @@ Every risk decision carries the measurements it was made on, stored in `risk_pol
 `device_integrity_memory_hours`, `server_observations` (the counts per phone, per account and per
 account on the phone, with `window_hours` and whether they were `scored`), `request_rate`,
 `held_by_denial`, `rate_limiter` when the counter was unavailable, `source_ip` and `user_agent` where the
-DBA records them (§6), and `business_events_30d` — counts by
+DBA records them (§6), `source_network` (§7), and `business_events_30d` — counts by
 type of the business events of the account, and of every account linked to the phone, over 30 days
 (DESIGN.md 76), where the business API is configured.
 
@@ -304,4 +309,38 @@ current phones:
   disclosure of persistent device identifiers. A device-owner app on a company-managed phone is the
   exception.
 
+---
+
+## 7. Where a request came from (`source_network`)
+
+`DESIGN.md` §81. iOS gives apps no way to see a VPN, so the server recognises VPN exits by the address
+a request comes from. Every risk decision's context carries `source_network`, five yes/no answers, each
+**None** where the server cannot know; the address itself is not kept there.
+
+| Key | Yes when | From |
+|---|---|---|
+| `vpn_listed` | the address is in a VPN provider's network | the X4BNet VPN list shipped with the server (IPv4) |
+| `tor_exit` | the address is a Tor exit | the Tor Project's exit list (IPv4) |
+| `hosting` | the address is in a hosting or data-centre network | the X4BNet data-centre list (IPv4) |
+| `vpn_observed` | this server's own Android phones show the address to be a VPN exit | learning, below; None while it is off |
+| `vpn_observed_non_hosting` | the same, and the address is outside hosting networks — a home or office VPN | learning and the hosting list; None where hosting is unknown |
+
+**Learning** (`vpn_exit_learning`, off by default). Android says reliably whether the app's own traffic
+goes through a VPN — the transports of the app's default network, in the `network` probe — and the server
+sees the address that traffic arrives from. Each Android scan adds a sighting to `vpn_exit_sightings`:
+the address, the phone (`device_id`), and whether it came through a VPN (`last_via_vpn_at`,
+`scans_via_vpn`) or direct (`last_direct_at`, `scans_direct`). An address counts as a VPN exit once at
+least `vpn_exit_min_phones` (3) different phones came through a VPN from it within
+`vpn_exit_window_days` (30), and they are at least `vpn_exit_min_share_percent` (90) of the phones seen
+from it then. A phone's own address — a home line, a carrier's shared pool — carries mostly direct
+traffic, even where an ad blocker or firewall app uses Android's VPN interface and sends traffic out
+from the phone's own address; a VPN server's address carries only VPN traffic. iOS cannot say where its
+traffic goes, so an iPhone is never a witness — and is recognised by the address it shares with them.
+The sightings are personal data (an address per phone), kept even when `record_source_ip` is off, never
+read by the business API and never published.
+
+The lists are refreshed by DevOps with `tools/fetch_network_lists.py` (daily); the server re-reads a
+changed file within a minute. Their sources and licences are in `data/network_lists/SOURCES.md`. The
+data-centre list includes cloud networks your own servers and partners use: an address in it is a
+measurement, never by itself a reason to refuse.
 

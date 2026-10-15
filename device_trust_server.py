@@ -37,8 +37,10 @@ hardware fingerprint is added.
 """
 
 import base64
+import bisect
 import hashlib
 import hmac
+import ipaddress
 import json
 import logging
 import os
@@ -1189,7 +1191,7 @@ def _get_backend_identity():
 # against a schema it does not understand. /health/* still answers so operators
 # can see why.
 
-REQUIRED_SCHEMA_VERSION = 22
+REQUIRED_SCHEMA_VERSION = 23
 
 _schema_state = None
 _schema_lock = threading.Lock()
@@ -1374,6 +1376,16 @@ _RISK_SETTING_KINDS = {
     "optional_measurements": "list:" + ",".join(_OPTIONAL_MEASUREMENTS),
     "record_source_ip": "bool",
     "record_user_agent": "bool",
+    # Migration 023 (DESIGN.md 81).
+    "vpn_exit_learning": "bool",
+    "vpn_exit_min_phones": "int",
+    "vpn_exit_min_share_percent": "int",
+    "vpn_exit_window_days": "int",
+    "source_vpn_listed_points": "int",
+    "source_tor_exit_points": "int",
+    "source_hosting_points": "int",
+    "source_vpn_observed_points": "int",
+    "source_vpn_observed_non_hosting_points": "int",
     "limited_session_paths": "paths",
     "limited_session_integrity_verdicts": "list:elevated,review",
     "limited_session_policy_actions": "list:step_up,review",
@@ -1451,6 +1463,9 @@ _RISK_SETTING_MINIMUMS = {
     "integrity_freshness_seconds": 30,
     "refresh_idle_days": 1,
     "app_pin_support_reset_minutes": 1,
+    "vpn_exit_min_phones": 1,
+    "vpn_exit_min_share_percent": 1,
+    "vpn_exit_window_days": 1,
 }
 # Upper bounds a value must also meet. The session limits are ours (DESIGN.md
 # 79): a refresh token idle for more than 90 days, or a session older than a
@@ -1461,6 +1476,8 @@ _RISK_SETTING_MAXIMUMS = {
     "refresh_idle_days": 90,
     "session_max_days": 365,
     "app_pin_support_reset_minutes": 1440,
+    "vpn_exit_min_share_percent": 100,
+    "vpn_exit_window_days": 365,
 }
 _RISK_SETTING_BOOL_WORDS = ("0", "1", "true", "false", "yes", "no", "on", "off")
 # Rows whose absence would silently weaken a gate instead of restoring the
@@ -3629,6 +3646,215 @@ def _server_observation_counts(cursor, device_id, installation_id, account_id, n
             "newcomer": newcomer}
 
 
+# Public network lists (DESIGN.md 81): VPN providers' networks and hosting
+# networks (X4BNet, MIT) and the Tor Project's exit list, shipped with the
+# server and refreshed by DevOps with tools/fetch_network_lists.py. Read at
+# call time, so a deployment -- or the gate -- may point elsewhere. The lists
+# are IPv4 only: an IPv6 address is unknown to them (None), never "not listed".
+NETWORK_LISTS_DIR = os.environ.get(
+    "NETWORK_LISTS_DIR",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "network_lists"),
+)
+_NETWORK_LIST_FILES = {
+    "vpn": "x4bnet_vpn_ipv4.txt",
+    "hosting": "x4bnet_datacenter_ipv4.txt",
+    "tor": "tor_exits.txt",
+}
+_NETWORK_LISTS_RECHECK_SECONDS = 60
+_network_lists = {"checked_at": None, "dir": None, "mtimes": None, "ranges": {}}
+_network_lists_lock = threading.Lock()
+
+
+def _parse_ipv4_ranges(text):
+    """(starts, ends): the IPv4 networks in `text`, merged and sorted. A line
+    that is not one -- a comment, a blank, an IPv6 network -- is skipped."""
+    ranges = []
+    for line in text.splitlines():
+        item = line.split("#", 1)[0].strip()
+        if not item:
+            continue
+        try:
+            network = ipaddress.IPv4Network(item, strict=False)
+        except ValueError:
+            continue
+        ranges.append((int(network.network_address), int(network.broadcast_address)))
+    ranges.sort()
+    merged = []
+    for start, end in ranges:
+        if merged and start <= merged[-1][1] + 1:
+            merged[-1] = (merged[-1][0], max(end, merged[-1][1]))
+        else:
+            merged.append((start, end))
+    return [start for start, _ in merged], [end for _, end in merged]
+
+
+def _network_list_ranges():
+    """{kind: (starts, ends) or None}, re-read when a file changes; a missing
+    or unreadable file is None -- unknown, never an empty list."""
+    state, directory = _network_lists, NETWORK_LISTS_DIR
+    now = time.monotonic()
+    if (state["checked_at"] is not None and state["dir"] == directory
+            and now - state["checked_at"] < _NETWORK_LISTS_RECHECK_SECONDS):
+        return state["ranges"]
+    with _network_lists_lock:
+        mtimes = {}
+        for kind, name in _NETWORK_LIST_FILES.items():
+            try:
+                mtimes[kind] = os.stat(os.path.join(directory, name)).st_mtime
+            except OSError:
+                mtimes[kind] = None
+        if mtimes != state["mtimes"] or state["dir"] != directory:
+            ranges = {}
+            for kind, name in _NETWORK_LIST_FILES.items():
+                if mtimes[kind] is None:
+                    ranges[kind] = None
+                    continue
+                try:
+                    with open(os.path.join(directory, name), encoding="utf-8") as handle:
+                        ranges[kind] = _parse_ipv4_ranges(handle.read())
+                except (OSError, UnicodeDecodeError):
+                    logger.exception("Network list %s could not be read; treating it as unknown.", name)
+                    ranges[kind] = None
+            state.update(ranges=ranges, mtimes=mtimes, dir=directory)
+        state["checked_at"] = now
+        return state["ranges"]
+
+
+def _in_ranges(ranges, value):
+    starts, ends = ranges
+    index = bisect.bisect_right(starts, value) - 1
+    return index >= 0 and value <= ends[index]
+
+
+def _learned_vpn_exit(address):
+    """Whether this server's own Android phones show `address` to be a VPN
+    exit (DESIGN.md 81): at least vpn_exit_min_phones of them came through a
+    VPN from it within vpn_exit_window_days, and they are at least
+    vpn_exit_min_share_percent of the phones seen from it then. A phone's own
+    address -- a home line, a carrier's shared pool -- carries mostly direct
+    traffic, even where an ad blocker uses Android's VPN interface."""
+    since = _utc_now() - timedelta(days=_risk_setting_int("vpn_exit_window_days", 30))
+    with _cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT COUNT(CASE WHEN last_via_vpn_at >= %s THEN 1 END),
+                   COUNT(CASE WHEN last_via_vpn_at >= %s OR last_direct_at >= %s THEN 1 END)
+            FROM vpn_exit_sightings
+            WHERE address = %s
+            """,
+            (since, since, since, address),
+        )
+        row = cursor.fetchone()
+    via_vpn, seen = (int(row[0] or 0), int(row[1] or 0)) if row else (0, 0)
+    return (via_vpn >= max(1, _risk_setting_int("vpn_exit_min_phones", 3))
+            and via_vpn * 100 >= seen * _risk_setting_int("vpn_exit_min_share_percent", 90))
+
+
+def _source_network():
+    """What the address this request came from is, as far as this server knows
+    (DESIGN.md 81). None wherever it cannot know: outside a request, no list
+    loaded, an IPv6 address against the IPv4 lists, learning switched off. The
+    address itself is not kept here."""
+    known = {"vpn_listed": None, "tor_exit": None, "hosting": None, "vpn_observed": None,
+             "vpn_observed_non_hosting": None}
+    if not has_request_context():
+        return known
+    try:
+        address = ipaddress.ip_address(request.remote_addr or "")
+    except ValueError:
+        return known
+    if address.version == 4:
+        lists = _network_list_ranges()
+        for key, kind in (("vpn_listed", "vpn"), ("tor_exit", "tor"), ("hosting", "hosting")):
+            if lists.get(kind) is not None:
+                known[key] = _in_ranges(lists[kind], int(address))
+    if _risk_setting_bool("vpn_exit_learning", False):
+        known["vpn_observed"] = _learned_vpn_exit(str(address))
+        if known["vpn_observed"] is False:
+            known["vpn_observed_non_hosting"] = False
+        elif known["hosting"] is not None:
+            # Outside hosting networks only where that is known.
+            known["vpn_observed_non_hosting"] = not known["hosting"]
+    return known
+
+
+def _record_vpn_sighting(cursor, device_id, network):
+    """Learn from one Android scan (DESIGN.md 81): the address it came from,
+    and whether the app's own traffic went through a VPN -- Android names the
+    transports of the app's default network, so a VPN another app's traffic
+    alone uses, or a split tunnel, counts as direct. iOS cannot say, so it is
+    never a witness. Joins the report's unit of work."""
+    if not has_request_context() or not isinstance(network, dict) or network.get("status") != "ok":
+        return
+    transports = network.get("transports")
+    if not isinstance(transports, list) or not transports:
+        return
+    try:
+        address = str(ipaddress.ip_address(request.remote_addr or ""))
+    except ValueError:
+        return
+    when, counter = (("last_via_vpn_at", "scans_via_vpn") if "vpn" in transports
+                     else ("last_direct_at", "scans_direct"))
+    update = ("UPDATE vpn_exit_sightings SET " + when + " = %s, " + counter + " = "
+              + counter + " + 1 WHERE address = %s AND device_id = %s")
+    now = _utc_now()
+    cursor.execute(update, (now, address, str(device_id)))
+    if cursor.rowcount:
+        return
+    savepoint = DIALECT.savepoint("vpn_sighting")
+    if savepoint:
+        cursor.execute(savepoint[0])
+    try:
+        cursor.execute(
+            "INSERT INTO vpn_exit_sightings (address, device_id, " + when + ", " + counter
+            + ") VALUES (%s, %s, %s, 1)",
+            (address, str(device_id), now),
+        )
+    except Exception as error:
+        if not DIALECT.is_unique_violation(error):
+            raise
+        if savepoint:
+            cursor.execute(savepoint[1])
+        cursor.execute(update, (now, address, str(device_id)))
+    else:
+        if savepoint:
+            cursor.execute(savepoint[2])
+
+
+_SOURCE_NETWORK_RULES = (
+    # (code, the source_network key, its points setting, message)
+    ("source_vpn_listed", "vpn_listed", "source_vpn_listed_points",
+     "The request came from an address on the public VPN list."),
+    ("source_tor_exit", "tor_exit", "source_tor_exit_points",
+     "The request came from a Tor exit."),
+    ("source_hosting", "hosting", "source_hosting_points",
+     "The request came from a hosting or data-centre network."),
+    ("source_vpn_observed", "vpn_observed", "source_vpn_observed_points",
+     "The request came from an address this server's Android phones show to be a VPN exit."),
+    ("source_vpn_observed_non_hosting", "vpn_observed_non_hosting",
+     "source_vpn_observed_non_hosting_points",
+     "The request came from an address this server's Android phones show to be a VPN exit, "
+     "outside hosting networks: a home or office VPN."),
+)
+
+
+def _source_network_reasons(reasons, source):
+    """The source-network reasons, 0 points unless the DBA gives them points;
+    each address is named once, by its most specific kind. Returns the points."""
+    found = {key for key, value in source.items() if value}
+    if "vpn_observed_non_hosting" in found:
+        found.discard("vpn_observed")
+    if found & {"vpn_listed", "vpn_observed", "vpn_observed_non_hosting"}:
+        found.discard("hosting")
+    total = 0
+    for code, key, setting, message in _SOURCE_NETWORK_RULES:
+        if key in found:
+            points = _risk_setting_int(setting, 0)
+            _policy_reason(reasons, code, points, message)
+            total += points
+    return total
+
+
 def _evaluate_risk_policy(
     event_type,
     device_id,
@@ -4007,6 +4233,11 @@ def _evaluate_risk_policy(
             )
             score += pop_points
 
+    # Where the request came from (DESIGN.md 81): measured into every
+    # decision, 0 points unless the DBA gives a kind points.
+    source_network = _source_network()
+    score += _source_network_reasons(reasons, source_network)
+
     # The server's own observations (DESIGN.md 77), scored only where the DBA
     # has switched them on. A phone's rules count what that phone did. The
     # account's rule judges only a phone new to the account, by the failures
@@ -4093,6 +4324,7 @@ def _evaluate_risk_policy(
     }
     if has_request_context() and g.get("rate_limiter_unavailable"):
         context["rate_limiter"] = "unavailable"
+    context["source_network"] = source_network
     if has_request_context():
         # Opt-in request metadata (DESIGN.md 80): personal data, so off unless
         # the DBA records it, and then kept as long as the decision is.
@@ -6859,6 +7091,8 @@ def integrity_report():
             "UPDATE integrity_challenges SET used_at = NOW() WHERE challenge_id = %s",
             (challenge_id,),
         )
+        if platform == "android" and _risk_setting_bool("vpn_exit_learning", False):
+            _record_vpn_sighting(cursor, device_id, probes.get("network"))
         cursor.execute(
             """
             INSERT INTO integrity_reports
