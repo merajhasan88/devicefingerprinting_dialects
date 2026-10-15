@@ -5,6 +5,14 @@
 <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
 <!-- Step-up prompts (BiometricPrompt, device credential or biometric). -->
 <uses-permission android:name="android.permission.USE_BIOMETRIC" />
+<!-- The location and mock_location measurements (DESIGN.md 82), each only where
+     the server's DBA asks for it and the app enabled it. A dangerous permission:
+     the person grants it, asked from the app's own screen, never by a scan. -->
+<uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+<uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+<!-- screen_capture on Android 15 and later: whether this app's window is being
+     recorded. A normal permission, granted at install. -->
+<uses-permission android:name="android.permission.DETECT_SCREEN_RECORDING" />
     <application
         android:label="devicefingerprinting"
         android:name="${applicationName}"
@@ -53,5 +61,27 @@
             <action android:name="android.intent.action.PROCESS_TEXT"/>
             <data android:mimeType="text/plain"/>
         </intent>
+        <!-- The apps that can hold Accessibility, a keyboard, notification access
+             or device administration, so the accessibility, notification_access
+             and other_access measurements can read who installed each
+             (DESIGN.md 82). -->
+        <intent>
+            <action android:name="android.accessibilityservice.AccessibilityService"/>
+        </intent>
+        <intent>
+            <action android:name="android.view.InputMethod"/>
+        </intent>
+        <intent>
+            <action android:name="android.service.notification.NotificationListenerService"/>
+        </intent>
+        <intent>
+            <action android:name="android.app.action.DEVICE_ADMIN_ENABLED"/>
+        </intent>
+        <!-- Remote-control apps scammers have victims install; the same list as
+             IntegrityProbeManager.remoteAccessPackages. -->
+        <package android:name="com.anydesk.anydeskandroid"/>
+        <package android:name="com.teamviewer.quicksupport.market"/>
+        <package android:name="com.carriez.flutter_hbb"/>
+        <package android:name="com.sand.airdroid"/>
     </queries>
 </manifest>

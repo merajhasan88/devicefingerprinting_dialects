@@ -1,7 +1,9 @@
 // IMPORTANT: Keep this package line identical to your existing MainActivity package.
 package com.example.devicefingerprinting
 
+import android.Manifest
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.os.Handler
 import android.os.Looper
 import io.flutter.embedding.android.FlutterActivity
@@ -16,6 +18,7 @@ class MainActivity : FlutterActivity() {
         private const val KEY_CHANNEL = "devicefingerprinting/installation_key_v2"
         private const val INTEGRITY_CHANNEL = "devicefingerprinting/integrity_v1"
         private const val STEPUP_CHANNEL = "devicefingerprinting/stepup_key_v1"
+        private const val LOCATION_REQUEST = 4721
     }
 
     private val worker: ExecutorService = Executors.newSingleThreadExecutor()
@@ -23,11 +26,14 @@ class MainActivity : FlutterActivity() {
     private lateinit var installationKeys: InstallationKeyManager
     private lateinit var integrityProbes: IntegrityProbeManager
     private lateinit var stepUpKeys: StepUpKeyManager
+    // The app's own request for the location permission, answered when the
+    // person chooses (DESIGN.md 82); the collector itself never asks.
+    private var pendingLocationResult: MethodChannel.Result? = null
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
         installationKeys = InstallationKeyManager(applicationContext)
-        integrityProbes = IntegrityProbeManager(applicationContext)
+        integrityProbes = IntegrityProbeManager(applicationContext) { this }
         stepUpKeys = StepUpKeyManager(applicationContext)
 
         MethodChannel(
@@ -72,6 +78,10 @@ class MainActivity : FlutterActivity() {
                         call.argument<List<String>>("enabled_measurements")?.toSet() ?: emptySet()
                     integrityProbes.collect(required, nonce, testFixture, optional, enabled)
                 }
+
+                // For the location and mock_location measurements: asks the
+                // person once, from a button on the app's own screen.
+                "requestLocationPermission" -> requestLocationPermission(result)
 
                 else -> result.notImplemented()
             }
@@ -121,6 +131,41 @@ class MainActivity : FlutterActivity() {
 
                 else -> result.notImplemented()
             }
+        }
+    }
+
+    private fun locationState(): String = when {
+        checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) ==
+            PackageManager.PERMISSION_GRANTED -> "precise"
+        checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) ==
+            PackageManager.PERMISSION_GRANTED -> "approximate"
+        else -> "none"
+    }
+
+    private fun requestLocationPermission(result: MethodChannel.Result) {
+        if (locationState() == "precise" || pendingLocationResult != null) {
+            result.success(locationState())
+            return
+        }
+        pendingLocationResult = result
+        requestPermissions(
+            arrayOf(
+                Manifest.permission.ACCESS_FINE_LOCATION,
+                Manifest.permission.ACCESS_COARSE_LOCATION,
+            ),
+            LOCATION_REQUEST,
+        )
+    }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray,
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == LOCATION_REQUEST) {
+            pendingLocationResult?.success(locationState())
+            pendingLocationResult = null
         }
     }
 

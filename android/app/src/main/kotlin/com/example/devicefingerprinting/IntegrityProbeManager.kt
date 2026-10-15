@@ -1,13 +1,26 @@
 package com.example.devicefingerprinting
 
+import android.Manifest
+import android.accessibilityservice.AccessibilityServiceInfo
+import android.annotation.SuppressLint
+import android.app.Activity
+import android.app.admin.DevicePolicyManager
+import android.content.ComponentName
 import android.content.Context
 import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
+import android.hardware.display.DisplayManager
+import android.location.Location
+import android.location.LocationManager
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.os.Build
 import android.os.Debug
+import android.os.SystemClock
 import android.provider.Settings
+import android.view.Display
+import android.view.WindowManager
+import android.view.accessibility.AccessibilityManager
 import java.io.BufferedReader
 import java.io.File
 import java.io.FileInputStream
@@ -18,7 +31,9 @@ import java.net.Socket
 import java.security.MessageDigest
 import java.util.Collections
 import java.util.Locale
+import java.util.concurrent.Executor
 import java.util.concurrent.TimeUnit
+import java.util.function.Consumer
 import org.json.JSONObject
 
 /**
@@ -29,7 +44,12 @@ import org.json.JSONObject
  * server must therefore score these signals together with server-observed
  * device/account behavior and must never trust a client-provided score.
  */
-class IntegrityProbeManager(private val context: Context) {
+class IntegrityProbeManager(
+    private val context: Context,
+    // The visible activity, for the one measurement that needs a window:
+    // whether it is being recorded (screen_capture, Android 15 and later).
+    private val activity: () -> Activity? = { null },
+) {
     companion object {
         // 1 = name-based hook detection only (runtime_maps token scan).
         // 2 = adds the structural probes: instrumentation_threads,
@@ -38,7 +58,9 @@ class IntegrityProbeManager(private val context: Context) {
         //     produced it - see DESIGN.md 29.
         // 4 = volunteers device and network on every scan, and answers the
         //     optional measurements the server asks for (DESIGN.md 80).
-        private const val COLLECTOR_VERSION = 4
+        // 5 = adds the optional measurements of what can read or drive the
+        //     phone, screen capture, location and mock locations (DESIGN.md 82).
+        private const val COLLECTOR_VERSION = 5
         // Sent with every scan whether or not the server asked: the server
         // tolerates probes beyond its plan but refuses a report missing one it
         // asked for, so a probe new to this collector stays out of the plan and
@@ -46,7 +68,21 @@ class IntegrityProbeManager(private val context: Context) {
         private val volunteeredProbes = listOf("device", "network")
         // The optional measurements this collector knows. Each is collected
         // only when the server asks for it AND the app enabled it.
-        private val optionalMeasurements = setOf("local_addresses")
+        private val optionalMeasurements = setOf(
+            "local_addresses", "accessibility", "notification_access", "other_access",
+            "screen_capture", "location", "mock_location"
+        )
+        // Apps listed per capability, at most (DESIGN.md 82).
+        private const val MAX_APPS = 32
+        // Remote-control apps scammers have their victims install. Android 11
+        // and later show an app only the packages it names in advance, so the
+        // same names are in the manifest's <queries> (DESIGN.md 82).
+        private val remoteAccessPackages = listOf(
+            "com.anydesk.anydeskandroid",
+            "com.teamviewer.quicksupport.market",
+            "com.carriez.flutter_hbb",
+            "com.sand.airdroid"
+        )
         private const val MAX_TEXT = 8192
         // Every shell command is bounded (review, DESIGN.md 63): one hung
         // child used to block its probe, and the whole scan, indefinitely.
@@ -142,6 +178,18 @@ class IntegrityProbeManager(private val context: Context) {
                 "network" -> probeNetwork()
                 "local_addresses" ->
                     if (probe in enabledMeasurements) probeLocalAddresses() else notEnabled()
+                "accessibility" ->
+                    if (probe in enabledMeasurements) probeAccessibility() else notEnabled()
+                "notification_access" ->
+                    if (probe in enabledMeasurements) probeNotificationAccess() else notEnabled()
+                "other_access" ->
+                    if (probe in enabledMeasurements) probeOtherAccess() else notEnabled()
+                "screen_capture" ->
+                    if (probe in enabledMeasurements) probeScreenCapture() else notEnabled()
+                "location" ->
+                    if (probe in enabledMeasurements) probeLocation() else notEnabled()
+                "mock_location" ->
+                    if (probe in enabledMeasurements) probeMockLocation() else notEnabled()
                 else -> resultUnsupported("Unknown probe requested by server")
             }
         } catch (error: Throwable) {
@@ -336,6 +384,202 @@ class IntegrityProbeManager(private val context: Context) {
             }
         }
         return ok("addresses" to addresses)
+    }
+
+    /**
+     * One app holding a capability (DESIGN.md 82): its package and component
+     * class, whether it is part of the system, and which package installed it
+     * ("" for none - adb, or an installer that names nobody). system and
+     * installer are left out where Android hides the app from this one; the
+     * server then calls its source unknown, which is never evidence. The
+     * server, not the phone, decides what counts as an app store.
+     */
+    private fun appEntry(
+        packageName: String,
+        component: String? = null,
+        knownInfo: ApplicationInfo? = null,
+    ): Map<String, Any> {
+        val entry = linkedMapOf<String, Any>("package" to packageName.take(128))
+        if (component != null) entry["service"] = component.take(200)
+        val pm = context.packageManager
+        val info = knownInfo ?: try {
+            pm.getApplicationInfo(packageName, 0)
+        } catch (_: Throwable) {
+            null
+        }
+        val installer: String? = try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                pm.getInstallSourceInfo(packageName).installingPackageName ?: ""
+            } else {
+                @Suppress("DEPRECATION")
+                pm.getInstallerPackageName(packageName) ?: ""
+            }
+        } catch (_: Throwable) {
+            null
+        }
+        if (info != null) {
+            entry["system"] = (info.flags and ApplicationInfo.FLAG_SYSTEM) != 0
+            if (installer != null) entry["installer"] = installer.take(128)
+        }
+        return entry
+    }
+
+    /**
+     * Every Accessibility service that is on, and the keyboard in use - the
+     * two ways banking trojans read what is typed (DESIGN.md 82). The
+     * Accessibility manager's list is compared with the system setting it is
+     * built from: a service the setting names that the manager does not report
+     * is hiding, as an Android bug allowed until the December 2022 patch.
+     */
+    private fun probeAccessibility(): Map<String, Any> {
+        val manager = context.getSystemService(Context.ACCESSIBILITY_SERVICE) as? AccessibilityManager
+            ?: return unavailable("AccessibilityManager is not available")
+        val services = mutableListOf<Map<String, Any>>()
+        val reported = mutableSetOf<String>()
+        for (info in manager.getEnabledAccessibilityServiceList(AccessibilityServiceInfo.FEEDBACK_ALL_MASK)) {
+            val service = info.resolveInfo?.serviceInfo ?: continue
+            if (!reported.add(ComponentName(service.packageName, service.name).flattenToString())) continue
+            if (services.size < MAX_APPS) {
+                services.add(appEntry(service.packageName, service.name, service.applicationInfo))
+            }
+        }
+        val settingsOnly = mutableListOf<String>()
+        Settings.Secure.getString(context.contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES)
+            ?.split(':')
+            ?.mapNotNull { ComponentName.unflattenFromString(it.trim())?.flattenToString() }
+            ?.filter { it !in reported }
+            ?.distinct()
+            ?.take(MAX_APPS)
+            ?.forEach { settingsOnly.add(it.take(200)) }
+        val result = linkedMapOf<String, Any>(
+            "status" to "ok",
+            "services" to services,
+            "settings_only" to settingsOnly
+        )
+        Settings.Secure.getString(context.contentResolver, Settings.Secure.DEFAULT_INPUT_METHOD)
+            ?.let { ComponentName.unflattenFromString(it.trim()) }
+            ?.let { result["keyboard"] = appEntry(it.packageName, it.className) }
+        return result
+    }
+
+    /** Every app allowed to read the phone's notifications - one-time codes among them. */
+    private fun probeNotificationAccess(): Map<String, Any> {
+        // Not a public constant; AndroidX's NotificationManagerCompat reads the
+        // same setting. Unreadable, it throws, and the probe answers error.
+        val listeners = Settings.Secure.getString(context.contentResolver, "enabled_notification_listeners")
+            ?.split(':')
+            ?.mapNotNull { ComponentName.unflattenFromString(it.trim()) }
+            ?.distinctBy { it.flattenToString() }
+            ?.take(MAX_APPS)
+            ?.map { appEntry(it.packageName, it.className) }
+            ?: emptyList()
+        return ok("listeners" to listeners)
+    }
+
+    /** The active device administrators, and the known remote-control apps installed. */
+    private fun probeOtherAccess(): Map<String, Any> {
+        val policy = context.getSystemService(Context.DEVICE_POLICY_SERVICE) as? DevicePolicyManager
+            ?: return unavailable("DevicePolicyManager is not available")
+        val admins = (policy.activeAdmins ?: emptyList())
+            .take(MAX_APPS)
+            .map { appEntry(it.packageName, it.className) }
+        val pm = context.packageManager
+        val remote = remoteAccessPackages.filter { name ->
+            try {
+                pm.getPackageInfo(name, 0)
+                true
+            } catch (_: PackageManager.NameNotFoundException) {
+                false
+            }
+        }.map { appEntry(it) }
+        return ok("device_admins" to admins, "remote_access_apps" to remote)
+    }
+
+    /**
+     * Whether this app's window is being recorded (Android 15 and later, with
+     * DETECT_SCREEN_RECORDING, a normal permission the app declares), and how
+     * many displays besides the phone's own show content: casting, mirroring,
+     * an external screen. Below Android 15 recording is left out - unknown,
+     * not "no".
+     */
+    private fun probeScreenCapture(): Map<String, Any> {
+        val result = linkedMapOf<String, Any>("status" to "ok")
+        val window = activity()?.windowManager
+        if (Build.VERSION.SDK_INT >= 35 && window != null &&
+            context.checkSelfPermission("android.permission.DETECT_SCREEN_RECORDING") ==
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            val callback = Consumer<Int> { }
+            try {
+                val state = window.addScreenRecordingCallback(Executor { it.run() }, callback)
+                result["recording"] = state == WindowManager.SCREEN_RECORDING_STATE_VISIBLE
+            } finally {
+                window.removeScreenRecordingCallback(callback)
+            }
+        }
+        val displays = (context.getSystemService(Context.DISPLAY_SERVICE) as? DisplayManager)?.displays
+            ?: return unavailable("DisplayManager is not available")
+        result["external_displays"] = displays.count { it.displayId != Display.DEFAULT_DISPLAY }
+        return result
+    }
+
+    private fun locationPermission(): String = when {
+        context.checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) ==
+            PackageManager.PERMISSION_GRANTED -> "precise"
+        context.checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) ==
+            PackageManager.PERMISSION_GRANTED -> "approximate"
+        else -> "none"
+    }
+
+    /**
+     * The newest location the phone already holds, from any enabled provider:
+     * never a fresh fix (no GPS power, no waiting) and never a prompt - only
+     * the app asks for the permission, on its own screen.
+     */
+    @SuppressLint("MissingPermission")
+    private fun lastKnownLocation(): Location? {
+        val manager = context.getSystemService(Context.LOCATION_SERVICE) as? LocationManager
+            ?: return null
+        return manager.getProviders(true).mapNotNull { provider ->
+            try {
+                manager.getLastKnownLocation(provider)
+            } catch (_: SecurityException) {
+                null
+            }
+        }.maxByOrNull { it.elapsedRealtimeNanos }
+    }
+
+    private fun fixAgeSeconds(fix: Location): Long =
+        maxOf(0L, (SystemClock.elapsedRealtimeNanos() - fix.elapsedRealtimeNanos) / 1_000_000_000L)
+
+    /** The last known location (DESIGN.md 82): the most identifying measurement here. */
+    private fun probeLocation(): Map<String, Any> {
+        val permission = locationPermission()
+        val result = linkedMapOf<String, Any>("status" to "ok", "permission" to permission)
+        if (permission == "none") return result
+        val fix = lastKnownLocation() ?: return result
+        result["latitude"] = fix.latitude
+        result["longitude"] = fix.longitude
+        if (fix.hasAccuracy()) result["accuracy_m"] = fix.accuracy.toDouble()
+        result["age_seconds"] = fixAgeSeconds(fix)
+        result["provider"] = (fix.provider ?: "").take(32)
+        return result
+    }
+
+    /** Whether that last location came from a mock-location app; no coordinates. */
+    private fun probeMockLocation(): Map<String, Any> {
+        val permission = locationPermission()
+        val result = linkedMapOf<String, Any>("status" to "ok", "permission" to permission)
+        if (permission == "none") return result
+        val fix = lastKnownLocation() ?: return result
+        result["mock"] = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            fix.isMock
+        } else {
+            @Suppress("DEPRECATION")
+            fix.isFromMockProvider
+        }
+        result["age_seconds"] = fixAgeSeconds(fix)
+        return result
     }
 
     @Suppress("DEPRECATION")
