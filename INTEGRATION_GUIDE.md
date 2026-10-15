@@ -972,3 +972,37 @@ it per network) or the **IMEI** (no iOS API; on Android 10 and later only system
 on Android 9 and earlier only behind the "make and manage phone calls" prompt and Google Play's
 identifier disclosures). Neither is collected: the owner dropped both (`DESIGN.md` §80).
 
+## 15. Where a request came from: VPN lists and VPN exits learned from your Android phones
+
+`DESIGN.md` §81. iOS gives apps no way to see a VPN, and a modified Android app can hide one, so your
+server also recognises VPN exits by the address each request comes from. Every risk decision's context
+carries `source_network` (listed in [MEASUREMENTS.md](MEASUREMENTS.md) §7): `vpn_listed`, `tor_exit`,
+`hosting`, `vpn_observed` and `vpn_observed_non_hosting`, each yes, no, or unknown. Each kind is a
+reason at **0 points** until your DBA gives it points (`source_vpn_listed_points`,
+`source_tor_exit_points`, `source_hosting_points`, `source_vpn_observed_points`,
+`source_vpn_observed_non_hosting_points`).
+
+**Public lists, shipped with the server.** `data/network_lists/` holds X4BNet's VPN and data-centre
+networks (MIT) and the Tor Project's exit list; `SOURCES.md` beside them gives the sources and the
+licence. **DevOps** refreshes them daily with `python3 tools/fetch_network_lists.py` (cron or a systemd
+timer, on a host with outbound HTTPS); a download that does not still look like its list never replaces
+it, and the server re-reads a changed file within a minute. `NETWORK_LISTS_DIR` points the server at
+another directory. The lists are IPv4: for an IPv6 client their answers are unknown. The data-centre
+list includes cloud networks your own servers and partners use — a measurement, never by itself a
+reason to refuse.
+
+**VPN exits learned from your own Android phones** — `vpn_exit_learning`, off by default. Android says
+reliably whether the app's own traffic goes through a VPN, and your server sees the address it arrives
+from: each Android scan becomes a sighting in `vpn_exit_sightings` (grant `SELECT, INSERT, UPDATE`). An
+address is a VPN exit once at least `vpn_exit_min_phones` (3) different phones came through a VPN from
+it within `vpn_exit_window_days` (30), and they are at least `vpn_exit_min_share_percent` (90) of the
+phones seen from it then. That share is the safeguard: ad blockers and firewall apps use Android's VPN
+interface while sending traffic out from the phone's own address, so a home line or a carrier's shared
+address collects a few VPN sightings among many direct ones; a VPN server's address carries only VPN
+traffic. iPhones are never witnesses — they are recognised by the address they share with your Android
+phones. A learned exit outside the hosting networks — someone's home or office VPN — has its own bit,
+`vpn_observed_non_hosting`, set only where the hosting answer is known.
+
+**Personal data.** The sightings keep an address per phone, even with `record_source_ip` off, for as long
+as you keep them; nothing in them is read by the business API or published. Turn learning on knowing
+that. Each deployment learns only from its own phones; no list is shared between deployments.
