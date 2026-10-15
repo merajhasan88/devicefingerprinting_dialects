@@ -1,8 +1,9 @@
+import CoreLocation
 import Flutter
 import UIKit
 
 @main
-@objc class AppDelegate: FlutterAppDelegate, FlutterImplicitEngineDelegate {
+@objc class AppDelegate: FlutterAppDelegate, FlutterImplicitEngineDelegate, CLLocationManagerDelegate {
   /// Matches the Android host's channel name exactly. The Dart client is
   /// platform-agnostic and talks to this same name on both platforms.
   private static let keyChannelName = "devicefingerprinting/installation_key_v2"
@@ -12,6 +13,10 @@ import UIKit
   private var installationKeys: InstallationKeyManager?
   private var integrityProbes: IntegrityProbeManager?
   private var stepUpKeys: StepUpKeyManager?
+  /// The app's own request for the location permission (DESIGN.md 82),
+  /// answered when the person chooses; a scan never asks.
+  private var locationManager: CLLocationManager?
+  private var pendingLocationResult: FlutterResult?
 
   /// Keychain and Secure Enclave calls can block, so they run off the platform
   /// thread. FlutterResult must be invoked on the platform thread, hence the
@@ -130,6 +135,9 @@ import UIKit
           )
         }
 
+      case "requestLocationPermission":
+        self.requestLocationPermission(result)
+
       default:
         result(FlutterMethodNotImplemented)
       }
@@ -177,6 +185,58 @@ import UIKit
         result(FlutterMethodNotImplemented)
       }
     }
+  }
+
+  private func locationState(_ manager: CLLocationManager) -> String {
+    let status: CLAuthorizationStatus
+    if #available(iOS 14.0, *) {
+      status = manager.authorizationStatus
+    } else {
+      status = CLLocationManager.authorizationStatus()
+    }
+    switch status {
+    case .authorizedWhenInUse, .authorizedAlways:
+      if #available(iOS 14.0, *), manager.accuracyAuthorization == .reducedAccuracy {
+        return "approximate"
+      }
+      return "precise"
+    case .notDetermined:
+      return "undetermined"
+    default:
+      return "none"
+    }
+  }
+
+  private func requestLocationPermission(_ result: @escaping FlutterResult) {
+    let manager = locationManager ?? CLLocationManager()
+    locationManager = manager
+    let state = locationState(manager)
+    guard state == "undetermined", pendingLocationResult == nil else {
+      result(state == "undetermined" ? "none" : state)
+      return
+    }
+    pendingLocationResult = result
+    manager.delegate = self
+    manager.requestWhenInUseAuthorization()
+  }
+
+  private func answerLocationRequest(_ manager: CLLocationManager) {
+    let state = locationState(manager)
+    guard state != "undetermined", let pending = pendingLocationResult else { return }
+    pendingLocationResult = nil
+    pending(state)
+  }
+
+  @available(iOS 14.0, *)
+  func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
+    answerLocationRequest(manager)
+  }
+
+  func locationManager(
+    _ manager: CLLocationManager,
+    didChangeAuthorization status: CLAuthorizationStatus
+  ) {
+    answerLocationRequest(manager)
   }
 
   private func runOffPlatformThread(

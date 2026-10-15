@@ -1,8 +1,10 @@
 import Foundation
 import CFNetwork
+import CoreLocation
 import CryptoKit
 import MachO
 import Security
+import UIKit
 
 /// Local integrity measurement collector for iOS.
 ///
@@ -20,13 +22,17 @@ final class IntegrityProbeManager {
     /// `code_integrity`, the dyld analogue of Android's native probe
     /// (DESIGN.md 33.4), which is what battery item 16 needs. 3 volunteers
     /// `device` and `network` on every scan and answers the optional
-    /// measurements the server asks for (DESIGN.md 80).
-    private static let collectorVersion = 3
+    /// measurements the server asks for (DESIGN.md 80). 4 adds screen capture,
+    /// location and mock locations, and the OS build (DESIGN.md 82).
+    private static let collectorVersion = 4
     /// Sent with every scan whether or not the server asked, like
     /// code_integrity below, so no older client breaks (DESIGN.md 80).
     private static let volunteeredProbes = ["device", "network"]
     /// Collected only when the server asks for one AND the app enabled it.
-    private static let optionalMeasurements: Set<String> = ["local_addresses"]
+    private static let optionalMeasurements: Set<String> = [
+        "local_addresses", "accessibility", "notification_access", "other_access",
+        "screen_capture", "location", "mock_location",
+    ]
     private static let maxTextLength = 8192
 
     /// Loaded-image names that indicate instrumentation or a hooking runtime.
@@ -130,6 +136,17 @@ final class IntegrityProbeManager {
         case "local_addresses":
             // Asked for by the server, declined by this app (DESIGN.md 80).
             return enabledMeasurements.contains(name) ? probeLocalAddresses() : ["status": "not_enabled"]
+        case "accessibility", "notification_access", "other_access":
+            // iOS shows an app no other app: nothing to list (DESIGN.md 82).
+            return enabledMeasurements.contains(name)
+                ? ["status": "unsupported", "reason": "iOS shows an app no other app."]
+                : ["status": "not_enabled"]
+        case "screen_capture":
+            return enabledMeasurements.contains(name) ? probeScreenCapture() : ["status": "not_enabled"]
+        case "location":
+            return enabledMeasurements.contains(name) ? probeLocation() : ["status": "not_enabled"]
+        case "mock_location":
+            return enabledMeasurements.contains(name) ? probeMockLocation() : ["status": "not_enabled"]
         default:
             return [
                 "status": "unsupported",
@@ -140,13 +157,84 @@ final class IntegrityProbeManager {
 
     // MARK: - Probes
 
-    /// The OS version and the hardware model (DESIGN.md 80).
+    /// The OS version and build, and the hardware model (DESIGN.md 80, 82).
+    /// iOS has no separate security patch level: its fixes ship as OS
+    /// versions, and the build tells a Rapid Security Response apart.
     private func probeDevice() -> [String: Any] {
         return [
             "status": "ok",
             "os_version": UIDeviceOSVersion(),
+            "os_build": osBuild(),
             "model_identifier": deviceModelIdentifier(),
         ]
+    }
+
+    /// Runs on the main thread: UIKit and Core Location state is read there.
+    /// The collector runs on a worker queue, so this never waits on itself.
+    private func onMain<T>(_ read: () -> T) -> T {
+        return Thread.isMainThread ? read() : DispatchQueue.main.sync(execute: read)
+    }
+
+    /// Whether the screen is being recorded, mirrored or sent to AirPlay
+    /// (`UIScreen.isCaptured`), and how many other screens are attached
+    /// (DESIGN.md 82).
+    private func probeScreenCapture() -> [String: Any] {
+        return onMain {
+            [
+                "status": "ok",
+                "recording": UIScreen.main.isCaptured,
+                "external_displays": max(0, UIScreen.screens.count - 1),
+            ]
+        }
+    }
+
+    private func locationPermission(_ manager: CLLocationManager) -> String {
+        let status: CLAuthorizationStatus
+        if #available(iOS 14.0, *) {
+            status = manager.authorizationStatus
+        } else {
+            status = CLLocationManager.authorizationStatus()
+        }
+        guard status == .authorizedWhenInUse || status == .authorizedAlways else { return "none" }
+        if #available(iOS 14.0, *), manager.accuracyAuthorization == .reducedAccuracy {
+            return "approximate"
+        }
+        return "precise"
+    }
+
+    /// The last location the phone already holds - never a fresh fix, never a
+    /// prompt: only the app asks for the permission (DESIGN.md 82).
+    private func lastLocation() -> (String, CLLocation?) {
+        return onMain {
+            let manager = CLLocationManager()
+            let permission = locationPermission(manager)
+            return (permission, permission == "none" ? nil : manager.location)
+        }
+    }
+
+    private func probeLocation() -> [String: Any] {
+        let (permission, fix) = lastLocation()
+        var result: [String: Any] = ["status": "ok", "permission": permission]
+        guard let fix = fix else { return result }
+        result["latitude"] = fix.coordinate.latitude
+        result["longitude"] = fix.coordinate.longitude
+        if fix.horizontalAccuracy >= 0 { result["accuracy_m"] = fix.horizontalAccuracy }
+        result["age_seconds"] = max(0, Int(-fix.timestamp.timeIntervalSinceNow))
+        return result
+    }
+
+    /// iOS 15 and later say whether a location was simulated by software or
+    /// produced by an accessory; before that the probe cannot tell.
+    private func probeMockLocation() -> [String: Any] {
+        let (permission, fix) = lastLocation()
+        var result: [String: Any] = ["status": "ok", "permission": permission]
+        guard let fix = fix else { return result }
+        if #available(iOS 15.0, *), let source = fix.sourceInformation {
+            result["mock"] = source.isSimulatedBySoftware
+            result["accessory"] = source.isProducedByAccessory
+        }
+        result["age_seconds"] = max(0, Int(-fix.timestamp.timeIntervalSinceNow))
+        return result
     }
 
     /// Whether a VPN or an HTTP proxy is in use. iOS gives other apps no VPN
@@ -761,6 +849,15 @@ final class IntegrityProbeManager {
             guard let value = element.value as? Int8, value != 0 else { return }
             identifier += String(UnicodeScalar(UInt8(bitPattern: value)))
         }
+    }
+
+    /// The OS build, for example "21F90" (kern.osversion).
+    private func osBuild() -> String {
+        var size = 0
+        guard sysctlbyname("kern.osversion", nil, &size, nil, 0) == 0, size > 0 else { return "" }
+        var buffer = [CChar](repeating: 0, count: size)
+        guard sysctlbyname("kern.osversion", &buffer, &size, nil, 0) == 0 else { return "" }
+        return String(cString: buffer)
     }
 
     private func UIDeviceOSVersion() -> String {

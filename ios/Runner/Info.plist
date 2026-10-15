@@ -28,6 +28,8 @@
 	<true/>
 	<key>NSFaceIDUsageDescription</key>
 	<string>Face ID can approve sensitive operations when biometric step-up is enabled.</string>
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>Where this app's developers turn the location check on, its security checks include the last location your phone knows.</string>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>
