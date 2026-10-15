@@ -6672,3 +6672,16 @@ not built.
 **Verified offline.** Gate **104/104** — three new checks (the lists' classification, learning, the
 download check); eleven mutations, each caught. Suite **90** (the shape of `source_network`; the suite
 cannot choose its own address, so learning is proved live by a script).
+
+**Live**, EC2 PostgreSQL 16.15, 2026-10-15, 09:29–09:38 UTC: migration 023 applied, `vpn_exit_sightings`
+granted `SELECT, INSERT, UPDATE` to the application role, the lists installed in
+`/opt/data/network_lists`, server `e8eb807` (md5 `eedcf1e5…`). Full suite in observe, no business token:
+**67 / 0 / 23**. With `vpn_exit_learning` on: an iPhone opening an account from the test machine's
+address saw the lists loaded and nothing known (`vpn_listed`, `tor_exit`, `hosting` false); after three
+fresh Android phones scanned with their app's traffic through a VPN from that address, the next iPhone
+from it got `vpn_observed` and `vpn_observed_non_hosting` true and the reason
+`source_vpn_observed_non_hosting` at 0 points; a fourth Android phone arriving direct (3 of 4, below
+90%) cleared it. No traceback in the journal. The test database keeps those four sightings of the test
+machine's address. **State:** EC2 stopped; schema 23; observe / observe; learning off; every new
+setting at its default.
+
