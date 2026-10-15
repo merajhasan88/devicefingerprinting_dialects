@@ -116,11 +116,17 @@ import UIKit
           return
         }
         let fixture = arguments["integrity_test_fixture"] as? String
+        // Absent from an older Dart client: then nothing optional is
+        // collected (DESIGN.md 80).
+        let optional = arguments["optional_probes"] as? [String] ?? []
+        let enabled = Set(arguments["enabled_measurements"] as? [String] ?? [])
         self.runOffPlatformThread(result) {
           collector.collect(
             requiredProbes: required,
             challengeNonce: nonce,
-            testFixture: fixture
+            testFixture: fixture,
+            optionalProbes: optional,
+            enabledMeasurements: enabled
           )
         }
 

@@ -1,4 +1,5 @@
 import Foundation
+import CFNetwork
 import CryptoKit
 import MachO
 import Security
@@ -17,8 +18,15 @@ import Security
 final class IntegrityProbeManager {
     /// Per-platform numbering. 1 was the baseline probe set; 2 adds
     /// `code_integrity`, the dyld analogue of Android's native probe
-    /// (DESIGN.md 33.4), which is what battery item 16 needs.
-    private static let collectorVersion = 2
+    /// (DESIGN.md 33.4), which is what battery item 16 needs. 3 volunteers
+    /// `device` and `network` on every scan and answers the optional
+    /// measurements the server asks for (DESIGN.md 80).
+    private static let collectorVersion = 3
+    /// Sent with every scan whether or not the server asked, like
+    /// code_integrity below, so no older client breaks (DESIGN.md 80).
+    private static let volunteeredProbes = ["device", "network"]
+    /// Collected only when the server asks for one AND the app enabled it.
+    private static let optionalMeasurements: Set<String> = ["local_addresses"]
     private static let maxTextLength = 8192
 
     /// Loaded-image names that indicate instrumentation or a hooking runtime.
@@ -62,12 +70,14 @@ final class IntegrityProbeManager {
     func collect(
         requiredProbes: [String],
         challengeNonce: String,
-        testFixture: String?
+        testFixture: String?,
+        optionalProbes: [String] = [],
+        enabledMeasurements: Set<String> = []
     ) -> [String: Any] {
         var probes: [String: Any] = [:]
 
         for probe in NSOrderedSet(array: requiredProbes).array as? [String] ?? requiredProbes {
-            probes[probe] = runProbe(probe)
+            probes[probe] = runProbe(probe, enabledMeasurements: enabledMeasurements)
         }
 
         // code_integrity is reported whether or not the server asked for it.
@@ -83,6 +93,13 @@ final class IntegrityProbeManager {
         if probes["code_integrity"] == nil {
             probes["code_integrity"] = runProbe("code_integrity")
         }
+        for probe in IntegrityProbeManager.volunteeredProbes where probes[probe] == nil {
+            probes[probe] = runProbe(probe, enabledMeasurements: enabledMeasurements)
+        }
+        for probe in optionalProbes
+        where probes[probe] == nil && IntegrityProbeManager.optionalMeasurements.contains(probe) {
+            probes[probe] = runProbe(probe, enabledMeasurements: enabledMeasurements)
+        }
 
         // Debug-only synthetic fixtures exist on Android but were retired
         // (DESIGN.md 25.7) and are deliberately not implemented here. The
@@ -97,7 +114,7 @@ final class IntegrityProbeManager {
         ]
     }
 
-    private func runProbe(_ name: String) -> [String: Any] {
+    private func runProbe(_ name: String, enabledMeasurements: Set<String> = []) -> [String: Any] {
         switch name {
         case "app_identity":    return probeAppIdentity()
         case "code_signing":    return probeCodeSigning()
@@ -108,6 +125,11 @@ final class IntegrityProbeManager {
         case "environment":     return probeEnvironment()
         case "simulator":       return probeSimulator()
         case "code_integrity":  return probeCodeIntegrity()
+        case "device":          return probeDevice()
+        case "network":         return probeNetwork()
+        case "local_addresses":
+            // Asked for by the server, declined by this app (DESIGN.md 80).
+            return enabledMeasurements.contains(name) ? probeLocalAddresses() : ["status": "not_enabled"]
         default:
             return [
                 "status": "unsupported",
@@ -117,6 +139,75 @@ final class IntegrityProbeManager {
     }
 
     // MARK: - Probes
+
+    /// The OS version and the hardware model (DESIGN.md 80).
+    private func probeDevice() -> [String: Any] {
+        return [
+            "status": "ok",
+            "os_version": UIDeviceOSVersion(),
+            "model_identifier": deviceModelIdentifier(),
+        ]
+    }
+
+    /// Whether a VPN or an HTTP proxy is in use. iOS gives other apps no VPN
+    /// API, so a VPN is inferred from the interfaces the system proxy settings
+    /// are scoped to - a heuristic, so their names are sent with it
+    /// (DESIGN.md 80). Names only, never an address.
+    private func probeNetwork() -> [String: Any] {
+        guard let unmanaged = CFNetworkCopySystemProxySettings() else {
+            return ["status": "error", "error": "The system proxy settings could not be read."]
+        }
+        let settings = unmanaged.takeRetainedValue() as NSDictionary
+        var scoped: [String] = []
+        if let scopes = settings["__SCOPED__"] as? NSDictionary {
+            scoped = scopes.allKeys.compactMap { $0 as? String }.sorted()
+        }
+        let tunnels = ["utun", "ipsec", "ppp", "tun", "tap"]
+        let vpn = scoped.contains { name in tunnels.contains { name.hasPrefix($0) } }
+        let proxy = ["HTTPEnable", "HTTPSEnable", "ProxyAutoConfigEnable"].contains { key in
+            (settings[key] as? NSNumber)?.intValue == 1
+        }
+        return [
+            "status": "ok",
+            "vpn_active": vpn,
+            "http_proxy_configured": proxy,
+            "scoped_interfaces": Array(scoped.prefix(32)),
+        ]
+    }
+
+    /// The phone's own IP addresses, per interface - an optional measurement
+    /// (DESIGN.md 80). Link-local addresses are left out: they can carry the
+    /// hardware address the platform deliberately hides.
+    private func probeLocalAddresses() -> [String: Any] {
+        var head: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&head) == 0, let first = head else {
+            return ["status": "error", "error": "The network interfaces could not be listed."]
+        }
+        defer { freeifaddrs(head) }
+        var addresses: [[String: Any]] = []
+        var cursor: UnsafeMutablePointer<ifaddrs>? = first
+        while let entry = cursor, addresses.count < 32 {
+            cursor = entry.pointee.ifa_next
+            let flags = entry.pointee.ifa_flags
+            guard (flags & UInt32(IFF_UP)) != 0, (flags & UInt32(IFF_LOOPBACK)) == 0,
+                  let address = entry.pointee.ifa_addr else { continue }
+            let family = Int32(address.pointee.sa_family)
+            guard family == AF_INET || family == AF_INET6 else { continue }
+            var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+            guard getnameinfo(address, socklen_t(address.pointee.sa_len), &host,
+                              socklen_t(host.count), nil, 0, NI_NUMERICHOST) == 0 else { continue }
+            let numeric = host.withUnsafeBufferPointer { String(cString: $0.baseAddress!) }
+            let text = numeric.split(separator: "%").first.map(String.init) ?? ""
+            if text.isEmpty || text.lowercased().hasPrefix("fe80") || text.hasPrefix("169.254") {
+                continue
+            }
+            addresses.append([
+                "interface": String(cString: entry.pointee.ifa_name),
+                "address": text,
+            ])
+        }
+        return ["status": "ok", "addresses": addresses]
+    }
 
     private func probeAppIdentity() -> [String: Any] {
         let bundle = Bundle.main
