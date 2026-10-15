@@ -1479,6 +1479,26 @@ def check_request_metadata(api, ctx):
               {k: context.get(k) for k in ("source_ip", "user_agent")}))
 
 
+@check("risk: every decision says what network the request came from")
+def check_source_network(api, ctx):
+    """DESIGN.md 81. A decision's context carries source_network: five yes/no
+    answers, each None where the server cannot know -- vpn_observed while
+    vpn_exit_learning is off. The suite cannot choose the address it comes
+    from, so only the shape and the learning switch are checked here."""
+    settings = live_settings(api)
+    inst, _, _, access, _ = _pin_phone(api, settings, False)
+    st, pl = protected(api, inst, "GET", "/v1/policy/me", access)
+    network = (((pl.get("policy") or {}).get("context")) or {}).get("source_network")
+    keys = {"vpn_listed", "tor_exit", "hosting", "vpn_observed", "vpn_observed_non_hosting"}
+    expect(st == 200 and isinstance(network, dict) and set(network) == keys
+           and all(value in (True, False, None) for value in network.values()),
+           "source_network must carry its five answers: %s %s" % (st, network))
+    learning = _setting_on(settings, "vpn_exit_learning")
+    expect((network["vpn_observed"] is None) == (not learning),
+           "vpn_observed is None exactly while learning is off (vpn_exit_learning=%s): %s"
+           % (settings.get("vpn_exit_learning"), network))
+
+
 @check("integrity: the ART JIT code cache is not mistaken for injection")
 def check_jit_not_flagged(api, ctx):
     """deleted_exec_jit is the legitimate JIT cache; it must never score."""
