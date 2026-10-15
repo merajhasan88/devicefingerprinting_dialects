@@ -910,3 +910,51 @@ on requests that check the session row; the user signs in again. It applies at o
 before the DBA set it. A refresh token is issued for at most the time left. The access token (10
 minutes) and the device token (10 minutes) are ours, not settings. `/health/ready` reports the
 effective values.
+
+## 14. The phone's OS and network, and measurements you switch on
+
+`DESIGN.md` §80. Every measurement is listed in [MEASUREMENTS.md](MEASUREMENTS.md).
+
+**On every scan** (collectors from Android 4 and iOS 3): the **`device`** probe — the OS version, on
+Android also the API level and **the security patch level**, the manufacturer, model and build — and
+the **`network`** probe: whether a **VPN** is up and an **HTTP proxy** is set, as yes/no, with interface
+names and never an address. They are sent outside the server's probe plan, so an app built before them
+keeps working and simply sends neither. On Android the network probe needs `ACCESS_NETWORK_STATE`, a
+normal permission granted at install (no prompt); add it to your app's manifest. iOS gives other apps
+no VPN API, so the collector **infers** a VPN from the interfaces the system proxy settings are scoped
+to — a heuristic, reported with the interface names.
+
+A VPN or a proxy costs **no points** (`android_vpn_active`, `ios_vpn_active`, `android_http_proxy`,
+`ios_http_proxy`): people use them for privacy and at work. If your deployment refuses them, your DBA
+sets the eligibility rules `vpn_active_refuses` and/or `http_proxy_refuses` to 1, which work like the
+developer-options rule in section 5: in enforce mode 403 `integrity_device_ineligible` with a remedy
+your app shows ("Turn off the VPN, then send a new integrity scan"). A phone whose app predates the
+network probe reports neither, and a modified app can hide them: a policy for honest phones, not a
+compromise check. Known VPN exit addresses are a separate matter: record the source address (below)
+and match it against your own list.
+
+**Optional measurements, two keys.** A measurement that identifies a person's phone or network is
+collected only where **your DBA** asks for it **and your app's developers** enabled it:
+
+| Name | DBA | App (reference client) | What |
+|---|---|---|---|
+| `local_addresses` | `optional_measurements` = `local_addresses` | `--dart-define=MEASURE_LOCAL_ADDRESSES=true` | the phone's own IP addresses per interface |
+
+Each challenge lists what the DBA asks for in `optional_probes`; it is never required. An app that did
+not enable one answers `not_enabled`, at no cost. Whatever the DBA does not ask for is dropped before
+a report is stored, even if a phone sends it.
+
+**Recorded by the server** — no app change: `record_source_ip` keeps the address each request came from
+(as seen through your configured proxies, `TRUSTED_PROXY_COUNT`) and `record_user_agent` its
+User-Agent header (cut at 256 characters), both in each risk decision's context (`source_ip`,
+`user_agent`). Both 0 by default. The Flutter client sends `Dart/<version> (dart:io)` unless your app
+sets its own User-Agent. Both are personal data, kept as long as the decisions are: your retention
+policy applies.
+
+**What a phone will not give.** An ordinary app cannot read the **MAC address** (iOS since 7, Android's
+Wi-Fi API since 6 answer a constant; Android 11 hides it from apps targeting it, and Android 10 randomises
+it per network) or the **IMEI** (no iOS API; on Android 10 and later only system and device-owner apps;
+on Android 9 and earlier only behind the "make and manage phone calls" prompt and Google Play's
+identifier disclosures). Neither is collected; the two-key switch above is where either would go if you
+decide to collect it from the older phones that still give it.
+
