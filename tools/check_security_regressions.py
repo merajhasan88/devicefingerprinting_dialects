@@ -122,6 +122,10 @@ class Rows(object):
             self.result = ("ES256", inst.jwk, inst.device_id, "active", "active")
         elif q.startswith("SELECT c.installation_id, c.device_id, c.platform"):
             self.result = self.report_row
+        elif q.startswith("SELECT d.platform, i.status, d.status FROM app_installations i"):
+            self.result = ("android", "active", "active")
+        elif q.startswith(("INSERT INTO integrity_challenges", "DELETE FROM integrity_challenges")):
+            self.writes.append((q, params))
         elif q.startswith("SELECT key_hardware_backed FROM app_installations"):
             self.result = (self.hardware_backed,)
         elif q.startswith("SELECT stepup_public_key_jwk"):
@@ -4497,6 +4501,164 @@ def the_settings_reference_matches_the_migrations():
                    if ({True: "1", False: "0"}.get(default, default)
                        if isinstance(default, bool) else str(default)) != seeded[key])
     expect(not wrong, "a missing row would fall back to another value: %s" % wrong)
+
+
+# ---------------------------------------------------------------------------
+# The device and network probes, optional measurements, request metadata
+# (DESIGN.md 80)
+# ---------------------------------------------------------------------------
+
+
+def _stored_probes():
+    """probe_results as the last report stored them."""
+    rows = [params for q, params in db.writes if q.startswith("INSERT INTO integrity_reports")]
+    return rows[-1][10].adapted if rows else None
+
+
+def _without(probes, *names):
+    return {name: value for name, value in probes.items() if name not in names}
+
+
+@check
+def the_network_probe_is_measured_and_advisory():
+    """DESIGN.md 80. Collectors from Android 4 and iOS 3 volunteer device and
+    network on every scan, never in the plan, so a report without them -- an
+    older app -- loses nothing. A VPN or an HTTP proxy is recorded at 0 points;
+    the fields are type-checked like any probe's, and stored."""
+    measured = {
+        "android": ({"status": "ok", "vpn_active": True, "http_proxy_configured": True,
+                     "transports": ["wifi", "vpn"], "interfaces": ["wlan0", "tun0"]},
+                    {"status": "ok", "release": "9", "sdk_int": 28, "security_patch": "2020-04-05",
+                     "manufacturer": "OPPO", "brand": "OPPO", "model": "CPH2083",
+                     "device": "OP4BA5L1", "build_id": "PPR1.180610.011",
+                     "fingerprint": "OPPO/CPH2083/OP4BA5L1:9/PPR1.180610.011/1:user/release-keys"}),
+        "ios": ({"status": "ok", "vpn_active": True, "http_proxy_configured": True,
+                 "scoped_interfaces": ["en0", "utun3"]},
+                {"status": "ok", "os_version": "15.8.5", "model_identifier": "iPhone9,3"}),
+    }
+    for platform, (network, device) in measured.items():
+        expect("network" not in s._integrity_probe_plan(platform)
+               and "device" not in s._integrity_probe_plan(platform),
+               "%s: a volunteered probe must stay out of the plan" % platform)
+        older = _without(clean(platform), "network", "device")
+        status, plain = send_report(platform, older)
+        expect(status == 200 and not {c for c in codes(plain) if c.startswith("integrity_")},
+               "%s: an older app without them loses nothing: %s %s"
+               % (platform, status, plain.get("integrity")))
+        db.writes = []
+        status, payload = send_report(platform, dict(older, network=network, device=device))
+        points = {r["code"]: r["points"] for r in (payload.get("integrity") or {}).get("reasons", [])}
+        expect(status == 200 and points.get("%s_vpn_active" % platform) == 0
+               and points.get("%s_http_proxy" % platform) == 0
+               and payload["integrity"]["score"] == plain["integrity"]["score"]
+               and payload["integrity"]["verdict"] == plain["integrity"]["verdict"],
+               "%s: a VPN and a proxy are recorded at 0 points: %s %s" % (platform, status, points))
+        stored = _stored_probes() or {}
+        expect(stored.get("network") == network and stored.get("device") == device,
+               "%s: both are stored as sent: %s" % (platform, sorted(stored)))
+        status, payload = send_report(platform, dict(older, network=dict(network, vpn_active="yes")))
+        expect(status == 400 and payload["error"]["code"] == "invalid_integrity_probe",
+               "%s: a wrongly typed field is refused: %s %s" % (platform, status, payload))
+
+
+@check
+def network_eligibility_rules_refuse_only_when_set():
+    """DESIGN.md 80. A VPN or an HTTP proxy never costs points; a deployment
+    that wants them off sets vpn_active_refuses or http_proxy_refuses, refused
+    with integrity_device_ineligible and the rule's remedy."""
+    saved = (s._latest_integrity_state, s._device_integrity_memory, s.INTEGRITY_MODE)
+    s._device_integrity_memory = lambda did, iid: None
+    s.INTEGRITY_MODE = "enforce"
+    try:
+        for rule, code in (("vpn_active_refuses", "android_vpn_active"),
+                           ("vpn_active_refuses", "ios_vpn_active"),
+                           ("http_proxy_refuses", "android_http_proxy"),
+                           ("http_proxy_refuses", "ios_http_proxy")):
+            s._latest_integrity_state = lambda iid, code=code: {
+                "score": 0, "verdict": "trusted", "fresh": True,
+                "reasons": [{"code": code, "points": 0}]}
+            for value, refused in ((0, False), (1, True)):
+                with policy(**{rule: value}):
+                    try:
+                        s._enforce_integrity_gate(inst.device_id, inst.installation_id)
+                        problem = None
+                    except s.ApiProblem as error:
+                        problem = error
+                expect(bool(problem) == refused and (
+                    not refused or (problem.code == "integrity_device_ineligible"
+                                    and [e["reason"] for e in problem.details["eligibility"]]
+                                    == [code]
+                                    and problem.details["eligibility"][0]["remedy"])),
+                       "%s=%d with %s: refused=%s, got %s" % (rule, value, code, refused,
+                                                             problem and problem.code))
+    finally:
+        s._latest_integrity_state, s._device_integrity_memory, s.INTEGRITY_MODE = saved
+
+
+@check
+def optional_measurements_need_both_keys():
+    """DESIGN.md 80. The DBA lists optional measurements; the challenge asks
+    for them and never requires them; the app answers each one it enabled, or
+    not_enabled, which is no collection problem. One the DBA does not request
+    is dropped before the report is stored; an unknown name is a DBA typo
+    that invalidates the snapshot."""
+    addresses = {"status": "ok",
+                 "addresses": [{"interface": "wlan0", "address": "192.0.2.10"}]}
+    path = "/v1/integrity/challenge"
+
+    def challenge():
+        reply = client.post(path, data=b"{}",
+                            headers=access_headers("POST", path, b"{}", device_token))
+        return reply.status_code, reply.get_json() or {}
+
+    with policy():
+        status, asked = challenge()
+        expect(status == 200 and asked.get("optional_probes") == [],
+               "nothing optional is asked for by default: %s %s" % (status, asked))
+        db.writes = []
+        status, payload = send_report("android", dict(clean("android"), local_addresses=addresses))
+        expect(status == 200 and "local_addresses" not in (_stored_probes() or {}),
+               "what the DBA did not request is dropped before storing: %s" % status)
+    with policy(optional_measurements="local_addresses"):
+        status, asked = challenge()
+        expect(status == 200 and asked.get("optional_probes") == ["local_addresses"]
+               and "local_addresses" not in asked.get("required_probes", []),
+               "requested, never required: %s" % asked)
+        db.writes = []
+        status, payload = send_report("android", dict(clean("android"), local_addresses=addresses))
+        expect(status == 200 and (_stored_probes() or {}).get("local_addresses") == addresses,
+               "requested and enabled: stored as sent: %s" % status)
+        for answer in ({"status": "not_enabled"}, {"status": "error", "error": "no interfaces"}):
+            status, payload = send_report("android", dict(clean("android"), local_addresses=answer))
+            expect(status == 200 and payload["integrity"]["verdict"] == "trusted"
+                   and not {c for c in codes(payload) if c.startswith("integrity_")},
+                   "%s is no collection problem: %s" % (answer["status"], codes(payload)))
+    for bad in ("mac_address", "local_addresses,imei"):
+        try:
+            s._validate_risk_settings(dict(SETTINGS, optional_measurements=bad))
+            refused = False
+        except ValueError:
+            refused = True
+        expect(refused, "optional_measurements=%r must invalidate the snapshot" % bad)
+
+
+@check
+def request_metadata_is_kept_only_where_the_dba_says():
+    """DESIGN.md 80. The address a request came from and its User-Agent are
+    personal data: a decision's context carries them only where the DBA sets
+    record_source_ip or record_user_agent, the agent cut at 256 characters."""
+    store = ObservationStore()
+    phone = store.phone()
+    with s.app.test_request_context("/v1/policy/me", headers={"User-Agent": "A" * 300},
+                                    environ_base={"REMOTE_ADDR": "203.0.113.7"}):
+        off = store.decide(phone)["context"]
+        address = store.decide(phone, record_source_ip=1)["context"]
+        both = store.decide(phone, record_source_ip=1, record_user_agent=1)["context"]
+    expect("source_ip" not in off and "user_agent" not in off,
+           "kept only where the DBA says: %s" % sorted(off))
+    expect(address.get("source_ip") == "203.0.113.7" and "user_agent" not in address,
+           "record_source_ip alone: %s" % {k: address.get(k) for k in ("source_ip", "user_agent")})
+    expect(both.get("user_agent") == "A" * 256, "the agent is cut at 256 characters")
 
 
 @check
