@@ -167,7 +167,7 @@ differ, or when the PostgreSQL and SQL Server migrations seed different rows. A 
 switches its rule off; the server holds a value to the bounds its description states.
 
 <!-- settings-reference:begin (tools/settings_reference.py --write; do not edit by hand) -->
-89 settings, seeded by migrations 003-021 with the owner's defaults; each row's own description.
+94 settings, seeded by migrations 003-022 with the owner's defaults; each row's own description.
 
 **Migration 003** — DBA-tunable risk policy settings
 
@@ -322,6 +322,16 @@ switches its rule off; the server holds a value to the bounds its description st
 | `session_max_days` | `0` | A session ends this many days after its first sign-in, however often it refreshes. 0 = no limit (owner default). Up to 365. |
 | `app_pin_support` | `off` | What support staff may do to a customer's app PIN through the business API, after verifying the customer: off, unlock, or unlock_and_reset. |
 | `app_pin_support_reset_minutes` | `15` | After a support reset, minutes within which the customer may set a new PIN, once, even from a limited session, with the password. |
+
+**Migration 022** — the network probe's eligibility rules, optional measurements, and request metadata
+
+| Setting | Default | What it decides |
+|---|---|---|
+| `vpn_active_refuses` | `0` | Eligibility rule: 1 refuses a phone whose latest scan reports a VPN active (android_vpn_active, ios_vpn_active), with its own code and remedy; 0 (owner default) = recorded at 0 points. A phone whose app predates the network probe reports none. |
+| `http_proxy_refuses` | `0` | Eligibility rule: 1 refuses a phone whose latest scan reports an HTTP proxy configured (android_http_proxy, ios_http_proxy); 0 (owner default) = recorded at 0 points. |
+| `optional_measurements` | *(empty)* | Optional measurements the server asks each scan for, comma-separated: local_addresses = the phone's own IP addresses. Empty (owner default) = none. A phone sends one only if its app's developers enabled it too; anything not listed here is dropped, never stored. |
+| `record_source_ip` | `0` | 1 = keep the IP address each request came from in its risk decision's context (source_ip); 0 (owner default) = not kept. Personal data: kept as long as the decisions are. |
+| `record_user_agent` | `0` | 1 = keep each request's User-Agent header in its risk decision's context (user_agent); 0 (owner default) = not kept. |
 <!-- settings-reference:end -->
 
 **Shared phones and several devices are a business decision.** By default a third account on one

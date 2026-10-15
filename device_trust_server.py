@@ -1189,7 +1189,7 @@ def _get_backend_identity():
 # against a schema it does not understand. /health/* still answers so operators
 # can see why.
 
-REQUIRED_SCHEMA_VERSION = 21
+REQUIRED_SCHEMA_VERSION = 22
 
 _schema_state = None
 _schema_lock = threading.Lock()
@@ -1337,6 +1337,12 @@ _CROSS_CHECK_RULES = (
 )
 CROSS_CHECK_WINDOW_HOURS = 24
 
+# Measurements a business may want and the OS allows, but which identify a
+# person's phone or network: collected only where the DBA lists them in
+# optional_measurements AND the app's developers enabled them; anything else
+# is dropped before a report is stored (DESIGN.md 80).
+_OPTIONAL_MEASUREMENTS = ("local_addresses",)
+
 # What each known setting must parse as. A value that does not is a DBA typo;
 # substituting the default would hide it, so the snapshot is refused instead.
 # Keys not listed here pass through unchecked.
@@ -1362,6 +1368,12 @@ _RISK_SETTING_KINDS = {
     "wx_far_above_baseline_percent": "int",
     "developer_options_refuses": "bool",
     "adb_enabled_refuses": "bool",
+    # Migration 022 (DESIGN.md 80).
+    "vpn_active_refuses": "bool",
+    "http_proxy_refuses": "bool",
+    "optional_measurements": "list:" + ",".join(_OPTIONAL_MEASUREMENTS),
+    "record_source_ip": "bool",
+    "record_user_agent": "bool",
     "limited_session_paths": "paths",
     "limited_session_integrity_verdicts": "list:elevated,review",
     "limited_session_policy_actions": "list:step_up,review",
@@ -1959,6 +1971,12 @@ def _bcrypt_db_bytes(value):
 # ---------------------------------------------------------------------------
 
 
+def _optional_measurements_requested():
+    """The optional measurements the DBA currently requests (DESIGN.md 80)."""
+    requested = _risk_setting_words("optional_measurements", "")
+    return [name for name in _OPTIONAL_MEASUREMENTS if name in requested]
+
+
 def _integrity_probe_plan(platform):
     if platform == "android":
         mandatory = [
@@ -2112,6 +2130,15 @@ _PROBE_REQUIRED_FIELDS = {
 # their type is checked.
 _PROBE_OPTIONAL_FIELDS = {
     "android": {
+        # Volunteered on every scan by collectors from version 4, never in the
+        # plan, so older clients lose nothing (DESIGN.md 80).
+        "device": {"release": str, "sdk_int": int, "security_patch": str, "manufacturer": str,
+                   "brand": str, "model": str, "device": str, "build_id": str,
+                   "fingerprint": str},
+        "network": {"vpn_active": bool, "http_proxy_configured": bool, "transports": list,
+                    "interfaces": list},
+        # Only where the DBA requests it and the app's developers enabled it.
+        "local_addresses": {"addresses": list},
         "exec_mappings": {"wx_bytes": int, "wx_size_classes": str,
                           "wx_smallest_bytes": int, "wx_largest_bytes": int,
                           "deleted_exec_own_code": int, "deleted_exec_jit": int,
@@ -2128,6 +2155,12 @@ _PROBE_OPTIONAL_FIELDS = {
             + [("protect_restore_failures", int), ("xom_regions_unlocked", int),
                ("xom_regions_unreadable", int), ("elapsed_ms", int)]
         ),
+    },
+    "ios": {
+        "device": {"os_version": str, "model_identifier": str},
+        "network": {"vpn_active": bool, "http_proxy_configured": bool,
+                    "scoped_interfaces": list},
+        "local_addresses": {"addresses": list},
     },
 }
 _CODE_BUCKETS = ("core", "ext", "app")
@@ -2845,6 +2878,19 @@ def _score_android_integrity(probes):
     if _as_bool(dev.get("adb_enabled")):
         _integrity_reason(reasons, "android_adb_enabled", 0, "ADB is enabled (advisory).")
 
+    # Volunteered by collectors from version 4 (DESIGN.md 80). A VPN or an HTTP
+    # proxy is common on legitimate phones -- privacy, a corporate network --
+    # and no evidence of compromise: recorded at 0 points. A deployment that
+    # wants them off makes it an eligibility rule (vpn_active_refuses,
+    # http_proxy_refuses).
+    network = _probe(probes, "network")
+    if _as_bool(network.get("vpn_active")):
+        _integrity_reason(reasons, "android_vpn_active", 0,
+                          "A VPN is active on this phone (advisory).")
+    if _as_bool(network.get("http_proxy_configured")):
+        _integrity_reason(reasons, "android_http_proxy", 0,
+                          "An HTTP proxy is configured on this phone (advisory).")
+
     return score, hard_block, reasons
 
 
@@ -3002,6 +3048,17 @@ def _score_ios_integrity(probes):
         if INTEGRITY_SCORE_IOS_CODE_INTEGRITY:
             score += 90
 
+    # As on Android (DESIGN.md 80); iOS offers no VPN API to other apps, so the
+    # collector infers one from the interfaces the system proxy settings are
+    # scoped to -- a heuristic, its interface names sent with it.
+    network = _probe(probes, "network")
+    if _as_bool(network.get("vpn_active")):
+        _integrity_reason(reasons, "ios_vpn_active", 0,
+                          "A VPN appears to be active on this phone (advisory, inferred).")
+    if _as_bool(network.get("http_proxy_configured")):
+        _integrity_reason(reasons, "ios_http_proxy", 0,
+                          "An HTTP proxy is configured on this phone (advisory).")
+
     return score, hard_block, reasons
 
 
@@ -3131,6 +3188,15 @@ _ELIGIBILITY_RULES = (
      "Turn off Developer options, then send a new integrity scan."),
     ("adb_enabled_refuses", "android_adb_enabled",
      "Turn off USB debugging (ADB), then send a new integrity scan."),
+    # DESIGN.md 80. A client older than the network probe reports neither.
+    ("vpn_active_refuses", "android_vpn_active",
+     "Turn off the VPN, then send a new integrity scan."),
+    ("vpn_active_refuses", "ios_vpn_active",
+     "Turn off the VPN, then send a new integrity scan."),
+    ("http_proxy_refuses", "android_http_proxy",
+     "Remove the HTTP proxy from the network settings, then send a new integrity scan."),
+    ("http_proxy_refuses", "ios_http_proxy",
+     "Remove the HTTP proxy from the network settings, then send a new integrity scan."),
 )
 
 
@@ -4027,6 +4093,13 @@ def _evaluate_risk_policy(
     }
     if has_request_context() and g.get("rate_limiter_unavailable"):
         context["rate_limiter"] = "unavailable"
+    if has_request_context():
+        # Opt-in request metadata (DESIGN.md 80): personal data, so off unless
+        # the DBA records it, and then kept as long as the decision is.
+        if _risk_setting_bool("record_source_ip", False):
+            context["source_ip"] = request.remote_addr
+        if _risk_setting_bool("record_user_agent", False):
+            context["user_agent"] = (request.headers.get("User-Agent") or "")[:256]
     if BUSINESS_API_TOKEN_SHA256:
         # Measurements only (DESIGN.md 76): the business decides what they mean.
         context["business_events_30d"] = _business_event_counts(device_id, account_id)
@@ -6611,6 +6684,10 @@ def integrity_challenge():
             "nonce": _b64url_encode(nonce),
             "platform": platform,
             "required_probes": probes,
+            # Asked for, never required: a client collects those its app's
+            # developers enabled and answers not_enabled for the rest; an older
+            # client ignores the field (DESIGN.md 80).
+            "optional_probes": _optional_measurements_requested(),
             "expires_at": _iso_z(expires_at),
             "server_time": _iso_z(_utc_now()),
             "collector_policy_version": 1,
@@ -6670,6 +6747,13 @@ def integrity_report():
     probes = report.get("probe_results")
     if not isinstance(probes, dict):
         raise ApiProblem("probe_results must be an object.", 400, "invalid_integrity_report")
+    # An optional measurement the DBA does not request now is dropped before
+    # anything reads or stores the report (DESIGN.md 80). The signature and
+    # report_sha256 still cover the bytes as sent.
+    requested = _optional_measurements_requested()
+    for name in _OPTIONAL_MEASUREMENTS:
+        if name not in requested:
+            probes.pop(name, None)
 
     report_id = str(uuid.uuid4())
     with _cursor(commit=True) as cursor:

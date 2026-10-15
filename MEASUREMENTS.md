@@ -17,39 +17,43 @@ server source uses appears in this file, so the catalog cannot fall behind the c
 
 **`probe_results` identify a phone** — its model, OS build, installed tools, the app's install source. A
 business that reads them holds device-identifying data and treats it as such. The server stores no name,
-e-mail, telephone number or network address with them.
+e-mail or telephone number with them, and no network address unless the DBA and the app both turn one on
+(§6).
 
 ---
 
 ## 1. What the phone measures (`probe_results`)
 
 A scan answers a challenge the server issued; the server chooses the probes (mandatory ones on every
-scan, plus a random draw of the optional ones) and the installation key signs the complete report. The
-phone never sends a score. The signed report:
+scan, plus a random draw of the optional ones) and the installation key signs the complete report. A
+current collector also **volunteers** `device` and `network` on every scan — never part of the plan, so
+an older app that does not send them loses nothing — and answers the **optional measurements** the
+challenge lists in `optional_probes` (§6). The phone never sends a score. The signed report:
 
 | Field | Meaning | Stored |
 |---|---|---|
 | `challenge_id`, `challenge_nonce` | the challenge it answers; each answers once | `integrity_reports.challenge_id` |
 | `installation_id` | the installation whose key signed it | yes |
 | `platform` | `android` or `ios` | yes |
-| `collector_version` | the native collector's version (Android 3, iOS 2 today) | yes |
+| `collector_version` | the native collector's version (Android 4, iOS 3 today) | yes |
 | `collected_at` | the phone's clock, which must be within the allowed skew | checked, not stored |
-| `probe_results` | one object per requested probe, below | yes, as sent |
+| `probe_results` | one object per probe, below | yes, as sent — except an optional measurement the DBA does not request, which is dropped |
 | `version` | the report format, 1 | checked |
 
 The server adds `report_id`, `device_id`, the SHA-256 of the signed bytes (`report_sha256`), its
 reasons, score, verdict, evidence quality and `created_at`. The native collector hands the app its
-`probes` with `collector_version`, `platform`, `challenge_nonce_echo`, the OS version (`sdk_int` on
-Android, `os_version` on iOS) and `test_fixture_applied`; the app checks the nonce echo and the
-platform, sends the probes as `probe_results`, and does not send the rest, so the OS version is not
-stored.
+`probes` with `collector_version`, `platform`, `challenge_nonce_echo`, `sdk_int` (Android) or
+`os_version` (iOS) and `test_fixture_applied`; the app checks the nonce echo and the platform and sends
+the probes as `probe_results`. The OS version reaches the server inside the `device` probe (collectors
+from Android 4 and iOS 3); a report from an older app has none.
 
 Checked against the test database on 2026-10-15: the latest report from a real Android phone (15
 probes, 87 fields) and from the real iPhone (9 probes, 47 fields) use only the fields named below.
 
-Every probe answers `status`: `ok`, `error` (with `error`, and on Android `error_type`) or
-`unsupported` (with `reason`). An `error` is a collection problem, never a clean result (§2,
-`integrity_probe_failed:<probe>`). **Bold** fields are the server's evidence contract
+Every probe answers `status`: `ok`, `error` (with `error`, and on Android `error_type`),
+`unsupported` (with `reason`) or, for an optional measurement this app's developers did not enable,
+`not_enabled`. An `error` in a probe of the plan is a collection problem, never a clean result (§2,
+`integrity_probe_failed:<probe>`); a volunteered or optional probe is never one. **Bold** fields are the server's evidence contract
 (`_PROBE_REQUIRED_FIELDS`): an `ok` probe without them is `integrity_probe_incomplete:<probe>`.
 *Italic* fields are read when present (`_PROBE_OPTIONAL_FIELDS`). The rest are recorded as sent.
 
@@ -76,6 +80,9 @@ Mandatory: `app_identity`, `debug_state`, `root_files`, `system_properties`, `ru
 | `code_integrity` | **`checked`**, **`diff_bytes`**, **`core_compared_bytes`**, **`ext_compared_bytes`**, **`ext_diff_bytes`**, **`app_compared_bytes`**, **`app_diff_bytes`**, `core_diff_bytes`, `ext_libs_diff`, `app_libs_diff`, `diffed_libs`, `reason`, *`core_expected_bytes`*, *`core_skipped_bytes`*, *`core_unreadable_bytes`*, *`core_complete`*, *`ext_expected_bytes`*, *`ext_skipped_bytes`*, *`ext_unreadable_bytes`*, *`ext_complete`*, *`app_expected_bytes`*, *`app_skipped_bytes`*, *`app_unreadable_bytes`*, *`app_complete`*, *`protect_restore_failures`*, *`xom_regions_unlocked`*, *`xom_regions_unreadable`*, *`elapsed_ms`* | system libraries (`core`, `ext`) and the app's own native code (`app`) compared in memory against their files on disk — an inline hook changes the bytes |
 | `developer_settings` | **`developer_options_enabled`**, **`adb_enabled`** | the phone's settings |
 | `emulator` | **`suspected`**, `reasons`, `model`, `manufacturer`, `product`, `hardware` | build values typical of an emulator |
+| `device` (volunteered, collector 4) | *`release`*, *`sdk_int`*, *`security_patch`*, *`manufacturer`*, *`brand`*, *`model`*, *`device`*, *`build_id`*, *`fingerprint`* | the OS version and API level, **the security patch level** (how current the phone's patches are), the hardware model, the build |
+| `network` (volunteered, collector 4) | *`vpn_active`*, *`http_proxy_configured`*, *`transports`* (`wifi`, `cellular`, `ethernet`, `vpn`), *`interfaces`* (names only) | whether a VPN is up — the system's connectivity service is asked about every network, not only the default — and whether an HTTP proxy is set; needs `ACCESS_NETWORK_STATE`, a normal permission granted at install |
+| `local_addresses` (optional, §6) | *`addresses`*: a list of `interface`, `address` | the phone's own IP addresses per interface, link-local ones left out |
 
 ### iOS
 
@@ -94,6 +101,9 @@ it unasked). Optional: `environment`, `simulator`.
 | `environment` | **`dyld_insert_libraries`** | the `DYLD_INSERT_LIBRARIES` variable |
 | `simulator` | **`is_simulator`**, `model` | the simulator, and the hardware model identifier |
 | `code_integrity` | **`checked`**, **`app_diff_bytes`**, **`app_compared_bytes`**, `diff_bytes`, `core_compared_bytes`, `core_diff_bytes`, `ext_compared_bytes`, `ext_diff_bytes`, `ext_libs_diff`, `app_libs_diff`, `app_images_compared`, `diffed_libs`, `system_images_unreadable`, `system_bucket_reason`, `app_segment_compared_bytes`, `app_segment_diff_bytes` (the last two telemetry, never scored) | the app's own code in memory against its file |
+| `device` (volunteered, collector 3) | *`os_version`*, *`model_identifier`* (for example `iPhone9,3`) | the OS version and the hardware model |
+| `network` (volunteered, collector 3) | *`vpn_active`*, *`http_proxy_configured`*, *`scoped_interfaces`* | iOS gives other apps no VPN API: a VPN is **inferred** from the interfaces the system proxy settings are scoped to (`utun`, `ipsec`, `ppp`, `tun`, `tap`) — a heuristic, so the names are sent with it; the proxy from the system proxy settings |
+| `local_addresses` (optional, §6) | *`addresses`*: a list of `interface`, `address` | as on Android |
 
 ---
 
@@ -157,6 +167,8 @@ incomplete scans in a row, under either setting.
 | `android_emulator` | 25 |  |  | Android | The runtime resembles an Android emulator. |
 | `android_developer_options` | 0 |  |  | Android | Developer options are enabled (advisory). The DBA may make it an eligibility rule: `developer_options_refuses`. |
 | `android_adb_enabled` | 0 |  |  | Android | ADB is enabled (advisory). The DBA may make it an eligibility rule: `adb_enabled_refuses`. |
+| `android_vpn_active` | 0 |  |  | Android | A VPN is active on this phone (advisory). Eligibility rule: `vpn_active_refuses`. |
+| `android_http_proxy` | 0 |  |  | Android | An HTTP proxy is configured on this phone (advisory). Eligibility rule: `http_proxy_refuses`. |
 | `ios_bundle_id_mismatch` | 100 | yes |  | iOS | Bundle identifier does not match the server baseline. |
 | `ios_executable_hash_mismatch` | 100 | yes |  | iOS | Executable hash does not match the configured build baseline. |
 | `ios_signing_identifier_mismatch` | 100 | yes |  | iOS | Code-signing identifier does not match the server baseline. |
@@ -172,6 +184,8 @@ incomplete scans in a row, under either setting.
 | `ios_dyld_injection_environment` | 90 |  |  | iOS | DYLD_INSERT_LIBRARIES is set. |
 | `ios_simulator` | 25 |  |  | iOS | The app is running in the iOS simulator. |
 | `ios_app_code_modified` | 90 |  | until enabled | iOS | The application's own code differs in memory from its packaged image. |
+| `ios_vpn_active` | 0 |  |  | iOS | A VPN appears to be active on this phone (advisory, inferred). Eligibility rule: `vpn_active_refuses`. |
+| `ios_http_proxy` | 0 |  |  | iOS | An HTTP proxy is configured on this phone (advisory). Eligibility rule: `http_proxy_refuses`. |
 
 *Until enabled*: report-only until the environment switch `INTEGRITY_SCORE_IOS_FAKE_SIGNATURE`
 (the two signing rules) or `INTEGRITY_SCORE_IOS_CODE_INTEGRITY` turns it on.
@@ -258,6 +272,37 @@ Every risk decision carries the measurements it was made on, stored in `risk_pol
 (the latest scan's state), `integrity_mode`, `integrity_freshness_seconds`, `device_integrity_memory`,
 `device_integrity_memory_hours`, `server_observations` (the counts per phone, per account and per
 account on the phone, with `window_hours` and whether they were `scored`), `request_rate`,
-`held_by_denial`, `rate_limiter` when the counter was unavailable, and `business_events_30d` — counts by
+`held_by_denial`, `rate_limiter` when the counter was unavailable, `source_ip` and `user_agent` where the
+DBA records them (§6), and `business_events_30d` — counts by
 type of the business events of the account, and of every account linked to the phone, over 30 days
 (DESIGN.md 76), where the business API is configured.
+
+---
+
+## 6. Optional measurements, and what a phone will not give
+
+Owner decision of 2026-10-15 (`DESIGN.md` §80): measurements that identify a person's phone or network
+stay optional, and the parties who answer for them switch them on.
+
+| Measurement | Switched on by | Where it lands |
+|---|---|---|
+| `local_addresses` — the phone's own IP addresses | **both**: the DBA lists it in `optional_measurements`, and the app's developers enable it in the app (the reference app: `--dart-define=MEASURE_LOCAL_ADDRESSES=true`). Asked for and not enabled, the phone answers `not_enabled` | the report's `probe_results`; dropped before storing whenever the DBA does not request it |
+| `source_ip` — the address a request came from, as the server sees it (behind the configured proxies) | the DBA: `record_source_ip` | each risk decision's context |
+| `user_agent` — the request's User-Agent header, cut at 256 characters | the DBA: `record_user_agent`. The Flutter client sends `Dart/<version> (dart:io)` unless the app sets its own | each risk decision's context |
+| `vpn_active`, `http_proxy_configured` | always measured by current collectors (a yes/no, no address) | the `network` probe; reasons at 0 points; eligibility rules `vpn_active_refuses`, `http_proxy_refuses` |
+
+Kept as long as the decisions and reports are: the business's retention policy applies to them.
+
+**Not measurable by an ordinary app on current phones**, so not collected:
+
+- **MAC address.** iOS has answered every app with the same constant (`02:00:00:00:00:00`) since iOS 7.
+  Android has done the same for the Wi-Fi API since Android 6, hides the address from apps targeting
+  Android 11 or later, and from Android 10 uses a random address per Wi-Fi network anyway.
+- **IMEI.** iOS has no API for it. From Android 10 it needs a privilege only system apps hold; up to
+  Android 9 it needs the "make and manage phone calls" permission prompt, and Google Play requires
+  disclosure of persistent device identifiers. A device-owner app on a company-managed phone is the
+  exception.
+
+The optional-measurement switch is built so either could be added later as one more name, for the
+phones that still give it.
+
