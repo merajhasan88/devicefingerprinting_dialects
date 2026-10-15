@@ -6531,7 +6531,7 @@ nullable; no new table, so no new grant), then the server as committed in `493fc
 | `refresh_idle_days` 7 | a new refresh token lives 604,800 s |
 | `GET /v1/policy/step-up` through Caddy | `Cache-Control: no-store` |
 | the stored rows | support unlocks and resets recorded with the ticket reference and no phone; `app_pin_set_after_support_reset` with the phone that used the reset; no traceback or error in the journal |
-| the catalog against stored reports | the latest real Android phone's report (15 probes, 87 fields) uses only catalogued fields; the real iPhone's (9, 47) had six the catalog missed — named in `11768ef`, and the gate now reads the collectors' keys as well (`6714eb0`) |
+| the catalog against stored reports | the latest real Android phone's report (15 probes, 87 fields) uses only catalogued fields; the real iPhone's (9, 47) had five the catalog missed, and the Swift source a sixth (`signature_parse_error`, sent only when parsing fails) — named in `11768ef`, and the gate now reads the collectors' keys as well (`6714eb0`). That Android report, the latest from a real phone (2026-10-12), is `collector_version` 2: no handset has yet sent a contract-3 report |
 
 The full enforce suite now needs about ten minutes, past the session's 600-second command limit: it
 was run as two batches with the same checks and order, the second one re-running the four setup
