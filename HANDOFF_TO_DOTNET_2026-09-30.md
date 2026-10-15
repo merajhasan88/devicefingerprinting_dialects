@@ -574,3 +574,13 @@ volunteered, never planned. What the SDK should do to match the reference collec
 live. The Kotlin collector builds into the release APK; the Swift is not compiled yet; neither
 has run on a phone.
 
+## 24. Added 2026-10-15 (later) — source networks (DESIGN.md §81, schema 23)
+
+The server requires **schema 23**. Nothing changes for an SDK: the server classifies the address each
+request comes from itself. One thing matters: the server learns VPN exits from Android scans, using the
+`network` probe's `transports` — the transports of **the app's default network** (`vpn` there means this
+app's own traffic goes through a VPN). Report exactly that, from `ConnectivityManager.getActiveNetwork()`,
+not "some VPN is up somewhere". Decisions now carry `source_network` and may carry the reasons
+`source_vpn_listed`, `source_tor_exit`, `source_hosting`, `source_vpn_observed`,
+`source_vpn_observed_non_hosting` (0 points unless the DBA sets them): tolerate them. Suite: 90 checks
+(`check_source_network`).

@@ -241,6 +241,7 @@ missing row.
 | Protocol transitions | `ACCESS_PROOF_MIN_VERSION`, `INTEGRITY_MIN_COLLECTOR_VERSION`, `INTEGRITY_CHALLENGE_LIFETIME_SECONDS`, `INTEGRITY_REPORT_MAX_SKEW_SECONDS` | Raise a floor to retire an old client |
 | Route 3 | `UPGRADE_ASSERTION_JWKS_FILE`, `UPGRADE_ASSERTION_ISSUER` | The customer's identity backend's public keys |
 | Housekeeping | `MAINTENANCE_INTERVAL_SECONDS`, `RISK_SETTINGS_CACHE_TTL_SECONDS`, `RISK_SETTINGS_MAX_STALE_SECONDS` | |
+| Network lists | `NETWORK_LISTS_DIR`; the daily job `tools/fetch_network_lists.py` | Public VPN, data-centre and Tor lists the server classifies addresses with (DESIGN.md 81) |
 | Fallbacks only, since migration 021 | `INTEGRITY_FRESHNESS_SECONDS`, `INTEGRITY_HARDWARE_BACKING_POLICY`, `POLICY_REINSTALL_WINDOW_HOURS`, `POLICY_REINSTALL_BLOCK_COUNT` | The DBA's settings decide; these answer only a missing row (G1, done) |
 | Fallbacks only | `POLICY_STEP_UP_SCORE`, `POLICY_REVIEW_SCORE`, `POLICY_BLOCK_SCORE`, `POLICY_DEVICE_ACCOUNT_BLOCK_COUNT`, `POLICY_ACCOUNT_DEVICE_BLOCK_COUNT`, `INTEGRITY_DEVICE_MEMORY_HOURS` | Used only when the settings row is missing |
 
@@ -292,6 +293,7 @@ and its W^X baseline (DESIGN.md 62), the iOS team, bundle and signing identifier
 | A catalog of every reason code, observation kind, probe field and context field | [MEASUREMENTS.md](MEASUREMENTS.md) | the gate fails if the source can emit a code it does not name (G5, done) |
 | The OS version and security patch level, a VPN, an HTTP proxy | the `device` and `network` probes, every scan (collectors Android 4, iOS 3) | the report feed; reasons at 0 points (DESIGN.md 80) |
 | Optional: the phone's own IP addresses; the request's source address and User-Agent | `local_addresses` (DBA + app); `source_ip`, `user_agent` in decisions (DBA) | the report feed; SQL (DESIGN.md 80) |
+| Where each request came from: a listed VPN, a Tor exit, a hosting network, a VPN exit learned from the deployment's own Android phones | `source_network` in every decision; `vpn_exit_sightings` (learning, DBA) | decisions; SQL (DESIGN.md 81) |
 
 ## 6. Answers to the owner's four questions
 

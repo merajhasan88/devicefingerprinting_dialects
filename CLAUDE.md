@@ -94,8 +94,8 @@ processes** from the systemd drop-in, with a per-process connection pool (`DB_PO
 `DB_POOL_RECHECK_SECONDS`) and, on SQL Server, a 15 s statement timeout (`DB_QUERY_TIMEOUT`) —
 DESIGN.md 55 and 60. Serve SQL Server with processes, never threads.
 
-**Schema is migrations, DBA-applied.** `migrations/<dialect>/001…022`, applied in order; the server
-refuses to serve unless `schema_migrations` holds the version it requires (currently **22**). A new
+**Schema is migrations, DBA-applied.** `migrations/<dialect>/001…023`, applied in order; the server
+refuses to serve unless `schema_migrations` holds the version it requires (currently **23**). A new
 table needs its grant (`GRANT`/`ALTER DEFAULT PRIVILEGES` on PostgreSQL). Risk and step-up policy
 values live in `risk_policy_settings`, seeded by the migrations with the owner's defaults, which a DBA
 may change — never hard-code a policy value; the gate fails when the server reads a setting no
@@ -113,7 +113,7 @@ DBA's `optional_measurements` and the app's build setting (DESIGN.md 80).
 ## Commands
 
 ```bash
-# Conformance suite — the gate. 89 checks; needs `cryptography` (harness only).
+# Conformance suite — the gate. 90 checks; needs `cryptography` (harness only).
 python3 conformance_suite.py --base-url https://<endpoint>
 #   Scoring checks need the server started with INTEGRITY_ANDROID_CERT_SHA256 set to the
 #   certificate the suite prints, or empty to disable the allow-list.
@@ -126,10 +126,12 @@ python3 conformance_suite.py --base-url https://<endpoint>
 #   check_parallel_clients (4 concurrent flows) must pass on any new backend BEFORE handset
 #   or paid-database time is spent on it.
 
-# Offline security regression gate (101 checks; DESIGN.md 63, 76-80): no database needed
+# Offline security regression gate (104 checks; DESIGN.md 63, 76-81): no database needed
 python3 tools/check_security_regressions.py
 # The generated settings reference (G7): print, or rewrite it in the two documents
 python3 tools/settings_reference.py [--write]
+# Refresh the public VPN, data-centre and Tor lists in data/network_lists (DevOps, daily)
+python3 tools/fetch_network_lists.py
 # Native scanner on the host (from a scratch dir; clang++ or g++)
 clang++ -std=c++17 -O1 -Wall -Wextra -Itools/native -Iandroid/app/src/main/cpp \
     tools/native/check_code_integrity.cpp -o check_code_integrity && ./check_code_integrity
@@ -155,7 +157,10 @@ not jailbroken). The emulator AVD `integrity_root_lab` is the disposable root la
 
 ## Current point of work
 
-See the end of DESIGN.md: section 80 records the device and network probes (the OS version and
+See the end of DESIGN.md: section 81 records the source-network signals — public VPN, data-centre and
+Tor lists shipped with the server, and VPN exits learned from the deployment's own Android phones
+(`vpn_exit_learning`, off by default), all at 0 points (schema 23) — and the platform scope; section 80
+records the device and network probes (the OS version and
 patch level, a VPN or proxy at 0 points with optional eligibility rules), optional measurements behind
 two keys (the DBA's `optional_measurements` and the app's build setting) and request metadata the DBA
 may record (schema 22; collectors Android 4, iOS 3 — the Swift not yet compiled); section 79 records the owner's answers to the who-configures-what audit

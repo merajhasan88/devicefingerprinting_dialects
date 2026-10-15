@@ -6620,3 +6620,55 @@ decisions recorded while `record_source_ip` was on.
 observe; every setting at the owner's defaults, the five new ones off or empty; the business token
 removed.
 
+## 81. VPN exits by address, five client SDKs, and a platform for any customer (2026-10-15)
+
+**Why.** The owner: *"The VPN-address project: we need it if iphone is blind to VPNs."* Costed first
+(`S3` plus a public CloudFront API on the flat-rate Free plan: about USD 0 a month; without that plan,
+AWS WAF alone about USD 6–7), then: *"As for collection: go with 1 and 2"* — the deployment's own
+Android phones, and public lists — *"Safeguard: how will we catch those VPNs? Can we have a separate bit
+for these VPNs outside of hosting companies?"* On distribution: *"I want only my customers to use it but
+its an open source project … Nothing paid. But I dont want to put my poor cloudfront out for abuse … Can
+we just hardcode it in the flutter package and leave it at that?"*
+
+**Where the check lives.** Not in the Flutter package: the phone cannot be trusted to judge itself, it
+does not know the address the server sees, and the lists change daily. The server holds the lists — a
+snapshot ships with it — and refreshes them from their public sources; each deployment learns VPN exits
+from its own Android phones. No central service, no CloudFront, no S3 (at this scale the database costs
+nothing more), nothing paid and nothing to abuse; "customers only" follows, since each runs its own
+server. A list shared between deployments would be the one thing needing the costed CloudFront design —
+not built.
+
+**What was built** (migration 023, schema 23; both engines):
+
+- **Public lists** in `data/network_lists/`: X4BNet's VPN networks (11,045 IPv4 networks) and
+  data-centre networks (44,345), MIT-licensed, the notice in `SOURCES.md`, and the Tor Project's exit
+  list (1,212). `tools/fetch_network_lists.py` refreshes them — DevOps, daily — and keeps the old file
+  unless a download still looks like its list. The server merges them into sorted ranges, re-reads a
+  changed file within a minute, and treats a missing file as unknown, never as empty. IPv4 only: for an
+  IPv6 client their answers are None.
+- **Learning** (`vpn_exit_learning`, off by default — it keeps an address per phone): each Android scan
+  records in `vpn_exit_sightings` the address it came from and whether the app's **own** traffic went
+  through a VPN — the transports of the app's default network, so a VPN carrying only other apps'
+  traffic, or a split tunnel, counts as direct. An address is a VPN exit once at least 3 phones came
+  through a VPN from it within 30 days and they are at least 90% of the phones seen there. **The
+  safeguard the owner asked about:** ad blockers and firewall apps use Android's VPN interface while
+  their traffic leaves from the phone's own address, so a home line or a carrier's shared address
+  collects a few VPN sightings among many direct ones, while a VPN server's address carries only VPN
+  traffic. iOS is never a witness, even when a client claims a VPN route.
+- **The separate bit**: `vpn_observed_non_hosting` — a learned exit outside the data-centre list, a home
+  or office VPN — set only where the hosting answer is known (never for IPv6). Every decision's context
+  carries `source_network` (`vpn_listed`, `tor_exit`, `hosting`, `vpn_observed`,
+  `vpn_observed_non_hosting`); each kind is a reason at 0 points until the DBA gives it points, an
+  address named once by its most specific kind.
+- **Five client SDKs** (G9 decided): native Android (Kotlin), native iOS (Swift), Flutter, .NET and
+  React Native, each built in a session of its own; Python is not an app SDK. For games a Unity (C#)
+  wrapper over the native SDKs would be the next; protecting **government websites** needs a browser
+  SDK — a different build, with keys from WebCrypto or passkeys and none of the native integrity probes.
+- **No single customer.** The owner: *"Leave payactiv out of it as this is a broad platform now and I
+  want to include games and govt site protection alongside financial apps."* `CLAUDE.md`, the guide, the
+  .NET brief and two code comments now speak of customers; the sections above are history and keep
+  their wording.
+
+**Verified offline.** Gate **104/104** — three new checks (the lists' classification, learning, the
+download check); eleven mutations, each caught. Suite **90** (the shape of `source_network`; the suite
+cannot choose its own address, so learning is proved live by a script).
