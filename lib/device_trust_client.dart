@@ -55,10 +55,37 @@ const int stepUpWindowSeconds =
 // -- two keys, because each identifies a person's phone or network. Off unless
 // a build turns it on:
 //   --dart-define=MEASURE_LOCAL_ADDRESSES=true   (the phone's own IP addresses)
+// and, from DESIGN.md 82 (Android collector 5, iOS collector 4):
+//   --dart-define=MEASURE_ACCESSIBILITY=true        (Accessibility services, keyboard)
+//   --dart-define=MEASURE_NOTIFICATION_ACCESS=true  (apps that read notifications)
+//   --dart-define=MEASURE_OTHER_ACCESS=true         (device admins, remote-control apps)
+//   --dart-define=MEASURE_SCREEN_CAPTURE=true       (screen recorded, cast or mirrored)
+//   --dart-define=MEASURE_LOCATION=true             (the last known location)
+//   --dart-define=MEASURE_MOCK_LOCATION=true        (whether it was simulated)
+// The two location measurements also need the person's OS permission, which
+// this app asks for only from its "Allow location" button.
 const bool measureLocalAddresses =
     bool.fromEnvironment('MEASURE_LOCAL_ADDRESSES', defaultValue: false);
+const bool measureAccessibility =
+    bool.fromEnvironment('MEASURE_ACCESSIBILITY', defaultValue: false);
+const bool measureNotificationAccess =
+    bool.fromEnvironment('MEASURE_NOTIFICATION_ACCESS', defaultValue: false);
+const bool measureOtherAccess =
+    bool.fromEnvironment('MEASURE_OTHER_ACCESS', defaultValue: false);
+const bool measureScreenCapture =
+    bool.fromEnvironment('MEASURE_SCREEN_CAPTURE', defaultValue: false);
+const bool measureLocation =
+    bool.fromEnvironment('MEASURE_LOCATION', defaultValue: false);
+const bool measureMockLocation =
+    bool.fromEnvironment('MEASURE_MOCK_LOCATION', defaultValue: false);
 const List<String> enabledMeasurements = <String>[
   if (measureLocalAddresses) 'local_addresses',
+  if (measureAccessibility) 'accessibility',
+  if (measureNotificationAccess) 'notification_access',
+  if (measureOtherAccess) 'other_access',
+  if (measureScreenCapture) 'screen_capture',
+  if (measureLocation) 'location',
+  if (measureMockLocation) 'mock_location',
 ];
 
 const Duration _networkTimeout = Duration(seconds: 15);
@@ -513,6 +540,21 @@ class NativeIntegrityCollector {
       throw NativeKeyException(
         error.code,
         error.message ?? 'The native integrity collector failed.',
+      );
+    }
+  }
+
+  /// Asks the person for the OS location permission (DESIGN.md 82) and
+  /// returns what the app now holds: precise, approximate or none. Only the
+  /// app asks, from its own screen; a scan never prompts.
+  Future<String> requestLocationPermission() async {
+    try {
+      return await _channel.invokeMethod<String>('requestLocationPermission') ??
+          'none';
+    } on PlatformException catch (error) {
+      throw NativeKeyException(
+        error.code,
+        error.message ?? 'The location permission request failed.',
       );
     }
   }
@@ -2625,6 +2667,17 @@ class DeviceRecognitionController extends ChangeNotifier {
     });
   }
 
+  /// The OS location permission this app holds, once asked (DESIGN.md 82).
+  String? locationPermission;
+
+  Future<void> allowLocation() {
+    return _run('Asking for the location permission…', () async {
+      locationPermission =
+          await _integrityCollector.requestLocationPermission();
+      status = 'Location permission: $locationPermission';
+    });
+  }
+
   Future<void> runIntegrityScan() {
     return _run('Running server-challenged native integrity scan…', () async {
       identity ??= await _store.loadOrCreateIdentity();
@@ -4474,6 +4527,18 @@ class _DeviceRecognitionPageState extends State<DeviceRecognitionPage> {
               icon: const Icon(Icons.security),
               label: const Text('Run native integrity scan'),
             ),
+            if (measureLocation || measureMockLocation) ...<Widget>[
+              const SizedBox(height: 8),
+              OutlinedButton.icon(
+                onPressed: _controller.busy ? null : _controller.allowLocation,
+                icon: const Icon(Icons.location_on_outlined),
+                label: Text(
+                  _controller.locationPermission == null
+                      ? 'Allow location (location measurements)'
+                      : 'Location permission: ${_controller.locationPermission}',
+                ),
+              ),
+            ],
             const SizedBox(height: 16),
             const Divider(),
             const SizedBox(height: 8),
