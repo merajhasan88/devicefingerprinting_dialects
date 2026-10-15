@@ -28,8 +28,10 @@ import json
 import os
 import random
 import re
+import shutil
 import sqlite3
 import sys
+import tempfile
 import time
 import uuid
 from contextlib import contextmanager
@@ -107,6 +109,7 @@ class Rows(object):
         self.app_pins = {}
         self.password_hash = None
         self.family_started = None
+        self.sightings = {}
 
     def execute(self, sql, params=None):
         q = " ".join(sql.split())
@@ -264,6 +267,17 @@ class Rows(object):
                 if "reset_until = NULL" in q:
                     pin["reset_until"] = None
                 self.rowcount = 1
+        elif q.startswith("UPDATE vpn_exit_sightings SET"):
+            key = (params[1], params[2])
+            self.rowcount = 0
+            if key in self.sightings:
+                self.sightings[key].append(q.split(" SET ")[1].split(" ")[0])
+                self.rowcount = 1
+        elif q.startswith("INSERT INTO vpn_exit_sightings"):
+            key = (params[0], params[1])
+            if key in self.sightings:
+                raise s.DIALECT._driver.errors.UniqueViolation("duplicate sighting")
+            self.sightings[key] = [q.split("device_id, ")[1].split(",")[0]]
         elif q.startswith("INSERT INTO app_pins (account_id, pin_hash, reset_until)"):
             if params[0] in self.app_pins:
                 raise s.DIALECT._driver.errors.UniqueViolation("duplicate app pin")
@@ -3458,6 +3472,15 @@ CREATE TABLE server_observations (
     installation_id TEXT,
     occurred_at     TSZ NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f+00:00', 'now'))
 );
+CREATE TABLE vpn_exit_sightings (
+    address         TEXT NOT NULL,
+    device_id       TEXT NOT NULL,
+    last_via_vpn_at TSZ,
+    last_direct_at  TSZ,
+    scans_via_vpn   INTEGER NOT NULL DEFAULT 0,
+    scans_direct    INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (address, device_id)
+);
 """
 
 
@@ -4411,6 +4434,7 @@ def _source_measurements():
                 if text.startswith("integrity_") and text.endswith(":%s"):
                     found["integrity reason"].add(text[:-2] + "<probe>")
     found["cross-check rule"] = {rule[0] for rule in s._CROSS_CHECK_RULES}
+    found["relationship reason"] |= {rule[0] for rule in s._SOURCE_NETWORK_RULES}
     found["observation kind"] = set(s._OBSERVATION_KINDS)
     fields = set()
     for contract in (s._PROBE_REQUIRED_FIELDS, s._PROBE_OPTIONAL_FIELDS):
@@ -4498,6 +4522,7 @@ def the_settings_reference_matches_the_migrations():
     read |= {"%s_%s" % (rule[0], part) for rule in s._CROSS_CHECK_RULES
              for part in ("count", "points")}
     read |= {rule[0] for rule in s._ELIGIBILITY_RULES}
+    read |= {rule[2] for rule in s._SOURCE_NETWORK_RULES}
     expect(not read - set(seeded), "read by the server but seeded by no migration: %s"
            % sorted(read - set(seeded)))
     expect(not set(seeded) - read, "seeded but never read: %s" % sorted(set(seeded) - read))
@@ -4664,6 +4689,203 @@ def request_metadata_is_kept_only_where_the_dba_says():
     expect(address.get("source_ip") == "203.0.113.7" and "user_agent" not in address,
            "record_source_ip alone: %s" % {k: address.get(k) for k in ("source_ip", "user_agent")})
     expect(both.get("user_agent") == "A" * 256, "the agent is cut at 256 characters")
+
+
+# ---------------------------------------------------------------------------
+# Where a request came from: public lists and learned VPN exits (DESIGN.md 81)
+# ---------------------------------------------------------------------------
+
+
+@contextmanager
+def network_lists(vpn="", hosting="", tor=""):
+    """Lists in a directory of their own, read instead of the shipped ones; a
+    None list is a missing file."""
+    directory = tempfile.mkdtemp(prefix="gate-lists-")
+    for name, text in (("x4bnet_vpn_ipv4.txt", vpn), ("x4bnet_datacenter_ipv4.txt", hosting),
+                       ("tor_exits.txt", tor)):
+        if text is not None:
+            with open(os.path.join(directory, name), "w", encoding="utf-8") as out:
+                out.write(text)
+    saved = s.NETWORK_LISTS_DIR
+    s.NETWORK_LISTS_DIR = directory
+    s._network_lists.update(checked_at=None, dir=None, mtimes=None, ranges={})
+    try:
+        yield directory
+    finally:
+        s.NETWORK_LISTS_DIR = saved
+        s._network_lists.update(checked_at=None, dir=None, mtimes=None, ranges={})
+        shutil.rmtree(directory, ignore_errors=True)
+
+
+def source_of(address):
+    with s.app.test_request_context("/", environ_base={"REMOTE_ADDR": address}):
+        return s._source_network()
+
+
+TEST_LISTS = {"vpn": "# VPN providers\n203.0.113.0/25\nnot-a-network\n2001:db8::/32\n",
+              "hosting": "203.0.113.0/24\n198.51.100.0/24\n198.51.100.128/25\n",
+              "tor": "192.0.2.7\n"}
+
+
+@check
+def the_source_address_is_classified_by_the_lists():
+    """DESIGN.md 81. The address a request came from is looked up in the lists
+    shipped with the server -- VPN providers, hosting networks, Tor exits --
+    each named once by its most specific kind, at 0 points unless the DBA
+    gives them points. The lists are IPv4: an IPv6 address, or a missing
+    list, is unknown (None), never "not listed". A changed file is re-read."""
+    blank = {"vpn_listed": None, "tor_exit": None, "hosting": None, "vpn_observed": None,
+             "vpn_observed_non_hosting": None}
+    with network_lists(**TEST_LISTS) as directory:
+        for address, expected in (
+                ("203.0.113.9", dict(blank, vpn_listed=True, tor_exit=False, hosting=True)),
+                ("203.0.113.200", dict(blank, vpn_listed=False, tor_exit=False, hosting=True)),
+                ("198.51.100.200", dict(blank, vpn_listed=False, tor_exit=False, hosting=True)),
+                ("192.0.2.7", dict(blank, vpn_listed=False, tor_exit=True, hosting=False)),
+                ("192.0.2.8", dict(blank, vpn_listed=False, tor_exit=False, hosting=False)),
+                ("2001:db8::1", blank)):
+            got = source_of(address)
+            expect(got == expected, "%s: %s, expected %s" % (address, got, expected))
+        store = ObservationStore()
+        phone = store.phone()
+        with s.app.test_request_context("/", environ_base={"REMOTE_ADDR": "203.0.113.9"}):
+            plain = store.decide(phone)
+            tuned = store.decide(phone, source_vpn_listed_points=15)
+        points = {r["code"]: r["points"] for r in plain["reasons"]}
+        expect(points.get("source_vpn_listed") == 0 and "source_hosting" not in points
+               and plain["context"]["source_network"]["vpn_listed"] is True,
+               "a listed VPN is recorded at 0 points, once, by its kind: %s" % points)
+        expect({r["code"]: r["points"] for r in tuned["reasons"]}.get("source_vpn_listed") == 15
+               and tuned["score"] == plain["score"] + 15, "the DBA's points count")
+        with open(os.path.join(directory, "x4bnet_vpn_ipv4.txt"), "w", encoding="utf-8") as out:
+            out.write("192.0.2.0/24\n")
+        os.utime(os.path.join(directory, "x4bnet_vpn_ipv4.txt"), (1, 1))
+        s._network_lists["checked_at"] = None
+        expect(source_of("192.0.2.8")["vpn_listed"] is True
+               and source_of("203.0.113.9")["vpn_listed"] is False, "a changed list is re-read")
+    with network_lists(vpn=None, hosting=None, tor=None):
+        expect(source_of("203.0.113.9") == blank, "missing lists are unknown, not empty")
+
+
+@check
+def vpn_exits_are_learned_from_android_phones():
+    """DESIGN.md 81. Where the DBA turns learning on, each Android scan records
+    the address it came from and whether the app's own traffic went through a
+    VPN; iOS cannot say and is never a witness. An address is a VPN exit once
+    vpn_exit_min_phones phones came through a VPN from it in the window and
+    they are vpn_exit_min_share_percent of the phones seen there -- a home or
+    carrier address carries mostly direct traffic. Outside hosting networks it
+    has its own bit, and only where hosting is known."""
+    exit_address, home = "192.0.2.50", "192.0.2.60"
+    store = ObservationStore()
+
+    def sight(address, via_vpn, phone=None, cursor=None, vpn_active=None):
+        phone = phone or store.phone()
+        network = {"status": "ok", "vpn_active": via_vpn if vpn_active is None else vpn_active,
+                   "transports": ["wifi", "vpn"] if via_vpn else ["wifi"]}
+        with s.app.test_request_context("/", environ_base={"REMOTE_ADDR": address}):
+            s._record_vpn_sighting(cursor or LiteCursor(store.connection), phone[0], network)
+        store.connection.commit()
+        return phone
+
+    def source(address, **settings):
+        with s.app.test_request_context("/", environ_base={"REMOTE_ADDR": address}):
+            return store.decide(store.phone(), **dict({"vpn_exit_learning": 1}, **settings))
+
+    with network_lists(hosting="198.51.100.0/24\n"):
+        expect(source(exit_address, vpn_exit_learning=0)["context"]["source_network"]
+               ["vpn_observed"] is None, "learning off: unknown, and nothing is asked")
+        for _ in range(2):
+            sight(exit_address, True)
+        expect(source(exit_address)["context"]["source_network"]["vpn_observed"] is False,
+               "two phones are not yet three")
+        sight(exit_address, True)
+        decision = source(exit_address)
+        network = decision["context"]["source_network"]
+        codes_found = {r["code"]: r["points"] for r in decision["reasons"]}
+        expect(network["vpn_observed"] is True and network["vpn_observed_non_hosting"] is True
+               and codes_found.get("source_vpn_observed_non_hosting") == 0
+               and "source_vpn_observed" not in codes_found,
+               "three phones through a VPN: a VPN exit outside hosting networks: %s %s"
+               % (network, codes_found))
+        # A carrier's shared address: a few ad blockers on the VPN interface,
+        # most phones direct.
+        for _ in range(3):
+            sight(home, True)
+        for _ in range(2):
+            sight(home, False)
+        expect(source(home)["context"]["source_network"]["vpn_observed"] is False,
+               "3 of 5 phones through a VPN is a phone's own address, not an exit")
+        expect(source(home, vpn_exit_min_share_percent=60)["context"]["source_network"]
+               ["vpn_observed"] is True, "the share is the DBA's")
+        # A VPN that carries other apps' traffic but not this app's (a split
+        # tunnel): the app's traffic arrived direct.
+        split = "192.0.2.70"
+        for _ in range(3):
+            sight(split, False, vpn_active=True)
+        expect(source(split)["context"]["source_network"]["vpn_observed"] is False,
+               "the app's own route decides, not whether some VPN is up")
+        store.connection.execute("UPDATE vpn_exit_sightings SET last_via_vpn_at = ? "
+                                 "WHERE address = ?",
+                                 (s._utc_now() - timedelta(days=40), exit_address))
+        store.connection.commit()
+        expect(source(exit_address)["context"]["source_network"]["vpn_observed"] is False,
+               "sightings older than the window are not counted")
+        hosted = "198.51.100.7"
+        for _ in range(3):
+            sight(hosted, True)
+        decision = source(hosted)
+        expect(decision["context"]["source_network"]["vpn_observed_non_hosting"] is False
+               and "source_vpn_observed" in {r["code"] for r in decision["reasons"]},
+               "a learned exit in a hosting network is not the non-hosting kind")
+        v6 = "2001:db8::50"
+        for _ in range(3):
+            sight(v6, True)
+        network = source(v6)["context"]["source_network"]
+        expect(network["vpn_observed"] is True and network["vpn_observed_non_hosting"] is None,
+               "IPv6: learned, but hosting unknown, so never the non-hosting bit: %s" % network)
+        before = store.connection.execute("SELECT COUNT(*) FROM vpn_exit_sightings").fetchone()[0]
+        with s.app.test_request_context("/", environ_base={"REMOTE_ADDR": exit_address}):
+            for network in ({"status": "error"}, {"status": "ok", "vpn_active": True},
+                            {"status": "ok", "transports": []}, None):
+                s._record_vpn_sighting(LiteCursor(store.connection), store.phone()[0], network)
+        expect(store.connection.execute("SELECT COUNT(*) FROM vpn_exit_sightings").fetchone()[0]
+               == before, "a scan that does not say where its traffic went is no witness")
+    # Through the report: Android only, and only while learning is on.
+    vpn_network = {"status": "ok", "vpn_active": True, "http_proxy_configured": False,
+                   "transports": ["wifi", "vpn"], "interfaces": ["wlan0", "tun0"]}
+    for platform, learning, recorded in (("android", 1, True), ("android", 0, False),
+                                         ("ios", 1, False)):
+        db.sightings = {}
+        probes = dict(clean(platform), network=dict(vpn_network)) if platform == "android" \
+            else dict(clean(platform), network={"status": "ok", "vpn_active": True,
+                                                "http_proxy_configured": False,
+                                                "scoped_interfaces": ["utun3"],
+                                                # what a modified client might claim
+                                                "transports": ["wifi", "vpn"]})
+        with policy(vpn_exit_learning=learning):
+            status, payload = send_report(platform, probes)
+        expect(status == 200 and bool(db.sightings) == recorded
+               and (not recorded or list(db.sightings.values()) == [["last_via_vpn_at"]]),
+               "%s, learning=%s: recorded=%s, got %s %s" % (platform, learning, recorded, status,
+                                                             db.sightings))
+
+
+@check
+def a_network_list_download_is_checked_before_it_replaces_one():
+    """DESIGN.md 81. tools/fetch_network_lists.py keeps the old file unless the
+    download still looks like its list: enough networks, nearly all lines
+    IPv4 networks -- an error page or a truncated file never empties a list."""
+    sys.path.insert(0, str(DOCS / "tools"))
+    try:
+        import fetch_network_lists as fetcher
+    finally:
+        sys.path.pop(0)
+    good = "\n".join("10.%d.%d.0/24" % (a, b) for a in range(5) for b in range(40))
+    expect(fetcher.check(good, 100) is None, "a sound list passes")
+    expect(fetcher.check("10.0.0.0/8\n", 100) is not None, "too few networks is refused")
+    expect(fetcher.check("<html>\n" * 50 + good, 100) is not None,
+           "a page that is mostly not networks is refused")
 
 
 @check
