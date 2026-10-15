@@ -6590,8 +6590,8 @@ frameworks: Flutter, .NET MAUI and React Native. Packaging belongs with G2, whic
   with a constant MAC and has no IMEI API; Android's Wi-Fi API answers a constant MAC since 6, Android 11
   hides it from apps targeting it, Android 10 randomises it per network; the IMEI needs a system-only
   privilege from Android 10, and up to 9 the "make and manage phone calls" prompt plus Google Play's
-  persistent-identifier disclosure. Told to the owner with the recommendation not to collect them;
-  either would be one more name in `optional_measurements` for the old phones that still give it.
+  persistent-identifier disclosure. Told to the owner with the recommendation not to collect them.
+  Owner, 2026-10-15: *"MAC and IMEI: drop them."*
 
 **Verified offline.** Gate **101/101** — four new checks (the network probe measured and advisory and
 out of the plan, its four eligibility pairs, optional measurements with both keys, request metadata);

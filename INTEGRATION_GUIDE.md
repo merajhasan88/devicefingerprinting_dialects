@@ -955,6 +955,5 @@ policy applies.
 Wi-Fi API since 6 answer a constant; Android 11 hides it from apps targeting it, and Android 10 randomises
 it per network) or the **IMEI** (no iOS API; on Android 10 and later only system and device-owner apps;
 on Android 9 and earlier only behind the "make and manage phone calls" prompt and Google Play's
-identifier disclosures). Neither is collected; the two-key switch above is where either would go if you
-decide to collect it from the older phones that still give it.
+identifier disclosures). Neither is collected: the owner dropped both (`DESIGN.md` §80).
 

@@ -293,7 +293,8 @@ stay optional, and the parties who answer for them switch them on.
 
 Kept as long as the decisions and reports are: the business's retention policy applies to them.
 
-**Not measurable by an ordinary app on current phones**, so not collected:
+**Not collected — dropped by the owner (2026-10-15).** Neither is measurable by an ordinary app on
+current phones:
 
 - **MAC address.** iOS has answered every app with the same constant (`02:00:00:00:00:00`) since iOS 7.
   Android has done the same for the Wi-Fi API since Android 6, hides the address from apps targeting
@@ -303,6 +304,4 @@ Kept as long as the decisions and reports are: the business's retention policy a
   disclosure of persistent device identifiers. A device-owner app on a company-managed phone is the
   exception.
 
-The optional-measurement switch is built so either could be added later as one more name, for the
-phones that still give it.
 

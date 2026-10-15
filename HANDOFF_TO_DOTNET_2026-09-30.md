@@ -565,6 +565,7 @@ volunteered, never planned. What the SDK should do to match the reference collec
   `ios_vpn_active`, `android_http_proxy`, `ios_http_proxy`; 403 `integrity_device_ineligible` where the
   DBA sets `vpn_active_refuses` or `http_proxy_refuses` — show `details.eligibility[].remedy`.
 - **User-Agent**: the server can record it (`record_user_agent`); send a meaningful one.
+- **No MAC address, no IMEI**: the owner dropped both (2026-10-15). Do not collect them.
 - **Suite:** 89 checks — `check_network_probe`, `check_optional_measurements`, `check_request_metadata`;
   every suite report now carries the two probes as collector 4 / 3 would.
 
