@@ -3,6 +3,8 @@ package com.example.devicefingerprinting
 import android.content.Context
 import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.os.Build
 import android.os.Debug
 import android.provider.Settings
@@ -11,8 +13,10 @@ import java.io.File
 import java.io.FileInputStream
 import java.io.InputStreamReader
 import java.net.InetSocketAddress
+import java.net.NetworkInterface
 import java.net.Socket
 import java.security.MessageDigest
+import java.util.Collections
 import java.util.Locale
 import java.util.concurrent.TimeUnit
 import org.json.JSONObject
@@ -32,7 +36,17 @@ class IntegrityProbeManager(private val context: Context) {
         //     exec_mappings, and the native code_integrity buckets. Every
         //     report carries this, so a stored report says which probe set
         //     produced it - see DESIGN.md 29.
-        private const val COLLECTOR_VERSION = 3
+        // 4 = volunteers device and network on every scan, and answers the
+        //     optional measurements the server asks for (DESIGN.md 80).
+        private const val COLLECTOR_VERSION = 4
+        // Sent with every scan whether or not the server asked: the server
+        // tolerates probes beyond its plan but refuses a report missing one it
+        // asked for, so a probe new to this collector stays out of the plan and
+        // every older client keeps working (DESIGN.md 80).
+        private val volunteeredProbes = listOf("device", "network")
+        // The optional measurements this collector knows. Each is collected
+        // only when the server asks for it AND the app enabled it.
+        private val optionalMeasurements = setOf("local_addresses")
         private const val MAX_TEXT = 8192
         // Every shell command is bounded (review, DESIGN.md 63): one hung
         // child used to block its probe, and the whole scan, indefinitely.
@@ -78,34 +92,19 @@ class IntegrityProbeManager(private val context: Context) {
         requiredProbes: List<String>,
         challengeNonce: String,
         testFixture: String? = null,
+        optionalProbes: List<String> = emptyList(),
+        enabledMeasurements: Set<String> = emptySet(),
     ): Map<String, Any> {
         val probes = linkedMapOf<String, Any>()
         for (probe in requiredProbes.distinct()) {
-            probes[probe] = try {
-                when (probe) {
-                    "app_identity" -> probeAppIdentity()
-                    "debug_state" -> probeDebugState()
-                    "root_files" -> probeRootFiles()
-                    "root_shell" -> probeRootShell()
-                    "system_properties" -> probeSystemProperties()
-                    "selinux" -> probeSelinux()
-                    "mounts" -> probeMounts()
-                    "runtime_maps" -> probeRuntimeMaps()
-                    "tracer" -> probeTracer()
-                    "frida_ports" -> probeFridaPorts()
-                    "emulator" -> probeEmulator()
-                    "developer_settings" -> probeDeveloperSettings()
-                    "instrumentation_threads" -> probeInstrumentationThreads()
-                    "exec_mappings" -> probeExecMappings()
-                    "code_integrity" -> probeCodeIntegrity()
-                    else -> resultUnsupported("Unknown probe requested by server")
-                }
-            } catch (error: Throwable) {
-                linkedMapOf(
-                    "status" to "error",
-                    "error_type" to error.javaClass.simpleName,
-                    "error" to ((error.message ?: "probe failed").take(240))
-                )
+            probes[probe] = runProbe(probe, enabledMeasurements)
+        }
+        for (probe in volunteeredProbes) {
+            if (!probes.containsKey(probe)) probes[probe] = runProbe(probe, enabledMeasurements)
+        }
+        for (probe in optionalProbes.distinct()) {
+            if (!probes.containsKey(probe) && probe in optionalMeasurements) {
+                probes[probe] = runProbe(probe, enabledMeasurements)
             }
         }
 
@@ -120,6 +119,38 @@ class IntegrityProbeManager(private val context: Context) {
             "probes" to probes
         )
     }
+
+    private fun runProbe(probe: String, enabledMeasurements: Set<String>): Map<String, Any> =
+        try {
+            when (probe) {
+                "app_identity" -> probeAppIdentity()
+                "debug_state" -> probeDebugState()
+                "root_files" -> probeRootFiles()
+                "root_shell" -> probeRootShell()
+                "system_properties" -> probeSystemProperties()
+                "selinux" -> probeSelinux()
+                "mounts" -> probeMounts()
+                "runtime_maps" -> probeRuntimeMaps()
+                "tracer" -> probeTracer()
+                "frida_ports" -> probeFridaPorts()
+                "emulator" -> probeEmulator()
+                "developer_settings" -> probeDeveloperSettings()
+                "instrumentation_threads" -> probeInstrumentationThreads()
+                "exec_mappings" -> probeExecMappings()
+                "code_integrity" -> probeCodeIntegrity()
+                "device" -> probeDevice()
+                "network" -> probeNetwork()
+                "local_addresses" ->
+                    if (probe in enabledMeasurements) probeLocalAddresses() else notEnabled()
+                else -> resultUnsupported("Unknown probe requested by server")
+            }
+        } catch (error: Throwable) {
+            linkedMapOf(
+                "status" to "error",
+                "error_type" to error.javaClass.simpleName,
+                "error" to ((error.message ?: "probe failed").take(240))
+            )
+        }
 
     /**
      * DEBUG-BUILD-ONLY integrity fixtures used to prove server scoring and
@@ -217,6 +248,95 @@ class IntegrityProbeManager(private val context: Context) {
         "status" to "unsupported",
         "reason" to reason
     )
+
+    // An optional measurement the server asked for but this app's developers
+    // did not enable: the business asked, the app declined (DESIGN.md 80).
+    private fun notEnabled(): Map<String, Any> = linkedMapOf("status" to "not_enabled")
+
+    /** The OS and the hardware model, and how current the security patches are. */
+    private fun probeDevice(): Map<String, Any> = ok(
+        "release" to (Build.VERSION.RELEASE ?: ""),
+        "sdk_int" to Build.VERSION.SDK_INT,
+        "security_patch" to
+            (if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) Build.VERSION.SECURITY_PATCH else ""),
+        "manufacturer" to (Build.MANUFACTURER ?: ""),
+        "brand" to (Build.BRAND ?: ""),
+        "model" to (Build.MODEL ?: ""),
+        "device" to (Build.DEVICE ?: ""),
+        "build_id" to (Build.ID ?: ""),
+        "fingerprint" to (Build.FINGERPRINT ?: "").take(256)
+    )
+
+    /**
+     * Whether a VPN is up and an HTTP proxy is set, as the system's own
+     * connectivity service says (ACCESS_NETWORK_STATE, granted at install). A
+     * VPN is a network of its own, so every network is asked, not only the
+     * default one. Interface names only - never an address.
+     */
+    private fun probeNetwork(): Map<String, Any> {
+        val manager = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+            ?: return unavailable("ConnectivityManager is not available")
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) {
+            return unavailable("needs Android 6 or newer")
+        }
+        val transports = linkedSetOf<String>()
+        manager.activeNetwork?.let { network ->
+            manager.getNetworkCapabilities(network)?.let { caps ->
+                if (caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) transports.add("wifi")
+                if (caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)) transports.add("cellular")
+                if (caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)) transports.add("ethernet")
+                if (caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) transports.add("vpn")
+            }
+        }
+        @Suppress("DEPRECATION")
+        val vpn = manager.allNetworks.any { network ->
+            manager.getNetworkCapabilities(network)
+                ?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) == true
+        }
+        val proxy = manager.defaultProxy != null ||
+            !System.getProperty("http.proxyHost").isNullOrBlank()
+        val interfaces = mutableListOf<String>()
+        try {
+            NetworkInterface.getNetworkInterfaces()?.let { all ->
+                for (item in Collections.list(all)) {
+                    if (item.isUp && !item.isLoopback) interfaces.add(item.name.take(32))
+                }
+            }
+        } catch (_: Throwable) {
+            // Names are context; the two answers above stand without them.
+        }
+        return ok(
+            "vpn_active" to vpn,
+            "http_proxy_configured" to proxy,
+            "transports" to transports.toList(),
+            "interfaces" to interfaces.distinct().take(32)
+        )
+    }
+
+    /**
+     * The phone's own IP addresses, per interface - an optional measurement
+     * (DESIGN.md 80). Link-local addresses are left out: they can carry the
+     * hardware address, which the platforms deliberately hide.
+     */
+    private fun probeLocalAddresses(): Map<String, Any> {
+        val addresses = mutableListOf<Map<String, Any>>()
+        val all = NetworkInterface.getNetworkInterfaces()
+            ?: return unavailable("no network interface could be listed")
+        for (item in Collections.list(all)) {
+            if (!item.isUp || item.isLoopback) continue
+            for (address in Collections.list(item.inetAddresses)) {
+                if (address.isLoopbackAddress || address.isLinkLocalAddress) continue
+                if (addresses.size >= 32) break
+                addresses.add(
+                    linkedMapOf(
+                        "interface" to item.name.take(32),
+                        "address" to (address.hostAddress ?: "").substringBefore('%').take(64)
+                    )
+                )
+            }
+        }
+        return ok("addresses" to addresses)
+    }
 
     @Suppress("DEPRECATION")
     private fun probeAppIdentity(): Map<String, Any> {

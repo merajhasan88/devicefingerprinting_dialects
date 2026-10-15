@@ -65,7 +65,12 @@ class MainActivity : FlutterActivity() {
                             "required_probes must be a list of strings.",
                         )
                     val testFixture = call.argument<String>("integrity_test_fixture")
-                    integrityProbes.collect(required, nonce, testFixture)
+                    // Absent from an older Dart client: then nothing optional
+                    // is collected (DESIGN.md 80).
+                    val optional = call.argument<List<String>>("optional_probes") ?: emptyList()
+                    val enabled =
+                        call.argument<List<String>>("enabled_measurements")?.toSet() ?: emptySet()
+                    integrityProbes.collect(required, nonce, testFixture, optional, enabled)
                 }
 
                 else -> result.notImplemented()
