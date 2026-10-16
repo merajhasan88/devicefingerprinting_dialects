@@ -45,6 +45,7 @@ import copy
 import hashlib
 import json
 import os
+import re
 import secrets
 import sys
 import threading
@@ -1843,6 +1844,49 @@ def check_installation_history(api, ctx):
     again = submit_report(api, inst, token, lambda probes: probes["device"].update(model="Elsewhere"))
     expect("installation_device_changed" not in history(again),
            "unchanged since: nothing new: %s" % history(again))
+
+
+@check("business: the DBA's rules over business events score a decision")
+def check_business_event_rules(api, ctx):
+    """DESIGN.md 84.5, item 4 of the eight of 2026-10-14. With
+    DEVICE_TRUST_BUSINESS_TOKEN (role events) and a business_event_rules entry
+    chargeback:1:<hours>:<points> (account scope), a chargeback sent with the
+    address it came from makes the account's next decision carry
+    business_event_rule:chargeback:account at the rule's points, sourced from
+    the business. Skips otherwise."""
+    token = os.environ.get("DEVICE_TRUST_BUSINESS_TOKEN", "")
+    rules = [rule for rule in _setting_words(live_settings(api), "business_event_rules", "")
+             if re.fullmatch(r"chargeback:1:[0-9]+:[0-9]+(:account)?", rule)]
+    if not token or not rules:
+        raise Skip("needs DEVICE_TRUST_BUSINESS_TOKEN and a business_event_rules entry "
+                   "chargeback:1:<hours>:<points>")
+    points = int(rules[0].split(":")[3])
+    integrity_context(ctx)
+    inst = Installation()
+    st, pl = enrol(api, inst, fresh_hint())
+    expect(st in (200, 201), "enrol failed: %s %s" % (st, pl))
+    device = device_token(api, inst)
+    submit_report(api, inst, device)
+    st, pl = open_account(api, inst, device, "rule-%s" % secrets.token_hex(4))
+    expect(st in (200, 201), "account open failed: %s %s" % (st, pl))
+    access, account_id = pl["access_token"], pl["account_id"]
+    event = {"event_id": "suite-rule-%s" % secrets.token_hex(6), "account_id": account_id,
+             "type": "chargeback", "occurred_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+             "source_address": "203.0.113.77"}
+    st, sent = api.call("POST", "/v1/business/events",
+                        headers={"Authorization": "Bearer " + token},
+                        body_text=json.dumps({"events": [event]}))
+    if st == 403 and error_code(sent) == "business_role_missing":
+        raise Skip("DEVICE_TRUST_BUSINESS_TOKEN lacks the events role")
+    expect(st == 200 and sent.get("accepted") == 1, "the event: %s %s" % (st, sent))
+    st, me = protected(api, inst, "GET", "/v1/policy/me", access)
+    policy = (me or {}).get("policy") or {}
+    found = [r for r in policy.get("reasons", []) if r.get("code") == "business_event_rule:chargeback:account"]
+    findings = [f for f in (policy.get("assessment") or {}).get("findings", [])
+                if f.get("code") == "business_event_rule:chargeback:account"]
+    expect(st == 200 and found and found[0].get("points") == points and found[0].get("count") == 1
+           and findings and findings[0].get("provenance") == "business",
+           "the rule scores the decision, from the business: %s %s %s" % (st, found, findings))
 
 
 @check("risk: the source IP and User-Agent are kept only where the DBA says")
