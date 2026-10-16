@@ -336,6 +336,7 @@ a rule off.
 | `source_hosting` | `source_hosting_points` 15 | The request came from a hosting or data-centre network not known as a VPN (§7). |
 | `source_vpn_observed` | `source_vpn_observed_points` 10 | The request came from an address this server's Android phones show to be a VPN exit, in a hosting network or where that is unknown (§7). |
 | `source_vpn_observed_non_hosting` | `source_vpn_observed_non_hosting_points` 10 | The same, outside hosting networks: a home or office VPN (§7). |
+| `business_event_rule:<rule>` | the rule's own points | One of the DBA's `business_event_rules` matched (DESIGN.md 84.5; none by default): `<rule>` is the rule's type, `/outcome` and `@source kind` as written, then its scope — for example `business_event_rule:chargeback:account`. It carries `count`, the matching events. |
 
 The server's cross-checks (DESIGN.md 77) score only where the DBA sets `cross_checks_enabled`; their
 counts are in every decision's context either way. Each rule has `<code>_count` and `<code>_points`,
@@ -391,7 +392,9 @@ account on the phone, with `window_hours` and whether they were `scored`), `requ
 `held_by_denial`, `rate_limiter` when the counter was unavailable, `source_ip` and `user_agent` where the
 DBA records them (§6), `source_network` (§7), and `business_events_30d` — counts by
 type of the business events of the account, and of every account linked to the phone, over 30 days
-(DESIGN.md 76), where the business API is configured. The stored context also keeps the decision's
+(DESIGN.md 76), where the business API is configured. A business event may carry the address it came
+from (DESIGN.md 84.5); the server stores only its kinds (`source_kinds`, as in §7) and a keyed hash
+(`source_hash`), never the address. The stored context also keeps the decision's
 `assessment`, the four answers of §8. A decision judged on a scan made for its operation (DESIGN.md
 84.3) carries `operation_scan` — `report_id`, `operation_sha256`, `age_seconds` — and one where observe
 mode let such a request through without that scan names the refusal enforce mode would have given

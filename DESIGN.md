@@ -7057,3 +7057,32 @@ Gate: `each_installation_is_compared_with_its_own_past` — first scan; unchange
 points; fourteen cases from a re-signed app to an OS update excusing an unsupported measurement; flips by
 count, window and category; iOS. Sixteen breakages caught. GAME_THREATS names the two that matter to
 games (a copied installation, a mod installed over the genuine app).
+
+### 84.5 Item 4 — events from the business's other services (migration 029, schema 29)
+
+**Asked for.** Item 4: credential changes, recovery, networks, payees from the customer's other
+services. §76's business events API already took them (payees as keyed hashes); open were the review's
+*"Restrict permitted event types per producer"* (F3), *"source-network patterns"* across services (the
+2026-10-13 review), and §76's note that *"Scoring rules over business events are one commit away if the
+business wants the server to apply them"* — the owner's role split: *"a means to apply logic on servers
+… that may differ from defaults"*, while *"Measurements we have to guarantee, leave business decisions
+for them."*
+
+**Built.**
+- `business_event_types_by_producer` (DBA, empty): `caller:type+type`; another type from a listed caller
+  is a 400 like an unlisted type. Validated in the settings snapshot.
+- `source_address` on an event: classified by the same code as a request's own address
+  (`_address_network`, split out of `_source_network`) and stored only as `,kind,kind,` and an HMAC
+  under its own derivation of the root secret (`business-source-v1`). A resent event must match its
+  source hash too, or it is an `event_id_conflict`.
+- `business_event_rules` (DBA, empty): `type[/outcome][@source kind]:count:hours:points[:scope]`, scope
+  `account`, `device` or `newcomer` (the account's events, only for a phone joining now or within the
+  rule's hours — a takeover after a reset). One count query per rule per decision, only when rules exist.
+  Each match is `business_event_rule:<type…>:<scope>` with its points and count; kind and provenance
+  `business` in the four answers. Validated: at least one event, 1–8760 hours, 0–100 points.
+- No default rules and no default types: the owner's line between measurements and business decisions.
+
+Gate: `business_events_from_other_services_follow_the_dbas_rules` — both settings' validation, a rule's
+reading, per-caller types, the source kept as kinds and hash only, duplicate versus conflict by source,
+nine rule cases (hours, count, device, outcome, source, newcomer), points added, the business as the
+source. Thirteen breakages caught.

@@ -3025,7 +3025,8 @@ CREATE TABLE business_events (event_id TEXT PRIMARY KEY,
                               account_id TEXT NOT NULL REFERENCES demo_accounts(account_id),
                               event_type TEXT NOT NULL, occurred_at TSZ NOT NULL,
                               received_at TSZ DEFAULT CURRENT_TIMESTAMP, amount_minor INTEGER,
-                              currency TEXT, outcome TEXT, subject_hash TEXT, producer TEXT);
+                              currency TEXT, outcome TEXT, subject_hash TEXT, producer TEXT,
+                              source_kinds TEXT, source_hash TEXT);
 CREATE TABLE acceptance_lapses (acceptance_id TEXT, reason_code TEXT, source TEXT, points INTEGER,
                                 account_id TEXT, installation_id TEXT, event_type TEXT,
                                 occurred_at TSZ, PRIMARY KEY (acceptance_id, reason_code));
@@ -3486,6 +3487,14 @@ CREATE TABLE session_upgrade_requests (
     device_id  TEXT NOT NULL,
     account_id TEXT NOT NULL,
     denied_at  TSZ
+);
+CREATE TABLE business_events (
+    event_id     TEXT PRIMARY KEY,
+    account_id   TEXT NOT NULL,
+    event_type   TEXT NOT NULL,
+    occurred_at  TSZ NOT NULL,
+    outcome      TEXT,
+    source_kinds TEXT
 );
 CREATE TABLE server_observations (
     observation_id  TEXT PRIMARY KEY,
@@ -4464,6 +4473,7 @@ def _source_measurements():
     found["relationship reason"] |= {rule[0] for rule in s._SOURCE_NETWORK_RULES}
     found["integrity reason"] |= {code for rule in s._ACCESS_HOLDERS for code in rule[2:4]}
     found["integrity reason"] |= {rule[0] for rule in s._HISTORY_RULES}
+    found["relationship reason"].add("business_event_rule:<rule>")
     found["observation kind"] = set(s._OBSERVATION_KINDS)
     fields = set()
     for contract in (s._PROBE_REQUIRED_FIELDS, s._PROBE_OPTIONAL_FIELDS):
@@ -6515,6 +6525,140 @@ def each_installation_is_compared_with_its_own_past():
     found = {r["code"] for r in payload["integrity"]["reasons"] if r["code"] in s._HISTORY_CODES}
     expect(status == 200 and found == {"installation_device_changed", "installation_os_downgraded"},
            "iOS: another model, an older iOS: %s %s" % (status, found))
+
+
+@check
+def business_events_from_other_services_follow_the_dbas_rules():
+    """DESIGN.md 84.5: item 4 of the eight the owner approved on 2026-10-14 --
+    events from the business's other services (credential changes, recovery,
+    networks, payees). Each caller may be held to its own event types; an
+    event may carry the address it came from, kept only as its kinds and a
+    keyed hash; and the DBA may write rules over the events -- none by
+    default -- each a reason at its points, sourced from the business."""
+    for value, valid in (("", True), ("payments:chargeback+refund, identity:credential_changed", True),
+                         ("payments", False), ("Pay:chargeback", False), ("payments:Chargeback", False)):
+        try:
+            s._validate_risk_settings(dict(SETTINGS, business_event_types_by_producer=value))
+            accepted = True
+        except ValueError:
+            accepted = False
+        expect(accepted == valid, "business_event_types_by_producer=%r: %s" % (value, accepted))
+    for value, valid in (("", True), ("chargeback:1:720:40", True),
+                         ("login_failed/blocked@tor_exit:3:24:20:device", True),
+                         ("credential_changed:1:24:30:newcomer", True),
+                         ("chargeback:0:720:40", False), ("chargeback:1:0:40", False),
+                         ("chargeback:1:720:101", False), ("chargeback:1:720:40:everyone", False),
+                         ("chargeback@moon:1:720:40", False), ("chargeback", False)):
+        try:
+            s._validate_risk_settings(dict(SETTINGS, business_event_rules=value))
+            accepted = True
+        except ValueError:
+            accepted = False
+        expect(accepted == valid, "business_event_rules=%r: %s" % (value, accepted))
+    rule = s._parse_event_rule("login_failed/blocked@tor_exit:3:24:20:device")
+    expect(rule == {"type": "login_failed", "outcome": "blocked", "source": "tor_exit", "count": 3,
+                    "hours": 24, "points": 20, "scope": "device",
+                    "code": "business_event_rule:login_failed/blocked@tor_exit:device"},
+           "a rule reads as written: %s" % rule)
+
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    saved_network = s._address_network
+    s._address_network = lambda address: dict(
+        dict.fromkeys(s._SOURCE_KINDS, False), tor_exit=address == "198.51.100.7")
+    try:
+        with business_store() as connection, business_policy(
+                business_event_types_by_producer="identity:credential_changed+recovery_completed"):
+            acct = business_account(connection, "events-holder")
+            s.BUSINESS_API_CALLERS = {c.sha256_hex(b"identity-token"): ("identity", ("events",)),
+                                      c.sha256_hex(b"payments-token"): ("payments", ("events",))}
+            event = {"event_id": "id-1", "account_id": acct, "type": "credential_changed",
+                     "occurred_at": now, "source_address": "198.51.100.7"}
+            status, reply = business_call("POST", "/v1/business/events",
+                                          {"events": [dict(event, type="chargeback")]},
+                                          token="identity-token")
+            expect(status == 400 and (reply.get("error") or {}).get("details", {}).get("field")
+                   == "type", "a type the caller may not send: %s %s" % (status, reply))
+            status, reply = business_call("POST", "/v1/business/events",
+                                          {"events": [dict(event, event_id="pay-1", type="chargeback",
+                                                           source_address=None)]},
+                                          token="payments-token")
+            expect(status == 200 and reply.get("accepted") == 1,
+                   "a caller not listed: any type: %s %s" % (status, reply))
+            status, reply = business_call("POST", "/v1/business/events", {"events": [event]},
+                                          token="identity-token")
+            stored = connection.execute(
+                "SELECT source_kinds, source_hash, producer FROM business_events WHERE event_id = 'id-1'"
+            ).fetchone()
+            expect(status == 200 and reply.get("accepted") == 1 and stored[0] == ",tor_exit,"
+                   and len(stored[1]) == 64 and "198.51.100.7" not in str(stored)
+                   and stored[2] == "identity",
+                   "the address kept as its kinds and a keyed hash only: %s %s" % (reply, stored))
+            status, reply = business_call("POST", "/v1/business/events", {"events": [event]},
+                                          token="identity-token")
+            expect(reply.get("duplicate") == 1, "resent: a duplicate: %s" % reply)
+            status, reply = business_call("POST", "/v1/business/events",
+                                          {"events": [dict(event, source_address="203.0.113.1")]},
+                                          token="identity-token")
+            expect(reply.get("rejected") == 1 and reply["results"][0]["code"] == "event_id_conflict",
+                   "another address under its ID: a conflict: %s" % reply)
+            status, reply = business_call("POST", "/v1/business/events",
+                                          {"events": [dict(event, event_id="id-2",
+                                                           source_address="not-an-address")]},
+                                          token="identity-token")
+            expect(status == 400, "a source that is not an address: %s" % status)
+    finally:
+        s._address_network = saved_network
+
+    store = ObservationStore()
+    acct, other = str(uuid.uuid4()), str(uuid.uuid4())
+    phone, newcomer = store.phone(), store.phone()
+    store.link(phone[0], acct, age_days=30)
+    store.link(phone[0], other, age_days=30)
+
+    def event(account_id, event_type, hours_ago=1.0, outcome=None, kinds=None):
+        store.connection.execute(
+            "INSERT INTO business_events VALUES (?, ?, ?, ?, ?, ?)",
+            (str(uuid.uuid4()), account_id, event_type, store.now - timedelta(hours=hours_ago),
+             outcome, kinds))
+
+    def rules(decision):
+        return {r["code"]: (r["points"], r.get("count")) for r in decision["reasons"]
+                if r["code"].startswith("business_event_rule:")}
+
+    event(acct, "chargeback")
+    event(other, "repayment_failed", outcome="late")
+    event(other, "repayment_failed", outcome="late")
+    event(acct, "credential_changed", hours_ago=2, kinds=",tor_exit,")
+    event(acct, "chargeback", hours_ago=800)
+    plain = store.decide(phone, acct)
+    expect(not rules(plain), "no rules by default: the business decides")
+    decided = store.decide(phone, acct, business_event_rules="chargeback:1:720:40")
+    expect(rules(decided) == {"business_event_rule:chargeback:account": (40, 1)}
+           and decided["score"] == min(100, plain["score"] + 40),
+           "a rule on the account, in its hours, adds its points: %s %s -> %s"
+           % (rules(decided), plain["score"], decided["score"]))
+    finding = [f for f in decided["assessment"]["findings"]
+               if f["code"] == "business_event_rule:chargeback:account"]
+    expect(finding and finding[0]["kind"] == "business" and finding[0]["provenance"] == "business",
+           "its facts are the business's: %s" % finding)
+    for setting, wanted in (
+            ("chargeback:2:720:40", {}),
+            ("chargeback:2:1000:40", {"business_event_rule:chargeback:account": (40, 2)}),
+            ("repayment_failed:2:24:30", {}),
+            ("repayment_failed:2:24:30:device", {"business_event_rule:repayment_failed:device": (30, 2)}),
+            ("repayment_failed/late:2:24:30:device",
+             {"business_event_rule:repayment_failed/late:device": (30, 2)}),
+            ("repayment_failed/missed:1:24:30:device", {}),
+            ("credential_changed@tor_exit:1:24:30", {"business_event_rule:credential_changed@tor_exit:account": (30, 1)}),
+            ("credential_changed@hosting:1:24:30", {}),
+            ("credential_changed:1:24:30:newcomer", {})):
+        got = rules(store.decide(phone, acct, business_event_rules=setting))
+        expect(got == wanted, "%s: %s, not %s" % (setting, got, wanted))
+    joining = store.decide(newcomer, acct, pending=True,
+                           business_event_rules="credential_changed:1:24:30:newcomer")
+    expect(rules(joining) == {"business_event_rule:credential_changed:newcomer": (30, 1)}
+           and joining["score"] >= 30,
+           "a phone joining the account just after its password changed: %s" % rules(joining))
 
 
 # The rows people change by hand (DESIGN.md 84): the key, the value, then the

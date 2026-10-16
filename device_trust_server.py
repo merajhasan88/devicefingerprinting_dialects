@@ -1248,7 +1248,7 @@ def _get_backend_identity():
 # against a schema it does not understand. /health/* still answers so operators
 # can see why.
 
-REQUIRED_SCHEMA_VERSION = 28
+REQUIRED_SCHEMA_VERSION = 29
 
 
 def _server_build():
@@ -1585,6 +1585,8 @@ _RISK_SETTING_KINDS = {
     "history_checks_enabled": "bool",
     "history_window_hours": "int",
     "installation_verdict_flips_count": "int",
+    "business_event_types_by_producer": "producer_codes",
+    "business_event_rules": "event_rules",
 }
 _RISK_SETTING_KINDS.update(
     ("%s_%s" % (rule[0], part), "int")
@@ -1672,6 +1674,19 @@ def _validate_risk_settings(values):
             # Reason codes, comma-separated; empty is a valid choice.
             valid = all(
                 re.fullmatch(r"[a-z0-9_:]{1,96}", item.strip()) is not None
+                for item in value.replace(";", ",").split(",")
+                if item.strip()
+            )
+        elif kind == "producer_codes":
+            # caller:type+type, comma-separated (DESIGN.md 84.5); empty is valid.
+            valid = all(
+                _PRODUCER_TYPES.fullmatch(item.strip()) is not None
+                for item in value.replace(";", ",").split(",")
+                if item.strip()
+            )
+        elif kind == "event_rules":
+            valid = all(
+                _parse_event_rule(item.strip()) is not None
                 for item in value.replace(";", ",").split(",")
                 if item.strip()
             )
@@ -4837,12 +4852,18 @@ def _source_network():
     (DESIGN.md 81). None wherever it cannot know: outside a request, no list
     loaded, an IPv6 address against the IPv4 lists, learning switched off. The
     address itself is not kept here."""
+    if not has_request_context():
+        return dict.fromkeys(_SOURCE_KINDS)
+    return _address_network(_client_address())
+
+
+def _address_network(address_text):
+    """_source_network for any address: a request's, or an event's
+    (DESIGN.md 84.5)."""
     known = {"vpn_listed": None, "tor_exit": None, "hosting": None, "vpn_observed": None,
              "vpn_observed_non_hosting": None}
-    if not has_request_context():
-        return known
     try:
-        address = ipaddress.ip_address(_client_address() or "")
+        address = ipaddress.ip_address(address_text or "")
     except ValueError:
         return known
     if address.version == 4:
@@ -5004,6 +5025,8 @@ def _findings(integrity=None, policy=None):
                     "collection" if _is_quality_reason(reason)
                     else "condition" if _is_condition_reason(reason) else "integrity")
                 provenance = "phone"
+            elif str(reason["code"]).startswith("business_event_rule:"):
+                kind, provenance = "business", "business"
             else:
                 kind, provenance = _POLICY_FINDINGS.get(str(reason["code"]), ("other", "server"))
             points = reason.get("points", 0)
@@ -5516,6 +5539,12 @@ def _evaluate_risk_policy(
                 message += " A denial alone holds the phone at review (limited) for that time."
             _policy_reason(reasons, code, points, message, count=count)
             score += points
+
+    # The DBA's rules over business events (DESIGN.md 84.5), none by default.
+    score += _business_rule_reasons(
+        reasons, device_id, account_id,
+        observed_at if (account_id is not None and account_link_pending and not link_exists)
+        else link_first_seen)
 
     recommended_action = _policy_action(score, hard_block=hard_block)
     held_by_denial = False
@@ -10039,8 +10068,101 @@ def deny_upgrade(request_id):
 
 _BUSINESS_EVENT_FIELDS = frozenset((
     "event_id", "account_id", "handle", "type", "occurred_at", "amount_minor",
-    "currency", "outcome", "subject_ref",
+    "currency", "outcome", "subject_ref", "source_address",
 ))
+# Events from the business's other services (DESIGN.md 84.5, item 4 of
+# 2026-10-14): which types each caller may send, and the address an event
+# came from -- classified by the same lists as a request's own, and kept only
+# as its kinds and a keyed hash, so accounts acting from one address can be
+# linked without storing it.
+_PRODUCER_TYPES = re.compile(r"[a-z0-9_-]{1,64}:[a-z][a-z0-9_]{1,47}(\+[a-z][a-z0-9_]{1,47})*")
+_BUSINESS_SOURCE_PEPPER = hmac.new(_ROOT_SECRET, b"business-source-v1", hashlib.sha256).digest()
+_SOURCE_KINDS = ("vpn_listed", "tor_exit", "hosting", "vpn_observed", "vpn_observed_non_hosting")
+# The DBA's rules over business events, off until listed: the business's own
+# logic, applied by this server only because it asked (the owner, 2026-10-14:
+# "a means to apply logic on servers ... that may differ from defaults").
+# type[/outcome][@source kind]:count:hours:points[:account|device|newcomer]
+_EVENT_RULE = re.compile(
+    r"(?P<type>[a-z][a-z0-9_]{1,47})(/(?P<outcome>[a-z][a-z0-9_]{0,31}))?"
+    r"(@(?P<source>" + "|".join(_SOURCE_KINDS) + r"))?"
+    r":(?P<count>[0-9]{1,6}):(?P<hours>[0-9]{1,5}):(?P<points>[0-9]{1,3})"
+    r"(:(?P<scope>account|device|newcomer))?")
+
+
+def _parse_event_rule(text):
+    """One rule as a dict, or None when it is not one: at least one event, in
+    1-8760 hours, for 0-100 points."""
+    match = _EVENT_RULE.fullmatch(text)
+    if match is None:
+        return None
+    rule = match.groupdict()
+    count, hours, points = int(rule["count"]), int(rule["hours"]), int(rule["points"])
+    if count < 1 or not 1 <= hours <= 8760 or points > 100:
+        return None
+    key = rule["type"] + ("/" + rule["outcome"] if rule["outcome"] else "") + (
+        "@" + rule["source"] if rule["source"] else "")
+    return {"type": rule["type"], "outcome": rule["outcome"], "source": rule["source"],
+            "count": count, "hours": hours, "points": points,
+            "scope": rule["scope"] or "account",
+            "code": "business_event_rule:%s:%s" % (key, rule["scope"] or "account")}
+
+
+def _business_event_rules():
+    rules = []
+    for item in sorted(_risk_setting_words("business_event_rules", "")):
+        rule = _parse_event_rule(item)
+        if rule is not None:
+            rules.append(rule)
+    return rules
+
+
+def _business_rule_reasons(reasons, device_id, account_id, joined_at):
+    """The DBA's rules over business events, each a reason at its points when
+    at least its count of matching events fell in its hours: on the account
+    (account), on every account of this phone (device), or on the account
+    for a phone that joined it within those hours (newcomer -- after a
+    password reset, say). Returns the points."""
+    rules = _business_event_rules()
+    if not rules:
+        return 0
+    now = _utc_now()
+    total = 0
+    with _cursor() as cursor:
+        for rule in rules:
+            since = now - timedelta(hours=rule["hours"])
+            if rule["scope"] == "device":
+                sql = ("SELECT COUNT(*) FROM business_events e "
+                       "JOIN device_account_links l ON l.account_id = e.account_id "
+                       "WHERE l.device_id = %s AND e.event_type = %s AND e.occurred_at >= %s")
+                params = [device_id, rule["type"], since]
+            elif account_id is None or (rule["scope"] == "newcomer"
+                                        and (joined_at is None or joined_at < since)):
+                continue
+            else:
+                sql = ("SELECT COUNT(*) FROM business_events e "
+                       "WHERE e.account_id = %s AND e.event_type = %s AND e.occurred_at >= %s")
+                params = [account_id, rule["type"], since]
+            if rule["outcome"]:
+                sql += " AND e.outcome = %s"
+                params.append(rule["outcome"])
+            if rule["source"]:
+                sql += " AND e.source_kinds LIKE %s"
+                params.append("%%,%s,%%" % rule["source"])
+            cursor.execute(sql, tuple(params))
+            count = int((cursor.fetchone() or (0,))[0] or 0)
+            if count < rule["count"]:
+                continue
+            _policy_reason(
+                reasons, rule["code"], rule["points"],
+                "%d %s event(s)%s%s in the last %d hours on %s: the DBA's rule %s:%d:%d:%d."
+                % (count, rule["type"], " with outcome " + rule["outcome"] if rule["outcome"] else "",
+                   " from a " + rule["source"] + " address" if rule["source"] else "",
+                   rule["hours"], {"account": "this account", "device": "this phone's accounts",
+                                   "newcomer": "the account this phone just joined"}[rule["scope"]],
+                   rule["code"].split(":")[1], rule["count"], rule["hours"], rule["points"]),
+                count=count)
+            total += rule["points"]
+    return total
 _BUSINESS_WINDOWS = (("1d", 1), ("7d", 7), ("30d", 30))
 
 
@@ -10089,7 +10211,7 @@ def _parse_business_time(value, index, field):
     return parsed.astimezone(timezone.utc)
 
 
-def _parse_business_event(event, index):
+def _parse_business_event(event, index, producer=None):
     if not isinstance(event, dict):
         raise _business_problem(index, "event", "must be an object.")
     unknown = sorted(set(event) - _BUSINESS_EVENT_FIELDS)
@@ -10110,6 +10232,12 @@ def _parse_business_event(event, index):
     allowed = _risk_setting_words("business_event_types", "")
     if allowed and event_type not in allowed:
         raise _business_problem(index, "type", "is not among the DBA's business_event_types.")
+    for entry in _risk_setting_words("business_event_types_by_producer", ""):
+        caller, _, types = entry.partition(":")
+        if caller == producer and event_type not in types.split("+"):
+            raise _business_problem(
+                index, "type", "is not a type the DBA lets %s send "
+                "(business_event_types_by_producer)." % producer)
     occurred_at = _parse_business_time(event.get("occurred_at"), index, "occurred_at")
     if occurred_at > _utc_now() + timedelta(minutes=5):
         raise _business_problem(index, "occurred_at", "is in the future.")
@@ -10130,6 +10258,16 @@ def _parse_business_event(event, index):
     subject = event.get("subject_ref")
     if subject is not None and (not isinstance(subject, str) or not 1 <= len(subject) <= 256):
         raise _business_problem(index, "subject_ref", "must be 1-256 characters.")
+    source_kinds = source_hash = None
+    if event.get("source_address") is not None:
+        try:
+            address = str(ipaddress.ip_address(event["source_address"]))
+        except ValueError:
+            raise _business_problem(index, "source_address", "must be an IP address.")
+        known = _address_network(address)
+        source_kinds = "," + "".join(kind + "," for kind in _SOURCE_KINDS if known.get(kind))
+        source_hash = hmac.new(_BUSINESS_SOURCE_PEPPER, address.encode("ascii"),
+                               hashlib.sha256).hexdigest()
     return {
         "event_id": event_id,
         "account_id": account_id,
@@ -10144,6 +10282,8 @@ def _parse_business_event(event, index):
         "subject_hash": hmac.new(
             _BUSINESS_SUBJECT_PEPPER, subject.encode("utf-8"), hashlib.sha256
         ).hexdigest() if subject is not None else None,
+        "source_kinds": source_kinds,
+        "source_hash": source_hash,
     }
 
 
@@ -10157,7 +10297,7 @@ def business_events():
         raise ApiProblem(
             'Send {"events": [...]} with 1-100 events.', 400, "invalid_business_events"
         )
-    parsed = [_parse_business_event(event, index) for index, event in enumerate(events)]
+    parsed = [_parse_business_event(event, index, producer) for index, event in enumerate(events)]
     results = []
     with _cursor(commit=True) as cursor:
         for event in parsed:
@@ -10184,12 +10324,13 @@ def business_events():
                     """
                     INSERT INTO business_events
                         (event_id, account_id, event_type, occurred_at, amount_minor,
-                         currency, outcome, subject_hash, producer)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                         currency, outcome, subject_hash, producer, source_kinds, source_hash)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     """,
                     (event["event_id"], str(row[0]), event["type"], event["occurred_at"],
                      event["amount_minor"], event["currency"], event["outcome"],
-                     event["subject_hash"], producer),
+                     event["subject_hash"], producer, event["source_kinds"],
+                     event["source_hash"]),
                 )
             except Exception as error:
                 if not DIALECT.is_unique_violation(error):
@@ -10218,7 +10359,8 @@ def _same_business_event(cursor, event, account_id):
     same account, type, time, amount, currency, outcome and subject."""
     cursor.execute(
         """
-        SELECT account_id, event_type, occurred_at, amount_minor, currency, outcome, subject_hash
+        SELECT account_id, event_type, occurred_at, amount_minor, currency, outcome, subject_hash,
+               source_hash
         FROM business_events WHERE event_id = %s
         """,
         (event["event_id"],),
@@ -10243,7 +10385,8 @@ def _same_business_event(cursor, event, account_id):
             and (None if stored[3] is None else int(stored[3])) == event["amount_minor"]
             and (stored[4] or None) == event["currency"]
             and (stored[5] or None) == event["outcome"]
-            and (stored[6] or None) == event["subject_hash"])
+            and (stored[6] or None) == event["subject_hash"]
+            and (stored[7] or None) == event["source_hash"])
 
 
 def _business_event_counts(device_id, account_id):

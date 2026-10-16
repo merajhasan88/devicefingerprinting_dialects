@@ -202,7 +202,7 @@ WHERE installation_id = '<installation_id>';
 ```
 
 <!-- settings-reference:begin (tools/settings_reference.py --write; do not edit by hand) -->
-154 settings, seeded by migrations 003-028 with the owner's defaults; each row's own description.
+156 settings, seeded by migrations 003-029 with the owner's defaults; each row's own description.
 
 **Migration 003** — DBA-tunable risk policy settings
 
@@ -452,6 +452,13 @@ WHERE installation_id = '<installation_id>';
 | `installation_coverage_dropped_points` | `30` | Points for installation_coverage_dropped: measurements taken before now missing, unsupported or switched off with no app or OS update to explain it. |
 | `installation_verdict_flips_points` | `30` | Points for installation_verdict_flips: scans that keep switching between suspicious and clean. |
 | `installation_app_changed_points` | `0` | Points for installation_app_changed: the app build changed since the last scan, normally an update. Owner default 0 = recorded only. |
+
+**Migration 029** — events from the business's other services -- which types each caller may send, where each came from, and the business's own rules over them
+
+| Setting | Default | What it decides |
+|---|---|---|
+| `business_event_types_by_producer` | *(empty)* | Which event types each business API caller may send: caller:type+type, comma-separated. A caller not listed is held only to business_event_types. Empty (owner default) = no per-caller limit. |
+| `business_event_rules` | *(empty)* | Your rules over business events, each type[/outcome][@source kind]:count:hours:points[:account\|device\|newcomer] -- e.g. chargeback:1:720:40. Each adds its points to a decision when it matches. Empty (owner default) = none: the business decides. |
 <!-- settings-reference:end -->
 
 **Shared phones and several devices are a business decision.** By default a third account on one
@@ -781,8 +788,8 @@ devices-per-account limit — `tools/race_admission.py` shows it on a real datab
 ## 10. The business API: events, the phone-account graph, integrity reports, PIN support
 
 The server guarantees the measurements; **what they should refuse is your business's decision**, so
-nothing here is scored (`DESIGN.md` §76). It is server to server — your backend calls it, never the
-app.
+nothing here is scored unless your DBA writes rules for it (`business_event_rules`, below; `DESIGN.md`
+§76, §84.5). It is server to server — your backend calls it, never the app.
 
 **Access: one token per caller, with only the roles it needs** (review F3). Give each system that calls
 the API its own random bearer token, and list them in `BUSINESS_API_TOKENS`, comma-separated, each entry
@@ -817,6 +824,16 @@ names `pin_unlock` or `pin_reset`. With neither variable set the API answers 404
 | `amount_minor` + `currency` | no | a whole number of minor units and its ISO 4217 code |
 | `outcome` | no | a short code |
 | `subject_ref` | no | a payee, a destination: stored **only as a keyed hash**, so accounts sharing one can be linked without storing it |
+| `source_address` | no | the IP address the event came from — a web sign-in, a password reset: classified by the lists of section 15 and stored **only as its kinds** (`source_kinds`: `vpn_listed`, `tor_exit`, `hosting`, `vpn_observed`, `vpn_observed_non_hosting`) **and a keyed hash** (`source_hash`), never the address |
+
+**Events from your other services.** Send what your identity, payments and support systems see, under
+types of your own; the server needs no list of them. Names that read well in rules: `credential_changed`,
+`mfa_changed`, `recovery_started`, `recovery_completed`, `email_changed`, `phone_changed`, `payee_added`,
+`login_failed`, `chargeback`. Your DBA may hold each caller to its own types —
+`business_event_types_by_producer`, `caller:type+type` comma-separated, for example
+`identity:credential_changed+recovery_completed, payments:chargeback+payee_added` — and an event of
+another type from that caller is refused like an unlisted type (400 `invalid_business_event`, field
+`type`). A caller not listed there is held only to `business_event_types`.
 
 Any other field, free text, an amount without its currency or a future time is refused (400
 `invalid_business_event`, with the event's index and field). The answer lists each event as
@@ -864,15 +881,31 @@ customer, unlock their app PIN or allow one reset of it, with a token holding `p
 are short codes, and nothing else is accepted. But these still link one person's activity together, the
 integrity reports identify a phone, and where you switch on location (section 14) a report holds where
 the phone was. Under data-protection laws such as the GDPR that is personal data: hold it under your
-privacy policy and retention rules. Business rules over these measurements — "three failed repayments
-across a phone's accounts adds points" — are yours to run, in your engine, from the graph and the
-decision context; the server can apply such rules too, but only if you decide it should.
+privacy policy and retention rules. A source address is kept only as its kinds and a keyed hash, which
+still lets accounts acting from one address be linked.
+
+**Your rules over the events, applied by this server — only if you write them.** Business rules over
+these measurements are yours to run, in your engine, from the graph and the decision context. Or your DBA
+lists them in `business_event_rules` (empty by default), each
+`type[/outcome][@source kind]:count:hours:points[:scope]`:
+
+| Rule | Adds |
+|---|---|
+| `chargeback:1:720:40` | 40 to a decision on an account with a chargeback in 30 days |
+| `repayment_failed/late:3:168:30:device` | 30 where the phone's accounts together had three late repayments in a week |
+| `login_failed@tor_exit:5:24:20` | 20 after five failed web sign-ins to the account from Tor exits in a day |
+| `credential_changed:1:24:40:newcomer` | 40 to a phone joining the account within a day of a password change — or that joined since |
+
+Scope `account` (the default) counts the account's events; `device` every account on this phone;
+`newcomer` the account's, but only for a phone that joined it within the rule's hours — the pattern of an
+account taken over after a reset. Each match is a reason `business_event_rule:<rule>` with its points and
+`count`, sourced from the business in the four answers (section 16); approvals cover it like any reason.
 
 **Database.** Migration 017 adds `business_events`: grant `SELECT, INSERT`, never `UPDATE` or
 `DELETE`; migration 021 adds the index the report feed pages through; migration 025 adds the caller's
-name (`producer`, `actor`). The server serves only at its schema version (26): a database behind it
-answers 503 `schema_version_mismatch` everywhere but `/health`, so no decision ever reads a missing
-table.
+name (`producer`, `actor`); migration 029 the event's `source_kinds` and `source_hash`. The server
+serves only at its schema version (`/health/ready` names it): a database behind it answers 503
+`schema_version_mismatch` everywhere but `/health`, so no decision ever reads a missing table.
 
 ## 11. The server's own observations (cross-checks)
 
