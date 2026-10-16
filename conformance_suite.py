@@ -1814,6 +1814,37 @@ def check_operation_scan(api, ctx):
            "once: %s %s" % (st, again))
 
 
+@check("integrity: each installation is compared with its own earlier scans")
+def check_installation_history(api, ctx):
+    """DESIGN.md 84.4, item 5 of the eight of 2026-10-14. A first scan has no
+    past; a later scan from the same installation claiming another phone model
+    gets installation_device_changed (category history), at the DBA's points
+    where history_checks_enabled is 1, at 0 otherwise; the scan after it,
+    unchanged against that one, gets nothing new."""
+    settings = live_settings(api)
+    integrity_context(ctx)
+    inst = Installation()
+    st, pl = enrol(api, inst, fresh_hint())
+    expect(st in (200, 201), "enrol failed: %s %s" % (st, pl))
+    token = device_token(api, inst)
+
+    def history(scan):
+        return {r["code"]: r for r in scan.get("reasons", []) if r.get("category") == "history"}
+
+    first = submit_report(api, inst, token)
+    expect(not history(first), "a first scan has no past: %s" % history(first))
+    moved = submit_report(api, inst, token, lambda probes: probes["device"].update(model="Elsewhere"))
+    found = history(moved).get("installation_device_changed") or {}
+    scored = str(settings.get("history_checks_enabled", "0")).strip() in ("1", "true", "yes", "on")
+    wanted = int(str(settings.get("installation_device_changed_points", "60")).strip()) if scored else 0
+    expect(found.get("points") == wanted,
+           "another phone model under the same installation: %s points, wanted %d"
+           % (found.get("points"), wanted))
+    again = submit_report(api, inst, token, lambda probes: probes["device"].update(model="Elsewhere"))
+    expect("installation_device_changed" not in history(again),
+           "unchanged since: nothing new: %s" % history(again))
+
+
 @check("risk: the source IP and User-Agent are kept only where the DBA says")
 def check_request_metadata(api, ctx):
     """DESIGN.md 80. A decision's context carries source_ip only under
