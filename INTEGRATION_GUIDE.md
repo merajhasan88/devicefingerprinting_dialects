@@ -480,7 +480,16 @@ installations spread a block to the others: its original installation, and reins
 above. A block reported by an unconfirmed hint-linked installation refuses only that installation, so
 someone holding a copied hint cannot lock the real owner out. The trade-off: a block first recorded on
 an unconfirmed reinstall does not follow the device into the next reinstall; reinstall velocity still
-counts every proven reinstall.
+counts every proven reinstall. Only integrity findings are remembered: conditions (section 14) and
+checks that could not run never follow the device.
+
+**A settings change applies from the next scan and the next decision** (review F4). Each scan keeps the
+score and reasons it was given when it arrived; nothing is re-scored. Lowering a weight helps a phone from
+its next scan, and until then its latest scan keeps the score it was given. The eligibility rules
+(`*_refuses`) read the stored reasons, so turning one on or off applies at once. Every scan and decision
+names the settings version it was judged under (`policy_version`) and, where stored, the server build
+(`server_build`); the latest scan in each decision says whether any setting has changed since
+(`policy_current`). [MEASUREMENTS.md](MEASUREMENTS.md) §5 explains them.
 
 **Step-up.** The optional step-up key needs the device passcode (or biometric) for each signature.
 Android 9 and 10 cannot bind a passcode to each use; there the key unlocks for a 30-second window and
@@ -718,9 +727,25 @@ The server guarantees the measurements; **what they should refuse is your busine
 nothing here is scored (`DESIGN.md` §76). It is server to server — your backend calls it, never the
 app.
 
-**Access.** Set `BUSINESS_API_TOKEN_SHA256` to the SHA-256 digests (hex) of one or more random bearer
-tokens, comma-separated so you can rotate without a gap; unset, the API answers 404. Calls carry
-`Authorization: Bearer <token>`; anything else answers 401 `business_token_invalid`. Expose
+**Access: one token per caller, with only the roles it needs** (review F3). Give each system that calls
+the API its own random bearer token, and list them in `BUSINESS_API_TOKENS`, comma-separated, each entry
+`name:role+role:<SHA-256 of the token, hex>`:
+
+```
+BUSINESS_API_TOKENS=payments:events:<digest>,risk-engine:graph+lapses+reports:<digest>,support-tool:pin_unlock+pin_reset:<digest>
+```
+
+The roles are `events`, `graph`, `lapses`, `reports`, `pin_unlock` and `pin_reset`; a name is 1–64 of
+`a-z 0-9 _ -`. `printf %s "$TOKEN" | sha256sum` gives a digest. List a caller twice, with two digests,
+to rotate its token without a gap. A malformed entry stops the server at start. Calls carry
+`Authorization: Bearer <token>`: an unknown token answers 401 `business_token_invalid`, a known one
+without the role 403 `business_role_missing` (with `caller` and `role`). The server stores the caller's
+name with each event it sends (`business_events.producer`) and with each PIN support action
+(`server_observations.actor`).
+
+The older `BUSINESS_API_TOKEN_SHA256` (digests only) still works: its tokens are the caller `default`
+with `events`, `graph`, `lapses` and `reports` — but no longer PIN support, which needs a token that
+names `pin_unlock` or `pin_reset`. With neither variable set the API answers 404. Expose
 `/v1/business/*` only to your backend network.
 
 **`POST /v1/business/events`**, `{"events": [...]}`, 1–100 per call. Each event:
@@ -737,8 +762,11 @@ tokens, comma-separated so you can rotate without a gap; unset, the API answers 
 
 Any other field, free text, an amount without its currency or a future time is refused (400
 `invalid_business_event`, with the event's index and field). The answer lists each event as
-`accepted`, `duplicate` or `rejected` (`unknown_account` — accounts are never created). Events are
-evidence, never updated or deleted.
+`accepted`, `duplicate` or `rejected`, with a `code` when rejected: `unknown_account` (accounts are
+never created) or `event_id_conflict`. An `event_id` is one event across all your callers: the same
+event sent again is a `duplicate`, while a different event under an `event_id` already used is
+rejected as `event_id_conflict` and the first one stands (review F6) — so give each event its own ID,
+for example prefixed with the caller's name. Events are evidence, never updated or deleted.
 
 **`GET /v1/business/graph?account_id=…`** (or `device_id=`, or `handle=`): the phones and accounts
 around one node, to `business_graph_depth` hops (2: the account, its phones, the accounts on them),
@@ -758,7 +786,9 @@ page edge are never skipped. Each `(acceptance_id, reason_code)` appears once.
 
 **`GET /v1/business/integrity-reports?since=<ISO time>&limit=<n>`**: every integrity report as
 stored, oldest first — the phone's own measurements (`probe_results`), the reasons and score the server
-derived from them, the verdict, the evidence quality, `report_sha256`, `created_at`. At most one filter:
+derived from them, the verdict, the evidence quality, each measurement's status (`measurements`),
+`report_sha256`, `created_at`, and the settings version and server build it was scored under
+(`policy_version`, `server_build`; review F4). At most one filter:
 `device_id=`, `installation_id=`, or `account_id=` (the reports of every phone linked to the account,
 from before the link too: a report describes the phone). `limit` 1–200, default 50; page with
 `?cursor=<next_cursor>` as above. Every field is listed in [MEASUREMENTS.md](MEASUREMENTS.md).
@@ -766,20 +796,25 @@ from before the link too: a report describes the phone). `limit` 1–200, defaul
 hold them as device-identifying data.
 
 **`POST /v1/business/app-pin/unlock`** and **`/reset`**: your support staff, after verifying the
-customer, unlock their app PIN or allow one reset of it — section 12.
+customer, unlock their app PIN or allow one reset of it, with a token holding `pin_unlock` or
+`pin_reset` — section 12.
 
 **In every decision.** With the business API configured, each risk decision's `context` carries
 `business_events_30d`: this account's counts by type, and those of every account on this phone.
 
-**Not personal data.** Accounts are opaque IDs; subjects are keyed hashes; types and outcomes are short
-codes; nothing else is accepted. Business rules over these measurements — "three failed repayments
+**Pseudonymous, not anonymous.** Accounts are opaque IDs, subjects are keyed hashes, types and outcomes
+are short codes, and nothing else is accepted. But these still link one person's activity together, the
+integrity reports identify a phone, and where you switch on location (section 14) a report holds where
+the phone was. Under data-protection laws such as the GDPR that is personal data: hold it under your
+privacy policy and retention rules. Business rules over these measurements — "three failed repayments
 across a phone's accounts adds points" — are yours to run, in your engine, from the graph and the
 decision context; the server can apply such rules too, but only if you decide it should.
 
 **Database.** Migration 017 adds `business_events`: grant `SELECT, INSERT`, never `UPDATE` or
-`DELETE`; migration 021 adds the index the report feed pages through. The server serves only at its
-schema version (21): a database behind it answers 503 `schema_version_mismatch` everywhere but
-`/health`, so no decision ever reads a missing table.
+`DELETE`; migration 021 adds the index the report feed pages through; migration 025 adds the caller's
+name (`producer`, `actor`). The server serves only at its schema version (25): a database behind it
+answers 503 `schema_version_mismatch` everywhere but `/health`, so no decision ever reads a missing
+table.
 
 ## 11. The server's own observations (cross-checks)
 
@@ -906,7 +941,8 @@ could otherwise never be replaced.
 
 **Support staff** (`DESIGN.md` §79). Your DBA chooses what they may do, `app_pin_support`: `off` (the
 default), `unlock`, or `unlock_and_reset`. Your support tool calls the business API (section 10) after
-verifying the customer, naming the account and its own ticket reference:
+verifying the customer, naming the account and its own ticket reference, with its own token holding the
+role `pin_unlock` or `pin_reset` (a token without it answers 403 `business_role_missing`):
 
 ```
 POST /v1/business/app-pin/unlock    {"handle": "…", "reference": "TICKET-4711"}
@@ -920,9 +956,9 @@ of an existing PIN — for a customer who remembers it (404 `app_pin_not_set` wh
 which the customer may set a new PIN **even from a limited session** — still with the password, still
 refused if the phone is blocked — once: setting it closes the window, and a second attempt is refused.
 The answer carries `reset_until`; `/v1/account/me` shows `app_pin_reset_open`. Each action is recorded
-for the account (`app_pin_support_unlocked`, `app_pin_support_reset`, with the reference), and the PIN
-set through a reset as `app_pin_set_after_support_reset`, with the phone that set it. Off, both answer
-403 `app_pin_support_disabled`.
+for the account (`app_pin_support_unlocked`, `app_pin_support_reset`, with the reference and the support
+tool's name from its token), and the PIN set through a reset as `app_pin_set_after_support_reset`, with
+the phone that set it. Off, both answer 403 `app_pin_support_disabled`.
 
 **The risk lands on your verification procedure.** Whoever convinces your support staff that they are
 the customer gets the unlock or the reset; during a reset window the password alone sets the PIN, from
@@ -1008,9 +1044,10 @@ normal permission granted at install (no prompt); add it to your app's manifest.
 no VPN API, so the collector **infers** a VPN from the interfaces the system proxy settings are scoped
 to — a heuristic, reported with the interface names.
 
-A VPN or a proxy costs **no points** (`android_vpn_active`, `ios_vpn_active`, `android_http_proxy`,
-`ios_http_proxy`): people use them for privacy and at work. If your deployment refuses them, your DBA
-sets the eligibility rules `vpn_active_refuses` and/or `http_proxy_refuses` to 1, which work like the
+A VPN scores `vpn_active_points` (owner default 10) and an HTTP proxy `http_proxy_points` (15) —
+`android_vpn_active`, `ios_vpn_active`, `android_http_proxy`, `ios_http_proxy`. People use both for
+privacy and at work, so each only nudges: on its own it stays below the step-up band. If your deployment
+refuses them, your DBA sets the eligibility rules `vpn_active_refuses` and/or `http_proxy_refuses` to 1, which work like the
 developer-options rule in section 5: in enforce mode 403 `integrity_device_ineligible` with a remedy
 your app shows ("Turn off the VPN, then send a new integrity scan"). A phone whose app predates the
 network probe reports neither, and a modified app can hide them: a policy for honest phones, not a
@@ -1025,8 +1062,9 @@ unpatched phones are legitimate users too, so it nudges, never decides), and the
 iOS has no separate patch level — its fixes ship as OS versions — so an iPhone's `device` probe carries
 `os_version` and, from iOS collector 4, `os_build`.
 
-**Optional measurements, two keys.** A measurement that identifies a person's phone or network is
-collected only where **your DBA** asks for it **and your app's developers** enabled it:
+**Optional measurements: your DBA asks, your app enables.** A measurement that identifies a person's
+phone or network is collected only where **your DBA** asks for it **and your app's developers** enabled
+it:
 
 | Name | DBA lists in `optional_measurements` | App (reference client `--dart-define`) | What |
 |---|---|---|---|
@@ -1043,7 +1081,20 @@ iOS shows an app no other app, so `accessibility`, `notification_access` and `ot
 
 Each challenge lists what the DBA asks for in `optional_probes`; it is never required. An app that did
 not enable one answers `not_enabled`, at no cost. Whatever the DBA does not ask for is dropped before
-a report is stored, even if a phone sends it.
+a report is stored, even if a phone sends it. Every scan's answer gives each measurement's status
+(`measurements`: `ok`, `failed`, `not_enabled`, `absent` and the rest, [MEASUREMENTS.md](MEASUREMENTS.md)
+§1), and the report says which optional measurements your app enabled (`enabled_measurements`).
+
+**Measurements a path needs** (review F1). A rule such as `accessibility_sideloaded_refuses` judges
+only a scan that has its measurement, so a phone whose app does not send it — an older app, a modified
+one, one that did not enable it — is never refused by the rule. Where that matters, your DBA lists the
+measurements a scan must have in `required_measurements`, and the paths they guard in
+`required_measurements_paths` (both empty by default). A scan without them, under
+`missing_measurement_action` `limit` (owner default), is treated like an elevated one: a step-up proof
+passes a request that accepts one, a sign-in gives a limited session, and anything else answers 403
+`integrity_measurements_missing` until a scan has them; under `refuse` it is always refused. An
+approval never covers a missing measurement, and an iPhone is never asked for what it cannot measure.
+The scan's answer lists what is missing (`missing_requirements`).
 
 **What can read or drive the phone** (`DESIGN.md` §82). Banking trojans that capture what a person
 types work through Android's Accessibility, a replacement keyboard, notification access (one-time
@@ -1064,17 +1115,23 @@ Each finding adds its points to the scan's integrity score — your DBA's `*_poi
 owner's defaults — and has an eligibility rule your DBA may turn on, working like the developer-options
 rule (in enforce mode 403 `integrity_device_ineligible` with a remedy your app shows). The integrity bands
 are 30 step-up, 60 review, 90 block: a sideloaded Accessibility service alone asks for a step-up; with a
-remote-control app or a sideloaded keyboard it reaches review.
+remote-control app or a sideloaded keyboard it reaches review. These findings, a VPN, a proxy and an old
+patch are **conditions** — what the phone allows or is doing, which its owner can change. Together they
+add at most `conditions_points_cap` (owner default 60) to a scan, so on their own they never block, and
+the device memory does not keep them: a clean scan clears them (review F2). Each reason says its
+`category`: `integrity`, `condition` or `collection`.
 
 | Finding | When | Points (owner default) | Eligibility rule |
 |---|---|---|---|
 | `android_accessibility_sideloaded` / `_non_system` | an Accessibility service is on in a sideloaded app / in any app not part of the system | 45 / 0 | `accessibility_sideloaded_refuses` / `accessibility_non_system_refuses` |
+| `android_accessibility_hidden` | a service the system setting names is missing from the Accessibility list | 30 | `accessibility_hidden_refuses` |
 | `android_keyboard_sideloaded` / `_non_system` | the keyboard in use | 30 / 0 | `keyboard_sideloaded_refuses` / `keyboard_non_system_refuses` |
 | `android_notification_access_sideloaded` / `_non_system` | an app can read notifications | 30 / 0 | `notification_access_sideloaded_refuses` / `notification_access_non_system_refuses` |
 | `android_device_admin_sideloaded` / `_non_system` | a device-administrator app is active | 30 / 0 | `device_admin_sideloaded_refuses` / `device_admin_non_system_refuses` |
 | `android_remote_access_app` | a remote-control app is installed | 20 | `remote_access_app_refuses` |
-| `android_screen_captured`, `ios_screen_captured` | the screen was recorded or mirrored, or another display on, during the scan | 30 | `screen_capture_refuses` |
-| `android_mock_location`, `ios_mock_location` | the last location was simulated | 40 | `mock_location_refuses` |
+| `android_screen_captured`, `ios_screen_captured` | the app's screen was recorded during the scan (iOS: also mirrored or on AirPlay) | 30 | `screen_capture_refuses` |
+| `android_external_display`, `ios_external_display` | another display was on: a cast, a mirror or a monitor | 10 | `external_display_refuses` |
+| `android_mock_location`, `ios_mock_location` | the last location was simulated, and is younger than `location_max_age_seconds` (600) | 40 | `mock_location_refuses` |
 
 The points settings are `<finding>_points` without the platform prefix (`accessibility_sideloaded_points`,
 `screen_capture_points`, …). The `_non_system` findings stay at 0 because screen readers, password
@@ -1090,8 +1147,12 @@ Singapore, which since August 2023 restricts its app on a phone with a sideloade
 Accessibility. A phone maker's preloaded app that is not a system app and has no installer counts as
 sideloaded. An Android bug let an Accessibility service hide from the list until the December 2022
 patch: the probe reports services the system setting names but the list omits (`settings_only`), and
-the patch level is in every scan. A display that is on counts as screen capture whether it shows a cast,
-a mirror or an external screen (a DeX dock, a monitor): look before turning `screen_capture_refuses` on.
+the patch level is in every scan. Another display — a cast, a mirror, a DeX dock, a monitor — is no
+proof that the app's screen is captured, so it is its own finding with its own rule (review F7). A
+simulated location older than `location_max_age_seconds` stays in the report but is not scored. Each
+`_sideloaded` finding names its apps and where each came from: `(no installer)` — `adb`, some preloads —
+or `(installed by <package>)` — a browser, a file manager, a malware dropper; both count as not from a
+store.
 
 **What your app's developers add** for these measurements — only for those they enable:
 
@@ -1127,9 +1188,11 @@ identifier disclosures). Neither is collected: the owner dropped both (`DESIGN.m
 server also recognises VPN exits by the address each request comes from. Every risk decision's context
 carries `source_network` (listed in [MEASUREMENTS.md](MEASUREMENTS.md) §7): `vpn_listed`, `tor_exit`,
 `hosting`, `vpn_observed` and `vpn_observed_non_hosting`, each yes, no, or unknown. Each kind is a
-reason at **0 points** until your DBA gives it points (`source_vpn_listed_points`,
-`source_tor_exit_points`, `source_hosting_points`, `source_vpn_observed_points`,
-`source_vpn_observed_non_hosting_points`).
+reason at your DBA's points; the owner's defaults are `source_vpn_listed_points` 10,
+`source_tor_exit_points` 30, `source_hosting_points` 15, `source_vpn_observed_points` 10 and
+`source_vpn_observed_non_hosting_points` 10 (0 records it only). They were 0 until migration 025, which
+sets the new defaults only where a value is still 0: **a deployment that chose 0 on purpose sets it
+again after applying migration 025.**
 
 **Public lists, shipped with the server.** `data/network_lists/` holds X4BNet's VPN and data-centre
 networks (MIT) and the Tor Project's exit list; `SOURCES.md` beside them gives the sources and the
@@ -1140,12 +1203,16 @@ another directory. The lists are IPv4: for an IPv6 client their answers are unkn
 list includes cloud networks your own servers and partners use — a measurement, never by itself a
 reason to refuse.
 
-**VPN exits learned from your own Android phones** — `vpn_exit_learning`, off by default. Android says
-reliably whether the app's own traffic goes through a VPN, and your server sees the address it arrives
-from: each Android scan becomes a sighting in `vpn_exit_sightings` (grant `SELECT, INSERT, UPDATE`). An
-address is a VPN exit once at least `vpn_exit_min_phones` (3) different phones came through a VPN from
-it within `vpn_exit_window_days` (30), and they are at least `vpn_exit_min_share_percent` (90) of the
-phones seen from it then. That share is the safeguard: ad blockers and firewall apps use Android's VPN
+**VPN exits learned from your own Android phones** — `vpn_exit_learning`, off by default. Android tells
+the app whether its own traffic goes through a VPN, and your server sees the address it arrives from:
+each Android scan becomes a sighting in `vpn_exit_sightings` (grant `SELECT, INSERT, UPDATE`). Whether a
+scan went through a VPN is the phone's own report, which a modified app can falsify, so a learned exit is
+an inference from your phones' reports, not a verified fact: keep its points low (review F5). Each phone
+counts by its latest sighting at an address — one that came through a VPN once and direct since counts
+as direct — and only phones your server has known for `vpn_exit_min_device_age_days` (7) count at all,
+so freshly made-up phone identities cannot label an address. An address is a VPN exit once at least
+`vpn_exit_min_phones` (3) different phones came through a VPN from it within `vpn_exit_window_days`
+(30), and they are at least `vpn_exit_min_share_percent` (90) of the phones seen from it then. That share is the safeguard: ad blockers and firewall apps use Android's VPN
 interface while sending traffic out from the phone's own address, so a home line or a carrier's shared
 address collects a few VPN sightings among many direct ones; a VPN server's address carries only VPN
 traffic. iPhones are never witnesses — they are recognised by the address they share with your Android
