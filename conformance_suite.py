@@ -1687,6 +1687,54 @@ def check_conditions_cap(api, ctx):
            % (st, error_code(pl), memory.get("finding_verdict")))
 
 
+@check("decisions: every scan and decision answers the four questions apart")
+def check_four_answers(api, ctx):
+    """DESIGN.md 84.2, item 8 of the eight of 2026-10-14. A scan's assessment
+    says what proved it (challenge, signature, installation key), what it
+    measured, what it found -- each reason, from the phone -- and what it calls
+    for; a protected request's decision adds the relationship policy's reasons
+    and what the request was granted."""
+    integrity_context(ctx)
+    inst = Installation()
+    st, pl = enrol(api, inst, fresh_hint())
+    expect(st in (200, 201), "enrol failed: %s %s" % (st, pl))
+    token = device_token(api, inst)
+    scan = submit_report(api, inst, token)
+    answers = scan.get("assessment") or {}
+    protocol, evidence = answers.get("protocol") or {}, answers.get("evidence") or {}
+    expect(protocol.get("result") == "valid" and protocol.get("token") == "device"
+           and protocol.get("installation_key") == "verified"
+           and protocol.get("challenge") == "single_use"
+           and protocol.get("report_signature") == "verified",
+           "the scan says what proved it: %s" % protocol)
+    expect(evidence.get("quality") == scan.get("evidence_quality")
+           and evidence.get("report_id") == scan.get("report_id") and evidence.get("fresh") is True,
+           "the scan says what it measured: %s" % evidence)
+    expect([(f.get("code"), f.get("points"), f.get("provenance")) for f in answers.get("findings") or []]
+           == [(r.get("code"), r.get("points"), "phone") for r in scan.get("reasons") or []],
+           "the scan's findings are its reasons, from the phone: %s" % answers.get("findings"))
+    decision = answers.get("decision") or {}
+    expect(decision.get("recommended") in ("allow", "step_up", "scan", "review", "deny")
+           and decision.get("relationship") is None,
+           "the scan says what it calls for: %s" % decision)
+    st, pl = open_account(api, inst, token, "four-%s" % secrets.token_hex(4))
+    expect(st in (200, 201), "account open failed: %s %s" % (st, pl))
+    granted = (((pl or {}).get("policy") or {}).get("assessment") or {}).get("decision") or {}
+    expect(granted.get("allowed") == pl.get("scope"),
+           "the new session says what it was granted: %s %s" % (pl.get("scope"), granted))
+    st, me = protected(api, inst, "GET", "/v1/account/me", pl["access_token"])
+    trust = (me or {}).get("trust_policy") or {}
+    answers = trust.get("assessment") or {}
+    decision = answers.get("decision") or {}
+    found = {f.get("code") for f in answers.get("findings") or []}
+    expect(st == 200 and (answers.get("protocol") or {}).get("token") == "account"
+           and (answers.get("evidence") or {}).get("report_id") == scan.get("report_id")
+           and decision.get("allowed") in ("full", "limited")
+           and decision.get("relationship") in ("allow", "step_up", "review", "deny")
+           and {r.get("code") for r in trust.get("reasons") or []} <= found,
+           "a request's decision adds the policy and what was granted: %s %s" % (st, answers))
+
+
 @check("risk: the source IP and User-Agent are kept only where the DBA says")
 def check_request_metadata(api, ctx):
     """DESIGN.md 80. A decision's context carries source_ip only under
