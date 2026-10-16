@@ -2501,6 +2501,10 @@ class DeviceRecognitionController extends ChangeNotifier {
       'collector_version': (native['collector_version'] as num?)?.toInt() ?? 1,
       'collected_at': DateTime.now().toUtc().millisecondsSinceEpoch ~/ 1000,
       'probe_results': Map<String, dynamic>.from(native['probes'] as Map),
+      // Which optional measurements this app enabled, whether or not the
+      // server asked for them: the server keeps every measurement's status
+      // (DESIGN.md 83).
+      'enabled_measurements': enabledMeasurements,
       'version': 1,
     };
 
