@@ -231,7 +231,7 @@ All of these are DBA settings.
 | **G2 — a Flutter package** | *"defer it to later after we have finished testing. It will be done. Note it down. Just not now."* (2026-10-14) | A Flutter plugin with the Dart API, the models and the Android and iOS native code; the harness then depends on it. The package's name, versioning and where it is published are the owner's call. |
 | **G3 — a guide for app developers** | *"do after G2"* | Today an app developer reads the guide and copies code out of the harness. |
 | **G6 — the front page** | *"after G3"*; and the open-source project *"which I will eventually host on a website called necessary.com or necessary.io"* (2026-10-15) | `README.md` is still Flutter's template. |
-| **G10 — SQL Server** | *"fill the gaps, we will do that afterwards"* (2026-10-14) | One RDS round. It covers the suite for migrations 015–024, the guide's T-SQL deletion of VPN sightings, and binding ID parameters as `varchar(36)` in the SQL Server dialect (§74). Nothing ships without the suite on both engines. |
+| **G10 — SQL Server** | *"fill the gaps, we will do that afterwards"* (2026-10-14) | One RDS round. It covers the suite for migrations 015–025, the guide's T-SQL deletion of VPN sightings, and binding ID parameters as `varchar(36)` in the SQL Server dialect (§74). Nothing ships without the suite on both engines. |
 | **The other client SDKs (G9)** | *"I will note this down and have separate claude's build each."* | Native Android (Kotlin), native iOS (Swift) and React Native, each built in a Claude session of its own. .NET exists; Flutter is this repository. |
 | **The iPhone round** | *"Run iphone after the review work. Would need another codemagic build or we could go with gitlab actions."* (2026-10-13) | It needs a new iOS build: iOS collectors 3 and 4, the location request and the PIN protection have never been compiled. |
 
@@ -286,7 +286,7 @@ built. It is needed only if customers are to share what they learn.
 - **An app from Google Play counted as a store app.** The emulator has no Play Store.
 - **A screen recording made by a recorder app.** A command-line recording was tried and was not
   detected.
-- **SQL Server:** migrations 015–024, and the guide's T-SQL deletion.
+- **SQL Server:** migrations 015–025, and the guide's T-SQL deletion.
 
 ---
 
