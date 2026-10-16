@@ -114,19 +114,42 @@ _BUSINESS_SUBJECT_PEPPER = hmac.new(
 _APP_PIN_PEPPER = hmac.new(_ROOT_SECRET, b"app-pin-v1", hashlib.sha256).digest()
 
 
-def _business_token_digests():
-    """SHA-256 digests (hex) of the bearer tokens the customer's backend may
-    use on /v1/business/* (DESIGN.md 76), comma-separated so a token can be
-    rotated with no gap. Unset: the business API answers 404."""
+# What a business API caller may do (review F3, DESIGN.md 83): each team's
+# token carries only its own roles, and the caller's name is recorded with what
+# it does.
+_BUSINESS_ROLES = ("events", "graph", "lapses", "reports", "pin_unlock", "pin_reset")
+# A token from BUSINESS_API_TOKEN_SHA256 (DESIGN.md 76) keeps what it did
+# before -- except PIN support, which now needs a token that names it.
+_DEFAULT_BUSINESS_ROLES = ("events", "graph", "lapses", "reports")
+
+
+def _business_callers():
+    """{sha256 digest: (caller name, roles)} for the business API (DESIGN.md
+    76, 83). BUSINESS_API_TOKENS, comma-separated, names each caller and its
+    roles: name:role+role:sha256hex (support-tool:pin_unlock+pin_reset:...).
+    BUSINESS_API_TOKEN_SHA256 still works for its digests, as caller default
+    with events, graph, lapses and reports. Several digests per caller let a
+    token be rotated with no gap. Neither set: the business API answers 404."""
+    callers = {}
     raw = os.environ.get("BUSINESS_API_TOKEN_SHA256", "")
-    digests = [d.strip().lower() for d in raw.replace(";", ",").split(",") if d.strip()]
-    for digest in digests:
+    for digest in (d.strip().lower() for d in raw.replace(";", ",").split(",") if d.strip()):
         if re.fullmatch(r"[0-9a-f]{64}", digest) is None:
             raise RuntimeError("BUSINESS_API_TOKEN_SHA256 must list 64-hex SHA-256 digests.")
-    return tuple(digests)
+        callers[digest] = ("default", _DEFAULT_BUSINESS_ROLES)
+    raw = os.environ.get("BUSINESS_API_TOKENS", "")
+    for entry in (e.strip() for e in raw.replace(";", ",").split(",") if e.strip()):
+        parts = entry.split(":")
+        if (len(parts) != 3 or re.fullmatch(r"[a-z0-9_-]{1,64}", parts[0]) is None
+                or re.fullmatch(r"[0-9a-f]{64}", parts[2].lower()) is None
+                or not parts[1] or any(role not in _BUSINESS_ROLES for role in parts[1].split("+"))):
+            raise RuntimeError(
+                "BUSINESS_API_TOKENS entries are name:role+role:sha256hex, roles from %s."
+                % ", ".join(_BUSINESS_ROLES))
+        callers[parts[2].lower()] = (parts[0], tuple(parts[1].split("+")))
+    return callers
 
 
-BUSINESS_API_TOKEN_SHA256 = _business_token_digests()
+BUSINESS_API_CALLERS = _business_callers()
 
 ACCESS_TOKEN_LIFETIME = timedelta(minutes=10)
 DEVICE_TOKEN_LIFETIME = timedelta(minutes=10)
@@ -4074,7 +4097,7 @@ _OBSERVATION_ONCE_NAMESPACE = uuid.UUID("0b7d6c2e-58f4-5a3e-9c1d-7e2a4b6f8d90")
 
 
 def _record_observation(kind, code, device_id, installation_id, account_id=None, cursor=None,
-                        once_key=None):
+                        once_key=None, actor=None):
     """Record one server observation.
 
     With a cursor the row joins the caller's transaction, so a change and its
@@ -4090,10 +4113,12 @@ def _record_observation(kind, code, device_id, installation_id, account_id=None,
         raise ValueError("unknown observation kind %r" % kind)
     if once_key is not None and cursor is not None:
         raise ValueError("a once-only observation is recorded in its own unit")
+    # actor: the business API caller that did it, for support actions (review
+    # F3); the server's own observations have none.
     statement = (
         "INSERT INTO server_observations "
-        "(observation_id, kind, code, account_id, device_id, installation_id) "
-        "VALUES (%s, %s, %s, %s, %s, %s)"
+        "(observation_id, kind, code, account_id, device_id, installation_id%s) "
+        "VALUES (%%s, %%s, %%s, %%s, %%s, %%s%s)" % ((", actor", ", %s") if actor is not None else ("", ""))
     )
     values = (
         str(uuid.uuid5(_OBSERVATION_ONCE_NAMESPACE, "%s:%s" % (kind, once_key)))
@@ -4103,7 +4128,7 @@ def _record_observation(kind, code, device_id, installation_id, account_id=None,
         str(account_id) if account_id is not None else None,
         str(device_id) if device_id is not None else None,
         str(installation_id) if installation_id is not None else None,
-    )
+    ) + ((actor,) if actor is not None else ())
     if cursor is not None:
         cursor.execute(statement, values)
         return
@@ -4942,7 +4967,7 @@ def _evaluate_risk_policy(
             context["source_ip"] = request.remote_addr
         if _risk_setting_bool("record_user_agent", False):
             context["user_agent"] = (request.headers.get("User-Agent") or "")[:256]
-    if BUSINESS_API_TOKEN_SHA256:
+    if BUSINESS_API_CALLERS:
         # Measurements only (DESIGN.md 76): the business decides what they mean.
         context["business_events_30d"] = _business_event_counts(device_id, account_id)
     decision = {
@@ -9334,17 +9359,30 @@ _BUSINESS_EVENT_FIELDS = frozenset((
 _BUSINESS_WINDOWS = (("1d", 1), ("7d", 7), ("30d", 30))
 
 
-def _require_business_caller():
-    if not BUSINESS_API_TOKEN_SHA256:
+def _require_business_caller(role):
+    """The caller's name, once its token is valid and holds this role (review
+    F3): 401 business_token_invalid for an unknown token, 403
+    business_role_missing for a known one without the role."""
+    if not BUSINESS_API_CALLERS:
         raise ApiProblem("Not found.", 404, "not_found")
     _enforce_rate_limit("business_api", request.remote_addr or "unknown")
     header = request.headers.get("Authorization", "")
     token = header[len("Bearer "):].strip() if header.startswith("Bearer ") else ""
     digest = hashlib.sha256(token.encode("utf-8")).hexdigest() if token else "-"
-    if not any(hmac.compare_digest(digest, allowed) for allowed in BUSINESS_API_TOKEN_SHA256):
+    caller = None
+    for allowed, entry in BUSINESS_API_CALLERS.items():
+        if hmac.compare_digest(digest, allowed):
+            caller = entry
+    if caller is None:
         raise ApiProblem(
             "A valid business API token is required.", 401, "business_token_invalid"
         )
+    if role not in caller[1]:
+        raise ApiProblem(
+            "This business API token may not do this (%s)." % role, 403, "business_role_missing",
+            details={"caller": caller[0], "role": role},
+        )
+    return caller[0]
 
 
 def _business_problem(index, field, message):
@@ -9427,7 +9465,7 @@ def _parse_business_event(event, index):
 @app.post("/v1/business/events")
 def business_events():
     """Record business events for accounts; each event once (its event_id)."""
-    _require_business_caller()
+    producer = _require_business_caller("events")
     body = _json_body()
     events = body.get("events")
     if set(body) - {"events"} or not isinstance(events, list) or not 1 <= len(events) <= 100:
@@ -9461,12 +9499,12 @@ def business_events():
                     """
                     INSERT INTO business_events
                         (event_id, account_id, event_type, occurred_at, amount_minor,
-                         currency, outcome, subject_hash)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                         currency, outcome, subject_hash, producer)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                     """,
                     (event["event_id"], str(row[0]), event["type"], event["occurred_at"],
                      event["amount_minor"], event["currency"], event["outcome"],
-                     event["subject_hash"]),
+                     event["subject_hash"], producer),
                 )
             except Exception as error:
                 if not DIALECT.is_unique_violation(error):
@@ -9685,7 +9723,7 @@ def business_graph():
     events per account and per component (DESIGN.md 76). Walked one
     parameterised query per node -- no recursive SQL -- to the DBA's
     business_graph_depth, cut at business_graph_max_nodes."""
-    _require_business_caller()
+    _require_business_caller("graph")
     args = request.args
     given = [key for key in ("account_id", "device_id", "handle") if args.get(key)]
     if len(given) != 1:
@@ -9780,8 +9818,9 @@ def _app_pin_support(action):
     allows it, also open one reset (DESIGN.md 79). Server to server: the
     company's support tool calls it after verifying the customer, naming the
     account (or handle) and its own ticket reference, which is recorded with
-    the action. Off unless the DBA sets app_pin_support."""
-    _require_business_caller()
+    the action, and the support tool's own name from its token (review F3).
+    Off unless the DBA sets app_pin_support."""
+    actor = _require_business_caller("pin_unlock" if action == "unlock" else "pin_reset")
     allowed = {"unlock": ("unlock", "unlock_and_reset"), "reset": ("unlock_and_reset",)}[action]
     if _risk_setting_str("app_pin_support", "off") not in allowed:
         raise ApiProblem(
@@ -9851,9 +9890,10 @@ def _app_pin_support(action):
                         cursor.execute(savepoint[2])
         _record_observation(
             "app_pin_support_unlocked" if action == "unlock" else "app_pin_support_reset",
-            reference, None, None, account_id=account_id, cursor=cursor,
+            reference, None, None, account_id=account_id, cursor=cursor, actor=actor,
         )
-    logger.warning("App PIN support %s: account=%s reference=%s", action, account_id, reference)
+    logger.warning("App PIN support %s: account=%s reference=%s caller=%s", action, account_id,
+                   reference, actor)
     return jsonify({"account_id": account_id, "unlocked": True,
                     "reset_until": _iso_z(reset_until) if reset_until else None})
 
@@ -9875,7 +9915,7 @@ def business_acceptance_lapses():
     with ?cursor=<next_cursor>. A row appears once per acceptance and reason;
     (acceptance_id, reason_code) is its key. The cursor carries the last row's
     time and key, so rows sharing a timestamp at a page edge are not skipped."""
-    _require_business_caller()
+    _require_business_caller("lapses")
     # Without a cursor nothing at the "since" instant itself is returned: the
     # highest possible key makes the tie branch empty, on both engines.
     after_acceptance, after_reason = "ffffffff-ffff-ffff-ffff-ffffffffffff", ""
@@ -9937,7 +9977,7 @@ def business_integrity_reports():
     phone linked to the account, from before the link too, since a report
     describes the phone, not the account. probe_results identify a phone
     (model, build, installed tools): the business holds them as such."""
-    _require_business_caller()
+    _require_business_caller("reports")
     given = [name for name in _REPORT_FILTERS if request.args.get(name)]
     if len(given) > 1:
         raise ApiProblem("Give at most one of device_id, installation_id or account_id.", 400,

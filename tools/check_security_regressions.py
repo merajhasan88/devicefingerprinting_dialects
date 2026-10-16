@@ -3007,13 +3007,14 @@ CREATE TABLE business_events (event_id TEXT PRIMARY KEY,
                               account_id TEXT NOT NULL REFERENCES demo_accounts(account_id),
                               event_type TEXT NOT NULL, occurred_at TSZ NOT NULL,
                               received_at TSZ DEFAULT CURRENT_TIMESTAMP, amount_minor INTEGER,
-                              currency TEXT, outcome TEXT, subject_hash TEXT);
+                              currency TEXT, outcome TEXT, subject_hash TEXT, producer TEXT);
 CREATE TABLE acceptance_lapses (acceptance_id TEXT, reason_code TEXT, source TEXT, points INTEGER,
                                 account_id TEXT, installation_id TEXT, event_type TEXT,
                                 occurred_at TSZ, PRIMARY KEY (acceptance_id, reason_code));
 CREATE TABLE server_observations (observation_id TEXT PRIMARY KEY, kind TEXT NOT NULL, code TEXT,
                                   account_id TEXT, device_id TEXT, installation_id TEXT,
-                                  occurred_at TSZ NOT NULL DEFAULT CURRENT_TIMESTAMP);
+                                  occurred_at TSZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                                  actor TEXT);
 CREATE TABLE app_pins (account_id TEXT PRIMARY KEY, pin_hash BLOB,
                        failures INTEGER NOT NULL DEFAULT 0, locked_at TSZ, reset_until TSZ,
                        set_at TSZ, set_by_installation TEXT);
@@ -3033,19 +3034,20 @@ def business_store(configured=True):
         yield LiteCursor(connection)
         connection.commit()
 
-    saved = (s._cursor, s.BUSINESS_API_TOKEN_SHA256)
+    saved = (s._cursor, s.BUSINESS_API_CALLERS)
     s._risk_settings_cache.update(values=dict(db.settings), at=time.monotonic(),
                                   failed_at=None, error=None)
     s._cursor = lite_cursor
-    s.BUSINESS_API_TOKEN_SHA256 = (
-        (c.sha256_hex(BUSINESS_TOKEN.encode()),) if configured else ())
+    # The suite's token holds every role; the role checks use their own.
+    s.BUSINESS_API_CALLERS = (
+        {c.sha256_hex(BUSINESS_TOKEN.encode()): ("suite", s._BUSINESS_ROLES)} if configured else {})
     real_unique = s.DIALECT.is_unique_violation
     s.DIALECT.is_unique_violation = lambda error: (isinstance(error, sqlite3.IntegrityError)
                                                    or real_unique(error))
     try:
         yield connection
     finally:
-        s._cursor, s.BUSINESS_API_TOKEN_SHA256 = saved
+        s._cursor, s.BUSINESS_API_CALLERS = saved
         del s.DIALECT.is_unique_violation
         connection.close()
 
@@ -3220,7 +3222,8 @@ def the_business_graph_carries_what_the_server_saw():
                 ("sign_in_failed", other, alice, timedelta(days=40)),
                 ("stepup_failed", phone, alice, timedelta(days=10)),
                 ("sign_in_unknown_account", phone, None, timedelta(hours=1))):
-            conn.execute("INSERT INTO server_observations VALUES (?, ?, 'test', ?, ?, ?, ?)",
+            conn.execute("INSERT INTO server_observations (observation_id, kind, code, account_id, device_id, "
+                "installation_id, occurred_at) VALUES (?, ?, 'test', ?, ?, ?, ?)",
                          (str(uuid.uuid4()), kind, account_id, device_id, str(uuid.uuid4()),
                           now - age))
         conn.execute("INSERT INTO session_upgrade_requests VALUES (?, ?, ?)",
@@ -3473,7 +3476,8 @@ CREATE TABLE server_observations (
     account_id      TEXT,
     device_id       TEXT,
     installation_id TEXT,
-    occurred_at     TSZ NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f+00:00', 'now'))
+    occurred_at     TSZ NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f+00:00', 'now')),
+    actor           TEXT
 );
 CREATE TABLE vpn_exit_sightings (
     address         TEXT NOT NULL,
@@ -3522,7 +3526,8 @@ class ObservationStore(object):
     def observe(self, kind, phone, account_id=None, times=1, age_hours=0.0):
         for _ in range(times):
             self.connection.execute(
-                "INSERT INTO server_observations VALUES (?, ?, 'test', ?, ?, ?, ?)",
+                "INSERT INTO server_observations (observation_id, kind, code, account_id, device_id, "
+                "installation_id, occurred_at) VALUES (?, ?, 'test', ?, ?, ?, ?)",
                 (str(uuid.uuid4()), kind, account_id, phone[0], phone[1],
                  self.now - timedelta(hours=age_hours)))
 
@@ -5129,6 +5134,89 @@ def a_reused_event_id_with_other_content_is_a_conflict():
         rows = conn.execute("SELECT account_id, event_type, amount_minor FROM business_events "
                             "WHERE event_id = 'ev-9'").fetchall()
         expect([tuple(r) for r in rows] == [(alice, "purchase", 999)], "the first event stands: %s" % rows)
+
+
+@check
+def each_business_token_does_only_what_its_roles_allow():
+    """Review F3. One business token used to do everything: send events, read
+    the graph and the integrity reports, and unlock or reset a customer's app
+    PIN. BUSINESS_API_TOKENS now names each token's caller and roles; a token
+    without the role is refused (403 business_role_missing), and the caller's
+    name is stored with the events it sends and the PIN support it does. A
+    token from BUSINESS_API_TOKEN_SHA256 keeps events, graph, lapses and
+    reports -- PIN support needs a token that names it. A malformed entry
+    stops the server at start."""
+    secret = {"payments": "payments-token", "support-tool": "support-tool-token",
+              "default": "legacy-token"}
+    digest = {name: c.sha256_hex(token.encode()) for name, token in secret.items()}
+    saved = {key: os.environ.get(key) for key in ("BUSINESS_API_TOKEN_SHA256", "BUSINESS_API_TOKENS")}
+    try:
+        os.environ["BUSINESS_API_TOKEN_SHA256"] = digest["default"]
+        os.environ["BUSINESS_API_TOKENS"] = "payments:events:%s, support-tool:pin_unlock+pin_reset:%s" % (
+            digest["payments"], digest["support-tool"].upper())
+        callers = s._business_callers()
+        expect(callers == {digest["default"]: ("default", ("events", "graph", "lapses", "reports")),
+                           digest["payments"]: ("payments", ("events",)),
+                           digest["support-tool"]: ("support-tool", ("pin_unlock", "pin_reset"))},
+               "each token is read with its caller and roles: %s" % callers)
+        for bad in ("payments:events", "payments:refunds:%s" % digest["payments"],
+                    "payments::%s" % digest["payments"], "Pay Ments:events:%s" % digest["payments"],
+                    "payments:events:%s" % digest["payments"][:63]):
+            os.environ["BUSINESS_API_TOKENS"] = bad
+            try:
+                s._business_callers()
+                stopped = False
+            except RuntimeError:
+                stopped = True
+            expect(stopped, "%r must stop the server at start" % bad)
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+    unlock, reset = "/v1/business/app-pin/unlock", "/v1/business/app-pin/reset"
+    with business_store() as connection, business_policy(app_pin_support="unlock_and_reset"):
+        s.BUSINESS_API_CALLERS = callers
+        locked = business_account(connection, "role-locked")
+        connection.execute("INSERT INTO app_pins (account_id, pin_hash, failures, locked_at) "
+                           "VALUES (?, ?, 5, ?)", (locked, b"verifier", s._utc_now()))
+        event = {"event_id": "role-1", "account_id": locked, "type": "purchase",
+                 "occurred_at": "2026-10-12T10:00:00Z"}
+        ask = {"account_id": locked, "reference": "T-1"}
+        for caller, method, path, body, role in (
+                ("payments", "GET", "/v1/business/graph", None, "graph"),
+                ("payments", "POST", reset, ask, "pin_reset"),
+                ("default", "POST", unlock, ask, "pin_unlock"),
+                ("default", "POST", reset, ask, "pin_reset"),
+                ("support-tool", "POST", "/v1/business/events", {"events": [event]}, "events"),
+                ("support-tool", "GET", "/v1/business/integrity-reports", None, "reports")):
+            status, payload = business_call(method, path, body, token=secret[caller],
+                                            query={"account_id": locked})
+            error = payload.get("error") or {}
+            expect(status == 403 and error.get("code") == "business_role_missing"
+                   and error.get("details") == {"caller": caller, "role": role},
+                   "%s must not reach %s: %s %s" % (caller, path, status, payload))
+        status, payload = business_call("POST", unlock, ask, token="not-a-token")
+        expect(status == 401 and (payload.get("error") or {}).get("code") == "business_token_invalid",
+               "an unknown token is still 401: %s %s" % (status, payload))
+        status, payload = business_call("POST", "/v1/business/events", {"events": [event]},
+                                        token=secret["payments"])
+        expect(status == 200 and [r["status"] for r in payload.get("results", [])] == ["accepted"],
+               "the events token sends events: %s %s" % (status, payload))
+        status, payload = business_call("GET", "/v1/business/integrity-reports",
+                                        token=secret["default"], query={"account_id": locked})
+        expect(status == 200, "the older token still reads the reports: %s %s" % (status, payload))
+        status, payload = business_call("POST", unlock, ask, token=secret["support-tool"])
+        expect(status == 200 and payload.get("unlocked") is True,
+               "the support token unlocks: %s %s" % (status, payload))
+        produced = [tuple(r) for r in connection.execute(
+            "SELECT event_id, producer FROM business_events")]
+        acted = [tuple(r) for r in connection.execute(
+            "SELECT kind, code, actor FROM server_observations")]
+        expect(produced == [("role-1", "payments")]
+               and acted == [("app_pin_support_unlocked", "T-1", "support-tool")],
+               "each row names the caller that did it: %s %s" % (produced, acted))
 
 
 @check

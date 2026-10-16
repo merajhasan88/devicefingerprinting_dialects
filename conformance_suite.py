@@ -2027,8 +2027,9 @@ def check_parallel_first_sign_ins(api, ctx):
 
 @check("business: events are recorded once and combined with the phone-account graph")
 def check_business_api(api, ctx):
-    """DESIGN.md 76. Server to server: needs the token whose SHA-256 the server
-    lists in BUSINESS_API_TOKEN_SHA256, given to the suite as
+    """DESIGN.md 76. Server to server: needs a token whose SHA-256 the server
+    lists in BUSINESS_API_TOKENS with the events, graph and lapses roles (or in
+    the older BUSINESS_API_TOKEN_SHA256), given to the suite as
     DEVICE_TRUST_BUSINESS_TOKEN; skips without it. A fresh account on a fresh
     phone gets two events (one sent twice); the graph from the account shows
     the phone, the link and the counts; the lapse feed answers."""
@@ -2108,8 +2109,14 @@ def check_business_integrity_reports(api, ctx):
 
 
 def _support(api, token, action, body):
-    return api.call("POST", "/v1/business/app-pin/%s" % action,
-                    headers={"Authorization": "Bearer " + token}, body_text=json.dumps(body))
+    st, pl = api.call("POST", "/v1/business/app-pin/%s" % action,
+                      headers={"Authorization": "Bearer " + token}, body_text=json.dumps(body))
+    if st == 403 and error_code(pl) == "business_role_missing":
+        # Review F3: PIN support needs a token whose BUSINESS_API_TOKENS entry
+        # names the role; the older BUSINESS_API_TOKEN_SHA256 tokens lack it.
+        raise Skip("DEVICE_TRUST_BUSINESS_TOKEN lacks the pin_%s role (BUSINESS_API_TOKENS)"
+                   % action)
+    return st, pl
 
 
 def _observing_phone(api):
@@ -2395,7 +2402,8 @@ def check_step_up_policy(api, ctx):
 
 @check("support: unlock a locked app PIN, as the DBA's app_pin_support allows")
 def check_app_pin_support_unlock(api, ctx):
-    """DESIGN.md 79. Needs DEVICE_TRUST_BUSINESS_TOKEN. Off (the default),
+    """DESIGN.md 79. Needs DEVICE_TRUST_BUSINESS_TOKEN with the pin_unlock role
+    (BUSINESS_API_TOKENS); skips without it. Off (the default),
     both support actions answer app_pin_support_disabled. Where the DBA
     allows unlock, a PIN locked by wrong attempts is unlocked by support --
     naming the account by handle, with a ticket reference -- and the right
@@ -2447,7 +2455,8 @@ def check_app_pin_support_unlock(api, ctx):
 
 @check("support: a reset lets a limited session set a new app PIN, once")
 def check_app_pin_support_reset(api, ctx):
-    """DESIGN.md 79. Needs DEVICE_TRUST_BUSINESS_TOKEN, app_pin_support =
+    """DESIGN.md 79. Needs DEVICE_TRUST_BUSINESS_TOKEN with the pin_reset role
+    (BUSINESS_API_TOKENS), app_pin_support =
     unlock_and_reset, and enforce mode. A limited session cannot set a PIN;
     after support opens a reset it can, with the password -- a wrong one
     leaves the reset open -- and only once."""
