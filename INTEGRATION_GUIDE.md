@@ -172,7 +172,7 @@ differ, or when the PostgreSQL and SQL Server migrations seed different rows. A 
 switches its rule off; the server holds a value to the bounds its description states.
 
 <!-- settings-reference:begin (tools/settings_reference.py --write; do not edit by hand) -->
-130 settings, seeded by migrations 003-025 with the owner's defaults; each row's own description.
+134 settings, seeded by migrations 003-025 with the owner's defaults; each row's own description.
 
 **Migration 003** — DBA-tunable risk policy settings
 
@@ -345,11 +345,6 @@ switches its rule off; the server holds a value to the bounds its description st
 | `vpn_exit_min_phones` | `3` | Different Android phones that must have come through a VPN from one address in vpn_exit_window_days before it counts as a VPN exit. At least 1. |
 | `vpn_exit_min_share_percent` | `90` | Of the Android phones seen from that address in the window, the share that must have come through a VPN: a phone's own address carries mostly direct traffic. 1-100. |
 | `vpn_exit_window_days` | `30` | Days of sightings the two rules above count. 1-365. |
-| `source_vpn_listed_points` | `0` | Points when a request comes from an address on the public VPN list shipped with the server. 0 (owner default) = recorded only. |
-| `source_tor_exit_points` | `0` | Points when a request comes from a Tor exit. 0 (owner default) = recorded only. |
-| `source_hosting_points` | `0` | Points when a request comes from a hosting or data-centre network not known as a VPN. 0 (owner default) = recorded only. |
-| `source_vpn_observed_points` | `0` | Points when a request comes from an address learned as a VPN exit in a hosting network, or of unknown kind. 0 (owner default) = recorded only. |
-| `source_vpn_observed_non_hosting_points` | `0` | Points when a request comes from an address learned as a VPN exit outside hosting networks: a home or office VPN. 0 (owner default) = recorded only. |
 
 **Migration 024** — what can read or drive the phone (Accessibility, the keyboard, notification access, device administrators, remote-control apps), screen capture, location and mock locations, and the age of the security patch
 
@@ -388,6 +383,15 @@ switches its rule off; the server holds a value to the bounds its description st
 | Setting | Default | What it decides |
 |---|---|---|
 | `conditions_points_cap` | `60` | Most points the conditions add together -- apps that can read the screen, keyboard or notifications, remote-control apps, screen capture, fake GPS, an old patch, a VPN or proxy. Never kept in the device memory. 1-100. |
+| `vpn_active_points` | `10` | Points for android_vpn_active and ios_vpn_active (iOS infers it): privacy and work VPNs are common, so it nudges. 0 = recorded only. |
+| `http_proxy_points` | `15` | Points for android_http_proxy and ios_http_proxy: traffic-editing tools set one, so do some company networks. 0 = recorded only. |
+| `accessibility_hidden_points` | `30` | Points for android_accessibility_hidden: a service the system setting names but the Accessibility list omits, as an Android bug allowed malware until the December 2022 patch. |
+| `accessibility_hidden_refuses` | `0` | Eligibility rule. 1 = in enforce mode a phone with a hidden Accessibility service is refused until it is off and a new scan is sent; 0 (owner default) = no refusal. |
+| `source_vpn_listed_points` | `10` | Points when a request comes from an address on the public VPN list shipped with the server. 0 = recorded only. *(Seeded by migration 023 at `0`; this migration's default, set only where it is still `0`.)* |
+| `source_tor_exit_points` | `30` | Points when a request comes from a Tor exit: on its own, a step-up. 0 = recorded only. *(Seeded by migration 023 at `0`; this migration's default, set only where it is still `0`.)* |
+| `source_hosting_points` | `15` | Points when a request comes from a hosting or data-centre network not known as a VPN: cloud phones and bots, also some company networks. 0 = recorded only. *(Seeded by migration 023 at `0`; this migration's default, set only where it is still `0`.)* |
+| `source_vpn_observed_points` | `10` | Points when a request comes from an address learned as a VPN exit in a hosting network, or of unknown kind. 0 = recorded only. *(Seeded by migration 023 at `0`; this migration's default, set only where it is still `0`.)* |
+| `source_vpn_observed_non_hosting_points` | `10` | Points when a request comes from an address learned as a VPN exit outside hosting networks: a home or office VPN. 0 = recorded only. *(Seeded by migration 023 at `0`; this migration's default, set only where it is still `0`.)* |
 <!-- settings-reference:end -->
 
 **Shared phones and several devices are a business decision.** By default a third account on one

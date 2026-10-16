@@ -1417,11 +1417,12 @@ def check_eligibility_rule(api, ctx):
     expect(st == 200 and not (pl.get("integrity") or {}).get("eligibility"),
            "a new scan with the settings off must clear it, got %s %s" % (st, error_code(pl)))
 
-@check("integrity: a VPN and an HTTP proxy are measured and cost no points")
+@check("integrity: a VPN and an HTTP proxy are measured and score the DBA's small points")
 def check_network_probe(api, ctx):
-    """DESIGN.md 80. A current collector volunteers the network probe on every
-    scan; a VPN and an HTTP proxy are recorded (android_vpn_active,
-    android_http_proxy) at 0 points, so the verdict stays what it was."""
+    """DESIGN.md 80, 83. A current collector volunteers the network probe on
+    every scan; a VPN and an HTTP proxy are recorded (android_vpn_active,
+    android_http_proxy) at the DBA's vpn_active_points and http_proxy_points
+    (owner defaults 10 and 15), conditions the device memory never keeps."""
     integrity_context(ctx)
     settings = live_settings(api)
     if _setting_on(settings, "vpn_active_refuses") or _setting_on(settings, "http_proxy_refuses"):
@@ -1438,10 +1439,13 @@ def check_network_probe(api, ctx):
 
     decision = submit_report(api, inst, token, tunnel)
     points = {r["code"]: r["points"] for r in decision.get("reasons", [])}
-    expect(points.get("android_vpn_active") == 0 and points.get("android_http_proxy") == 0
-           and decision["score"] == plain["score"] and decision["verdict"] == plain["verdict"],
-           "a VPN and a proxy are recorded at 0 points: %s, score %s -> %s"
-           % (points, plain["score"], decision["score"]))
+    vpn = int(str(settings.get("vpn_active_points", "10")).strip() or "10")
+    proxy = int(str(settings.get("http_proxy_points", "15")).strip() or "15")
+    expect(points.get("android_vpn_active") == vpn and points.get("android_http_proxy") == proxy
+           and decision["score"] == min(100, plain["score"] + vpn + proxy)
+           and decision.get("finding_score") == plain.get("finding_score"),
+           "a VPN and a proxy score %d + %d and are never remembered: %s, score %s -> %s"
+           % (vpn, proxy, points, plain["score"], decision["score"]))
 
 
 @check("integrity: optional measurements are asked for as the DBA lists them, kept only then")

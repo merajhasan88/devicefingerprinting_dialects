@@ -4547,6 +4547,8 @@ def the_settings_reference_matches_the_migrations():
              for part in ("count", "points")}
     read |= {rule[0] for rule in s._ELIGIBILITY_RULES}
     read |= {rule[2] for rule in s._SOURCE_NETWORK_RULES}
+    # A table's default is a fallback too (migration 025 re-defaulted these).
+    fallbacks += [(rule[2], rule[3]) for rule in s._SOURCE_NETWORK_RULES]
     expect(not read - set(seeded), "read by the server but seeded by no migration: %s"
            % sorted(read - set(seeded)))
     expect(not set(seeded) - read, "seeded but never read: %s" % sorted(set(seeded) - read))
@@ -4603,11 +4605,12 @@ def the_network_probe_is_measured_and_advisory():
         db.writes = []
         status, payload = send_report(platform, dict(older, network=network, device=device))
         points = {r["code"]: r["points"] for r in (payload.get("integrity") or {}).get("reasons", [])}
-        expect(status == 200 and points.get("%s_vpn_active" % platform) == 0
-               and points.get("%s_http_proxy" % platform) == 0
-               and payload["integrity"]["score"] == plain["integrity"]["score"]
-               and payload["integrity"]["verdict"] == plain["integrity"]["verdict"],
-               "%s: a VPN and a proxy are recorded at 0 points: %s %s" % (platform, status, points))
+        expect(status == 200 and points.get("%s_vpn_active" % platform) == 10
+               and points.get("%s_http_proxy" % platform) == 15
+               and payload["integrity"]["score"] == plain["integrity"]["score"] + 25
+               and payload["integrity"]["finding_score"] == plain["integrity"]["finding_score"],
+               "%s: a VPN and a proxy nudge (10 + 15) and are never remembered: %s %s"
+               % (platform, status, points))
         stored = _stored_probes() or {}
         expect(stored.get("network") == network and stored.get("device") == device,
                "%s: both are stored as sent: %s" % (platform, sorted(stored)))
@@ -4961,7 +4964,7 @@ def the_new_eligibility_rules_refuse_only_when_set():
     rules = [(rule, code) for rule, code, _ in s._ELIGIBILITY_RULES
              if rule not in ("developer_options_refuses", "adb_enabled_refuses",
                              "vpn_active_refuses", "http_proxy_refuses")]
-    expect(len(rules) == 14, "fourteen new rule-reason pairs: %s" % rules)
+    expect(len(rules) == 15, "fifteen new rule-reason pairs: %s" % rules)
     saved = (s._latest_integrity_state, s._device_integrity_memory, s.INTEGRITY_MODE)
     s._device_integrity_memory = lambda did, iid: None
     s.INTEGRITY_MODE = "enforce"
@@ -5106,8 +5109,8 @@ TEST_LISTS = {"vpn": "# VPN providers\n203.0.113.0/25\nnot-a-network\n2001:db8::
 def the_source_address_is_classified_by_the_lists():
     """DESIGN.md 81. The address a request came from is looked up in the lists
     shipped with the server -- VPN providers, hosting networks, Tor exits --
-    each named once by its most specific kind, at 0 points unless the DBA
-    gives them points. The lists are IPv4: an IPv6 address, or a missing
+    each named once by its most specific kind, at the DBA's points (owner
+    defaults since migration 025: listed VPN 10, Tor 30, hosting 15). The lists are IPv4: an IPv6 address, or a missing
     list, is unknown (None), never "not listed". A changed file is re-read."""
     blank = {"vpn_listed": None, "tor_exit": None, "hosting": None, "vpn_observed": None,
              "vpn_observed_non_hosting": None}
@@ -5127,11 +5130,11 @@ def the_source_address_is_classified_by_the_lists():
             plain = store.decide(phone)
             tuned = store.decide(phone, source_vpn_listed_points=15)
         points = {r["code"]: r["points"] for r in plain["reasons"]}
-        expect(points.get("source_vpn_listed") == 0 and "source_hosting" not in points
+        expect(points.get("source_vpn_listed") == 10 and "source_hosting" not in points
                and plain["context"]["source_network"]["vpn_listed"] is True,
-               "a listed VPN is recorded at 0 points, once, by its kind: %s" % points)
+               "a listed VPN scores the owner's 10, once, by its kind: %s" % points)
         expect({r["code"]: r["points"] for r in tuned["reasons"]}.get("source_vpn_listed") == 15
-               and tuned["score"] == plain["score"] + 15, "the DBA's points count")
+               and tuned["score"] == plain["score"] + 5, "the DBA's points replace the owner's 10")
         with open(os.path.join(directory, "x4bnet_vpn_ipv4.txt"), "w", encoding="utf-8") as out:
             out.write("192.0.2.0/24\n")
         os.utime(os.path.join(directory, "x4bnet_vpn_ipv4.txt"), (1, 1))
@@ -5179,7 +5182,7 @@ def vpn_exits_are_learned_from_android_phones():
         network = decision["context"]["source_network"]
         codes_found = {r["code"]: r["points"] for r in decision["reasons"]}
         expect(network["vpn_observed"] is True and network["vpn_observed_non_hosting"] is True
-               and codes_found.get("source_vpn_observed_non_hosting") == 0
+               and codes_found.get("source_vpn_observed_non_hosting") == 10
                and "source_vpn_observed" not in codes_found,
                "three phones through a VPN: a VPN exit outside hosting networks: %s %s"
                % (network, codes_found))

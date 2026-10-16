@@ -18,7 +18,7 @@ even if the same people wear two hats.
 | Party | Decides | Where it lives | Documented today |
 |---|---|---|---|
 | **Us**, the product | how phones are measured and how much each finding weighs; the protocol | code | `DESIGN.md` (internal) |
-| **DBA and business analysts** | what is refused, limited, counted, for how long; what support staff may do to a PIN | `risk_policy_settings`, 130 rows | `INTEGRATION_GUIDE.md` §5 (every row, generated), §7–§13; the rows' own descriptions |
+| **DBA and business analysts** | what is refused, limited, counted, for how long; what support staff may do to a PIN | `risk_policy_settings`, 134 rows | `INTEGRATION_GUIDE.md` §5 (every row, generated), §7–§13; the rows' own descriptions |
 | **DevOps** | running the server: database, Redis, TLS, secrets, rollout modes, the app's identity pins | about 60 environment variables | guide §2–§4, §6 |
 | **App developers** | the app: native keys and collector, SDK calls, the screens users see, release values handed to DevOps | build settings, native modules, UI | scattered through the guide — **no app-developer guide** (gap G3) |
 | **Backend developers** | business events in; the graph, the lapse feed and every integrity report out; the support tool's PIN unlock and reset; route-3 assertions from their identity system | business API, JWKS file | guide §10, §12, §7; [MEASUREMENTS.md](MEASUREMENTS.md) |
@@ -45,7 +45,7 @@ without a policy. A count of `0` switches a rule off. Environment variables answ
 missing row.
 
 <!-- settings-reference:begin (tools/settings_reference.py --write; do not edit by hand) -->
-130 settings, seeded by migrations 003-025 with the owner's defaults; each row's own description.
+134 settings, seeded by migrations 003-025 with the owner's defaults; each row's own description.
 
 **Migration 003** — DBA-tunable risk policy settings
 
@@ -218,11 +218,6 @@ missing row.
 | `vpn_exit_min_phones` | `3` | Different Android phones that must have come through a VPN from one address in vpn_exit_window_days before it counts as a VPN exit. At least 1. |
 | `vpn_exit_min_share_percent` | `90` | Of the Android phones seen from that address in the window, the share that must have come through a VPN: a phone's own address carries mostly direct traffic. 1-100. |
 | `vpn_exit_window_days` | `30` | Days of sightings the two rules above count. 1-365. |
-| `source_vpn_listed_points` | `0` | Points when a request comes from an address on the public VPN list shipped with the server. 0 (owner default) = recorded only. |
-| `source_tor_exit_points` | `0` | Points when a request comes from a Tor exit. 0 (owner default) = recorded only. |
-| `source_hosting_points` | `0` | Points when a request comes from a hosting or data-centre network not known as a VPN. 0 (owner default) = recorded only. |
-| `source_vpn_observed_points` | `0` | Points when a request comes from an address learned as a VPN exit in a hosting network, or of unknown kind. 0 (owner default) = recorded only. |
-| `source_vpn_observed_non_hosting_points` | `0` | Points when a request comes from an address learned as a VPN exit outside hosting networks: a home or office VPN. 0 (owner default) = recorded only. |
 
 **Migration 024** — what can read or drive the phone (Accessibility, the keyboard, notification access, device administrators, remote-control apps), screen capture, location and mock locations, and the age of the security patch
 
@@ -261,6 +256,15 @@ missing row.
 | Setting | Default | What it decides |
 |---|---|---|
 | `conditions_points_cap` | `60` | Most points the conditions add together -- apps that can read the screen, keyboard or notifications, remote-control apps, screen capture, fake GPS, an old patch, a VPN or proxy. Never kept in the device memory. 1-100. |
+| `vpn_active_points` | `10` | Points for android_vpn_active and ios_vpn_active (iOS infers it): privacy and work VPNs are common, so it nudges. 0 = recorded only. |
+| `http_proxy_points` | `15` | Points for android_http_proxy and ios_http_proxy: traffic-editing tools set one, so do some company networks. 0 = recorded only. |
+| `accessibility_hidden_points` | `30` | Points for android_accessibility_hidden: a service the system setting names but the Accessibility list omits, as an Android bug allowed malware until the December 2022 patch. |
+| `accessibility_hidden_refuses` | `0` | Eligibility rule. 1 = in enforce mode a phone with a hidden Accessibility service is refused until it is off and a new scan is sent; 0 (owner default) = no refusal. |
+| `source_vpn_listed_points` | `10` | Points when a request comes from an address on the public VPN list shipped with the server. 0 = recorded only. *(Seeded by migration 023 at `0`; this migration's default, set only where it is still `0`.)* |
+| `source_tor_exit_points` | `30` | Points when a request comes from a Tor exit: on its own, a step-up. 0 = recorded only. *(Seeded by migration 023 at `0`; this migration's default, set only where it is still `0`.)* |
+| `source_hosting_points` | `15` | Points when a request comes from a hosting or data-centre network not known as a VPN: cloud phones and bots, also some company networks. 0 = recorded only. *(Seeded by migration 023 at `0`; this migration's default, set only where it is still `0`.)* |
+| `source_vpn_observed_points` | `10` | Points when a request comes from an address learned as a VPN exit in a hosting network, or of unknown kind. 0 = recorded only. *(Seeded by migration 023 at `0`; this migration's default, set only where it is still `0`.)* |
+| `source_vpn_observed_non_hosting_points` | `10` | Points when a request comes from an address learned as a VPN exit outside hosting networks: a home or office VPN. 0 = recorded only. *(Seeded by migration 023 at `0`; this migration's default, set only where it is still `0`.)* |
 <!-- settings-reference:end -->
 
 ## 3. DevOps — running the server
@@ -347,7 +351,7 @@ and its W^X baseline (DESIGN.md 62), the iOS team, bundle and signing identifier
 1. **What we fix** — the integrity weights and bands, measurement rules, the protocol and its token
    lifetimes, the invariants. The relationship rules and how long a session lives moved to the DBA in
    migration 021 (G1, G8).
-2. **The DBA's and business analysts' domain** — 130 settings, each with the owner's default and a
+2. **The DBA's and business analysts' domain** — 134 settings, each with the owner's default and a
    description in the row, all of them in the guide, generated from the migrations (G7).
 3. **The app developers' domain** — the native code and a working reference client exist, and the
    client now follows the server's step-up policy (G4); there is still no package to depend on (G2) and

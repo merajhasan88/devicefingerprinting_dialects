@@ -1428,6 +1428,10 @@ _RISK_SETTING_KINDS = {
     "security_patch_outdated_points": "int",
     # Migration 025 (DESIGN.md 83).
     "conditions_points_cap": "int",
+    "vpn_active_points": "int",
+    "http_proxy_points": "int",
+    "accessibility_hidden_points": "int",
+    "accessibility_hidden_refuses": "bool",
     "limited_session_paths": "paths",
     "limited_session_integrity_verdicts": "list:elevated,review",
     "limited_session_policy_actions": "list:step_up,review",
@@ -2836,6 +2840,26 @@ def _package_names(entries):
     return shown + (" and %d more" % (len(names) - 5) if len(names) > 5 else "")
 
 
+def _score_vpn_and_proxy(reasons, network, platform):
+    """A VPN or an HTTP proxy on the phone, at the DBA's points (owner defaults 10
+    and 15 since 2026-10-16: untested on real traffic, so they nudge). Both are
+    conditions: capped with the others, never in the device memory."""
+    total = 0
+    if _as_bool(network.get("vpn_active")):
+        points = _risk_setting_int("vpn_active_points", 10)
+        _integrity_reason(reasons, "android_vpn_active" if platform == "android" else "ios_vpn_active",
+                          points,
+                          "A VPN is active on this phone." if platform == "android" else
+                          "A VPN appears to be active on this phone (inferred).")
+        total += points
+    if _as_bool(network.get("http_proxy_configured")):
+        points = _risk_setting_int("http_proxy_points", 15)
+        _integrity_reason(reasons, "android_http_proxy" if platform == "android" else "ios_http_proxy",
+                          points, "An HTTP proxy is configured on this phone.")
+        total += points
+    return total
+
+
 def _access_points():
     """Each finding's points: the DBA's settings, the owner's defaults (migration
     024, DESIGN.md 82)."""
@@ -2876,6 +2900,16 @@ def _score_access_holders(reasons, probes):
                               "%s: %s." % (what % "that is not part of the system",
                                            _package_names(not_system)))
             total += points[non_system_code]
+    hidden = [item for item in _as_list(_probe(probes, "accessibility").get("settings_only"))
+              if isinstance(item, str) and item][:_MAX_LISTED_APPS]
+    if hidden:
+        points = _risk_setting_int("accessibility_hidden_points", 30)
+        _integrity_reason(reasons, "android_accessibility_hidden", points,
+                          "An Accessibility service the system setting names is missing from the "
+                          "Accessibility list (an Android bug allowed hiding until the December "
+                          "2022 patch): %s." % _package_names([{"package": item.split("/")[0]}
+                                                              for item in hidden]))
+        total += points
     remote = _listed_apps(_probe(probes, "other_access").get("remote_access_apps"))
     if remote:
         _integrity_reason(reasons, "android_remote_access_app", points["android_remote_access_app"],
@@ -3202,12 +3236,7 @@ def _score_android_integrity(probes):
     # wants them off makes it an eligibility rule (vpn_active_refuses,
     # http_proxy_refuses).
     network = _probe(probes, "network")
-    if _as_bool(network.get("vpn_active")):
-        _integrity_reason(reasons, "android_vpn_active", 0,
-                          "A VPN is active on this phone (advisory).")
-    if _as_bool(network.get("http_proxy_configured")):
-        _integrity_reason(reasons, "android_http_proxy", 0,
-                          "An HTTP proxy is configured on this phone (advisory).")
+    score += _score_vpn_and_proxy(reasons, network, "android")
 
     # Optional measurements and the patch level (DESIGN.md 82): the DBA's
     # points, each with an eligibility rule the DBA turns on.
@@ -3376,12 +3405,7 @@ def _score_ios_integrity(probes):
     # collector infers one from the interfaces the system proxy settings are
     # scoped to -- a heuristic, its interface names sent with it.
     network = _probe(probes, "network")
-    if _as_bool(network.get("vpn_active")):
-        _integrity_reason(reasons, "ios_vpn_active", 0,
-                          "A VPN appears to be active on this phone (advisory, inferred).")
-    if _as_bool(network.get("http_proxy_configured")):
-        _integrity_reason(reasons, "ios_http_proxy", 0,
-                          "An HTTP proxy is configured on this phone (advisory).")
+    score += _score_vpn_and_proxy(reasons, network, "ios")
 
     # iOS shows an app no other app, so only these two (DESIGN.md 82).
     score += _score_capture_and_location(reasons, probes, "ios")
@@ -3561,6 +3585,9 @@ _ELIGIBILITY_RULES = (
      "Stop simulating the location, then send a new integrity scan."),
     ("security_patch_outdated_refuses", "android_security_patch_outdated",
      "Install the latest security update, then send a new integrity scan."),
+    # DESIGN.md 83.
+    ("accessibility_hidden_refuses", "android_accessibility_hidden",
+     "Turn off Accessibility for the service the phone hides, then send a new integrity scan."),
 )
 
 
@@ -4169,34 +4196,37 @@ def _record_vpn_sighting(cursor, device_id, network):
 
 
 _SOURCE_NETWORK_RULES = (
-    # (code, the source_network key, its points setting, message)
-    ("source_vpn_listed", "vpn_listed", "source_vpn_listed_points",
+    # (code, the source_network key, its points setting, the owner's default,
+    # message). The defaults were 0 until the owner asked for reasonable
+    # scores on untested signals (2026-10-16, migration 025): a Tor exit asks
+    # for a step-up on its own; the others nudge.
+    ("source_vpn_listed", "vpn_listed", "source_vpn_listed_points", 10,
      "The request came from an address on the public VPN list."),
-    ("source_tor_exit", "tor_exit", "source_tor_exit_points",
+    ("source_tor_exit", "tor_exit", "source_tor_exit_points", 30,
      "The request came from a Tor exit."),
-    ("source_hosting", "hosting", "source_hosting_points",
+    ("source_hosting", "hosting", "source_hosting_points", 15,
      "The request came from a hosting or data-centre network."),
-    ("source_vpn_observed", "vpn_observed", "source_vpn_observed_points",
+    ("source_vpn_observed", "vpn_observed", "source_vpn_observed_points", 10,
      "The request came from an address this server's Android phones show to be a VPN exit."),
     ("source_vpn_observed_non_hosting", "vpn_observed_non_hosting",
-     "source_vpn_observed_non_hosting_points",
+     "source_vpn_observed_non_hosting_points", 10,
      "The request came from an address this server's Android phones show to be a VPN exit, "
      "outside hosting networks: a home or office VPN."),
 )
 
 
 def _source_network_reasons(reasons, source):
-    """The source-network reasons, 0 points unless the DBA gives them points;
-    each address is named once, by its most specific kind. Returns the points."""
+    """The source-network reasons at the DBA's points; each address is named
+    once, by its most specific kind. Returns the points."""
     found = {key for key, value in source.items() if value}
     if "vpn_observed_non_hosting" in found:
         found.discard("vpn_observed")
     if found & {"vpn_listed", "vpn_observed", "vpn_observed_non_hosting"}:
         found.discard("hosting")
     total = 0
-    for code, key, setting, message in _SOURCE_NETWORK_RULES:
+    for code, key, setting, default, message in _SOURCE_NETWORK_RULES:
         if key in found:
-            points = _risk_setting_int(setting, 0)
+            points = _risk_setting_int(setting, default)
             _policy_reason(reasons, code, points, message)
             total += points
     return total
