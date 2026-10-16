@@ -38,6 +38,7 @@ challenge lists in `optional_probes` (§6). The phone never sends a score. The s
 | `collector_version` | the native collector's version (Android 5, iOS 4 today) | yes |
 | `collected_at` | the phone's clock, which must be within the allowed skew | checked, not stored |
 | `probe_results` | one object per probe, below | yes, as sent — except an optional measurement the DBA does not request, which is dropped |
+| `enabled_measurements` | the optional measurements this app's developers enabled, whether or not the server asked; an older app leaves it out | yes, as `enabled_by_app` in the measurements' statuses, below |
 | `version` | the report format, 1 | checked |
 
 The server adds `report_id`, `device_id`, the SHA-256 of the signed bytes (`report_sha256`), its
@@ -96,6 +97,28 @@ A collector sends at most 32 apps per list and sets `truncated` when the phone h
 checked: a malformed one (an app without a valid package name, an unknown field, a list longer than 64)
 refuses the report with 400 `invalid_integrity_probe`, never silently dropped (review F1, DESIGN.md 83).
 
+**Each measurement's status** (review F1, DESIGN.md 83). With every report the server stores the status
+of every measurement a current collector of the platform answers — planned, volunteered or optional,
+scored or not — so it always knows what a scan did and did not measure. They are stored in
+`measurement_status` and returned as `measurements` in the scan's answer, in `/v1/integrity/me`, in each
+decision's `integrity` and in the business report feed: `{"status": {measurement: status},
+"enabled_by_app": [...]}`.
+
+| Status | Meaning |
+|---|---|
+| `ok` | measured |
+| `failed` | it answered `error`, or nothing usable |
+| `unsupported` | this phone cannot measure it (iOS cannot see other apps) |
+| `not_enabled` | the server asked; this app's developers did not enable it |
+| `not_requested` | the server did not ask: an optional measurement the DBA does not list, or an optional probe not drawn this time |
+| `absent` | asked for or expected, and not answered: an older or a modified app |
+| `no_permission` | `location`, `mock_location`: the person has not given the app the location permission |
+| `no_fix` | `location`, `mock_location`: the phone knows no location |
+| `stale` | `location`, `mock_location`: the location is older than `location_max_age_seconds` (600) |
+
+`enabled_by_app` is the report's `enabled_measurements`, or `null` from an app that does not send it. A
+report stored before migration 025 has no statuses.
+
 ### iOS
 
 Mandatory: `app_identity`, `code_signing`, `debugger`, `jailbreak_files`, `sandbox`, `dyld_images`
@@ -126,10 +149,25 @@ it unasked). Optional: `environment`, `simulator`. Optional measurements (§6), 
 
 ## 2. Integrity reasons (derived by the server from a scan)
 
-Each reason carries `code`, `points`, `message` and `hard`. The integrity score is the sum of the points,
-capped at 100; a hard reason blocks. Bands: 0–29 trusted, 30–59 elevated, 60–89 review, 90+ block. A
-*report-only* reason scores 0 and carries `report_only: true` and `proposed_points` — what it would cost
-if enabled.
+Each reason carries `code`, `points`, `message`, `hard` and `category`. The integrity score is the sum of
+the points, capped at 100; a hard reason blocks. Bands: 0–29 trusted, 30–59 elevated, 60–89 review, 90+
+block. A *report-only* reason scores 0 and carries `report_only: true` and `proposed_points` — what it
+would cost if enabled.
+
+The `category` says what kind of evidence a reason is (review F2, DESIGN.md 83):
+
+- **`integrity`** — the phone or the app is compromised or not genuine: root, hooks, a debugger,
+  modified code, a wrong signature.
+- **`condition`** — what the phone allows or is doing, which its owner can change: developer options,
+  ADB, a VPN, an HTTP proxy, an old security patch, and the findings of the optional measurements
+  (Accessibility, the keyboard, notification access, device administrators, remote-control apps,
+  screen recording, another display, a simulated location).
+- **`collection`** — a check that measured nothing usable (below).
+
+Conditions add at most `conditions_points_cap` (owner default 60) together, so on their own they reach
+review, never a block. A reason the cap reduced keeps what it would have scored in `points_before_cap`.
+The device memory (`device_integrity_history_block`, §3) remembers only the integrity findings
+(`finding_score`), so a clean scan clears a condition.
 
 Collection problems (DESIGN.md 66): `integrity_probe_failed:<probe>` (a requested probe answered
 `error`), `integrity_probe_incomplete:<probe>` (an `ok` probe without its contract fields) and
@@ -184,8 +222,8 @@ incomplete scans in a row, under either setting.
 | `android_emulator` | 25 |  |  | Android | The runtime resembles an Android emulator. |
 | `android_developer_options` | 0 |  |  | Android | Developer options are enabled (advisory). The DBA may make it an eligibility rule: `developer_options_refuses`. |
 | `android_adb_enabled` | 0 |  |  | Android | ADB is enabled (advisory). The DBA may make it an eligibility rule: `adb_enabled_refuses`. |
-| `android_vpn_active` | 0 |  |  | Android | A VPN is active on this phone (advisory). Eligibility rule: `vpn_active_refuses`. |
-| `android_http_proxy` | 0 |  |  | Android | An HTTP proxy is configured on this phone (advisory). Eligibility rule: `http_proxy_refuses`. |
+| `android_vpn_active` | `vpn_active_points` 10 |  |  | Android | A VPN is active on this phone. Eligibility rule: `vpn_active_refuses`. |
+| `android_http_proxy` | `http_proxy_points` 15 |  |  | Android | An HTTP proxy is configured on this phone. Eligibility rule: `http_proxy_refuses`. |
 | `ios_bundle_id_mismatch` | 100 | yes |  | iOS | Bundle identifier does not match the server baseline. |
 | `ios_executable_hash_mismatch` | 100 | yes |  | iOS | Executable hash does not match the configured build baseline. |
 | `ios_signing_identifier_mismatch` | 100 | yes |  | iOS | Code-signing identifier does not match the server baseline. |
@@ -201,8 +239,8 @@ incomplete scans in a row, under either setting.
 | `ios_dyld_injection_environment` | 90 |  |  | iOS | DYLD_INSERT_LIBRARIES is set. |
 | `ios_simulator` | 25 |  |  | iOS | The app is running in the iOS simulator. |
 | `ios_app_code_modified` | 90 |  | until enabled | iOS | The application's own code differs in memory from its packaged image. |
-| `ios_vpn_active` | 0 |  |  | iOS | A VPN appears to be active on this phone (advisory, inferred). Eligibility rule: `vpn_active_refuses`. |
-| `ios_http_proxy` | 0 |  |  | iOS | An HTTP proxy is configured on this phone (advisory). Eligibility rule: `http_proxy_refuses`. |
+| `ios_vpn_active` | `vpn_active_points` 10 |  |  | iOS | A VPN appears to be active on this phone (inferred). Eligibility rule: `vpn_active_refuses`. |
+| `ios_http_proxy` | `http_proxy_points` 15 |  |  | iOS | An HTTP proxy is configured on this phone. Eligibility rule: `http_proxy_refuses`. |
 | `android_accessibility_sideloaded` | `accessibility_sideloaded_points` 45 |  |  | Android | An Accessibility service is on in an app no app store installed: the banking-trojan signature, though a phone maker's preloaded app with no installer looks the same. Eligibility rule: `accessibility_sideloaded_refuses`. |
 | `android_accessibility_non_system` | `accessibility_non_system_points` 0 |  |  | Android | An Accessibility service is on in an app that is not part of the system, store apps included: screen readers and password managers too. Eligibility rule: `accessibility_non_system_refuses`. |
 | `android_accessibility_hidden` | `accessibility_hidden_points` 30 |  |  | Android | An Accessibility service the system setting names is missing from the Accessibility list (`settings_only`): an Android bug let malware hide that way until the December 2022 patch. Eligibility rule: `accessibility_hidden_refuses`. |
@@ -221,10 +259,12 @@ incomplete scans in a row, under either setting.
 | `ios_mock_location` | `mock_location_points` 40 |  |  | iOS | The phone's last location was simulated by software. Eligibility rule: `mock_location_refuses`. |
 | `android_security_patch_outdated` | `security_patch_outdated_points` 10 |  |  | Android | The security patch level is older than `security_patch_max_age_days` (owner default 365; 0 = never). Eligibility rule: `security_patch_outdated_refuses`. |
 
-These fourteen score the DBA's `*_points` (owner defaults shown; DESIGN.md 82): the sideloaded holders and
+These score the DBA's `*_points` (owner defaults shown; DESIGN.md 82, 83): the sideloaded holders and
 the deliberate manipulations score, while what screen readers, password managers, store keyboards,
 smartwatch apps and company phone management also hold stays at 0. A sideloaded app is also not part of
-the system, so its two findings add up.
+the system, so its two findings add up. Developer options and ADB stay at 0, as decided after review R1
+(DESIGN.md 69): with them on, a clean phone scored 33, a step-up. A deployment that refuses them turns on
+their eligibility rules.
 
 An app's source, for the `_sideloaded` findings (DESIGN.md 82): **system** where the phone marks it part of
 the system; **store** where its installer is one of `app_store_installers` (owner default: Google Play,
@@ -268,11 +308,11 @@ a rule off.
 | `request_rate_unavailable` | 0 | The request-rate counter could not be read; the decision was made without it. |
 | `request_rate_anomaly` | `rate_anomaly_points` 30 | More than `rate_anomaly_max_requests` in `rate_anomaly_window_seconds` (only with `rate_anomaly_enabled`). |
 | `population_outlier` | `population_points` 30 | `population_baseline_metric` above `population_baseline_threshold` (only with `population_baseline_enabled`). |
-| `source_vpn_listed` | `source_vpn_listed_points` 0 | The request came from an address on the public VPN list (§7). |
-| `source_tor_exit` | `source_tor_exit_points` 0 | The request came from a Tor exit (§7). |
-| `source_hosting` | `source_hosting_points` 0 | The request came from a hosting or data-centre network not known as a VPN (§7). |
-| `source_vpn_observed` | `source_vpn_observed_points` 0 | The request came from an address this server's Android phones show to be a VPN exit, in a hosting network or where that is unknown (§7). |
-| `source_vpn_observed_non_hosting` | `source_vpn_observed_non_hosting_points` 0 | The same, outside hosting networks: a home or office VPN (§7). |
+| `source_vpn_listed` | `source_vpn_listed_points` 10 | The request came from an address on the public VPN list (§7). |
+| `source_tor_exit` | `source_tor_exit_points` 30 | The request came from a Tor exit (§7). |
+| `source_hosting` | `source_hosting_points` 15 | The request came from a hosting or data-centre network not known as a VPN (§7). |
+| `source_vpn_observed` | `source_vpn_observed_points` 10 | The request came from an address this server's Android phones show to be a VPN exit, in a hosting network or where that is unknown (§7). |
+| `source_vpn_observed_non_hosting` | `source_vpn_observed_non_hosting_points` 10 | The same, outside hosting networks: a home or office VPN (§7). |
 
 The server's cross-checks (DESIGN.md 77) score only where the DBA sets `cross_checks_enabled`; their
 counts are in every decision's context either way. Each rule has `<code>_count` and `<code>_points`,
@@ -294,7 +334,8 @@ counted over `cross_check_window_hours` (24):
 ## 4. What the server observes itself (`server_observations`)
 
 Recorded with the account (when there is one), the phone and the installation — the server's own opaque
-IDs. Never updated or deleted.
+IDs — and, for a support action, the business API caller that did it (`actor`, review F3). Never updated
+or deleted.
 
 | Kind | `code` | When |
 |---|---|---|
@@ -358,10 +399,27 @@ stay optional, and the parties who answer for them switch them on.
 | `local_addresses` — the phone's own IP addresses | **both**: the DBA lists it in `optional_measurements`, and the app's developers enable it in the app (the reference app: `--dart-define=MEASURE_LOCAL_ADDRESSES=true`). Asked for and not enabled, the phone answers `not_enabled` | the report's `probe_results`; dropped before storing whenever the DBA does not request it |
 | `source_ip` — the address a request came from, as the server sees it (behind the configured proxies) | the DBA: `record_source_ip` | each risk decision's context |
 | `user_agent` — the request's User-Agent header, cut at 256 characters | the DBA: `record_user_agent`. The Flutter client sends `Dart/<version> (dart:io)` unless the app sets its own | each risk decision's context |
-| `vpn_active`, `http_proxy_configured` | always measured by current collectors (a yes/no, no address) | the `network` probe; reasons at 0 points; eligibility rules `vpn_active_refuses`, `http_proxy_refuses` |
+| `vpn_active`, `http_proxy_configured` | always measured by current collectors (a yes/no, no address) | the `network` probe; reasons at the DBA's `vpn_active_points` (10) and `http_proxy_points` (15); eligibility rules `vpn_active_refuses`, `http_proxy_refuses` |
 | `accessibility`, `notification_access`, `other_access` — which apps can read the screen, the keyboard, the notifications, or administer or remotely control the phone (Android) | **both**, as for `local_addresses`: the DBA lists it, the app enables it (the reference app: `MEASURE_ACCESSIBILITY`, `MEASURE_NOTIFICATION_ACCESS`, `MEASURE_OTHER_ACCESS`). A person's Accessibility services can reveal a disability | the report's `probe_results`; reasons at the DBA's points with eligibility rules (§2) |
 | `screen_capture` — the screen recorded, cast or mirrored during the scan | **both** (`MEASURE_SCREEN_CAPTURE`); Android 15 and later also need the app to declare `DETECT_SCREEN_RECORDING`, a normal permission | as above |
 | `location` — the last location the phone knows; `mock_location` — whether it was simulated | **both** (`MEASURE_LOCATION`, `MEASURE_MOCK_LOCATION`), **and** the person grants the app the OS location permission, which only the app asks for. Without it the probe answers `permission: none` and nothing else | the report's `probe_results`; `mock_location` has its reason and eligibility rule |
+
+**Measurements a path requires** (review F1, DESIGN.md 83). An eligibility rule such as
+`accessibility_sideloaded_refuses` judges only a scan that has its measurement: a phone that does not
+send it is never refused by the rule. Where that matters, the DBA lists the measurements a scan must
+have in `required_measurements` (empty by default) and the paths they apply to in
+`required_measurements_paths` (empty: every request the integrity check guards). Only status `ok` meets
+a requirement; an iPhone is never asked for what it cannot measure (`accessibility`,
+`notification_access`, `other_access`). The scan's answer says `requirements_satisfied` and lists
+`missing_requirements`, each measurement with its status. A scan without one, under
+`missing_measurement_action`:
+
+- **`limit`** (owner default) — treated like an elevated scan: a step-up proof satisfies a request
+  that accepts one, a sign-in gives a limited session, and anything else answers 403
+  `integrity_measurements_missing` until a new scan has them;
+- **`refuse`** — always 403 `integrity_measurements_missing`.
+
+An approval never covers a missing measurement. Observe mode reports and never refuses.
 
 Kept as long as the decisions and reports are: the business's retention policy applies to them.
 
@@ -395,12 +453,16 @@ a request comes from. Every risk decision's context carries `source_network`, fi
 | `vpn_observed` | this server's own Android phones show the address to be a VPN exit | learning, below; None while it is off |
 | `vpn_observed_non_hosting` | the same, and the address is outside hosting networks — a home or office VPN | learning and the hosting list; None where hosting is unknown |
 
-**Learning** (`vpn_exit_learning`, off by default). Android says reliably whether the app's own traffic
-goes through a VPN — the transports of the app's default network, in the `network` probe — and the server
-sees the address that traffic arrives from. Each Android scan adds a sighting to `vpn_exit_sightings`:
-the address, the phone (`device_id`), and whether it came through a VPN (`last_via_vpn_at`,
-`scans_via_vpn`) or direct (`last_direct_at`, `scans_direct`). An address counts as a VPN exit once at
-least `vpn_exit_min_phones` (3) different phones came through a VPN from it within
+**Learning** (`vpn_exit_learning`, off by default). Android tells the app whether its own traffic goes
+through a VPN — the transports of the app's default network, in the `network` probe — and the server
+sees the address that traffic arrives from. That is the phone's own report, which a modified app can
+falsify: a learned exit is an inference from your phones' reports, not a verified fact (review F5).
+Each Android scan adds a sighting to `vpn_exit_sightings`: the address, the phone (`device_id`), and
+whether it came through a VPN (`last_via_vpn_at`, `scans_via_vpn`) or direct (`last_direct_at`,
+`scans_direct`). Each phone counts by its latest sighting there: one that came through a VPN once and
+direct since is a direct phone. Only phones the server has known for `vpn_exit_min_device_age_days` (7)
+count at all, so freshly made-up phone identities cannot label an address. An address counts as a VPN
+exit once at least `vpn_exit_min_phones` (3) different phones came through a VPN from it within
 `vpn_exit_window_days` (30), and they are at least `vpn_exit_min_share_percent` (90) of the phones seen
 from it then. A phone's own address — a home line, a carrier's shared pool — carries mostly direct
 traffic, even where an ad blocker or firewall app uses Android's VPN interface and sends traffic out
