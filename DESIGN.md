@@ -6800,3 +6800,67 @@ findings. A simulated second display, on and public, still scored `android_scree
 and with it on `integrity_device_ineligible`; full suite in observe **68 / 0 / 23**. **State:** EC2
 stopped; every setting at the owner's default (now including the points and the 365-day patch age);
 the emulator stopped, the test apps removed.
+
+## 83. The critical review of 2026-10-16, and what was built from it
+
+**The review** (of archive `8ac696a`, schema 24): *"a strong reference implementation for controlled
+pilots, with the findings below addressed before broad enforcement"*. Seven findings, each reproduced on
+our code before anything changed:
+
+| # | Finding |
+|---|---|
+| F1 | An enabled rule passes a phone that simply does not send its measurement; a malformed app entry is dropped silently; "complete" evidence overstates what was checked |
+| F2 | Legitimate capabilities add up to a block (45 + 20 + 30 = 95), and the device memory keeps it for 24 hours after a clean scan |
+| F3 | Any business API token does everything, PIN reset included |
+| F4 | Changing a weight does not change stored scans, and nothing says which settings judged what |
+| F5 | VPN learning counts a phone that used a VPN once and went direct since; fresh made-up identities can label an address |
+| F6 | A different event under a used `event_id` is answered `duplicate` and lost |
+| F7 | A 30-day-old fake-GPS fix still scores; another display scores as recording; installer labels overclaim; an installed remote app counts as an active one |
+
+**The owner's decisions (2026-10-16).** All seven recommendations, and: *"Go ahead with your
+recommednations. However in testing we would have to put a reasonable score on the untested
+measurements. Make sure all measurements are reachable to the server regardless of whether they are
+optional, scored, unscored, configurable."* Read as:
+
+- **Reachable**: the server always knows every measurement's status. It does not repeal §80: the DBA
+  still asks for an optional measurement and the app still enables it.
+- **Reasonable scores on the untested**: the signals that scored 0 without a test on a real phone got
+  owner defaults — a VPN 10, an HTTP proxy 15, a public-list VPN address 10, a Tor exit 30, a hosting
+  network 15, a learned VPN exit 10 (both kinds), a hidden Accessibility service 30, another display 10.
+  Kept at 0: developer options and ADB (tested on real phones; advisory since §69) and the four
+  `_non_system` findings (store keyboards, screen readers, watch apps and company management hold them).
+
+**Built** (each its own commit; schema **25**, migration `025_review_2026_10_16.sql` on both engines;
+141 settings):
+
+| Item | Change | Commit |
+|---|---|---|
+| F2 | Each integrity reason has a `category`: integrity, condition or collection. Conditions together add at most `conditions_points_cap` (60), a reduced reason keeps `points_before_cap`, and `finding_score` — what the device memory keeps — leaves them out | `e72daee` |
+| Untested signals | `vpn_active_points` 10, `http_proxy_points` 15, the five `source_*_points` re-defaulted where still 0, `android_accessibility_hidden` with `accessibility_hidden_points` 30 and its rule | `670a098` |
+| F7 | `*_external_display` apart from `*_screen_captured` (`external_display_points` 10, its own rule); a mock fix older than `location_max_age_seconds` (600) kept, not scored; installers labelled no installer / installed by another app; "installed, not necessarily running" | `91cf1d0` |
+| F5, F6 | A phone counts by its latest sighting at an address, and only once known for `vpn_exit_min_device_age_days` (7); an event with other content under a used `event_id` is rejected `event_id_conflict` | `d557c50` |
+| F1 | A malformed entry, or a list over 64, refuses the report (400 `invalid_integrity_probe`); collectors say `truncated` | `730263d`, `184efb4` |
+| F1 | Every report stores each measurement's status (ok, failed, unsupported, not_enabled, not_requested, absent, no_permission, no_fix, stale) and the app's `enabled_measurements`; `required_measurements`, `required_measurements_paths` and `missing_measurement_action` (limit by default: like an elevated scan; refuse) | `9eb7821`, `d2a2ed9` |
+| F3 | `BUSINESS_API_TOKENS`: one token per caller with its roles (events, graph, lapses, reports, pin_unlock, pin_reset); 403 `business_role_missing`; the caller stored as `producer` and `actor`. An older `BUSINESS_API_TOKEN_SHA256` token keeps all but PIN support | `4b5eae4` |
+| F4 | `policy_version` (an HMAC of every setting, keyed so a phone cannot test guesses) and `server_build` (the server file's SHA-256) stored with every scan and decision; `policy_current` on the latest scan and the device memory. Nothing is re-scored | `27c1ba0` |
+| Docs | MEASUREMENTS; the guide (§5, §8, §10, §12, §14, §15), "pseudonymous, not anonymous" for "not personal data"; the map; the games catalog's claims qualified, with a table of what was tested | `24d0ca1`, `d278278`, `d120721`, `c960a51`, `f2f508f` |
+
+**Verified offline.** Gate **118/118**, eight new checks, each reproducing the review's case first
+(95 → block; silence passing a rule; a token resetting PINs; 30 → 0 stored as 30). Thirty-one
+deliberate breakages, each caught, re-run on the final code: F1 6, F2 4, F3 6, F4 9, F5 and F6 3,
+F7 3. Python 3.9 syntax; the settings reference regenerated.
+
+**Not verified yet:** the live round (migration 025 on the EC2 PostgreSQL, the suite, the emulator);
+SQL Server (025 joins G10); the Swift (no change was needed: iOS sends no app lists); a real phone.
+
+**Not done — later, or for the owner:**
+
+- F4's later step: settings published as one approved version, with simulation, rollback, and stated
+  treatment of approvals in force. Stored scans are not re-scored.
+- F6's further steps: an event schema version, and corrections that keep the original.
+- F5: keep learned exits advisory until evaluated against carrier NAT, ad blockers and poisoning.
+- The review's ownership section: a policy publication contract and a decision adapter to the
+  customer's engine; separate outputs for protocol validity, evidence sufficiency, findings,
+  eligibility and behaviour.
+- The review's order from here: SQL Server, the iPhone and real OEM phones; then measuring false
+  restrictions on real traffic; then the Flutter package and the app-developer guide (G2, G3).
