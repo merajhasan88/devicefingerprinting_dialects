@@ -6937,3 +6937,42 @@ engines, the server requiring schema 26 and never writing the values or reasons;
 breakages caught (the schema not required, the server writing a status, PostgreSQL accepting the same
 reason, the login not stamped, SQL Server not refusing, a column missing, SQL Server comparing
 case-blind).
+
+### 84.2 Item 8 — the four answers in every scan and decision
+
+**Asked for.** The 2026-10-13 review's first recommendation: *"Make each verdict explain four separate
+questions"* — was the protocol followed, what was actually measured, what suggests abuse, what is this
+session allowed to do; *"A successful signature must not raise measurement confidence automatically."*
+§76 left it for "the next API version"; it is additive, so it went into this one.
+
+**Built.** `_assessment` gives every scan response, every risk decision (returned, and stored in the
+row's `context.assessment`) and every refusal that carries a scan or a decision an `assessment`:
+
+- `protocol` — `result: valid` (a failed check is refused under its own code), what proved the request
+  (`g.protocol`, set where the access proof verifies: token role, proof version, installation key,
+  single-use nonce; a scan adds its challenge and signature; `step_up_proof`).
+- `evidence` — quality, report, age, freshness, `requirements_satisfied` / `missing_requirements`.
+- `findings` — every reason with points, `kind` and `provenance` (`phone`, `server`, `business`). The
+  relationship reasons' kinds are a table, `_POLICY_FINDINGS`; the gate fails if the server can emit a
+  reason the table lacks. A learned VPN exit is `phone`: it rests on phones' reports about their own
+  traffic, while a listed address is the server's own sight.
+- `decision` — `recommended` (`allow` < `step_up` < `scan` < `review` < `deny`): the stricter of what the
+  latest scan calls for as enforce mode judges it (`_integrity_recommendation`: freshness, verdict,
+  eligibility rules, the device memory, required measurements under `limit` or `refuse`,
+  complete-evidence paths) and the relationship policy's action; `enforced` per mode. Responses add
+  `allowed` and `allowed_by` (`step_up_proof`, `approval`, `observe_mode`, `settings`): set on protected
+  requests, on every issued session (`limited` or `full`), and by the error handler for the twelve
+  refusal codes that carry a scan or decision (`_REFUSAL_GRANTS`).
+
+The stored row is written before anything is granted, so it has no `allowed`; its `acceptance_id`
+explains an approval. The business report feed gives each stored scan its answers as judged when it
+arrived (`as_scored`), never re-judged under today's settings (F4). In observe mode every decision still
+says what enforce mode would do — the raw material for item 7.
+
+Gate: `every_scan_and_decision_answers_the_four_questions_apart` — every emitted relationship reason
+classified; a scan's protocol, evidence and findings; eleven recommendation cases; a decision's findings
+summing to its score, the stricter source winning, the stored row keeping the answers; refusals and grants
+end to end through the protected echo. Fourteen breakages caught (a learned exit called the server's, an
+eligibility rule not denying, the policy ignored, the row without answers, a silent refusal, a request or a
+session not granted, observe mode called settings, the scan's or the request's proof unsaid, points
+dropped, a reason unclassified, a missing measurement ignored, the device memory ignored).

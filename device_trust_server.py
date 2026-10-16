@@ -407,11 +407,40 @@ class ApiProblem(Exception):
         self.details = details
 
 
+# A refusal that carries the scan or the decision behind it also carries the
+# four answers (DESIGN.md 84.2), with what the request was granted instead.
+_REFUSAL_GRANTS = {
+    "integrity_scan_required": "scan",
+    "integrity_elevated": "scan",
+    "integrity_measurements_missing": "scan",
+    "integrity_complete_evidence_required": "scan",
+    "integrity_step_up_required": "step_up",
+    "risk_step_up_required": "step_up",
+    "integrity_review_required": "review",
+    "risk_review_required": "review",
+    "integrity_blocked": "deny",
+    "integrity_device_ineligible": "deny",
+    "integrity_device_blocked_recently": "deny",
+    "risk_policy_blocked": "deny",
+}
+
+
 @app.errorhandler(ApiProblem)
 def handle_api_problem(error):
     payload = {"error": {"code": error.code, "message": error.message}}
-    if error.details is not None:
-        payload["error"]["details"] = error.details
+    details = error.details
+    if error.code in _REFUSAL_GRANTS and isinstance(details, dict):
+        try:
+            policy = details.get("policy") if isinstance(details.get("policy"), dict) else None
+            assessment = (policy or {}).get("assessment") or _assessment(
+                details.get("integrity") if isinstance(details.get("integrity"), dict) else None,
+                None, details.get("device_integrity_memory"))
+            details = dict(details, assessment=dict(assessment, decision=dict(
+                assessment["decision"], allowed=_REFUSAL_GRANTS[error.code], allowed_by=None)))
+        except Exception:  # noqa: BLE001 - the refusal stands without its summary
+            logger.exception("Could not summarise refusal %s", error.code)
+    if details is not None:
+        payload["error"]["details"] = details
     return jsonify(payload), error.status
 
 
@@ -4003,23 +4032,34 @@ def _require_complete_evidence(state):
     whatever the verdict, and no upgrade acceptance or step-up proof changes
     that. Blinding the probes therefore gains nothing where money moves. The
     app's remedy is a new scan, or an app update for a legacy collector."""
-    if not has_request_context():
+    lacking = _complete_evidence_lacking(state)
+    if lacking is None:
         return
-    if request.path not in _risk_setting_words("complete_evidence_paths", ""):
-        return
-    max_age = _risk_setting_int("complete_evidence_max_age_seconds", _integrity_freshness_seconds())
-    quality = (state or {}).get("evidence_quality")
-    age = (state or {}).get("age_seconds")
-    if quality == "complete" and isinstance(age, int) and age <= max_age:
-        return
+    quality, age, max_age = lacking
     raise ApiProblem(
         "This operation needs a fresh, complete integrity scan (at most %d seconds old); "
         "send a new scan, and update the app if it reports legacy evidence." % max_age,
         403,
         "integrity_complete_evidence_required",
         details={"evidence_quality": quality, "age_seconds": age,
-                 "max_age_seconds": max_age},
+                 "max_age_seconds": max_age, "integrity": state},
     )
+
+
+def _complete_evidence_lacking(state):
+    """(quality, age, max age) when this request's path is one of the DBA's
+    complete_evidence_paths and the scan is not complete and recent enough;
+    None otherwise."""
+    if not has_request_context():
+        return None
+    if request.path not in _risk_setting_words("complete_evidence_paths", ""):
+        return None
+    max_age = _risk_setting_int("complete_evidence_max_age_seconds", _integrity_freshness_seconds())
+    quality = (state or {}).get("evidence_quality")
+    age = (state or {}).get("age_seconds")
+    if quality == "complete" and isinstance(age, int) and age <= max_age:
+        return None
+    return quality, age, max_age
 
 
 # ---------------------------------------------------------------------------
@@ -4525,6 +4565,168 @@ def _source_network_reasons(reasons, source):
     return total
 
 
+# ---------------------------------------------------------------------------
+# The four answers (DESIGN.md 84.2; the review of 2026-10-13, recommendation 1)
+# ---------------------------------------------------------------------------
+# Every scan and every decision answers four questions apart, so that nobody
+# reads one as another: a valid signature is not a clean phone, and a trusted
+# verdict on evidence that measured little is not a clean one either.
+#   protocol -- was the request genuine, and what proved it;
+#   evidence -- what was actually measured, and whether the DBA's
+#               requirements are met;
+#   findings -- what suggests abuse, each with its kind and who supplied the
+#               facts: the phone (its own scans: claims a compromised phone
+#               can forge), the server (what it saw itself) or the business
+#               (its events);
+#   decision -- what the evidence calls for (recommended) and, in a response,
+#               what this request or session was granted (allowed).
+# Nothing here changes an outcome: it restates what the scan and the policy
+# decided, apart.
+
+# What the evidence can call for, mildest first.
+ASSESSMENT_RECOMMENDATIONS = ("allow", "step_up", "scan", "review", "deny")
+# What a request or a session can be granted.
+ASSESSMENT_ALLOWED = ("full", "limited", "step_up", "scan", "review", "deny")
+_POLICY_RECOMMENDATION = {"allow": "allow", "step_up": "step_up", "review": "review",
+                          "block": "deny"}
+
+# The kind of each relationship-policy reason, and who supplied its facts.
+_POLICY_FINDINGS = dict(
+    [(code, ("administration", "server"))
+     for code in ("installation_not_active", "device_not_active")]
+    + [(code, ("relationship", "server")) for code in (
+        "new_device", "known_device_new_installation", "rapid_reinstall_elevated",
+        "rapid_reinstall_high", "rapid_reinstall_block_threshold",
+        "device_has_multiple_accounts", "device_has_many_accounts",
+        "device_account_count_block_threshold", "account_has_multiple_devices",
+        "account_has_many_devices", "account_device_count_block_threshold",
+        "population_outlier")]
+    # No scan, an old one, a counter that could not be read: nothing measured.
+    + [(code, ("collection", "server")) for code in (
+        "integrity_report_missing", "integrity_report_stale", "request_rate_unavailable")]
+    # The phone's own scans, as the relationship policy counts them.
+    + [(code, ("integrity", "phone"))
+       for code in ("native_integrity_risk", "device_integrity_history_block")]
+    + [("request_rate_anomaly", ("behaviour", "server"))]
+    + [(rule[0], ("behaviour", "server")) for rule in _CROSS_CHECK_RULES]
+    # The address is the server's own observation; a learned VPN exit rests on
+    # what other phones reported about their own traffic.
+    + [(rule[0], ("network", "phone" if rule[1].startswith("vpn_observed") else "server"))
+       for rule in _SOURCE_NETWORK_RULES]
+)
+
+
+def _findings(integrity=None, policy=None):
+    """Every reason of the scan and of the relationship policy, each with its
+    points, its kind and who supplied the facts behind it."""
+    found = []
+    for holder, from_scan in ((integrity, True), (policy, False)):
+        for reason in _as_list((holder or {}).get("reasons")):
+            if not isinstance(reason, dict) or not reason.get("code"):
+                continue
+            if from_scan:
+                kind = reason.get("category") or (
+                    "collection" if _is_quality_reason(reason)
+                    else "condition" if _is_condition_reason(reason) else "integrity")
+                provenance = "phone"
+            else:
+                kind, provenance = _POLICY_FINDINGS.get(str(reason["code"]), ("other", "server"))
+            points = reason.get("points", 0)
+            found.append({
+                "code": str(reason["code"]),
+                "points": points if isinstance(points, int) and not isinstance(points, bool) else 0,
+                "kind": kind,
+                "provenance": provenance,
+            })
+    return found
+
+
+def _integrity_recommendation(state, memory=None, missing=()):
+    """What this installation's latest scan calls for on this request, the way
+    the integrity gate would judge it in enforce mode -- before any step-up
+    proof or approval."""
+    if state is None or not state.get("fresh"):
+        return "scan"
+    verdict = state.get("verdict")
+    if (verdict == "block" or _eligibility_failures(state)
+            or (memory or {}).get("finding_verdict") == "block"):
+        return "deny"
+    if verdict == "review":
+        return "review"
+    if (missing and _risk_setting_str("missing_measurement_action", "limit") == "refuse") \
+            or _complete_evidence_lacking(state) is not None:
+        return "scan"
+    if verdict == "elevated" or missing:
+        return "step_up"
+    return "allow"
+
+
+def _assessment(integrity=None, policy=None, memory=None, here=True):
+    """The four answers for one decision, or for one scan (policy None; here
+    False: every requirement, not only those of this request's path)."""
+    missing = _missing_requirements(integrity, here=here) if integrity is not None else []
+    from_scan = _integrity_recommendation(integrity, memory, missing)
+    from_policy = None
+    recommended = from_scan
+    if policy is not None:
+        from_policy = _POLICY_RECOMMENDATION.get(policy.get("recommended_action"), "allow")
+        recommended = max(from_scan, from_policy, key=ASSESSMENT_RECOMMENDATIONS.index)
+    protocol = {"result": "valid"}
+    if has_request_context():
+        protocol.update(g.get("protocol") or {})
+        protocol["step_up_proof"] = bool(g.get("step_up"))
+    state = integrity or {}
+    return {
+        "protocol": protocol,
+        "evidence": {
+            "quality": state.get("evidence_quality") or ("none" if integrity is None else "unknown"),
+            "report_id": state.get("report_id"),
+            "age_seconds": state.get("age_seconds"),
+            "fresh": bool(state.get("fresh")),
+            "requirements_satisfied": not missing,
+            "missing_requirements": missing,
+        },
+        "findings": _findings(integrity, policy),
+        "decision": {
+            "recommended": recommended,
+            "integrity": from_scan,
+            "relationship": from_policy,
+            "enforced": {"integrity": INTEGRITY_MODE == "enforce",
+                         "relationship": DEVICE_POLICY_MODE == "enforce"},
+        },
+    }
+
+
+_VERDICT_RECOMMENDATION = {"block": "deny", "review": "review", "elevated": "step_up"}
+
+
+def _stored_scan_assessment(report):
+    """The four answers for a stored scan as it was judged when it arrived:
+    every stored scan passed the challenge and its signature; the decision
+    follows the verdict it was given (review F4: nothing is re-scored), and
+    which requirements applied then is not recorded."""
+    recommended = _VERDICT_RECOMMENDATION.get(report.get("verdict"), "allow")
+    return {
+        "protocol": {"result": "valid", "challenge": "single_use",
+                     "report_signature": "verified"},
+        "evidence": {"quality": report.get("evidence_quality") or "unknown",
+                     "report_id": report.get("report_id")},
+        "findings": _findings(report),
+        "decision": {"recommended": recommended, "integrity": recommended,
+                     "relationship": None, "as_scored": True},
+    }
+
+
+def _granted(holder, allowed, by=None):
+    """Record in a decision's (or a scan state's) assessment what this request
+    or session was granted; returns the holder."""
+    assessment = (holder or {}).get("assessment") if isinstance(holder, dict) else None
+    if isinstance(assessment, dict):
+        assessment["decision"] = dict(assessment.get("decision") or {}, allowed=allowed,
+                                      allowed_by=by)
+    return holder
+
+
 def _evaluate_risk_policy(
     event_type,
     device_id,
@@ -5021,6 +5223,7 @@ def _evaluate_risk_policy(
         "thresholds": _policy_bands(),
         "created_at": _iso_z(_utc_now()),
     }
+    decision["assessment"] = _assessment(integrity_state, decision, device_integrity_memory)
 
     if persist:
         with _cursor(commit=True) as cursor:
@@ -5043,7 +5246,8 @@ def _evaluate_risk_policy(
                     effective_action,
                     int(score),
                     DIALECT.json_param(reasons),
-                    DIALECT.json_param(dict(context, server_build=SERVER_BUILD)),
+                    DIALECT.json_param(dict(context, server_build=SERVER_BUILD,
+                                            assessment=decision["assessment"])),
                 ),
             )
 
@@ -5663,7 +5867,28 @@ def _require_trusted_account_request(event_type="protected_request"):
         persist=True,
     )
     _enforce_risk_policy(policy, accepted=accepted)
+    _granted(policy, "limited" if claims.get("scope") == "limited" else "full",
+             _granted_by(policy, integrity))
     return claims, policy, integrity
+
+
+def _granted_by(policy, integrity):
+    """Why a request passed that its evidence alone would have held back: a
+    step-up proof, an approval's acceptance, a mode that only observes, or the
+    DBA's settings (an elevated relationship risk refuses nothing unless
+    elevated_risk_refuses is 1). None when nothing held it back."""
+    integrity = integrity or {}
+    if integrity.get("satisfied_by_step_up"):
+        return "step_up_proof"
+    if integrity.get("accepted_by_upgrade") or (policy or {}).get("accepted_by_upgrade"):
+        return "approval"
+    decision = ((policy or {}).get("assessment") or {}).get("decision") or {}
+    if decision.get("recommended") in (None, "allow"):
+        return None
+    observed = [source for source, mode in (("integrity", INTEGRITY_MODE),
+                                            ("relationship", DEVICE_POLICY_MODE))
+                if decision.get(source) not in (None, "allow") and mode != "enforce"]
+    return "observe_mode" if observed else "settings"
 
 
 # An upgrade accepts what was approved, reason by reason (review R1, DESIGN.md
@@ -6532,6 +6757,9 @@ def _require_access_proof(required_role="account"):
 
     if required_role == "account" and claims.get("scope") == "limited":
         _require_limited_session_path(claims)
+    # What proved this request genuine: the first of the four answers.
+    g.protocol = {"token": required_role, "proof": "access_proof_v%d" % version,
+                  "installation_key": "verified", "nonce": "single_use"}
     return claims
 
 
@@ -6879,6 +7107,8 @@ def _issue_account_tokens(
             acceptance_id,
         ),
     )
+    _granted(policy, scope,
+             None if limited else "approval" if accepted else _granted_by(policy, None))
     tokens = {
         "access_token": access_token,
         "refresh_token": refresh_token,
@@ -7827,6 +8057,12 @@ def integrity_report():
         "remote_attestation": "not_used",
         "created_at": _iso_z(_utc_now()),
     }
+    # The four answers for this scan alone (DESIGN.md 84.2): what it calls for
+    # on the next requests, before the relationship policy has its say.
+    response["assessment"] = _assessment(
+        dict(response, platform=platform, fresh=True, age_seconds=0), here=False)
+    response["assessment"]["protocol"].update(challenge="single_use",
+                                              report_signature="verified")
     return jsonify({"integrity": response})
 
 
@@ -10074,6 +10310,8 @@ def business_integrity_reports():
          "policy_version": r[15], "server_build": r[16]}
         for r in rows
     ]
+    for report in reports:
+        report["assessment"] = _stored_scan_assessment(report)
     last = reports[-1] if reports else None
     return jsonify({
         "reports": reports,

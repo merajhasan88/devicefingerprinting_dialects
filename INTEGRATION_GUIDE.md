@@ -1289,3 +1289,28 @@ WHERE (last_via_vpn_at IS NULL OR last_via_vpn_at < DATEADD(day, -@days, SYSDATE
 Both read the window from the setting, so the job follows it when the DBA changes it; a deleted sighting
 was no longer counted, so learning answers exactly as before. Turning learning off stops new sightings
 but deletes nothing: delete the table's rows too if you will not turn it back on.
+
+## 16. The four answers in every scan and decision
+
+A valid signature says nothing about the phone, and a `trusted` verdict on a scan that measured little is
+not a clean phone either. So every scan response, every risk decision (`policy`, `trust_policy`) and every
+refusal that carries a scan or a decision has an `assessment` that answers four questions apart
+(`DESIGN.md` §84.2; every field in [MEASUREMENTS.md](MEASUREMENTS.md) §8):
+
+1. **`protocol`** — was the request genuine, and what proved it (the token, the access proof signed by the
+   installation key, the single-use nonce, a step-up proof; for a scan, its challenge and signature).
+2. **`evidence`** — what was actually measured: the scan's quality, age and freshness, and whether your
+   DBA's required measurements are there.
+3. **`findings`** — every reason with its points, its kind, and who supplied the facts: `phone` (the
+   phone's own scans — evidence a compromised phone can forge), `server` (what this server saw itself) or
+   `business` (your events).
+4. **`decision`** — what the evidence calls for (`recommended`: `allow`, `step_up`, `scan`, `review`,
+   `deny`), whether each mode enforces it, and in a response what was granted (`allowed`: `full`,
+   `limited`, `step_up`, `scan`, `review`, `deny`) and, when the request passed although the evidence
+   called for more, why (`allowed_by`: a step-up proof, an approval, observe mode, or your settings).
+
+It changes no outcome: it restates what the scan and the policy decided. Use it in your app to show the
+right remedy (`scan` — send a new scan; `step_up`; `limited` — offer the upgrade routes of section 7), in
+your backend to log why a request passed, and in observe mode to count what enforce mode would have done:
+every stored decision keeps its answers, and `decision.recommended` against `decision.enforced` says what
+an enforcing server would have refused.

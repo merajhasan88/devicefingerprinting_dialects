@@ -5966,6 +5966,187 @@ def every_scan_and_decision_names_the_settings_and_code_it_was_judged_under():
            % (context.get("policy_version"), {k: kept.get(k) for k in ("policy_version", "server_build")}))
 
 
+@check
+def every_scan_and_decision_answers_the_four_questions_apart():
+    """DESIGN.md 84.2: item 8 of the eight the owner approved on 2026-10-14
+    (the 2026-10-13 review's first recommendation). Was the request genuine,
+    what was actually measured, what was found and who supplied the facts,
+    and what the evidence calls for and the request was granted -- answered
+    apart in every scan, every decision (returned and stored) and every
+    refusal that carries a scan or a decision. A summary: it changes no
+    outcome."""
+    # Every relationship reason the server can give has a kind and a source.
+    source = Path(s.__file__).read_text(encoding="utf-8")
+    emitted = set(re.findall(r'_policy_reason\(\s*reasons,\s*"([a-z_]+)"', source))
+    emitted |= {rule[0] for rule in s._CROSS_CHECK_RULES} | {rule[0] for rule in s._SOURCE_NETWORK_RULES}
+    expect(len(emitted) >= 30 and not emitted - set(s._POLICY_FINDINGS),
+           "relationship reasons with no kind: %s" % sorted(emitted - set(s._POLICY_FINDINGS)))
+    expect(s._POLICY_FINDINGS["source_vpn_observed"] == ("network", "phone")
+           and s._POLICY_FINDINGS["source_tor_exit"] == ("network", "server")
+           and s._POLICY_FINDINGS["device_stepup_failures"] == ("behaviour", "server")
+           and s._POLICY_FINDINGS["native_integrity_risk"] == ("integrity", "phone"),
+           "a learned exit rests on phones' reports, an address on the server's own sight")
+
+    # A scan: what proved it, what it measured, what it found, what it calls for.
+    with policy():
+        status, payload = send_report("android", clean("android"))
+    scan = payload["integrity"]
+    answers = scan["assessment"]
+    expect(status == 200 and answers["protocol"] == {
+        "result": "valid", "token": "device", "proof": "access_proof_v2",
+        "installation_key": "verified", "nonce": "single_use", "step_up_proof": False,
+        "challenge": "single_use", "report_signature": "verified"},
+        "a scan says what proved it: %s" % answers.get("protocol"))
+    expect(answers["evidence"]["quality"] == scan["evidence_quality"]
+           and answers["evidence"]["report_id"] == scan["report_id"]
+           and answers["evidence"]["fresh"] is True
+           and answers["evidence"]["requirements_satisfied"] is True
+           and answers["decision"]["recommended"] == "allow"
+           and answers["decision"]["relationship"] is None,
+           "a clean scan: %s" % answers)
+    expect([(f["code"], f["points"], f["kind"], f["provenance"]) for f in answers["findings"]]
+           == [(r["code"], r["points"], r["category"], "phone") for r in scan["reasons"]],
+           "a scan's findings are its reasons, each from the phone: %s" % answers["findings"])
+
+    def recommended(state, memory=None, path="/v1/account/me", **settings):
+        with policy(**settings), s.app.test_request_context(path):
+            return s._assessment(state, None, memory)["decision"]["recommended"]
+
+    measured = {name: "ok" for name in s._MEASUREMENTS["android"]}
+    base = {"report_id": "r", "verdict": "trusted", "fresh": True, "age_seconds": 5,
+            "evidence_quality": "complete", "platform": "android", "reasons": [],
+            "measurements": {"status": measured}}
+    for state, memory, settings, wanted in (
+            (None, None, {}, "scan"),
+            (dict(base, fresh=False), None, {}, "scan"),
+            (base, None, {}, "allow"),
+            (dict(base, verdict="elevated"), None, {}, "step_up"),
+            (dict(base, verdict="review"), None, {}, "review"),
+            (dict(base, verdict="block"), None, {}, "deny"),
+            (base, {"finding_verdict": "block"}, {}, "deny"),
+            (dict(base, reasons=[{"code": "android_screen_captured", "points": 30}]), None,
+             {"screen_capture_refuses": 1}, "deny"),
+            (dict(base, measurements={"status": dict(measured, accessibility="absent")}), None,
+             {"required_measurements": "accessibility"}, "step_up"),
+            (dict(base, measurements={"status": dict(measured, accessibility="absent")}), None,
+             {"required_measurements": "accessibility", "missing_measurement_action": "refuse"},
+             "scan"),
+            (dict(base, evidence_quality="partial"), None,
+             {"complete_evidence_paths": "/v1/account/me"}, "scan")):
+        got = recommended(state, memory, **settings)
+        expect(got == wanted, "%s %s %s: recommended %s, not %s"
+               % ((state or {}).get("verdict"), memory, settings, got, wanted))
+
+    # A decision: both sources, the stricter recommendation, kept with the row.
+    store = ObservationStore()
+    acct = str(uuid.uuid4())
+    newcomer = store.phone(age_days=0)
+    for _ in range(5):
+        store.observe("sign_in_failed", store.phone(), acct)
+    captured, real_execute = [], LiteCursor.execute
+
+    def execute(cursor, sql, params=()):
+        if sql.lstrip().startswith("INSERT INTO risk_policy_decisions"):
+            captured.append(params)
+            return
+        real_execute(cursor, sql, params)
+
+    LiteCursor.execute = execute
+    try:
+        decided = store.decide(newcomer, acct, pending=True, persist=True, cross_checks_enabled=1,
+                               account_sign_in_failures_elsewhere_points=60)
+        missing = store.decide(newcomer, acct, pending=True, scan="missing")
+    finally:
+        LiteCursor.execute = real_execute
+    answers = decided["assessment"]
+    kinds = {f["code"]: (f["kind"], f["provenance"]) for f in answers["findings"]}
+    expect(kinds.get("new_device") == ("relationship", "server")
+           and kinds.get("account_sign_in_failures_elsewhere") == ("behaviour", "server")
+           and sum(f["points"] for f in answers["findings"]) == decided["score"],
+           "a decision's findings are its reasons with their sources: %s" % answers["findings"])
+    expect(decided["recommended_action"] == "review"
+           and answers["decision"]["relationship"] == "review"
+           and answers["decision"]["integrity"] == "allow"
+           and answers["decision"]["recommended"] == "review",
+           "the stricter of the two: %s" % answers["decision"])
+    expect(missing["assessment"]["decision"]["integrity"] == "scan"
+           and missing["assessment"]["evidence"]["quality"] == "none"
+           and missing["assessment"]["decision"]["recommended"]
+           == max("scan", missing["assessment"]["decision"]["relationship"],
+                  key=s.ASSESSMENT_RECOMMENDATIONS.index),
+           "no scan: nothing measured, a scan called for: %s" % missing["assessment"])
+    kept = captured[0][10].adapted if captured else {}
+    expect(kept.get("assessment") == answers and "allowed" not in answers["decision"],
+           "the stored row keeps the four answers, before anything was granted: %s"
+           % kept.get("assessment"))
+
+    # What a request was granted, and why it passed when its evidence said otherwise.
+    def stub_policy(*args, **kwargs):
+        decision = {"effective_action": "allow", "recommended_action": "allow", "reasons": []}
+        decision["assessment"] = s._assessment(s._latest_integrity_state(None), decision, None)
+        return decision
+
+    saved = (s._latest_integrity_state, s._device_integrity_memory, s._evaluate_risk_policy)
+    s._latest_integrity_state = lambda iid: dict(base, verdict="elevated", score=30)
+    s._device_integrity_memory = lambda did, iid: None
+    s._evaluate_risk_policy = stub_policy
+    try:
+        with policy():
+            body = encode({"x": 1})
+            reply = client.post(ECHO, data=body, headers=access_headers("POST", ECHO, body))
+            details = ((reply.get_json() or {}).get("error") or {}).get("details") or {}
+            expect(reply.status_code == 403 and error_code(reply) == "integrity_step_up_required"
+                   and details.get("assessment", {}).get("decision", {}).get("allowed") == "step_up"
+                   and details["assessment"]["decision"]["recommended"] == "step_up",
+                   "a refusal says what it grants instead: %s" % details.get("assessment"))
+            nonce = fresh_nonce()
+            head = access_headers("POST", ECHO, body, nonce=nonce)
+            head.update(stepup_headers("POST", ECHO, body, nonce))
+            reply = client.post(ECHO, data=body, headers=head)
+            granted = ((reply.get_json() or {}).get("trust_policy") or {}).get("assessment") or {}
+            expect(reply.status_code == 200
+                   and granted.get("decision", {}).get("allowed") == "full"
+                   and granted["decision"]["allowed_by"] == "step_up_proof"
+                   and granted["protocol"]["step_up_proof"] is True
+                   and granted["protocol"]["proof"] == "access_proof_v2",
+                   "a step-up proof let an elevated scan through: %s" % granted)
+        s._latest_integrity_state = lambda iid: dict(base, verdict="block", score=90)
+        with policy():
+            reply = client.post(ECHO, data=body, headers=access_headers("POST", ECHO, body))
+            details = ((reply.get_json() or {}).get("error") or {}).get("details") or {}
+            expect(error_code(reply) == "integrity_blocked"
+                   and details.get("assessment", {}).get("decision", {}).get("allowed") == "deny",
+                   "a block grants nothing: %s" % details.get("assessment"))
+    finally:
+        s._latest_integrity_state, s._device_integrity_memory, s._evaluate_risk_policy = saved
+    with s.app.test_request_context("/v1/accounts/login"):
+        review = {"recommended_action": "review", "reasons": []}
+        review["assessment"] = s._assessment(base, review, None)
+        problem = s.ApiProblem("held", 403, "risk_review_required", details={"policy": review})
+        refused = s.handle_api_problem(problem)[0].get_json()["error"]["details"]["assessment"]
+        expect(refused["decision"]["allowed"] == "review"
+               and "allowed" not in review["assessment"]["decision"],
+               "a review refusal grants review, and leaves the decision itself alone: %s" % refused)
+    with s.app.app_context():
+        limited = s._issue_account_tokens(db, account, inst.device_id, inst.installation_id,
+                                          policy=dict(review), limited_causes=["risk_review"])
+        expect(limited["policy"]["assessment"]["decision"]["allowed"] == "limited",
+               "a limited session says so: %s" % limited["policy"]["assessment"]["decision"])
+    for integrity, decision, mode, wanted in (
+            ({"satisfied_by_step_up": True}, {}, "enforce", "step_up_proof"),
+            ({"accepted_by_upgrade": True}, {}, "enforce", "approval"),
+            ({}, {"recommended": "allow"}, "enforce", None),
+            ({}, {"recommended": "review", "relationship": "review"}, "observe", "observe_mode"),
+            ({}, {"recommended": "step_up", "relationship": "step_up"}, "enforce", "settings")):
+        saved_mode = s.DEVICE_POLICY_MODE
+        s.DEVICE_POLICY_MODE = mode
+        try:
+            got = s._granted_by({"assessment": {"decision": decision}}, integrity)
+        finally:
+            s.DEVICE_POLICY_MODE = saved_mode
+        expect(got == wanted, "%s %s %s: granted by %s, not %s" % (integrity, decision, mode, got, wanted))
+
+
 # The rows people change by hand (DESIGN.md 84): the key, the value, then the
 # columns that say why it last changed, who changed it and when.
 _HAND_EDITED = {

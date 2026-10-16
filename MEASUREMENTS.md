@@ -368,7 +368,8 @@ account on the phone, with `window_hours` and whether they were `scored`), `requ
 `held_by_denial`, `rate_limiter` when the counter was unavailable, `source_ip` and `user_agent` where the
 DBA records them (§6), `source_network` (§7), and `business_events_30d` — counts by
 type of the business events of the account, and of every account linked to the phone, over 30 days
-(DESIGN.md 76), where the business API is configured.
+(DESIGN.md 76), where the business API is configured. The stored context also keeps the decision's
+`assessment`, the four answers of §8.
 
 **Which settings and which code** (review F4, DESIGN.md 83). `policy_version` is the version of the DBA's
 settings the decision was made under: 16 hex characters, the same for the same settings and different
@@ -477,4 +478,26 @@ The lists are refreshed by DevOps with `tools/fetch_network_lists.py` (daily); t
 changed file within a minute. Their sources and licences are in `data/network_lists/SOURCES.md`. The
 data-centre list includes cloud networks your own servers and partners use: an address in it is a
 measurement, never by itself a reason to refuse.
+
+---
+
+## 8. The four answers (`assessment`)
+
+Every scan response, every risk decision — returned, and stored in its row's context — and every refusal
+that carries a scan or a decision answers four questions apart (DESIGN.md 84.2), so that a valid
+signature is never read as a clean phone, nor a trusted verdict on thin evidence as a clean one. It
+restates what the scan and the policy decided; it changes no outcome.
+
+| Answer | Fields |
+|---|---|
+| `protocol` — was the request genuine | `result` is `valid`: a request that fails a check is refused with that check's own code and never gets this far. `token` (`device` or `account`), `proof` (`access_proof_v2`), `installation_key` (`verified`), `nonce` (`single_use`), `step_up_proof` (a step-up proof was verified for this request). A scan adds `challenge` (`single_use`) and `report_signature` (`verified`) |
+| `evidence` — what was measured | `quality` — `complete`, `partial`, `incomplete`, `invalid`, `legacy`, `none` (no scan) or `unknown` (a scan from before migration 015); `report_id`, `age_seconds`, `fresh`; `requirements_satisfied` and `missing_requirements` (the DBA's required measurements the scan lacks, §6) |
+| `findings` — what suggests abuse, and who supplied the facts | one per reason, with its `code` and `points`; `kind` — a scan's reasons are `integrity`, `condition` or `collection` (§2), the relationship policy's are `relationship`, `behaviour` (§4 and the request rate), `network` (§7), `administration` (a revoked phone or installation), `integrity` (the scan's score as the policy counts it, the device memory) or `collection` (no scan, an old one, a counter that could not be read); `provenance` — `phone` (the phone's own scans, which a compromised phone can forge; a learned VPN exit rests on other phones' reports), `server` (what the server saw itself) or `business` (the business's events) |
+| `decision` — what the evidence calls for, and what was granted | `recommended`: `allow`, `step_up`, `scan` (a fresh or complete scan), `review` or `deny` — the stricter of `integrity` (the latest scan judged as enforce mode judges it: its verdict, the eligibility rules, required measurements, complete-evidence paths, the device memory) and `relationship` (the policy's action; absent for a scan); `enforced`, per mode. In a response also `allowed` — `full`, `limited`, `step_up`, `scan`, `review` or `deny` — and `allowed_by` when the request passed although the evidence called for more: `step_up_proof`, `approval`, `observe_mode`, or `settings` (for example an elevated relationship risk, which refuses nothing unless `elevated_risk_refuses` is 1) |
+
+The stored row keeps the answers as evaluated, before anything was granted (no `allowed`); its
+`acceptance_id` names an approval that let the request pass. The business report feed gives each stored
+scan its answers as judged when it arrived (`as_scored`: its verdict, its reasons). In observe mode every
+decision still says what enforce mode would have done: compare `decision.recommended` with
+`decision.enforced`.
 
