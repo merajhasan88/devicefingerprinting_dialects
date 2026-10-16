@@ -1442,7 +1442,10 @@ CREATE TABLE integrity_reports (
     hard_block       BOOLEAN NOT NULL,
     created_at       TSZ NOT NULL,
     evidence_quality TEXT,
-    finding_score    INTEGER
+    finding_score    INTEGER,
+    measurement_status TEXT,
+    platform         TEXT,
+    policy_version   TEXT
 );
 CREATE TABLE device_account_links (
     device_id             TEXT NOT NULL,
@@ -2999,7 +3002,7 @@ CREATE TABLE integrity_reports (report_id TEXT PRIMARY KEY, installation_id TEXT
                                 score INTEGER, verdict TEXT, hard_block BOOLEAN, created_at TSZ,
                                 evidence_quality TEXT, finding_score INTEGER, platform TEXT,
                                 collector_version INTEGER, reasons TEXT, probe_results TEXT,
-                                report_sha256 TEXT);
+                                report_sha256 TEXT, measurement_status TEXT, policy_version TEXT);
 CREATE TABLE business_events (event_id TEXT PRIMARY KEY,
                               account_id TEXT NOT NULL REFERENCES demo_accounts(account_id),
                               event_type TEXT NOT NULL, occurred_at TSZ NOT NULL,
@@ -5155,6 +5158,178 @@ def malformed_list_entries_are_refused_not_dropped():
             status, payload = send_report("android", dict(clean("android"), **{probe: answer}))
             expect(status == 400 and payload["error"]["code"] == "invalid_integrity_probe",
                    "%s %s must be refused: %s %s" % (probe, answer, status, payload))
+
+
+def _stored_measurements():
+    """measurement_status as the last report stored it."""
+    rows = [params for q, params in db.writes if q.startswith("INSERT INTO integrity_reports")]
+    return rows[-1][14].adapted if rows else None
+
+
+@check
+def every_measurement_reaches_the_server_with_its_status():
+    """Review F1, DESIGN.md 83. Every report stores the status of every
+    measurement the platform's collectors answer -- planned, volunteered or
+    optional, scored or not -- so the server is never in the dark: ok,
+    failed, unsupported, not_enabled, not_requested, absent (an older or
+    modified app), no_permission, no_fix, stale; and which optional
+    measurements the app enabled, whether or not the server asked."""
+    probes = dict(clean("android"),
+                  accessibility={"status": "ok", "services": [], "settings_only": []},
+                  notification_access={"status": "not_enabled"},
+                  other_access={"status": "error", "error": "SecurityException"},
+                  screen_capture={"status": "unsupported", "reason": "test"},
+                  location={"status": "ok", "permission": "none"})
+    with policy(optional_measurements=_ALL_OPTIONAL):
+        db.writes = []
+        status, payload = send_report("android", probes)
+    stored = _stored_measurements() or {}
+    states = stored.get("status") or {}
+    expect(status == 200 and set(states) == set(s._MEASUREMENTS["android"])
+           and all(states[name] == "ok" for name in s._integrity_probe_plan("android"))
+           and states["accessibility"] == "ok" and states["notification_access"] == "not_enabled"
+           and states["other_access"] == "failed" and states["screen_capture"] == "unsupported"
+           and states["location"] == "no_permission" and states["mock_location"] == "absent"
+           and states["local_addresses"] == "absent" and states["device"] == "absent"
+           and payload["integrity"]["measurements"] == stored,
+           "every measurement's status is stored and returned: %s %s" % (status, states))
+    with policy():
+        db.writes = []
+        status, payload = send_report("android", dict(probes, location={
+            "status": "ok", "permission": "precise", "latitude": 1.0, "longitude": 2.0,
+            "age_seconds": 5}))
+    states = (_stored_measurements() or {}).get("status") or {}
+    expect(status == 200 and all(states[name] == "not_requested" for name in s._OPTIONAL_MEASUREMENTS)
+           and "location" not in (_stored_probes() or {}),
+           "what the DBA did not request reads not_requested, its data dropped: %s" % states)
+    with policy(optional_measurements="location,mock_location"):
+        for answer, expected in (
+                ({"status": "ok", "permission": "precise", "latitude": 1.0, "longitude": 2.0,
+                  "age_seconds": 5}, "ok"),
+                ({"status": "ok", "permission": "precise", "latitude": 1.0, "longitude": 2.0,
+                  "age_seconds": 3600}, "stale"),
+                ({"status": "ok", "permission": "approximate"}, "no_fix")):
+            db.writes = []
+            send_report("android", dict(clean("android"), location=answer))
+            got = ((_stored_measurements() or {}).get("status") or {}).get("location")
+            expect(got == expected, "location %s reads %s, got %s" % (answer, expected, got))
+    # The app says which optional measurements it enabled.
+    report_enabled = {"accessibility": {"status": "ok", "services": []}}
+    with policy(optional_measurements="accessibility"):
+        db.writes = []
+        status, payload = send_report_with(report_enabled, ["accessibility", "location"])
+        expect(status == 200 and (_stored_measurements() or {}).get("enabled_by_app")
+               == ["accessibility", "location"], "the app's enabled list is kept: %s" % status)
+        status, payload = send_report_with(report_enabled, ["imei"])
+        expect(status == 400 and payload["error"]["code"] == "invalid_integrity_report",
+               "an unknown measurement in the app's list is refused: %s" % status)
+
+
+def send_report_with(extra_probes, enabled):
+    """send_report, with the app's enabled_measurements in the signed report."""
+    platform = "android"
+    probes = dict(clean(platform), **extra_probes)
+    required = s._integrity_probe_plan(platform)
+    nonce = os.urandom(32)
+    db.report_row = (inst.installation_id, inst.device_id, platform, c.sha256_hex(nonce),
+                     required, s._utc_now() + s.INTEGRITY_CHALLENGE_LIFETIME, None,
+                     "ES256", inst.jwk, "active", "active")
+    report = {"version": 1, "installation_id": inst.installation_id,
+              "challenge_id": str(uuid.uuid4()), "platform": platform,
+              "challenge_nonce": c.b64u(nonce), "collected_at": int(time.time()),
+              "collector_version": s._EVIDENCE_CONTRACT_VERSION.get(platform, 1),
+              "probe_results": probes, "enabled_measurements": enabled}
+    raw = c.b64u(encode(report))
+    body = encode({"report_payload": raw, "report_signature": inst.sign_b64(raw)})
+    path = "/v1/integrity/report"
+    reply = client.post(path, data=body, headers=access_headers("POST", path, body, device_token))
+    return reply.status_code, reply.get_json()
+
+
+@check
+def required_measurements_are_met_only_by_a_measurement():
+    """Review F1. With accessibility required, a report that simply omits it
+    used to pass as trusted and complete. A requirement is now met only by a
+    measurement the scan has (status ok). Missing: limit (owner default) acts
+    like an elevated scan -- a step-up proof satisfies a request that accepts
+    one, sign-in gives a limited session, anything else is refused with
+    integrity_measurements_missing; refuse refuses everywhere. A platform that
+    cannot measure it at all (iOS and Accessibility) is not held to it.
+    required_measurements_paths limits where it applies."""
+    def state(platform, **statuses):
+        base = {name: "ok" for name in s._MEASUREMENTS[platform]}
+        base.update(statuses)
+        return {"score": 0, "verdict": "trusted", "fresh": True, "platform": platform,
+                "measurements": {"status": base, "enabled_by_app": None}}
+
+    def gate(latest, path="/v1/account/me", **kwargs):
+        saved = (s._latest_integrity_state, s._device_integrity_memory, s.INTEGRITY_MODE)
+        s._latest_integrity_state = lambda iid: latest
+        s._device_integrity_memory = lambda did, iid: None
+        try:
+            with s.app.test_request_context(path):
+                return s._enforce_integrity_gate(inst.device_id, inst.installation_id, **kwargs), None
+        except s.ApiProblem as problem:
+            return None, problem
+        finally:
+            s._latest_integrity_state, s._device_integrity_memory, s.INTEGRITY_MODE = saved
+
+    s_mode = s.INTEGRITY_MODE
+    s.INTEGRITY_MODE = "enforce"
+    try:
+        absent = state("android", accessibility="absent")
+        with policy(required_measurements="accessibility,screen_capture"):
+            result, problem = gate(state("android"))
+            expect(problem is None, "everything measured: no refusal: %s" % (problem and problem.code))
+            result, problem = gate(absent)
+            expect(problem is not None and problem.code == "integrity_measurements_missing"
+                   and problem.details["missing_requirements"]
+                   == [{"measurement": "accessibility", "status": "absent"}],
+                   "a request that accepts neither a step-up nor a limited session waits for the scan: %s"
+                   % ((problem and (problem.code, problem.details.get("missing_requirements"))),))
+            result, problem = gate(absent, step_up_accepted=True)
+            expect(problem is not None and problem.code == "integrity_step_up_required",
+                   "limit: a step-up is asked for: %s" % (problem and problem.code))
+            result, problem = gate(absent, step_up=object(), step_up_accepted=True)
+            expect(problem is None and result.get("satisfied_by_step_up")
+                   and result["missing_requirements"][0]["measurement"] == "accessibility",
+                   "limit: a step-up proof satisfies it: %s" % (problem and problem.code))
+            result, problem = gate(absent, limited_ok=True)
+            expect(problem is None and result.get("limited_cause") == "integrity_elevated",
+                   "limit: sign-in gives a limited session: %s %s" % (problem and problem.code, result))
+            for status in ("not_enabled", "unsupported", "failed", "no_permission"):
+                result, problem = gate(state("android", screen_capture=status))
+                expect(problem is not None and problem.code == "integrity_measurements_missing",
+                       "%s does not meet a requirement: %s" % (status, problem and problem.code))
+            result, problem = gate(state("ios", accessibility="unsupported"))
+            expect(problem is None, "iOS cannot measure Accessibility and is not held to it")
+            result, problem = gate(dict(absent, measurements=None))
+            expect(problem is not None and problem.code == "integrity_measurements_missing",
+                   "a report from before the statuses reads absent")
+        with policy(required_measurements="accessibility", missing_measurement_action="refuse"):
+            result, problem = gate(absent, limited_ok=True)
+            expect(problem is not None and problem.code == "integrity_measurements_missing",
+                   "refuse: even sign-in waits for the scan: %s" % (problem and problem.code))
+        with policy(required_measurements="accessibility", required_measurements_paths="/v1/pay"):
+            result, problem = gate(absent)
+            expect(problem is None, "outside the listed paths the requirement does not apply")
+            result, problem = gate(absent, path="/v1/pay")
+            expect(problem is not None, "on a listed path it does")
+        for bad in ("imei", "accessibility,mac"):
+            try:
+                s._validate_risk_settings(dict(SETTINGS, required_measurements=bad))
+                refused = False
+            except ValueError:
+                refused = True
+            expect(refused, "required_measurements=%r must invalidate the snapshot" % bad)
+        s.INTEGRITY_MODE = "observe"
+        with policy(required_measurements="accessibility"):
+            result, problem = gate(absent)
+            expect(problem is None and result["missing_requirements"][0]["status"] == "absent",
+                   "observe mode reports what is missing and refuses nothing: %s"
+                   % ((problem and problem.code),))
+    finally:
+        s.INTEGRITY_MODE = s_mode
 
 
 @check

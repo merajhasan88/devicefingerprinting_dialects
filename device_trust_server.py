@@ -1353,6 +1353,24 @@ _OPTIONAL_MEASUREMENTS = ("local_addresses", "accessibility", "notification_acce
 # (migration 024's default; the DBA's app_store_installers replaces it). Each
 # was checked against published installer tables, 2026-10-15; a store missing
 # here -- vivo's, Honor's -- counts as sideloading until the DBA adds it.
+# Every measurement a current collector answers, per platform (DESIGN.md 83):
+# the plan's probes, the ones it volunteers and the optional measurements. Each
+# report stores the status of every one -- planned or not, scored or not,
+# optional or not -- so the server is never in the dark about a measurement.
+_MEASUREMENTS = {
+    "android": ("app_identity", "debug_state", "root_files", "system_properties",
+                "runtime_maps", "tracer", "root_shell", "selinux", "mounts", "frida_ports",
+                "instrumentation_threads", "exec_mappings", "code_integrity",
+                "developer_settings", "emulator", "device", "network") + _OPTIONAL_MEASUREMENTS,
+    "ios": ("app_identity", "code_signing", "debugger", "jailbreak_files", "sandbox",
+            "dyld_images", "code_integrity", "environment", "simulator", "device",
+            "network") + _OPTIONAL_MEASUREMENTS,
+}
+_ALL_MEASUREMENTS = tuple(sorted(set(_MEASUREMENTS["android"]) | set(_MEASUREMENTS["ios"])))
+# What a platform cannot measure at all: iOS shows an app no other app. A
+# requirement for one of these never applies to that platform; a phone of
+# another platform answering "unsupported" for it is missing it.
+_CANNOT_MEASURE = {"ios": frozenset(("accessibility", "notification_access", "other_access"))}
 APP_STORE_INSTALLERS_DEFAULT = (
     "com.android.vending,com.sec.android.app.samsungapps,com.huawei.appmarket,"
     "com.heytap.market,com.oppo.market,com.xiaomi.mipicks,com.amazon.venezia"
@@ -1436,6 +1454,9 @@ _RISK_SETTING_KINDS = {
     "external_display_refuses": "bool",
     "location_max_age_seconds": "int",
     "vpn_exit_min_device_age_days": "int",
+    "required_measurements": "list:" + ",".join(_ALL_MEASUREMENTS),
+    "required_measurements_paths": "paths",
+    "missing_measurement_action": ("limit", "refuse"),
     "limited_session_paths": "paths",
     "limited_session_integrity_verdicts": "list:elevated,review",
     "limited_session_policy_actions": "list:step_up,review",
@@ -2388,6 +2409,57 @@ def _check_listed_entries(probes):
                            for k in ("interface", "address"))
                 for entry in entries):
             refuse("local_addresses", "addresses", "each entry is an interface and an address")
+
+
+def _measurement_status(platform, probes, plan, requested, enabled_by_app):
+    """{"status": {measurement: status}, "enabled_by_app": [...] or None} for
+    one report (review F1, DESIGN.md 83). status is ok, failed, unsupported,
+    not_enabled (the app did not enable it), not_requested (the server did not
+    ask), absent (asked or expected, not answered: an older or modified app),
+    no_permission, no_fix or stale (a location older than
+    location_max_age_seconds)."""
+    max_age = _risk_setting_int("location_max_age_seconds", 600)
+    status = {}
+    for name in _MEASUREMENTS.get(platform, ()):
+        value = probes.get(name)
+        if name in _OPTIONAL_MEASUREMENTS and name not in requested:
+            status[name] = "not_requested"
+        elif not isinstance(value, dict):
+            planned = name in plan or name in requested or name in ("device", "network")
+            status[name] = "absent" if planned else "not_requested"
+        else:
+            answer = value.get("status")
+            if answer == "ok" and name in ("location", "mock_location"):
+                age = value.get("age_seconds")
+                if value.get("permission") == "none":
+                    answer = "no_permission"
+                elif value.get("latitude") is None and value.get("mock") is None:
+                    answer = "no_fix"
+                elif isinstance(age, int) and age > max_age:
+                    answer = "stale"
+            status[name] = answer if answer in (
+                "ok", "unsupported", "not_enabled", "no_permission", "no_fix", "stale") else "failed"
+    return {"status": status, "enabled_by_app": enabled_by_app}
+
+
+def _missing_requirements(state, platform=None, here=False):
+    """The DBA's required_measurements this state's scan does not have, each
+    with its status: [{"measurement", "status"}]. With here, only where the
+    current request's path is listed in required_measurements_paths (empty:
+    every request the integrity check guards)."""
+    required = [name for name in _ALL_MEASUREMENTS
+                if name in _risk_setting_words("required_measurements", "")]
+    if not required or state is None:
+        return []
+    if here:
+        paths = _risk_setting_words("required_measurements_paths", "")
+        if paths and (not has_request_context() or request.path not in paths):
+            return []
+    platform = platform or state.get("platform")
+    statuses = (state.get("measurements") or {}).get("status") or {}
+    return [{"measurement": name, "status": statuses.get(name, "absent")}
+            for name in required
+            if name not in _CANNOT_MEASURE.get(platform, ()) and statuses.get(name) != "ok"]
 
 
 def _check_probe_evidence(platform, probes, required_probes):
@@ -3560,7 +3632,7 @@ def _latest_integrity_state(installation_id):
         cursor.execute(
             """
             SELECT report_id, score, verdict, hard_block, reasons, created_at,
-                   evidence_quality, finding_score
+                   evidence_quality, finding_score, measurement_status, platform
             FROM integrity_reports
             WHERE installation_id = %s
             ORDER BY created_at DESC
@@ -3584,6 +3656,10 @@ def _latest_integrity_state(installation_id):
         # Reports stored before migration 015 carry neither.
         "evidence_quality": row[6],
         "finding_score": int(row[7]) if row[7] is not None else None,
+        # Reports before migration 025 have no statuses: every requirement
+        # then reads absent.
+        "measurements": DIALECT.json_value(row[8]) if row[8] is not None else None,
+        "platform": row[9],
     }
 
 
@@ -3758,6 +3834,12 @@ def _enforce_integrity_gate(
     ineligible = _eligibility_failures(state)
     if ineligible:
         state = dict(state, eligibility=ineligible)
+    # The DBA's required_measurements (review F1, DESIGN.md 83): a requirement
+    # is met only by a measurement the scan actually has -- never by its
+    # absence. Reported in observe mode too.
+    missing = _missing_requirements(state, here=True)
+    if missing:
+        state = dict(state, requirements_satisfied=False, missing_requirements=missing)
     if INTEGRITY_MODE != "enforce":
         return state
     if state is None or not state.get("fresh"):
@@ -3799,9 +3881,28 @@ def _enforce_integrity_gate(
             "integrity_device_ineligible",
             details={"integrity": state, "eligibility": ineligible},
         )
+    if missing:
+        # refuse: the operation waits for a scan that has them. limit (owner
+        # default): like an elevated scan -- a step-up proof satisfies a
+        # request that accepts one, sign-in gives a limited session, anything
+        # else waits for the scan. An approval cannot supply a measurement.
+        if _risk_setting_str("missing_measurement_action", "limit") == "refuse" or (
+                verdict == "trusted" and not step_up and not step_up_accepted
+                and "elevated" not in soft):
+            raise ApiProblem(
+                "This operation needs measurements the latest scan does not have: %s. Send a "
+                "new scan with them." % ", ".join("%s (%s)" % (m["measurement"], m["status"])
+                                                   for m in missing),
+                403,
+                "integrity_measurements_missing",
+                details={"integrity": state, "missing_requirements": missing},
+            )
+        if verdict == "trusted":
+            verdict = "elevated"
     if verdict == "elevated" and step_up:
         state = dict(state, satisfied_by_step_up=True)
-    elif verdict == "elevated" and _accepted(accepted, "integrity_elevated", integrity=state):
+    elif verdict == "elevated" and not missing and _accepted(accepted, "integrity_elevated",
+                                                             integrity=state):
         state = dict(state, accepted_by_upgrade=True, acceptance_id=accepted.acceptance_id)
     elif verdict == "elevated" and step_up_accepted:
         raise ApiProblem(
@@ -7488,6 +7589,14 @@ def integrity_report():
     probes = report.get("probe_results")
     if not isinstance(probes, dict):
         raise ApiProblem("probe_results must be an object.", 400, "invalid_integrity_report")
+    # Which optional measurements the app enabled (DESIGN.md 83), whether or
+    # not the server asked: absent from an older app, which is None, unknown.
+    enabled_by_app = report.get("enabled_measurements")
+    if enabled_by_app is not None and (
+            not isinstance(enabled_by_app, list) or len(enabled_by_app) > len(_OPTIONAL_MEASUREMENTS)
+            or any(name not in _OPTIONAL_MEASUREMENTS for name in enabled_by_app)):
+        raise ApiProblem("enabled_measurements must list optional measurements.", 400,
+                         "invalid_integrity_report")
     # An optional measurement the DBA does not request now is dropped before
     # anything reads or stores the report (DESIGN.md 80). The signature and
     # report_sha256 still cover the bytes as sent.
@@ -7602,13 +7711,16 @@ def integrity_report():
         )
         if platform == "android" and _risk_setting_bool("vpn_exit_learning", False):
             _record_vpn_sighting(cursor, device_id, probes.get("network"))
+        measurements = _measurement_status(platform, probes, required_probes, requested,
+                                           enabled_by_app)
         cursor.execute(
             """
             INSERT INTO integrity_reports
                 (report_id, challenge_id, installation_id, device_id, platform,
                  collector_version, score, verdict, hard_block, reasons,
-                 probe_results, report_sha256, evidence_quality, finding_score)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                 probe_results, report_sha256, evidence_quality, finding_score,
+                 measurement_status)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """,
             (
                 report_id,
@@ -7625,9 +7737,11 @@ def integrity_report():
                 hashlib.sha256(report_bytes).hexdigest(),
                 scored["evidence_quality"],
                 scored["finding_score"],
+                DIALECT.json_param(measurements),
             ),
         )
 
+    missing = _missing_requirements({"measurements": measurements}, platform)
     response = {
         "report_id": report_id,
         "score": scored["score"],
@@ -7636,6 +7750,10 @@ def integrity_report():
         "evidence_quality": scored["evidence_quality"],
         "finding_score": scored["finding_score"],
         "reasons": scored["reasons"],
+        # Every measurement's status, and what the DBA's requirements lack.
+        "measurements": measurements,
+        "requirements_satisfied": not missing,
+        "missing_requirements": missing,
         "mode": INTEGRITY_MODE,
         "fresh_for_seconds": _integrity_freshness_seconds(),
         "remote_attestation": "not_used",
@@ -9852,7 +9970,7 @@ def business_integrity_reports():
             """
             SELECT report_id, installation_id, device_id, platform, collector_version,
                    score, verdict, hard_block, evidence_quality, finding_score,
-                   reasons, probe_results, report_sha256, created_at
+                   reasons, probe_results, report_sha256, created_at, measurement_status
             FROM integrity_reports
             WHERE """ + where + """(created_at > %s OR (created_at = %s AND report_id > %s))
             ORDER BY created_at, report_id
@@ -9867,7 +9985,8 @@ def business_integrity_reports():
          "finding_score": None if r[9] is None else int(r[9]),
          "reasons": _as_list(DIALECT.json_value(r[10])),
          "probe_results": DIALECT.json_value(r[11]), "report_sha256": r[12],
-         "created_at": _iso_z(r[13])}
+         "created_at": _iso_z(r[13]),
+         "measurements": DIALECT.json_value(r[14]) if r[14] is not None else None}
         for r in rows
     ]
     last = reports[-1] if reports else None
