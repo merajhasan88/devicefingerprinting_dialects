@@ -131,9 +131,9 @@ statement timeout `DB_QUERY_TIMEOUT` (15 s).
 - The Flutter client's release builds refuse a non-`https://` endpoint and its Android manifest refuses
   cleartext; require the same of every client build you ship.
 
-**Database.** PostgreSQL 13+ or SQL Server 2017+ (`DB_ENGINE`). Your DBA applies
-`migrations/<engine>/001…019` in order; the server only reads `schema_migrations` and refuses to serve
-on any other version (`/health/ready` says why). Use verified TLS: PostgreSQL `DB_SSLMODE=verify-full`
+**Database.** PostgreSQL 13+ or SQL Server 2017+ (`DB_ENGINE`). Your DBA applies every file in
+`migrations/<engine>/` in order, from `001`; the server only reads `schema_migrations` and refuses to
+serve on any version but the one it requires (`/health/ready` says which, and why). Use verified TLS: PostgreSQL `DB_SSLMODE=verify-full`
 with `DB_SSLROOTCERT`; SQL Server always connects with `Encrypt=yes` and `TrustServerCertificate=no`.
 
 **Grant the application principal no DDL, and DELETE only where it needs it.** The server deletes
@@ -170,6 +170,36 @@ defaults and changed by your DBA, never by the server. Every setting follows, ge
 migrations by `tools/settings_reference.py`; the gate fails when this list and the migrations
 differ, or when the PostgreSQL and SQL Server migrations seed different rows. A count of `0`
 switches its rule off; the server holds a value to the bounds its description states.
+
+**Changing a setting: say why.** Each row records why its value last changed (`change_reason`), the
+database login that changed it (`changed_by`) and when (`updated_at`); a reason left NULL means the
+value is as the migrations set it (migration 026). Give the reason in the same statement: the database
+refuses a change of `setting_value` without a new reason, and fills in the login and the time itself.
+
+```sql
+-- PostgreSQL; on SQL Server write dbo.risk_policy_settings
+UPDATE risk_policy_settings
+SET setting_value = '20', change_reason = 'Fraud team, ticket 4521: VPN abuse in October'
+WHERE setting_key = 'source_vpn_listed_points';
+```
+
+Each reason must differ from the row's previous one, so add a date or a ticket when one setting changes
+twice for the same cause. A later migration that changes an owner default changes only the values no
+person has changed — a NULL reason, or one written by a migration, which starts with `Migration ` — and
+gives its own reason; never start yours that way. Migrations do rewrite descriptions, which are ours.
+
+**Revoking a phone or an installation.** Set its `status` to anything but `active` and every request
+from it is refused — 403 `installation_inactive` or `device_inactive`, reasons `installation_not_active`
+or `device_not_active` — in observe mode too. Give `status_reason` in the same statement: the database
+refuses a status change without a new reason, and records `status_changed_by` and `status_changed_at`.
+Setting `active` again, with its own reason, restores it.
+
+```sql
+-- PostgreSQL; on SQL Server write dbo.app_installations (dbo.recognized_devices for a phone)
+UPDATE app_installations
+SET status = 'revoked', status_reason = 'Support, ticket 4522: phone reported stolen'
+WHERE installation_id = '<installation_id>';
+```
 
 <!-- settings-reference:begin (tools/settings_reference.py --write; do not edit by hand) -->
 141 settings, seeded by migrations 003-025 with the owner's defaults; each row's own description.
@@ -814,7 +844,7 @@ decision context; the server can apply such rules too, but only if you decide it
 
 **Database.** Migration 017 adds `business_events`: grant `SELECT, INSERT`, never `UPDATE` or
 `DELETE`; migration 021 adds the index the report feed pages through; migration 025 adds the caller's
-name (`producer`, `actor`). The server serves only at its schema version (25): a database behind it
+name (`producer`, `actor`). The server serves only at its schema version (26): a database behind it
 answers 503 `schema_version_mismatch` everywhere but `/health`, so no decision ever reads a missing
 table.
 

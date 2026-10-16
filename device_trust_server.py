@@ -1218,7 +1218,7 @@ def _get_backend_identity():
 # against a schema it does not understand. /health/* still answers so operators
 # can see why.
 
-REQUIRED_SCHEMA_VERSION = 25
+REQUIRED_SCHEMA_VERSION = 26
 
 
 def _server_build():

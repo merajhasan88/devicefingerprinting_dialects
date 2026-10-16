@@ -6888,3 +6888,52 @@ defaults, checked against the migrations; the business tokens removed; the emula
   eligibility and behaviour.
 - The review's order from here: SQL Server, the iPhone and real OEM phones; then measuring false
   restrictions on real traffic; then the Flutter package and the app-developer guide (G2, G3).
+
+## 84. Change reasons, and the eight security improvements of 2026-10-14 finished (2026-10-16)
+
+**The owner (2026-10-16).** On migration 025's re-default, which could not tell a 0 nobody touched from
+a 0 a DBA chose: *"Then add change reason column in relevant database tables so updates can be mapped.
+In the SQL and if needed on the RDS and postgres when I run it. Anyway continue with your work and
+complete all 8 security points I had highlighted on Oct 14th"* — the eight of §76 (*"I want to fix any
+hole and breach in our defenses"*), of which §77 had finished the first.
+
+### 84.1 Why a row was changed by hand (migration 026, schema 26)
+
+The rows people edit — the DBA's `risk_policy_settings`, and the `status` that revokes a phone
+(`recognized_devices`) or an installation (`app_installations`) — had no trace of a change:
+`updated_at` was filled when a setting was seeded and never again, and nothing named who changed it.
+The server writes none of these values.
+
+| Table | Value | Why | Who (database login) | When |
+|---|---|---|---|---|
+| `risk_policy_settings` | `setting_value` | `change_reason` | `changed_by` | `updated_at` |
+| `app_installations` | `status` | `status_reason` | `status_changed_by` | `status_changed_at` |
+| `recognized_devices` | `status` | `status_reason` | `status_changed_by` | `status_changed_at` |
+
+A NULL reason means the value is as the migrations left it. One trigger per table, on both engines,
+refuses a change of the value that does not come with a new reason (non-blank, different from the row's
+previous one) and stamps the login (`session_user`, `ORIGINAL_LOGIN()`) and the time itself, so the
+record cannot go stale when a DBA forgets it. Descriptions stay free for migrations to rewrite. A later
+migration that changes an owner default changes only rows whose reason is NULL or starts with
+`Migration ` (a migration wrote it), and gives its own. The five source-network points that 025 raised
+from 0 are marked as 025's where they hold its value.
+
+**Design choices.**
+- **Triggers, not convention.** A reason column alone goes stale the first time a DBA updates the value
+  without it, and a stale reason misleads a later migration more than no reason at all.
+- **The login, not a name the statement supplies.** A person's name or ticket belongs in the reason; the
+  database stamps what it knows. A DBA who changes one setting twice for the same cause adds a date.
+- **PostgreSQL:** `BEFORE UPDATE OF <value> … WHEN (OLD IS DISTINCT FROM NEW)` — never even called for
+  the server's `last_seen_at` updates. **SQL Server:** `AFTER UPDATE` (there is no column trigger); it
+  returns at once unless the value is set, compares in a binary collation and by length so case and
+  trailing spaces count as PostgreSQL counts them, guards recursion with `TRIGGER_NESTLEVEL`, and runs
+  `SET NOCOUNT ON` so the server's row counts are untouched. On the two hot tables this costs an empty
+  trigger call per update. Not run on SQL Server yet (G10).
+- **Re-running migration 025** on a database where a DBA has since set one of the five to 0 with a reason
+  now fails instead of resetting it: the trigger refuses 025's reasonless change.
+
+Gate: `hand_made_changes_carry_their_reason_on_both_engines` — the columns and triggers on both
+engines, the server requiring schema 26 and never writing the values or reasons; seven deliberate
+breakages caught (the schema not required, the server writing a status, PostgreSQL accepting the same
+reason, the login not stamped, SQL Server not refusing, a column missing, SQL Server comparing
+case-blind).

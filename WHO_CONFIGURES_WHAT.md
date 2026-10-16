@@ -42,7 +42,8 @@ Every setting, generated from the migrations by `tools/settings_reference.py` an
 gate. The server re-reads the table every 30 seconds; a value that does not parse makes the snapshot
 invalid, and the server keeps its last good one for five minutes, then refuses rather than run
 without a policy. A count of `0` switches a rule off. Environment variables answer only for a
-missing row.
+missing row. Every change of a value carries its reason, and the database records who made it and when
+(migration 026; the statement is in the guide's section 5).
 
 <!-- settings-reference:begin (tools/settings_reference.py --write; do not edit by hand) -->
 141 settings, seeded by migrations 003-025 with the owner's defaults; each row's own description.

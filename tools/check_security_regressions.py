@@ -5966,6 +5966,83 @@ def every_scan_and_decision_names_the_settings_and_code_it_was_judged_under():
            % (context.get("policy_version"), {k: kept.get(k) for k in ("policy_version", "server_build")}))
 
 
+# The rows people change by hand (DESIGN.md 84): the key, the value, then the
+# columns that say why it last changed, who changed it and when.
+_HAND_EDITED = {
+    "risk_policy_settings": ("setting_key", "setting_value", "change_reason", "changed_by",
+                             "updated_at"),
+    "app_installations": ("installation_id", "status", "status_reason", "status_changed_by",
+                          "status_changed_at"),
+    "recognized_devices": ("device_id", "status", "status_reason", "status_changed_by",
+                           "status_changed_at"),
+}
+
+
+@check
+def hand_made_changes_carry_their_reason_on_both_engines():
+    """DESIGN.md 84, the owner on 2026-10-16: "add change reason column in
+    relevant database tables so updates can be mapped". The rows people edit by
+    hand -- a DBA's settings, a phone's or an installation's status -- say why
+    their value last changed, the database login and the time, on both engines:
+    the migrations add the columns and, per table, a trigger that refuses a
+    change of the value without a new reason and stamps the login and the time
+    itself. The server requires that schema and never writes those values or
+    their reasons, so the triggers never stand in its way."""
+    newest = {}
+    for engine in ("postgresql", "sqlserver"):
+        files = sorted((DOCS / "migrations" / engine).glob("[0-9][0-9][0-9]_*.sql"))
+        newest[engine] = int(files[-1].name[:3])
+        text = "".join(path.read_text(encoding="utf-8") for path in files)
+        for table, (key, value, reason, by, at) in _HAND_EDITED.items():
+            for column in (reason, by) + ((at,) if at != "updated_at" else ()):
+                expect(re.search(r"ALTER TABLE (?:dbo\.)?%s ADD (?:COLUMN IF NOT EXISTS )?%s\b"
+                                 % (table, column), text),
+                       "%s: no %s.%s" % (engine, table, column))
+            if engine == "postgresql":
+                trigger = re.search(
+                    r"CREATE TRIGGER \w+\s+BEFORE UPDATE OF %s ON %s\s+FOR EACH ROW\s+"
+                    r"WHEN \(OLD\.%s IS DISTINCT FROM NEW\.%s\)\s+EXECUTE FUNCTION (\w+)\(\);"
+                    % (value, table, value, value), text)
+                expect(trigger, "postgresql: no trigger on %s.%s" % (table, value))
+                body = re.search(r"CREATE OR REPLACE FUNCTION %s\(\) RETURNS trigger\s+"
+                                 r"LANGUAGE plpgsql AS \$\$(.*?)\$\$;" % trigger.group(1), text, re.S)
+                expect(body, "postgresql: no function %s" % trigger.group(1))
+                needed = ("NEW.%s IS NULL OR btrim(NEW.%s) = ''" % (reason, reason),
+                          "NEW.%s IS NOT DISTINCT FROM OLD.%s THEN" % (reason, reason),
+                          "RAISE EXCEPTION", "NEW.%s := session_user;" % by,
+                          "NEW.%s := NOW();" % at, "RETURN NEW;")
+            else:
+                body = re.search(r"CREATE TRIGGER dbo\.\w+\s+ON dbo\.%s\s+AFTER UPDATE\s+AS\s+"
+                                 r"BEGIN(.*?)\nEND;" % table, text, re.S)
+                expect(body, "sqlserver: no trigger on %s" % table)
+                needed = ("SET NOCOUNT ON;", "TRIGGER_NESTLEVEL(@@PROCID) > 1 OR NOT UPDATE(%s)" % value,
+                          "JOIN deleted AS d ON d.%s = i.%s" % (key, key),
+                          "i.%s IS NULL" % reason, "LTRIM(RTRIM(i.%s)) = N''" % reason,
+                          "i.%s COLLATE Latin1_General_BIN2 = d.%s COLLATE Latin1_General_BIN2"
+                          % (reason, reason),
+                          "THROW 51026", "%s = ORIGINAL_LOGIN()" % by, "%s = SYSUTCDATETIME()" % at)
+                # A change is a change the way PostgreSQL sees one -- case and
+                # trailing spaces included -- both where it is refused and
+                # where it is stamped.
+                for twice in ("i.%s COLLATE Latin1_General_BIN2 <> d.%s COLLATE Latin1_General_BIN2"
+                              % (value, value), "DATALENGTH(i.%s) <> DATALENGTH(d.%s)" % (value, value)):
+                    expect(body.group(1).count(twice) == 2,
+                           "sqlserver: the trigger on %s compares %s %d times, not twice"
+                           % (table, value, body.group(1).count(twice)))
+            missing = [part for part in needed if part not in body.group(1)]
+            expect(not missing, "%s: the trigger on %s lacks %s" % (engine, table, missing))
+    expect(newest["postgresql"] == newest["sqlserver"] == s.REQUIRED_SCHEMA_VERSION,
+           "the server requires schema %s; the migrations end at %s"
+           % (s.REQUIRED_SCHEMA_VERSION, newest))
+    source = Path(s.__file__).read_text(encoding="utf-8")
+    expect(not re.search(r"INSERT INTO (?:dbo\.)?risk_policy_settings\b", source),
+           "the server inserts settings")
+    for table, (_, value, reason, by, _) in _HAND_EDITED.items():
+        for statement in re.findall(r"UPDATE (?:dbo\.)?%s\s+SET\s+(.*?)\s+WHERE" % table, source, re.S):
+            written = set(re.findall(r"(\w+)\s*=", statement)) & {value, reason, by}
+            expect(not written, "the server writes %s on %s" % (sorted(written), table))
+
+
 def main():
     passed = failed = 0
     for function in CHECKS:
