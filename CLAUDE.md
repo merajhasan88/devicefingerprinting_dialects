@@ -94,8 +94,8 @@ processes** from the systemd drop-in, with a per-process connection pool (`DB_PO
 `DB_POOL_RECHECK_SECONDS`) and, on SQL Server, a 15 s statement timeout (`DB_QUERY_TIMEOUT`) —
 DESIGN.md 55 and 60. Serve SQL Server with processes, never threads.
 
-**Schema is migrations, DBA-applied.** `migrations/<dialect>/001…024`, applied in order; the server
-refuses to serve unless `schema_migrations` holds the version it requires (currently **24**). A new
+**Schema is migrations, DBA-applied.** `migrations/<dialect>/001…025`, applied in order; the server
+refuses to serve unless `schema_migrations` holds the version it requires (currently **25**). A new
 table needs its grant (`GRANT`/`ALTER DEFAULT PRIVILEGES` on PostgreSQL). Risk and step-up policy
 values live in `risk_policy_settings`, seeded by the migrations with the owner's defaults, which a DBA
 may change — never hard-code a policy value; the gate fails when the server reads a setting no
@@ -108,8 +108,10 @@ bots and exploits onto those codes; every code it names must exist (gated).
 **A new probe is volunteered, never planned.** The server refuses a report that lacks a planned probe,
 so adding one to `_integrity_probe_plan` breaks every older client, the .NET collectors included. New
 collectors send it unasked (`device`, `network`, iOS `code_integrity`); promote it to the plan only once
-every client sends it. Measurements that identify a person's phone or network go behind two keys: the
-DBA's `optional_measurements` and the app's build setting (DESIGN.md 80).
+every client sends it. A measurement that identifies a person's phone or network is collected only
+where the DBA asks for it (`optional_measurements`) and the app enables it (its build setting;
+DESIGN.md 80). Every report stores every measurement's status, so the server always knows what was and
+was not measured (DESIGN.md 83).
 
 ## Commands
 
@@ -123,11 +125,12 @@ python3 conformance_suite.py --base-url https://<endpoint>
 #   scored cross-checks, the app PIN where no path needs it) SKIP
 #   until their risk_policy_settings rows are enabled; route 3 also needs the suite's JWKS
 #   (it prints it) in the file named by UPGRADE_ASSERTION_JWKS_FILE. The business API checks
-#   (events, the report feed, PIN support) need DEVICE_TRUST_BUSINESS_TOKEN in the environment.
+#   (events, the report feed, PIN support) need DEVICE_TRUST_BUSINESS_TOKEN in the environment;
+#   PIN support needs a token whose BUSINESS_API_TOKENS entry names pin_unlock and pin_reset.
 #   check_parallel_clients (4 concurrent flows) must pass on any new backend BEFORE handset
 #   or paid-database time is spent on it.
 
-# Offline security regression gate (110 checks; DESIGN.md 63, 76-82): no database needed
+# Offline security regression gate (118 checks; DESIGN.md 63, 76-83): no database needed
 python3 tools/check_security_regressions.py
 # The generated settings reference (G7): print, or rewrite it in the two documents
 python3 tools/settings_reference.py [--write]
@@ -158,7 +161,12 @@ not jailbroken). The emulator AVD `integrity_root_lab` is the disposable root la
 
 ## Current point of work
 
-See the end of DESIGN.md: section 82 records six optional measurements — the apps holding
+See the end of DESIGN.md: section 83 records the critical review of 2026-10-16 and what was built from
+it — conditions capped at 60 together and kept out of the device memory, each measurement's status
+with the measurements a path requires, malformed app lists refused, business API tokens per caller with
+roles, every scan and decision stamped with its settings version and server build, VPN learning by
+latest sighting and phone age, event-ID conflicts, recording apart from another display, old fake-GPS
+fixes unscored, and owner defaults for the signals that scored 0 (schema 25); section 82 records six optional measurements — the apps holding
 Accessibility, the keyboard, notification access and device administration with their source (system,
 store by the DBA's `app_store_installers`, sideloaded), remote-control apps, screen capture, the location
 and mock locations — each finding at the DBA's points (owner defaults: sideloaded holders 30-45, the broad
