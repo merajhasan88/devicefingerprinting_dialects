@@ -60,7 +60,10 @@ class IntegrityProbeManager(
         //     optional measurements the server asks for (DESIGN.md 80).
         // 5 = adds the optional measurements of what can read or drive the
         //     phone, screen capture, location and mock locations (DESIGN.md 82).
-        private const val COLLECTOR_VERSION = 5
+        // 6 = sizes of writable-executable and unlabelled executable memory,
+        //     and the process ABI, for runtime baselines published by the
+        //     release pipeline (DESIGN.md 84.6).
+        private const val COLLECTOR_VERSION = 6
         // Sent with every scan whether or not the server asked: the server
         // tolerates probes beyond its plan but refuses a report missing one it
         // asked for, so a probe new to this collector stays out of the plan and
@@ -312,8 +315,20 @@ class IntegrityProbeManager(
         "model" to (Build.MODEL ?: ""),
         "device" to (Build.DEVICE ?: ""),
         "build_id" to (Build.ID ?: ""),
-        "fingerprint" to (Build.FINGERPRINT ?: "").take(256)
+        "fingerprint" to (Build.FINGERPRINT ?: "").take(256),
+        // The ABI this process runs as: a 32-bit app on a 64-bit phone maps
+        // different code, so a runtime baseline is per ABI (DESIGN.md 84.6).
+        "abi" to processAbi()
     )
+
+    private fun processAbi(): String {
+        val abis = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            if (android.os.Process.is64Bit()) Build.SUPPORTED_64_BIT_ABIS else Build.SUPPORTED_32_BIT_ABIS
+        } else {
+            Build.SUPPORTED_ABIS
+        }
+        return abis.firstOrNull() ?: ""
+    }
 
     /**
      * Whether a VPN is up and an HTTP proxy is set, as the system's own
@@ -929,6 +944,10 @@ class IntegrityProbeManager(
         val ownCodeDir = File(context.applicationInfo.sourceDir).parentFile?.path?.let { "$it/oat/" }
         var anonExecLabeled = 0
         var anonExecUnlabeled = 0
+        var anonExecUnlabeledBytes = 0L
+        // The size of every writable-executable mapping, so the server can
+        // hold them to the build's published envelope (DESIGN.md 62, 84.6).
+        val wxSizes = java.util.TreeMap<Long, Int>(Collections.reverseOrder<Long>())
         val samples = mutableListOf<String>()
         var mapsLines = 0
         val file = File("/proc/self/maps")
@@ -944,8 +963,10 @@ class IntegrityProbeManager(
                 val executable = perms[2] == 'x'
                 if (!executable) return@forEachLine
                 val path = if (parts.size >= 6) parts[5] else ""
+                val size = mappingSize(parts[0])
                 if (writable) {
                     wx++
+                    if (size > 0) wxSizes[size] = (wxSizes[size] ?: 0) + 1
                     if (samples.size < 8) samples.add(line.trim().take(160))
                 }
                 if (path.contains("(deleted)")) {
@@ -974,14 +995,23 @@ class IntegrityProbeManager(
                 }
                 if (path.isEmpty()) {
                     anonExecUnlabeled++
+                    anonExecUnlabeledBytes += maxOf(0L, size)
                 } else if (path.startsWith("[anon:")) {
                     anonExecLabeled++
                 }
             }
         }
         if (mapsLines == 0) return unavailable("/proc/self/maps returned no lines")
+        val wxBytes = wxSizes.entries.sumOf { it.key * it.value }
         return ok(
             "wx_mappings" to wx,
+            // Every size class, largest first, as "<bytes>:<count>": a list cut
+            // short earns no baseline allowance (DESIGN.md 66.2).
+            "wx_bytes" to wxBytes,
+            "wx_size_classes" to wxSizes.entries.joinToString(",") { "${it.key}:${it.value}" },
+            "wx_smallest_bytes" to (wxSizes.keys.lastOrNull() ?: 0L),
+            "wx_largest_bytes" to (wxSizes.keys.firstOrNull() ?: 0L),
+            "anon_exec_unlabeled_bytes" to anonExecUnlabeledBytes,
             "maps_lines" to mapsLines,
             "deleted_exec_mappings" to deletedExec,
             "deleted_exec_jit" to deletedExecJit,
@@ -990,6 +1020,15 @@ class IntegrityProbeManager(
             "anon_exec_unlabeled" to anonExecUnlabeled,
             "samples" to samples
         )
+    }
+
+    /** The size of one /proc/self/maps range, "start-end" in hex; 0 if unreadable. */
+    private fun mappingSize(range: String): Long {
+        val dash = range.indexOf('-')
+        if (dash <= 0) return 0L
+        val start = range.substring(0, dash).toLongOrNull(16) ?: return 0L
+        val end = range.substring(dash + 1).toLongOrNull(16) ?: return 0L
+        return if (end > start) end - start else 0L
     }
 
     /**
