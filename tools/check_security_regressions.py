@@ -4769,7 +4769,8 @@ def apps_holding_access_are_judged_by_their_source():
     finding scores the DBA's points, seeded with the owner's defaults: the
     sideloaded holders and remote-control apps score, the broad "not part of
     the system" findings stay at 0; a sideloaded Accessibility service alone
-    asks for a step-up, with a remote-control app it reaches review."""
+    asks for a step-up, with a remote-control app it reaches the cap's review
+    (review F2: conditions together add at most conditions_points_cap)."""
     system = _app("com.android.talkback", True, "com.android.vending", "a.TalkBack")
     store = _app("com.bitwarden.app", False, "com.android.vending", "b.Autofill")
     dropped = _app("com.evil.reader", False, "com.cleaner.dropper", "c.Svc")
@@ -4793,9 +4794,11 @@ def apps_holding_access_are_judged_by_their_source():
                     "android_notification_access_non_system": 0,
                     "android_device_admin_sideloaded": 30, "android_device_admin_non_system": 0,
                     "android_remote_access_app": 20}
-        expect(status == 200 and {code: found.get(code, {}).get("points") for code in defaults} == defaults
+        before_cap = {code: found.get(code, {}).get("points_before_cap", found.get(code, {}).get("points"))
+                      for code in defaults}
+        expect(status == 200 and before_cap == defaults
                and payload["integrity"]["score"]
-               == min(100, plain["integrity"]["score"] + sum(defaults.values())),
+               == min(100, plain["integrity"]["score"] + min(60, sum(defaults.values()))),
                "the owner's default points: %s, score %s" % (
                    {code: found[code]["points"] for code in found if code not in codes(plain)},
                    payload["integrity"]["score"]))
@@ -4820,8 +4823,8 @@ def apps_holding_access_are_judged_by_their_source():
                                        "remote_access_apps": [_app("com.carriez.flutter_hbb", False, "")]})
     with policy(optional_measurements=_ALL_OPTIONAL):
         verdicts = [send_report("android", probes)[1]["integrity"] for probes in (alone, paired)]
-        expect([(v["score"], v["verdict"]) for v in verdicts] == [(45, "elevated"), (65, "review")],
-               "45 asks for a step-up, 65 reaches review: %s"
+        expect([(v["score"], v["verdict"]) for v in verdicts] == [(45, "elevated"), (60, "review")],
+               "45 asks for a step-up; with the remote-control app, the cap's 60 is review: %s"
                % [(v["score"], v["verdict"]) for v in verdicts])
     with policy(optional_measurements=_ALL_OPTIONAL, accessibility_sideloaded_points=7,
                 accessibility_non_system_points=5, remote_access_app_points=0):
@@ -4982,6 +4985,66 @@ def the_new_eligibility_rules_refuse_only_when_set():
                                                              problem and problem.code))
     finally:
         s._latest_integrity_state, s._device_integrity_memory, s.INTEGRITY_MODE = saved
+
+
+# ---------------------------------------------------------------------------
+# The critical review of 2026-10-16 (DESIGN.md 83)
+# ---------------------------------------------------------------------------
+
+def _support_session():
+    """A genuine remote-support session: a support app holding Accessibility
+    (installed outside a store), a remote-control app, the screen recorded."""
+    return dict(clean("android"),
+                accessibility={"status": "ok", "services": [_app("com.support.helper", False, "", "a.Svc")],
+                               "settings_only": []},
+                other_access={"status": "ok", "device_admins": [],
+                              "remote_access_apps": [_app("com.teamviewer.quicksupport.market", False,
+                                                          "com.android.vending")]},
+                screen_capture={"status": "ok", "recording": True, "external_displays": 0})
+
+
+@check
+def conditions_never_block_alone_and_a_clean_rescan_restores_access():
+    """Review F2. A support session scored 45 + 20 + 30 = 95, a block, and the
+    device memory kept it: after a clean rescan the gate still refused
+    integrity_device_blocked_recently for 24 hours. Findings about what the
+    phone allows or is doing (conditions) now add at most conditions_points_cap
+    (owner default 60, review) together, show what was capped, and never enter
+    the device memory; a phone integrity finding still blocks and is
+    remembered."""
+    with policy(optional_measurements=_ALL_OPTIONAL):
+        status, payload = send_report("android", _support_session())
+    integrity = payload["integrity"]
+    reasons = _reasons_by_code(payload)
+    expect(status == 200 and integrity["score"] == 60 and integrity["verdict"] == "review"
+           and integrity["finding_score"] == 0,
+           "conditions alone: 60, review, nothing remembered: %s"
+           % {k: integrity.get(k) for k in ("score", "verdict", "finding_score")})
+    capped = [r for r in reasons.values() if "points_before_cap" in r]
+    expect(capped and sum(r["points"] for r in reasons.values()
+                          if r.get("category") == "condition") == 60
+           and all(r.get("category") == "condition" for r in capped),
+           "the capped reasons say so: %s" % reasons)
+    with lite_store() as db_:
+        device = str(uuid.uuid4())
+        owner = lite_installation(db_, device, "new_device")
+        lite_report(db_, owner, device, integrity["score"], age_hours=1.0,
+                    finding_score=integrity["finding_score"])
+        refused, _, _ = memory_outcome(device, owner)
+        expect(not refused, "after a clean rescan, a support session must not hold the phone")
+    with policy(optional_measurements=_ALL_OPTIONAL, conditions_points_cap=100):
+        status, payload = send_report("android", _support_session())
+        expect(payload["integrity"]["score"] == 95 and payload["integrity"]["finding_score"] == 0,
+               "the DBA's cap applies, and conditions stay out of the memory: %s"
+               % payload["integrity"])
+    frida = clean("android")
+    frida["runtime_maps"] = dict(frida["runtime_maps"], suspicious_tokens=["frida"],
+                                 suspicious_line_count=1)
+    with policy(optional_measurements=_ALL_OPTIONAL):
+        status, payload = send_report("android", dict(_support_session(), runtime_maps=frida["runtime_maps"]))
+    expect(payload["integrity"]["finding_score"] >= 90
+           and payload["integrity"]["verdict"] == "block",
+           "a phone integrity finding still blocks and is remembered: %s" % payload["integrity"])
 
 
 @check

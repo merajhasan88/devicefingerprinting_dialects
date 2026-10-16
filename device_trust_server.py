@@ -1192,7 +1192,7 @@ def _get_backend_identity():
 # against a schema it does not understand. /health/* still answers so operators
 # can see why.
 
-REQUIRED_SCHEMA_VERSION = 24
+REQUIRED_SCHEMA_VERSION = 25
 
 _schema_state = None
 _schema_lock = threading.Lock()
@@ -1426,6 +1426,8 @@ _RISK_SETTING_KINDS = {
     "screen_capture_points": "int",
     "mock_location_points": "int",
     "security_patch_outdated_points": "int",
+    # Migration 025 (DESIGN.md 83).
+    "conditions_points_cap": "int",
     "limited_session_paths": "paths",
     "limited_session_integrity_verdicts": "list:elevated,review",
     "limited_session_policy_actions": "list:step_up,review",
@@ -1506,6 +1508,7 @@ _RISK_SETTING_MINIMUMS = {
     "vpn_exit_min_phones": 1,
     "vpn_exit_min_share_percent": 1,
     "vpn_exit_window_days": 1,
+    "conditions_points_cap": 1,
 }
 # Upper bounds a value must also meet. The session limits are ours (DESIGN.md
 # 79): a refresh token idle for more than 90 days, or a session older than a
@@ -1519,6 +1522,7 @@ _RISK_SETTING_MAXIMUMS = {
     "vpn_exit_min_share_percent": 100,
     "vpn_exit_window_days": 365,
     "security_patch_max_age_days": 3650,
+    "conditions_points_cap": 100,
 }
 _RISK_SETTING_BOOL_WORDS = ("0", "1", "true", "false", "yes", "no", "on", "off")
 # Rows whose absence would silently weaken a gate instead of restoring the
@@ -2433,6 +2437,60 @@ def _is_quality_reason(reason):
     return str(reason.get("code", "")).startswith(_QUALITY_REASON_PREFIXES)
 
 
+# Conditions: what the phone allows or is doing -- apps that can read the
+# screen, the keyboard or notifications, device administrators, remote-control
+# apps, a recorded or extra screen, a fake location, an old security patch, a
+# VPN or proxy, developer options, ADB (DESIGN.md 82, 83). Legitimate use holds
+# every one of them, alone or together: a remote-support session is a support
+# app with Accessibility, a remote-control app and a recorded screen. So,
+# unlike a phone integrity finding (root, hooks, tampering), they add at most
+# conditions_points_cap together, and they never enter the device memory: a
+# clean rescan clears them (review F2, 2026-10-16).
+_CONDITION_CODES = frozenset((
+    "android_accessibility_sideloaded", "android_accessibility_non_system",
+    "android_accessibility_hidden",
+    "android_keyboard_sideloaded", "android_keyboard_non_system",
+    "android_notification_access_sideloaded", "android_notification_access_non_system",
+    "android_device_admin_sideloaded", "android_device_admin_non_system",
+    "android_remote_access_app",
+    "android_screen_captured", "ios_screen_captured",
+    "android_external_display", "ios_external_display",
+    "android_mock_location", "ios_mock_location",
+    "android_security_patch_outdated",
+    "android_vpn_active", "ios_vpn_active", "android_http_proxy", "ios_http_proxy",
+    "android_developer_options", "android_adb_enabled",
+))
+
+
+def _is_condition_reason(reason):
+    return reason.get("code") in _CONDITION_CODES
+
+
+def _cap_conditions(reasons):
+    """Conditions together add at most the DBA's conditions_points_cap (owner
+    default 60: review, never a block on their own). The later ones give way;
+    each reduced reason keeps what it would have scored in points_before_cap,
+    so an approver, and an approval's reason-level coverage, see the cap."""
+    room = _risk_setting_int("conditions_points_cap", 60)
+    for reason in reasons:
+        if not _is_condition_reason(reason):
+            continue
+        points = max(0, int(reason.get("points", 0)))
+        if points > room:
+            reason["points_before_cap"] = points
+            reason["points"] = max(0, room)
+        room -= min(points, max(0, room))
+
+
+def _categorize(reasons):
+    """Each integrity reason says what kind of evidence it is: integrity (the
+    phone or the app compromised or not genuine), condition (what the phone
+    allows or is doing) or collection (a check that measured nothing usable)."""
+    for reason in reasons:
+        reason["category"] = ("collection" if _is_quality_reason(reason) else
+                              "condition" if _is_condition_reason(reason) else "integrity")
+
+
 def _incomplete_streak(cursor, installation_id):
     """How many of this installation's latest reports, newest first, were
     incomplete or invalid with no complete one between them. Legacy reports
@@ -2521,9 +2579,13 @@ def _apply_collection_problems(scored, failed_required, incomplete, invalid=(), 
         )
     points = lambda reasons: min(100, sum(max(0, int(r.get("points", 0))) for r in reasons))
     scored["score"] = points(scored["reasons"])
+    # The device memory remembers phone integrity findings only: never a
+    # condition (review F2), nor, unless the DBA says so, a collection problem.
     scored["finding_score"] = points(
-        [r for r in scored["reasons"] if per_probe or not _is_quality_reason(r)]
+        [r for r in scored["reasons"]
+         if not _is_condition_reason(r) and (per_probe or not _is_quality_reason(r))]
     )
+    _categorize(scored["reasons"])
     scored["verdict"] = _integrity_verdict(scored["score"], hard_block=scored["hard_block"])
     codes = {r.get("code") for r in scored["reasons"]}
     if invalid:
@@ -3334,6 +3396,7 @@ def _score_integrity(platform, probes):
         score, hard_block, reasons = _score_ios_integrity(probes)
     else:
         raise ApiProblem("Unsupported integrity platform.", 400, "unsupported_platform")
+    _cap_conditions(reasons)
     # Derive the displayed integrity score from the same reasons returned to
     # callers. This keeps hard-block findings such as a signing-certificate
     # mismatch numerically consistent with their advertised +100 points.

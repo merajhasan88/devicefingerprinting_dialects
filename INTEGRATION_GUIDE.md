@@ -172,7 +172,7 @@ differ, or when the PostgreSQL and SQL Server migrations seed different rows. A 
 switches its rule off; the server holds a value to the bounds its description states.
 
 <!-- settings-reference:begin (tools/settings_reference.py --write; do not edit by hand) -->
-129 settings, seeded by migrations 003-024 with the owner's defaults; each row's own description.
+130 settings, seeded by migrations 003-025 with the owner's defaults; each row's own description.
 
 **Migration 003** — DBA-tunable risk policy settings
 
@@ -382,6 +382,12 @@ switches its rule off; the server holds a value to the bounds its description st
 | `screen_capture_points` | `30` | Points for android_screen_captured and ios_screen_captured: recorded, cast or mirrored during the scan, or another display on. 0 = recorded only. |
 | `mock_location_points` | `40` | Points for android_mock_location and ios_mock_location: a location simulated by an app. 0 = recorded only. |
 | `security_patch_outdated_points` | `10` | Points for android_security_patch_outdated: unpatched phones are legitimate users too, so it nudges, never decides. 0 = recorded only. |
+
+**Migration 025** — the critical review of 2026-10-16 -- conditions capped and kept out of the device memory, measurements a path requires, every report and decision stamped with the settings it was judged under, business API callers named, new owner defaults for signals that scored 0
+
+| Setting | Default | What it decides |
+|---|---|---|
+| `conditions_points_cap` | `60` | Most points the conditions add together -- apps that can read the screen, keyboard or notifications, remote-control apps, screen capture, fake GPS, an old patch, a VPN or proxy. Never kept in the device memory. 1-100. |
 <!-- settings-reference:end -->
 
 **Shared phones and several devices are a business decision.** By default a third account on one

@@ -23,6 +23,12 @@ END = "<!-- settings-reference:end -->"
 DOCUMENTS = ("INTEGRATION_GUIDE.md", "WHO_CONFIGURES_WHAT.md")
 
 _ROW = re.compile(r"\(\s*'((?:[^']|'')*)'\s*,\s*'((?:[^']|'')*)'\s*,\s*'((?:[^']|'')*)'\s*\)")
+# A later migration's new default for a setting an earlier one seeded: applied
+# only where the setting still holds the earlier default (migration 025).
+_REDEFAULT = re.compile(
+    r"UPDATE (?:dbo\.)?risk_policy_settings\s+SET setting_value = CASE WHEN setting_value = "
+    r"'((?:[^']|'')*)' THEN '((?:[^']|'')*)' ELSE setting_value END,\s*description = "
+    r"'((?:[^']|'')*)'\s+WHERE setting_key = '((?:[^']|'')*)';")
 
 
 def _unquote(text):
@@ -48,15 +54,27 @@ def seeded_settings(engine="postgresql"):
                 break
         start = text.find("risk_policy_settings AS t") if engine == "sqlserver" else text.find(
             "INSERT INTO risk_policy_settings")
-        if start < 0:
+        if start < 0 and not _REDEFAULT.search(text):
             continue
         end = text.find("ON CONFLICT", start) if engine == "postgresql" else text.find(
             ") AS s(", start)
         rows = [tuple(_unquote(part) for part in found)
-                for found in _ROW.findall(text[start:end])]
+                for found in _ROW.findall(text[start:end])] if start >= 0 else []
+        rows += [(_unquote(key), _unquote(new), _unquote(description))
+                 for old, new, description, key in _REDEFAULT.findall(text)]
         if rows:
             migrations.append((int(path.name[:3]), title, rows))
     return migrations
+
+
+def redefaults(engine="postgresql"):
+    """{key: (migration, earlier default)} for every setting a migration
+    re-defaulted by an UPDATE."""
+    found = {}
+    for path in sorted((ROOT / "migrations" / engine).glob("[0-9][0-9][0-9]_*.sql")):
+        for old, _, _, key in _REDEFAULT.findall(path.read_text(encoding="utf-8")):
+            found[_unquote(key)] = (int(path.name[:3]), _unquote(old))
+    return found
 
 
 def effective_settings(engine="postgresql"):
@@ -92,7 +110,11 @@ def render():
                 "| Setting | Default | What it decides |", "|---|---|---|"]
         for key, value, description, first in rows:
             shown = "`%s`" % value if value != "" else "*(empty)*"
-            if first != number:
+            changed = redefaults().get(key)
+            if changed and changed[0] == number:
+                description += (" *(Seeded by migration %03d at `%s`; this migration's default, set "
+                                "only where it is still `%s`.)*" % (first, changed[1], changed[1]))
+            elif first != number:
                 description += " *(Seeded by migration %03d; this migration describes it.)*" % first
             out.append("| `%s` | %s | %s |" % (key, _cell(shown), _cell(description)))
         out.append("")
