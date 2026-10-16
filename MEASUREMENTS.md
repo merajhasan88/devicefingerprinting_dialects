@@ -424,7 +424,8 @@ An approval never covers a missing measurement. Observe mode reports and never r
 Kept as long as the decisions and reports are: the business's retention policy applies to them.
 
 Location was outside the platform until the owner asked for it on 2026-10-15 (DESIGN.md 82); it is
-the most identifying measurement here, so it needs the person's own permission on top of both keys.
+the most identifying measurement here, so it needs the person's own permission as well as the DBA's
+request and the app's setting.
 
 **Not collected — dropped by the owner (2026-10-15).** Neither is measurable by an ordinary app on
 current phones:
