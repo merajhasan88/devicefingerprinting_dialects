@@ -686,6 +686,16 @@ anything.
   addressed by its thumbprint); it is read at start, so restart after a rotation. `/health/ready` lists
   the key IDs and reports an unusable file as `upgrade_assertion_keys_invalid`.
 
+  **A working example of your half** (`DESIGN.md` §84.8): `tools/identity_backend_example.py` makes a
+  signing key and prints its JWKS (`--jwks`), enrols an account in authenticator-app codes (`--enrol`),
+  and serves `POST /assertions` (`--serve 127.0.0.1:8710`, behind your TLS proxy): given the claims and the
+  user's six-digit code, it checks the code for the account the claims name, refuses anything but those
+  exact claims for this server's audience, locks an account for 15 minutes after five wrong codes, and
+  answers `{"assertion": ...}`, valid five minutes, `amr` `["otp"]`. Copy it into your stack: a real
+  backend signs in the person first (your own login, or your support team's checks), keeps the key in a
+  KMS or HSM, and logs what it signs. The Flutter harness uses it when built with
+  `--dart-define=IDENTITY_BACKEND_URL=https://<host>/<prefix>` (an `https://` URL in release builds).
+
 | Route | Default | Proves | Caveats |
 |---|---|---|---|
 | 1. Step-up on the same phone (device passcode or biometric) | off | possession of the phone and its screen lock | It is the same phone the soft risk came from, and it proves nothing about who the user is. On Android 9 and 10 the key unlocks for a 30-second window rather than per use. It never clears relationship risk. |

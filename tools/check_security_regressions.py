@@ -6983,6 +6983,86 @@ def observation_metrics_count_restrictions_recoveries_and_coverage():
            "a scan stores its build: %s" % (stored and stored[-1][19]))
 
 
+@check
+def the_reference_identity_backend_signs_what_route_3_accepts():
+    """DESIGN.md 84.8: item 3 of the eight the owner approved on 2026-10-14 --
+    a way back for users with one phone. Route 3 was built (DESIGN.md 70) but
+    every customer had to write the signing half themselves.
+    tools/identity_backend_example.py is that half: after a one-time code for
+    the account the claims name, it signs exactly the claims the server handed
+    out, and the server's own verifier accepts the result from its JWKS --
+    while a wrong code, another audience, extra claims or too many attempts
+    get no signature at all."""
+    sys.path.insert(0, str(DOCS / "tools"))
+    try:
+        import identity_backend_example as idp
+    finally:
+        sys.path.pop(0)
+    expect(idp.totp("GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ", at=59) == "287082",
+           "RFC 6238's own test vector (SHA-1, T=59): %s" % idp.totp(
+               "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ", at=59))
+    state = tempfile.mkdtemp(prefix="idp-gate-")
+    try:
+        clock = {"now": 1_800_000_000.0}
+        signer = idp.Signer(state, s.UPGRADE_ASSERTION_AUDIENCE, clock=lambda: clock["now"])
+        account, installation, request_id = str(uuid.uuid4()), str(uuid.uuid4()), str(uuid.uuid4())
+        secret = idp.enrol(state, account)
+        expect(oct(os.stat(os.path.join(state, "signing_key.pem")).st_mode & 0o777) == "0o600"
+               and oct(os.stat(os.path.join(state, "accounts.json")).st_mode & 0o777) == "0o600",
+               "the key and the enrolments are readable by their owner only")
+        claims = {"aud": s.UPGRADE_ASSERTION_AUDIENCE, "sub": account, "iid": installation,
+                  "rid": request_id, "nonce": c.b64u(os.urandom(32))}
+        jwks = os.path.join(state, "jwks.json")
+        with open(jwks, "w") as handle:
+            json.dump({"keys": [idp.public_jwk(signer.key)]}, handle)
+        saved = (s.UPGRADE_ASSERTION_JWKS_FILE, dict(s._upgrade_assertion_cache))
+        s.UPGRADE_ASSERTION_JWKS_FILE = jwks
+        s._upgrade_assertion_cache.clear()
+        real_now = s._utc_now
+        s._utc_now = lambda: datetime.fromtimestamp(clock["now"], timezone.utc)
+        try:
+            status, answer = signer.sign(claims, idp.totp(secret, at=clock["now"]))
+            expect(status == 200 and answer.get("assertion"), "a right code is signed: %s" % answer)
+            verified = s._verify_upgrade_assertion(answer["assertion"], account, installation,
+                                                   request_id)
+            expect(verified.get("nonce") == claims["nonce"] and verified.get("amr") == ["otp"]
+                   and verified["exp"] - verified["iat"] == idp.ASSERTION_SECONDS,
+                   "the server accepts it as route 3: %s" % verified)
+            for other in ({"sub": str(uuid.uuid4())}, {"iid": str(uuid.uuid4())},
+                          {"rid": str(uuid.uuid4())}):
+                try:
+                    s._verify_upgrade_assertion(answer["assertion"], other.get("sub", account),
+                                                other.get("iid", installation),
+                                                other.get("rid", request_id))
+                    refused = False
+                except s.ApiProblem as problem:
+                    refused = problem.code == "upgrade_assertion_invalid"
+                expect(refused, "an assertion serves its own account, phone and request only: %s"
+                       % other)
+        finally:
+            s._utc_now = real_now
+            s.UPGRADE_ASSERTION_JWKS_FILE = saved[0]
+            s._upgrade_assertion_cache.clear()
+            s._upgrade_assertion_cache.update(saved[1])
+        for bad, wanted in ((dict(claims, aud="someone-else"), 403), (dict(claims, admin=True), 400),
+                            ({k: v for k, v in claims.items() if k != "nonce"}, 400)):
+            status, answer = signer.sign(bad, idp.totp(secret, at=clock["now"]))
+            expect(status == wanted and "assertion" not in answer, "%s: %s %s" % (bad, status, answer))
+        other = str(uuid.uuid4())
+        idp.enrol(state, other)
+        status, answer = signer.sign(dict(claims, sub=other), idp.totp(secret, at=clock["now"]))
+        expect(status == 403, "one account's code does not vouch for another: %s" % status)
+        for _ in range(idp.LOCK_FAILURES):
+            signer.sign(claims, "000000" if idp.totp(secret, at=clock["now"]) != "000000" else "111111")
+        status, _ = signer.sign(claims, idp.totp(secret, at=clock["now"]))
+        expect(status == 403, "after five wrong codes even the right one waits: %s" % status)
+        clock["now"] += idp.LOCK_SECONDS + 1
+        status, _ = signer.sign(claims, idp.totp(secret, at=clock["now"]))
+        expect(status == 200, "and is accepted after the lock: %s" % status)
+    finally:
+        shutil.rmtree(state, ignore_errors=True)
+
+
 # The rows people change by hand (DESIGN.md 84): the key, the value, then the
 # columns that say why it last changed, who changed it and when.
 _HAND_EDITED = {

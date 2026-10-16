@@ -7150,3 +7150,29 @@ Gate: `observation_metrics_count_restrictions_recoveries_and_coverage` — eight
 installations (a recovery, an approval, a block that never recovers, decisions from before 031), labels
 before and after, limited sessions with an upgrade and an earlier approval that is not one, three scans;
 both splits; the window and role; the stored columns. Thirteen breakages caught.
+
+### 84.8 Item 3 — the way back for users with one phone (route 3, end to end)
+
+**Asked for.** Item 3: users with one phone, who get a limited session, need a way back — the customer's
+identity system vouching for them, *"before any customer turns enforcement on"*. Route 3 existed on the
+server since §70 (an ES256 assertion from the customer's backend over the claims the server hands out,
+single-use, ten minutes at most), and the suite exercised it with its own key; the open part was the
+customer's half — every integrator had to write the signer — and the harness had no way to use it.
+
+**Built.**
+- `tools/identity_backend_example.py`, a reference identity backend (standard library and pycryptodome,
+  which the server already needs): a P-256 key kept `0600` with its JWKS for
+  `UPGRADE_ASSERTION_JWKS_FILE`; RFC 6238 codes per account (`--enrol`); `POST /assertions` that signs
+  only the five claims the server handed out, only for this server's audience, only after the right code
+  for the account the claims name, with a 15-minute lock after five wrong codes; assertions live five
+  minutes with `amr ["otp"]`. Its docstring and the guide say what a real backend adds: authenticate the
+  person first, a KMS or HSM, logging.
+- The Flutter harness (`IDENTITY_BACKEND_URL`, `https://` in release): a one-time-code field and
+  "Upgrade with my identity provider" on the limited-session card — request the claims, have the backend
+  sign them, upgrade.
+- The sensitive echo answers with its `operation_scan`, so the harness can show item 2's binding too.
+
+Gate: `the_reference_identity_backend_signs_what_route_3_accepts` — RFC 6238's own test vector; the key
+and enrolments readable by their owner only; the server's verifier accepting the example's assertion from
+its JWKS and refusing it for another account, installation or request; another audience, extra or missing
+claims, another account's code and the lock refused. Seven breakages of the example caught.

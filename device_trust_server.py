@@ -8925,6 +8925,9 @@ def account_sensitive_echo():
             "step_up": "verified" if step_up else "not_required",
             "step_up_key": step_up,
             "app_pin": "verified" if g.get("app_pin_verified") else "not_required",
+            # The scan made for this operation, where the path needs one
+            # (DESIGN.md 84.3).
+            "operation_scan": ((policy or {}).get("context") or {}).get("operation_scan"),
         }
     )
 
