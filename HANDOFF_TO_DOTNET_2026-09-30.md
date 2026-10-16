@@ -619,3 +619,37 @@ probes, listed in `optional_probes` only where the DBA requests them, never requ
 
 **Verified on our side** (DESIGN.md §82): gate 110/110; EC2 at schema 24, observe 68/0/23; every new
 measurement live on the Android emulator (API 36) against real holders; the Swift is not compiled yet.
+
+## 26. Added 2026-10-16 — the review of 2026-10-16 (DESIGN.md §83, schema 25)
+
+The server requires **schema 25**. One change can break a careless collector (malformed app lists);
+the rest is new fields to send or tolerate.
+
+- **Send `enabled_measurements`** in the signed report, beside `probe_results`: the optional
+  measurements this app enabled (names from the seven), whether or not the server asked. Optional — an
+  SDK that leaves it out is recorded as not saying (`enabled_by_app: null`); anything but a list of
+  known names answers 400 `invalid_integrity_report`.
+- **App lists must be well formed.** Each entry an object with only `package`, `service`, `system`,
+  `installer`, a valid package name; at most 64 per list. Send at most 32 and set `truncated: true`
+  when the phone had more (the Android reference does). A malformed entry answers 400
+  `invalid_integrity_probe` — it used to be dropped silently.
+- **Tolerate in responses:** each integrity reason has `category` (`integrity`, `condition`,
+  `collection`) and may have `points_before_cap` (conditions are capped at 60 together). The scan
+  response has `measurements` (`status` per measurement, `enabled_by_app`), `requirements_satisfied`,
+  `missing_requirements` and `policy_version`; the integrity state (`/v1/integrity/me`, a decision's
+  `integrity`) has `measurements`, `platform`, `policy_version` and `policy_current`; a decision's
+  context has `policy_version`.
+- **New refusal:** 403 `integrity_measurements_missing`, `details.missing_requirements` listing each
+  `measurement` with its `status`, where the DBA requires measurements. The remedy is a new scan with
+  them, so the app must have enabled them. Under the default `missing_measurement_action` (`limit`) a
+  sign-in gets a limited session instead and a request that accepts step-up asks for it
+  (`integrity_step_up_required`).
+- **New and re-weighted reasons, tolerate:** `android_external_display`, `ios_external_display` (10,
+  apart from recording); `android_accessibility_hidden` (30); a VPN now 10 and a proxy 15; the
+  source-network reasons score by default.
+- **Business API**, only if the SDK ships a backend helper: one token per caller with its roles
+  (`BUSINESS_API_TOKENS`), 403 `business_role_missing`; PIN support needs a token with `pin_unlock` or
+  `pin_reset`; an event may come back `rejected` with `event_id_conflict`.
+- **Suite:** still 91 checks; the PIN support checks skip when the business token lacks the role.
+
+**Verified on our side:** gate 118/118, offline. Schema 25 has not run live yet.
