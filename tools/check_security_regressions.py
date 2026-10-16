@@ -137,9 +137,11 @@ class Rows(object):
         elif q.startswith("SELECT baseline_id, os_level, abi, wx_bytes_max, wx_granularity, "
                           "anon_exec_max, release_label FROM runtime_baselines"):
             self.result = [row[1:] for row in self.baselines if row[0] == params[1]]
-        elif q.startswith("SELECT created_at, collector_version, probe_results, measurement_status, "
-                          "reasons FROM integrity_reports WHERE installation_id"):
-            self.result = list(self.history_rows)
+        elif q.startswith("SELECT collector_version, probe_results, measurement_status FROM "
+                          "integrity_reports WHERE installation_id"):
+            self.result = self.history_rows[0][1:4] if self.history_rows else None
+        elif q.startswith("SELECT created_at, reasons FROM integrity_reports WHERE installation_id"):
+            self.result = [(row[0], row[4]) for row in self.history_rows if row[0] >= params[1]]
         elif q.startswith("INSERT INTO operation_scan_uses"):
             if params[0] in self.operation_uses:
                 raise s.DIALECT._driver.errors.UniqueViolation("used")
@@ -6289,6 +6291,11 @@ def a_scan_approves_only_the_operation_it_was_made_for():
                     (bound_report(quality="partial"), (403, "integrity_complete_evidence_required"))):
                 got = send(report_id)[:2]
                 expect(got == wanted, "%s: %s, not %s" % (report_id, got, wanted))
+            status, code, payload = send(bound_report(age=121))
+            answers = ((payload.get("error") or {}).get("details") or {}).get("assessment") or {}
+            expect(answers.get("decision", {}).get("allowed") == "scan"
+                   and answers.get("evidence", {}).get("age_seconds", 0) >= 121,
+                   "the refusal carries the four answers of the scan it refused: %s" % answers)
             fresh = bound_report("trusted")
             status, code, payload = send(fresh)
             judged = seen[-1] if seen else {}

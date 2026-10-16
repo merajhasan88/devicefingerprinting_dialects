@@ -415,6 +415,10 @@ _REFUSAL_GRANTS = {
     "integrity_elevated": "scan",
     "integrity_measurements_missing": "scan",
     "integrity_complete_evidence_required": "scan",
+    "integrity_operation_scan_required": "scan",
+    "integrity_operation_scan_mismatch": "scan",
+    "integrity_operation_scan_stale": "scan",
+    "integrity_operation_scan_used": "scan",
     "integrity_step_up_required": "step_up",
     "risk_step_up_required": "step_up",
     "integrity_review_required": "review",
@@ -2858,19 +2862,20 @@ def _history_reasons(cursor, installation_id, platform, probes, collector_versio
     """Add to scored's reasons what this scan says against the installation's
     earlier ones (the rules above), at the DBA's points where
     history_checks_enabled is 1, at 0 otherwise. The first scan has no past."""
+    # The previous scan in full; the flips need only the reasons of the rest.
     cursor.execute(
         """
-        SELECT created_at, collector_version, probe_results, measurement_status, reasons
+        SELECT collector_version, probe_results, measurement_status
         FROM integrity_reports
         WHERE installation_id = %s
         ORDER BY created_at DESC
-        LIMIT 20""",
+        LIMIT 1""",
         (installation_id,),
     )
-    rows = cursor.fetchall() or []
-    if not rows:
+    previous = cursor.fetchone()
+    if previous is None:
         return
-    _, old_collector, old_probes, old_measurements, _ = rows[0]
+    old_collector, old_probes, old_measurements = previous
     old_probes = DIALECT.json_value(old_probes) or {}
     found = {}
     old_build, old_signers, old_package, old_version = _app_facts(platform, old_probes)
@@ -2904,8 +2909,17 @@ def _history_reasons(cursor, installation_id, platform, probes, collector_versio
         found["installation_coverage_dropped"] = ": %s" % ", ".join(
             "%s now %s" % (name, now[name]) for name in lost)
     window = _utc_now() - timedelta(hours=max(1, _risk_setting_int("history_window_hours", 24)))
-    suspicious = [_integrity_points(DIALECT.json_value(row[4])) >= 30
-                  for row in reversed(rows) if row[0] >= window]
+    cursor.execute(
+        """
+        SELECT created_at, reasons
+        FROM integrity_reports
+        WHERE installation_id = %s AND created_at >= %s
+        ORDER BY created_at DESC
+        LIMIT 20""",
+        (installation_id, window),
+    )
+    suspicious = [_integrity_points(DIALECT.json_value(row[1])) >= 30
+                  for row in reversed(cursor.fetchall() or [])]
     suspicious.append(_integrity_points(scored["reasons"]) >= 30)
     flips = sum(1 for earlier, later in zip(suspicious, suspicious[1:]) if earlier != later)
     count = _risk_setting_int("installation_verdict_flips_count", 4)

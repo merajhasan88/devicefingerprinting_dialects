@@ -7018,7 +7018,7 @@ feed. Seventeen breakages caught.
 
 **Not built.** Binding to a *session* as well as an installation: the installation key already signs both
 the scan and the request, and the access proof binds the request to its token. A Flutter harness button
-for an operation scan is in 84.10.
+for an operation scan is in 84.8.
 
 ### 84.4 Item 5 — each installation against its own past (migration 028, schema 28)
 
