@@ -6850,8 +6850,32 @@ optional, scored, unscored, configurable."* Read as:
 deliberate breakages, each caught, re-run on the final code: F1 6, F2 4, F3 6, F4 9, F5 and F6 3,
 F7 3. Python 3.9 syntax; the settings reference regenerated.
 
-**Not verified yet:** the live round (migration 025 on the EC2 PostgreSQL, the suite, the emulator);
-SQL Server (025 joins G10); the Swift (no change was needed: iOS sends no app lists); a real phone.
+Suite **94** (`c4088c3`): `check_measurement_status`, `check_required_measurements` (skips unless the
+DBA requires measurements it requests), `check_conditions_cap`; the suite's reports send
+`enabled_measurements`.
+
+**Live**, EC2 PostgreSQL 16.15, 2026-10-16, 09:16:51–09:43:58 UTC (about 27 minutes): migration 025
+applied (schema 25, 141 settings, the five source points re-defaulted from 0), server md5 `97f42c6c…`,
+its build `b1727e6692e5`, two throwaway business tokens (every role; events only).
+
+| Run | Result |
+|---|---|
+| observe / observe, owner defaults, the seven optional measurements requested, the full suite | **73 / 0 / 21** |
+| enforce / enforce, a step-up path, the same-phone upgrade, cross-checks, support reset | **87 / 0 / 7** |
+| enforce, `required_measurements` = accessibility, under `limit` and then `refuse` | `check_required_measurements` passes under both |
+| the events-only token | an event accepted, stored with `producer` = payments; graph, reports and PIN reset 403 `business_role_missing`; an unknown token 401 |
+| an event sent again; other content under its ID | `duplicate`; `rejected` with `event_id_conflict` |
+| a support session with SELinux permissive besides | conditions 45 + 0 + 15 (of 20) + 0 (of 30) = 60, `finding_score` 45, score 100 block; after a clean scan no block held |
+| the emulator's own scan (API 36, the release harness with six measurements enabled) | `enabled_by_app` lists the six; every status stored (`location` `no_fix`); reasons categorised |
+
+In the database every report and decision of the window carries server build `b1727e6692e5` — the
+deployed file's own hash — and one of four settings versions, one per settings state; restoring the
+enforce settings gave the same version again. The support actions carry `actor` = suite.
+
+**Not verified:** SQL Server (025 joins G10); the Swift (no change was needed: iOS sends no app lists);
+a real phone; a real holder app this round — the cap was exercised with the suite's reports live and the
+gate offline. **State:** EC2 stopped; schema 25; observe / observe; all 141 settings at the owner's
+defaults, checked against the migrations; the business tokens removed; the emulator stopped.
 
 **Not done — later, or for the owner:**
 
