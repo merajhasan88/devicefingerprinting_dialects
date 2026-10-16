@@ -1445,7 +1445,8 @@ CREATE TABLE integrity_reports (
     finding_score    INTEGER,
     measurement_status TEXT,
     platform         TEXT,
-    policy_version   TEXT
+    policy_version   TEXT,
+    server_build     TEXT
 );
 CREATE TABLE device_account_links (
     device_id             TEXT NOT NULL,
@@ -3002,7 +3003,8 @@ CREATE TABLE integrity_reports (report_id TEXT PRIMARY KEY, installation_id TEXT
                                 score INTEGER, verdict TEXT, hard_block BOOLEAN, created_at TSZ,
                                 evidence_quality TEXT, finding_score INTEGER, platform TEXT,
                                 collector_version INTEGER, reasons TEXT, probe_results TEXT,
-                                report_sha256 TEXT, measurement_status TEXT, policy_version TEXT);
+                                report_sha256 TEXT, measurement_status TEXT, policy_version TEXT,
+                                server_build TEXT);
 CREATE TABLE business_events (event_id TEXT PRIMARY KEY,
                               account_id TEXT NOT NULL REFERENCES demo_accounts(account_id),
                               event_type TEXT NOT NULL, occurred_at TSZ NOT NULL,
@@ -3538,8 +3540,8 @@ class ObservationStore(object):
                                      self.now - timedelta(hours=1)))
 
     def decide(self, phone, account_id=None, pending=False, scan="fresh", memory=None,
-               **settings):
-        """The real _evaluate_risk_policy, not persisted, under these settings,
+               persist=False, **settings):
+        """The real _evaluate_risk_policy, persisted if asked, under these settings,
         with the latest scan fresh and clean (or "missing", or "stale") and
         the device memory given."""
         values = dict(db.settings, **{key: str(value) for key, value in settings.items()})
@@ -3559,7 +3561,7 @@ class ObservationStore(object):
         s._device_integrity_memory = lambda did, iid: memory
         try:
             return s._evaluate_risk_policy("account_login", phone[0], phone[1], account_id=account_id,
-                                           account_link_pending=pending, persist=False)
+                                           account_link_pending=pending, persist=persist)
         finally:
             s._cursor, s._latest_integrity_state, s._device_integrity_memory = saved
             s._risk_settings_cache.update(values=dict(db.settings), at=time.monotonic(),
@@ -5856,6 +5858,112 @@ def an_approval_covers_a_counted_reason_only_up_to_its_count():
                                   "message": "m"}], "relationship")
     expect(entries and entries[0].get("count") == 3,
            "what an approver is shown keeps the count: %s" % entries)
+
+
+@check
+def every_scan_and_decision_names_the_settings_and_code_it_was_judged_under():
+    """Review F4. A stored scan keeps the score it was given: the review
+    stored a screen recording at 30 points, set screen_capture_points to 0 and
+    still read 30 back, while a new scan scored 0. That stays -- a report is
+    the record of what was decided, and nothing is re-scored -- but every
+    report and decision now names the settings version it was judged under
+    (policy_version: keyed, so a phone cannot test guesses of the settings
+    against it; any changed setting gives a new one), the stored ones the code
+    as well (server_build), and the latest scan and the device memory say
+    whether any setting changed since (policy_current; None for a report
+    from before migration 025)."""
+    one = {"a": "1", "b": "2"}
+    version = s._policy_version(one)
+    expect(re.fullmatch(r"[0-9a-f]{16}", version) is not None
+           and version == s._policy_version({"b": "2", "a": "1"})
+           and version != s._policy_version({"a": "1", "b": "3"})
+           and version != c.sha256_hex(json.dumps(one, sort_keys=True,
+                                                  separators=(",", ":")).encode())[:16],
+           "one keyed version per settings snapshot: %s" % version)
+    expect(re.fullmatch(r"[0-9a-f]{12}", s.SERVER_BUILD) is not None,
+           "server_build is this file's hash: %r" % s.SERVER_BUILD)
+    recording = dict(clean("android"), screen_capture={"status": "ok", "recording": True,
+                                                       "external_displays": 0})
+    then = {"optional_measurements": _ALL_OPTIONAL, "screen_capture_points": 30}
+    now = dict(then, screen_capture_points=0)
+    with policy(**then):
+        db.writes = []
+        status, first = send_report("android", recording)
+        stored = [params for q, params in db.writes if q.startswith("INSERT INTO integrity_reports")]
+        version_then = s._policy_version()
+    first = first["integrity"]
+    expect(status == 200 and _reasons_by_code({"integrity": first})["android_screen_captured"]["points"]
+           == 30 and first["policy_version"] == version_then == stored[-1][15]
+           and stored[-1][16] == s.SERVER_BUILD and "server_build" not in first,
+           "the report names its settings, the stored row its code too: %s %s"
+           % (status, stored[-1][15:] if stored else None))
+    with policy(**now):
+        status, second = send_report("android", recording)
+        version_now = s._policy_version()
+    second = second["integrity"]
+    expect(_reasons_by_code({"integrity": second})["android_screen_captured"]["points"] == 0
+           and second["policy_version"] == version_now != version_then,
+           "a new scan is scored under the new settings: %s" % second["policy_version"])
+    latest, memory = s._latest_integrity_state, s._device_integrity_memory
+    with lite_store() as connection:
+        connection.execute("ALTER TABLE integrity_reports ADD COLUMN reasons TEXT DEFAULT '[]'")
+        phone, older = str(uuid.uuid4()), str(uuid.uuid4())
+        install = lite_installation(connection, phone, "new_device")
+        before_025 = lite_installation(connection, older, "new_device")
+        connection.execute(
+            "INSERT INTO integrity_reports (report_id, installation_id, device_id, score, verdict, "
+            "hard_block, created_at, finding_score, policy_version) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (first["report_id"], install, phone, first["score"], first["verdict"], False,
+             s._utc_now(), first["finding_score"], first["policy_version"]))
+        lite_report(connection, before_025, older, 10)
+        for settings, current in ((then, True), (now, False)):
+            with business_policy(**settings):
+                state, remembered = latest(install), memory(phone, install)
+                old_state, old_memory = latest(before_025), memory(older, before_025)
+            expect(state["score"] == first["score"] and state["verdict"] == first["verdict"]
+                   and state["policy_version"] == version_then and state["policy_current"] is current
+                   and remembered["report_id"] == first["report_id"]
+                   and remembered["policy_version"] == version_then
+                   and remembered["policy_current"] is current,
+                   "the stored score stands; policy_current=%s: %s %s" % (current, state, remembered))
+            expect(old_state["policy_version"] is None and old_state["policy_current"] is None
+                   and old_memory["policy_current"] is None,
+                   "a report from before 025 cannot say: %s %s" % (old_state, old_memory))
+    with business_store() as connection:
+        connection.execute(
+            "INSERT INTO integrity_reports (report_id, installation_id, device_id, score, verdict, "
+            "hard_block, created_at, evidence_quality, finding_score, platform, collector_version, "
+            "reasons, probe_results, report_sha256, policy_version, server_build) "
+            "VALUES (?, ?, ?, 30, 'elevated', 0, ?, 'complete', 0, 'android', 5, '[]', '{}', ?, ?, ?)",
+            (first["report_id"], str(uuid.uuid4()), str(uuid.uuid4()), s._utc_now(), "ab" * 32,
+             version_then, s.SERVER_BUILD))
+        status, feed = business_call("GET", "/v1/business/integrity-reports")
+        fed = (feed.get("reports") or [{}])[0]
+        expect(status == 200 and fed.get("policy_version") == version_then
+               and fed.get("server_build") == s.SERVER_BUILD,
+               "the business reads both with each report: %s %s" % (status, fed))
+    store = ObservationStore()
+    captured, real_execute = [], LiteCursor.execute
+
+    def execute(cursor, sql, params=()):
+        if sql.lstrip().startswith("INSERT INTO risk_policy_decisions"):
+            captured.append(params)
+            return
+        real_execute(cursor, sql, params)
+
+    LiteCursor.execute = execute
+    try:
+        decision = store.decide(store.phone(), persist=True)
+    finally:
+        LiteCursor.execute = real_execute
+    context = decision["context"]
+    kept = captured[0][10].adapted if captured else {}
+    expect(context["policy_version"] == s._policy_version(dict(db.settings))
+           and "server_build" not in context
+           and kept.get("policy_version") == context["policy_version"]
+           and kept.get("server_build") == s.SERVER_BUILD,
+           "the decision names its settings, the stored row its code too: %s %s"
+           % (context.get("policy_version"), {k: kept.get(k) for k in ("policy_version", "server_build")}))
 
 
 def main():

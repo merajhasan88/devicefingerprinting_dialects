@@ -16,6 +16,7 @@ BEGIN;
 
 ALTER TABLE integrity_reports ADD COLUMN IF NOT EXISTS measurement_status JSONB;
 ALTER TABLE integrity_reports ADD COLUMN IF NOT EXISTS policy_version VARCHAR(16);
+ALTER TABLE integrity_reports ADD COLUMN IF NOT EXISTS server_build VARCHAR(16);
 ALTER TABLE business_events ADD COLUMN IF NOT EXISTS producer VARCHAR(64);
 ALTER TABLE server_observations ADD COLUMN IF NOT EXISTS actor VARCHAR(64);
 

@@ -21,6 +21,10 @@ IF COL_LENGTH('dbo.integrity_reports', 'policy_version') IS NULL
     ALTER TABLE dbo.integrity_reports ADD policy_version varchar(16) NULL;
 GO
 
+IF COL_LENGTH('dbo.integrity_reports', 'server_build') IS NULL
+    ALTER TABLE dbo.integrity_reports ADD server_build varchar(16) NULL;
+GO
+
 IF COL_LENGTH('dbo.business_events', 'producer') IS NULL
     ALTER TABLE dbo.business_events ADD producer varchar(64) NULL;
 GO

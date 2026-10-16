@@ -112,6 +112,9 @@ _BUSINESS_SUBJECT_PEPPER = hmac.new(
 # App PINs (DESIGN.md 78) are stored only as bcrypt over an HMAC keyed by this:
 # a copy of the table without the root secret cannot be searched at all.
 _APP_PIN_PEPPER = hmac.new(_ROOT_SECRET, b"app-pin-v1", hashlib.sha256).digest()
+# The settings version (review F4, DESIGN.md 83) is keyed, so a phone that sees
+# it cannot test guesses of the DBA's settings against it offline.
+_POLICY_VERSION_KEY = hmac.new(_ROOT_SECRET, b"policy-version-v1", hashlib.sha256).digest()
 
 
 # What a business API caller may do (review F3, DESIGN.md 83): each team's
@@ -1217,6 +1220,19 @@ def _get_backend_identity():
 
 REQUIRED_SCHEMA_VERSION = 25
 
+
+def _server_build():
+    with open(os.path.abspath(__file__), "rb") as source:
+        return hashlib.sha256(source.read()).hexdigest()[:12]
+
+
+# Which code scored a report or made a decision (review F4, DESIGN.md 83): the
+# first 12 hex of this file's SHA-256. The same server_build and policy_version
+# judge the same evidence the same way; a new build means a deploy, not
+# necessarily a change to scoring -- the commit says which. Stored with each
+# report and decision, never returned to a phone.
+SERVER_BUILD = _server_build()
+
 _schema_state = None
 _schema_lock = threading.Lock()
 
@@ -1690,6 +1706,17 @@ def _risk_policy_settings():
             503,
             "risk_policy_unavailable",
         )
+
+
+def _policy_version(values=None):
+    """The version of a settings snapshot (review F4, DESIGN.md 83): 16 hex of
+    an HMAC over every risk_policy_settings row, keys sorted. Any change to any
+    setting gives a new version; the same settings give the same version on
+    every worker and after a restart."""
+    values = _risk_policy_settings() if values is None else values
+    canonical = json.dumps(values, sort_keys=True, separators=(",", ":"))
+    return hmac.new(_POLICY_VERSION_KEY, canonical.encode("utf-8"),
+                    hashlib.sha256).hexdigest()[:16]
 
 
 def _risk_policy_status():
@@ -3655,7 +3682,8 @@ def _latest_integrity_state(installation_id):
         cursor.execute(
             """
             SELECT report_id, score, verdict, hard_block, reasons, created_at,
-                   evidence_quality, finding_score, measurement_status, platform
+                   evidence_quality, finding_score, measurement_status, platform,
+                   policy_version
             FROM integrity_reports
             WHERE installation_id = %s
             ORDER BY created_at DESC
@@ -3683,6 +3711,11 @@ def _latest_integrity_state(installation_id):
         # then reads absent.
         "measurements": DIALECT.json_value(row[8]) if row[8] is not None else None,
         "platform": row[9],
+        # Review F4: the score above is the one given when the report arrived.
+        # policy_current says whether any setting changed since; a report from
+        # before migration 025 has no version, so that is unknown (None).
+        "policy_version": row[10],
+        "policy_current": None if row[10] is None else row[10] == _policy_version(),
     }
 
 
@@ -3716,7 +3749,7 @@ def _device_integrity_memory(device_id, installation_id):
         cursor.execute(
             """
             SELECT r.report_id, r.installation_id, r.score, r.verdict,
-                   r.hard_block, r.created_at, r.finding_score
+                   r.hard_block, r.created_at, r.finding_score, r.policy_version
             FROM integrity_reports r
             JOIN app_installations i ON i.installation_id = r.installation_id
             WHERE r.device_id = %s AND r.created_at >= %s
@@ -3744,6 +3777,8 @@ def _device_integrity_memory(device_id, installation_id):
         "finding_score": finding,
         "finding_verdict": _integrity_verdict(finding, hard_block=bool(row[4])),
         "window_hours": hours,
+        "policy_version": row[7],
+        "policy_current": None if row[7] is None else row[7] == _policy_version(),
     }
 
 
@@ -4945,6 +4980,9 @@ def _evaluate_risk_policy(
         "reinstall_window_hours": reinstall_window_hours,
         "integrity": integrity_state,
         "integrity_mode": INTEGRITY_MODE,
+        # The settings this decision was made under (review F4); the stored
+        # row adds server_build, the code that made it.
+        "policy_version": _policy_version(),
         "integrity_freshness_seconds": _integrity_freshness_seconds(),
         "device_integrity_memory": device_integrity_memory,
         "device_integrity_memory_hours": _risk_setting_int(
@@ -5005,7 +5043,7 @@ def _evaluate_risk_policy(
                     effective_action,
                     int(score),
                     DIALECT.json_param(reasons),
-                    DIALECT.json_param(context),
+                    DIALECT.json_param(dict(context, server_build=SERVER_BUILD)),
                 ),
             )
 
@@ -7738,14 +7776,15 @@ def integrity_report():
             _record_vpn_sighting(cursor, device_id, probes.get("network"))
         measurements = _measurement_status(platform, probes, required_probes, requested,
                                            enabled_by_app)
+        policy_version = _policy_version()
         cursor.execute(
             """
             INSERT INTO integrity_reports
                 (report_id, challenge_id, installation_id, device_id, platform,
                  collector_version, score, verdict, hard_block, reasons,
                  probe_results, report_sha256, evidence_quality, finding_score,
-                 measurement_status)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                 measurement_status, policy_version, server_build)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """,
             (
                 report_id,
@@ -7763,6 +7802,8 @@ def integrity_report():
                 scored["evidence_quality"],
                 scored["finding_score"],
                 DIALECT.json_param(measurements),
+                policy_version,
+                SERVER_BUILD,
             ),
         )
 
@@ -7779,6 +7820,8 @@ def integrity_report():
         "measurements": measurements,
         "requirements_satisfied": not missing,
         "missing_requirements": missing,
+        # The settings it was scored under (review F4).
+        "policy_version": policy_version,
         "mode": INTEGRITY_MODE,
         "fresh_for_seconds": _integrity_freshness_seconds(),
         "remote_attestation": "not_used",
@@ -10010,7 +10053,8 @@ def business_integrity_reports():
             """
             SELECT report_id, installation_id, device_id, platform, collector_version,
                    score, verdict, hard_block, evidence_quality, finding_score,
-                   reasons, probe_results, report_sha256, created_at, measurement_status
+                   reasons, probe_results, report_sha256, created_at, measurement_status,
+                   policy_version, server_build
             FROM integrity_reports
             WHERE """ + where + """(created_at > %s OR (created_at = %s AND report_id > %s))
             ORDER BY created_at, report_id
@@ -10026,7 +10070,8 @@ def business_integrity_reports():
          "reasons": _as_list(DIALECT.json_value(r[10])),
          "probe_results": DIALECT.json_value(r[11]), "report_sha256": r[12],
          "created_at": _iso_z(r[13]),
-         "measurements": DIALECT.json_value(r[14]) if r[14] is not None else None}
+         "measurements": DIALECT.json_value(r[14]) if r[14] is not None else None,
+         "policy_version": r[15], "server_build": r[16]}
         for r in rows
     ]
     last = reports[-1] if reports else None

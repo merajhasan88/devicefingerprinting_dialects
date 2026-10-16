@@ -329,6 +329,23 @@ DBA records them (§6), `source_network` (§7), and `business_events_30d` — co
 type of the business events of the account, and of every account linked to the phone, over 30 days
 (DESIGN.md 76), where the business API is configured.
 
+**Which settings and which code** (review F4, DESIGN.md 83). `policy_version` is the version of the DBA's
+settings the decision was made under: 16 hex characters, the same for the same settings and different
+after any change to any setting. It is keyed with the server's root secret, so it cannot be used to
+guess the settings, and a new root secret gives every version anew. The stored row's context also has
+`server_build`: the first 12 hex characters of the SHA-256 of the server file that made the decision.
+It is never returned to the phone. The same `server_build` and `policy_version` judge the same
+measurements the same way; a different `server_build` means only that the server was redeployed —
+`git log` says what changed. The decision's time is its `created_at`, and the scan it used is
+`integrity.report_id`.
+
+Nothing is re-scored. Each scan keeps the score and reasons it was given when it arrived, and stores
+`policy_version` and `server_build` with them. In `integrity` (the latest scan) and in
+`device_integrity_memory`, `policy_version` is the version the scan was scored under, and
+`policy_current` says whether the settings are still that version (`true`), have changed since
+(`false` — a new scan is scored under the current settings), or cannot be told because the scan was
+stored before migration 025 (`null`).
+
 ---
 
 ## 6. Optional measurements, and what a phone will not give
