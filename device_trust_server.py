@@ -120,7 +120,8 @@ _POLICY_VERSION_KEY = hmac.new(_ROOT_SECRET, b"policy-version-v1", hashlib.sha25
 # What a business API caller may do (review F3, DESIGN.md 83): each team's
 # token carries only its own roles, and the caller's name is recorded with what
 # it does.
-_BUSINESS_ROLES = ("events", "graph", "lapses", "reports", "pin_unlock", "pin_reset")
+_BUSINESS_ROLES = ("events", "graph", "lapses", "reports", "pin_unlock", "pin_reset",
+                   "operations")
 # A token from BUSINESS_API_TOKEN_SHA256 (DESIGN.md 76) keeps what it did
 # before -- except PIN support, which now needs a token that names it.
 _DEFAULT_BUSINESS_ROLES = ("events", "graph", "lapses", "reports")
@@ -1247,7 +1248,7 @@ def _get_backend_identity():
 # against a schema it does not understand. /health/* still answers so operators
 # can see why.
 
-REQUIRED_SCHEMA_VERSION = 26
+REQUIRED_SCHEMA_VERSION = 27
 
 
 def _server_build():
@@ -1546,6 +1547,8 @@ _RISK_SETTING_KINDS = {
     "integrity_device_memory_hours": "int",
     "complete_evidence_paths": "paths",
     "complete_evidence_max_age_seconds": "int",
+    "operation_scan_paths": "paths",
+    "operation_scan_max_age_seconds": "int",
     "incomplete_evidence_review_after": "int",
     "acceptance_auto_cover_reasons": "codes",
     "business_event_types": "codes",
@@ -1592,6 +1595,7 @@ _RISK_SETTING_MINIMUMS = {
     "upgrade_request_ttl_seconds": 30,
     "policy_step_up_score": 1,
     "complete_evidence_max_age_seconds": 30,
+    "operation_scan_max_age_seconds": 10,
     "business_graph_depth": 1,
     "business_graph_max_nodes": 1,
     "cross_check_window_hours": 1,
@@ -1623,6 +1627,7 @@ _RISK_SETTING_MAXIMUMS = {
     "conditions_points_cap": 100,
     "location_max_age_seconds": 86400,
     "vpn_exit_min_device_age_days": 365,
+    "operation_scan_max_age_seconds": 600,
 }
 _RISK_SETTING_BOOL_WORDS = ("0", "1", "true", "false", "yes", "no", "on", "off")
 # Rows whose absence would silently weaken a gate instead of restoring the
@@ -2532,7 +2537,7 @@ def _missing_requirements(state, platform=None, here=False):
         return []
     if here:
         paths = _risk_setting_words("required_measurements_paths", "")
-        if paths and (not has_request_context() or request.path not in paths):
+        if paths and (not has_request_context() or _judged_path() not in paths):
             return []
     platform = platform or state.get("platform")
     statuses = (state.get("measurements") or {}).get("status") or {}
@@ -3895,6 +3900,7 @@ def _enforce_integrity_gate(
     step_up_accepted=False,
     limited_ok=False,
     accepted=None,
+    state=None,
 ):
     """Refuse the request unless the latest integrity verdict allows it.
 
@@ -3917,7 +3923,10 @@ def _enforce_integrity_gate(
     that cause: a worse verdict, an eligibility rule or a device-memory block
     refuses as ever.
     """
-    state = _latest_integrity_state(installation_id)
+    # The scan judged: the latest, or the one made for this operation
+    # (DESIGN.md 84.3).
+    if state is None:
+        state = _latest_integrity_state(installation_id)
     ineligible = _eligibility_failures(state)
     if ineligible:
         state = dict(state, eligibility=ineligible)
@@ -4052,7 +4061,7 @@ def _complete_evidence_lacking(state):
     None otherwise."""
     if not has_request_context():
         return None
-    if request.path not in _risk_setting_words("complete_evidence_paths", ""):
+    if _judged_path() not in _risk_setting_words("complete_evidence_paths", ""):
         return None
     max_age = _risk_setting_int("complete_evidence_max_age_seconds", _integrity_freshness_seconds())
     quality = (state or {}).get("evidence_quality")
@@ -4060,6 +4069,177 @@ def _complete_evidence_lacking(state):
     if quality == "complete" and isinstance(age, int) and age <= max_age:
         return None
     return quality, age, max_age
+
+
+# ---------------------------------------------------------------------------
+# A scan made for one operation (DESIGN.md 84.3, item 2 of 2026-10-14)
+# ---------------------------------------------------------------------------
+# A fresh challenge makes a replayed scan useless, but not a scan made for
+# something else: a clean scan taken before a payment says nothing about the
+# next payment. On the DBA's operation_scan_paths the app asks for a challenge
+# naming the exact request it is about to send -- method, path, query and the
+# SHA-256 of its body, the fields that request's access proof signs -- scans,
+# and sends the request with X-Integrity-Report: <report_id>. The server judges
+# that scan, not the phone's latest one; the scan must have been made for this
+# very request, be recent and complete, and it approves one request only. A
+# business backend that performs the operation itself verifies the scan the
+# same way through POST /v1/business/operation-scans/verify.
+_OPERATION_METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE")
+_OPERATION_FIELDS = ("method", "path", "query", "body_sha256")
+
+
+def _operation_digest(operation):
+    """SHA-256 over one request's canonical description. A malformed
+    description is refused, never guessed at."""
+    if not isinstance(operation, dict) or set(operation) - set(_OPERATION_FIELDS):
+        raise ApiProblem("operation must be an object of method, path, query and body_sha256.",
+                         400, "invalid_operation")
+    method, path = operation.get("method"), operation.get("path")
+    query, body_sha256 = operation.get("query", ""), operation.get("body_sha256")
+    if (method not in _OPERATION_METHODS
+            or not isinstance(path, str) or not path.startswith("/") or len(path) > 512
+            or not isinstance(query, str) or len(query) > 2048
+            or not isinstance(body_sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", body_sha256)):
+        raise ApiProblem(
+            "operation needs a method (%s), a path starting with /, the query as sent (may be "
+            "empty) and the body's SHA-256 in lower-case hex." % ", ".join(_OPERATION_METHODS),
+            400, "invalid_operation")
+    canonical = json.dumps({"method": method, "path": path, "query": query,
+                            "body_sha256": body_sha256}, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _this_operation():
+    """This request, described the way its challenge must have named it --
+    exactly what its access proof signs."""
+    return {"method": request.method.upper(), "path": request.path,
+            "query": request.query_string.decode("latin-1"),
+            "body_sha256": hashlib.sha256(request.get_data(cache=True) or b"").hexdigest()}
+
+
+def _state_from_report_row(row):
+    """An integrity state, as _latest_integrity_state gives one, from report_id,
+    score, verdict, hard_block, reasons, created_at, evidence_quality,
+    finding_score, measurement_status, platform, policy_version."""
+    age_seconds = max(0, int((_utc_now() - row[5]).total_seconds()))
+    return {
+        "report_id": str(row[0]),
+        "score": int(row[1]),
+        "verdict": row[2],
+        "hard_block": bool(row[3]),
+        "reasons": _as_list(DIALECT.json_value(row[4])),
+        "created_at": _iso_z(row[5]),
+        "age_seconds": age_seconds,
+        "fresh": age_seconds <= _integrity_freshness_seconds(),
+        "evidence_quality": row[6],
+        "finding_score": int(row[7]) if row[7] is not None else None,
+        "measurements": DIALECT.json_value(row[8]) if row[8] is not None else None,
+        "platform": row[9],
+        "policy_version": row[10],
+        "policy_current": None if row[10] is None else row[10] == _policy_version(),
+    }
+
+
+def _operation_scan(report_id, installation_id, operation):
+    """The scan report_id, judged for one operation: made by this installation
+    for exactly this operation, at most operation_scan_max_age_seconds old, and
+    complete. Returns its integrity state with operation_scan set; refuses
+    otherwise. Whether it was used before is _consume_operation_scan's to say."""
+    max_age = _risk_setting_int("operation_scan_max_age_seconds", 120)
+    wanted = _operation_digest(operation)
+    with _cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT report_id, score, verdict, hard_block, reasons, created_at,
+                   evidence_quality, finding_score, measurement_status, platform,
+                   policy_version, installation_id, operation_sha256
+            FROM integrity_reports
+            WHERE report_id = %s
+            """,
+            (report_id,),
+        )
+        row = cursor.fetchone()
+    details = {"operation": operation, "max_age_seconds": max_age}
+    if row is None or str(row[11]) != str(installation_id) or row[12] is None \
+            or not hmac.compare_digest(str(row[12]), wanted):
+        raise ApiProblem(
+            "This operation needs a scan made for it: ask for a challenge naming this request "
+            "(details.operation), scan, and send the request again with X-Integrity-Report.",
+            403, "integrity_operation_scan_mismatch", details=details)
+    state = _state_from_report_row(row)
+    if state["age_seconds"] > max_age:
+        raise ApiProblem(
+            "The scan made for this operation is %d seconds old; at most %d are accepted. "
+            "Scan again for it." % (state["age_seconds"], max_age),
+            403, "integrity_operation_scan_stale", details=dict(details, integrity=state))
+    if state["evidence_quality"] != "complete":
+        raise ApiProblem(
+            "The scan made for this operation did not measure everything requested (%s); "
+            "scan again, and update the app if it reports legacy evidence."
+            % state["evidence_quality"],
+            403, "integrity_complete_evidence_required",
+            details=dict(details, evidence_quality=state["evidence_quality"],
+                         age_seconds=state["age_seconds"], integrity=state))
+    state["operation_scan"] = {"report_id": state["report_id"], "operation_sha256": wanted,
+                               "age_seconds": state["age_seconds"]}
+    return state
+
+
+def _operation_scan_for_request(claims):
+    """On the DBA's operation_scan_paths: the scan this request names in
+    X-Integrity-Report, judged for this request. None elsewhere."""
+    if request.path not in _risk_setting_words("operation_scan_paths", ""):
+        return None
+    operation = _this_operation()
+    header = (request.headers.get("X-Integrity-Report") or "").strip()
+    try:
+        report_id = str(uuid.UUID(header))
+    except ValueError:
+        raise ApiProblem(
+            "This operation needs a scan made for it: ask for a challenge naming this request "
+            "(details.operation), scan, and send the request again with X-Integrity-Report.",
+            403, "integrity_operation_scan_required",
+            details={"operation": operation,
+                     "max_age_seconds": _risk_setting_int("operation_scan_max_age_seconds", 120)})
+    state = _operation_scan(report_id, claims.get("iid"), operation)
+    _consume_operation_scan(state, claims.get("iid"), "app")
+    return state
+
+
+def _unless_observing(check, *args):
+    """An operation-scan requirement refuses in enforce mode. In observe mode,
+    which refuses nothing, its refusal is recorded instead -- the decision's
+    context.operation_scan names it, and its assessment calls for a scan -- and
+    the request goes on, judged on the latest scan. A malformed request (400)
+    is refused in either mode."""
+    try:
+        return check(*args)
+    except ApiProblem as problem:
+        if INTEGRITY_MODE == "enforce" or problem.status == 400:
+            raise
+        g.operation_scan_problem = problem.code
+        return None
+
+
+def _consume_operation_scan(state, installation_id, used_by):
+    """A scan approves one operation. The INSERT is the whole defence, as for
+    access-proof nonces: a duplicate primary key is the second use."""
+    try:
+        with _cursor(commit=True) as cursor:
+            cursor.execute(
+                """
+                INSERT INTO operation_scan_uses (report_id, installation_id, used_by)
+                VALUES (%s, %s, %s)
+                """,
+                (state["report_id"], installation_id, used_by),
+            )
+    except Exception as error:
+        if not DIALECT.is_unique_violation(error):
+            raise
+        raise ApiProblem(
+            "The scan made for this operation was already used; each approves one request. "
+            "Scan again for this one.", 409, "integrity_operation_scan_used",
+            details={"report_id": state["report_id"]})
 
 
 # ---------------------------------------------------------------------------
@@ -4457,6 +4637,30 @@ def _learned_vpn_exit(address):
             and via_vpn * 100 >= seen * _risk_setting_int("vpn_exit_min_share_percent", 90))
 
 
+def _judged_path():
+    """The path a decision is about: this request's own, or the operation a
+    business backend asks about (DESIGN.md 84.3)."""
+    return g.get("operation_path") or request.path
+
+
+def _client_address():
+    """The address of the phone a decision is about: this request's own, or,
+    when a business backend asks about an operation it performs itself
+    (DESIGN.md 84.3), the address that backend saw -- None where it gave none."""
+    if not has_request_context():
+        return None
+    if "client_address" in g:
+        return g.client_address
+    return request.remote_addr
+
+
+def _client_user_agent():
+    """This request's User-Agent; None when a business backend is asking."""
+    if not has_request_context() or "client_address" in g:
+        return None
+    return request.headers.get("User-Agent") or ""
+
+
 def _source_network():
     """What the address this request came from is, as far as this server knows
     (DESIGN.md 81). None wherever it cannot know: outside a request, no list
@@ -4467,7 +4671,7 @@ def _source_network():
     if not has_request_context():
         return known
     try:
-        address = ipaddress.ip_address(request.remote_addr or "")
+        address = ipaddress.ip_address(_client_address() or "")
     except ValueError:
         return known
     if address.version == 4:
@@ -4656,6 +4860,8 @@ def _integrity_recommendation(state, memory=None, missing=()):
     if (missing and _risk_setting_str("missing_measurement_action", "limit") == "refuse") \
             or _complete_evidence_lacking(state) is not None:
         return "scan"
+    if has_request_context() and g.get("operation_scan_problem"):
+        return "scan"
     if verdict == "elevated" or missing:
         return "step_up"
     return "allow"
@@ -4734,6 +4940,7 @@ def _evaluate_risk_policy(
     account_id=None,
     account_link_pending=False,
     persist=True,
+    integrity_state=None,
 ):
     """Calculate an opaque relationship-based risk decision.
 
@@ -4863,7 +5070,10 @@ def _evaluate_risk_policy(
     add_link = bool(account_id is not None and account_link_pending and not link_exists)
     projected_device_account_count = device_account_count + (1 if add_link else 0)
     projected_account_device_count = account_device_count + (1 if add_link else 0)
-    integrity_state = _latest_integrity_state(installation_id)
+    # The scan made for this operation, where one was (DESIGN.md 84.3);
+    # otherwise the installation's latest.
+    if integrity_state is None:
+        integrity_state = _latest_integrity_state(installation_id)
     device_integrity_memory = _device_integrity_memory(device_id, installation_id)
 
     reasons = []
@@ -5200,13 +5410,17 @@ def _evaluate_risk_policy(
     if has_request_context() and g.get("rate_limiter_unavailable"):
         context["rate_limiter"] = "unavailable"
     context["source_network"] = source_network
+    if (integrity_state or {}).get("operation_scan"):
+        context["operation_scan"] = integrity_state["operation_scan"]
+    elif has_request_context() and g.get("operation_scan_problem"):
+        context["operation_scan"] = {"problem": g.operation_scan_problem}
     if has_request_context():
         # Opt-in request metadata (DESIGN.md 80): personal data, so off unless
         # the DBA records it, and then kept as long as the decision is.
         if _risk_setting_bool("record_source_ip", False):
-            context["source_ip"] = request.remote_addr
-        if _risk_setting_bool("record_user_agent", False):
-            context["user_agent"] = (request.headers.get("User-Agent") or "")[:256]
+            context["source_ip"] = _client_address()
+        if _risk_setting_bool("record_user_agent", False) and _client_user_agent() is not None:
+            context["user_agent"] = _client_user_agent()[:256]
     if BUSINESS_API_CALLERS:
         # Measurements only (DESIGN.md 76): the business decides what they mean.
         context["business_events_30d"] = _business_event_counts(device_id, account_id)
@@ -5849,6 +6063,9 @@ def _require_trusted_account_request(event_type="protected_request"):
     server-side device/account policy and enforce its effective action.
     """
     claims = _require_access_proof("account")
+    # On the DBA's operation_scan_paths, the scan made for this very request
+    # is the one judged, used up as it is presented (DESIGN.md 84.3).
+    bound = _unless_observing(_operation_scan_for_request, claims)
     accepted = _session_acceptance(claims, event_type)
     step_up = _enforce_step_up(claims.get("iid"), get_jwt_identity())
     integrity = _enforce_integrity_gate(
@@ -5857,6 +6074,7 @@ def _require_trusted_account_request(event_type="protected_request"):
         step_up=step_up,
         step_up_accepted=True,
         accepted=accepted,
+        state=bound,
     )
     policy = _evaluate_risk_policy(
         event_type,
@@ -5865,6 +6083,7 @@ def _require_trusted_account_request(event_type="protected_request"):
         account_id=str(get_jwt_identity()),
         account_link_pending=False,
         persist=True,
+        integrity_state=bound,
     )
     _enforce_risk_policy(policy, accepted=accepted)
     _granted(policy, "limited" if claims.get("scope") == "limited" else "full",
@@ -7757,6 +7976,12 @@ def integrity_challenge():
     claims = _require_access_proof(role)
     installation_id = claims.get("iid")
     device_id = claims.get("did")
+    # The operation this scan is to approve, if the app names one (DESIGN.md
+    # 84.3); the access proof has signed the body that names it.
+    operation_sha256 = None
+    body = request.get_json(silent=True)
+    if isinstance(body, dict) and body.get("operation") is not None:
+        operation_sha256 = _operation_digest(body["operation"])
 
     with _cursor() as cursor:
         cursor.execute(
@@ -7799,8 +8024,8 @@ def integrity_challenge():
             """
             INSERT INTO integrity_challenges
                 (challenge_id, installation_id, device_id, platform,
-                 nonce_sha256, required_probes, expires_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
+                 nonce_sha256, required_probes, expires_at, operation_sha256)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
             """,
             (
                 challenge_id,
@@ -7810,6 +8035,7 @@ def integrity_challenge():
                 hashlib.sha256(nonce).hexdigest(),
                 DIALECT.json_param(probes),
                 expires_at,
+                operation_sha256,
             ),
         )
 
@@ -7826,6 +8052,8 @@ def integrity_challenge():
             "expires_at": _iso_z(expires_at),
             "server_time": _iso_z(_utc_now()),
             "collector_policy_version": 1,
+            # Set when the scan is to approve one operation (DESIGN.md 84.3).
+            "operation_sha256": operation_sha256,
         }
     )
 
@@ -7904,7 +8132,8 @@ def integrity_report():
             """
             SELECT c.installation_id, c.device_id, c.platform, c.nonce_sha256,
                    c.required_probes, c.expires_at, c.used_at,
-                   i.key_algorithm, i.public_key_jwk, i.status, d.status
+                   i.key_algorithm, i.public_key_jwk, i.status, d.status,
+                   c.operation_sha256
             FROM integrity_challenges c""" + DIALECT.row_lock_hint() + """
             JOIN app_installations i ON i.installation_id = c.installation_id
             JOIN recognized_devices d ON d.device_id = c.device_id
@@ -7928,6 +8157,7 @@ def integrity_report():
             public_key_jwk,
             installation_status,
             device_status,
+            operation_sha256,
         ) = row
         if str(stored_installation_id) != installation_id or str(stored_device_id) != device_id:
             raise ApiProblem("Integrity challenge binding mismatch.", 401, "integrity_challenge_binding_mismatch")
@@ -8013,8 +8243,8 @@ def integrity_report():
                 (report_id, challenge_id, installation_id, device_id, platform,
                  collector_version, score, verdict, hard_block, reasons,
                  probe_results, report_sha256, evidence_quality, finding_score,
-                 measurement_status, policy_version, server_build)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                 measurement_status, policy_version, server_build, operation_sha256)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """,
             (
                 report_id,
@@ -8034,6 +8264,7 @@ def integrity_report():
                 DIALECT.json_param(measurements),
                 policy_version,
                 SERVER_BUILD,
+                operation_sha256,
             ),
         )
 
@@ -8052,6 +8283,8 @@ def integrity_report():
         "missing_requirements": missing,
         # The settings it was scored under (review F4).
         "policy_version": policy_version,
+        # The one operation this scan may approve, if its challenge named one.
+        "operation_sha256": operation_sha256,
         "mode": INTEGRITY_MODE,
         "fresh_for_seconds": _integrity_freshness_seconds(),
         "remote_attestation": "not_used",
@@ -10246,6 +10479,83 @@ def business_acceptance_lapses():
 _REPORT_FILTERS = ("device_id", "installation_id", "account_id")
 
 
+@app.post("/v1/business/operation-scans/verify")
+def business_operation_scan_verify():
+    """A scan made for an operation the business's own backend performs
+    (DESIGN.md 84.3): the app asks this server for a challenge naming the
+    request it is about to send to that backend -- method, path, query, the
+    body's SHA-256 -- scans, and sends the request there with the scan's
+    report_id. The backend asks here, once: was the scan made by this
+    installation for exactly this operation, recently and completely, and what
+    do it and the relationship policy call for? Answering uses the scan up.
+    The decision is stored like any other; enforcing it is the backend's job.
+    Body: report_id, installation_id, operation; optionally account_id or
+    handle, and client_address -- the address the backend saw the request
+    come from, classified like a request's own (never stored unless the DBA
+    records source addresses)."""
+    caller = _require_business_caller("operations")
+    body = _json_body()
+    unknown = sorted(set(body) - {"report_id", "installation_id", "operation", "account_id",
+                                  "handle", "client_address"})
+    if unknown:
+        raise ApiProblem("%s is not a known field." % unknown[0], 400, "invalid_operation_check",
+                         details={"field": unknown[0]})
+    if "account_id" in body and "handle" in body:
+        raise ApiProblem("Give at most one of account_id or handle.", 400,
+                         "invalid_operation_check", details={"field": "account_id"})
+    report_id = _uuid_text(body.get("report_id"), "report_id")
+    installation_id = _uuid_text(body.get("installation_id"), "installation_id")
+    operation = body.get("operation")
+    _operation_digest(operation)
+    client_address = body.get("client_address")
+    if client_address is not None:
+        try:
+            client_address = str(ipaddress.ip_address(client_address))
+        except ValueError:
+            raise ApiProblem("client_address must be an IP address.", 400,
+                             "invalid_operation_check", details={"field": "client_address"})
+    with _cursor() as cursor:
+        cursor.execute("SELECT device_id FROM app_installations WHERE installation_id = %s",
+                       (installation_id,))
+        installation = cursor.fetchone()
+        account_id = None
+        if "account_id" in body or "handle" in body:
+            if "account_id" in body:
+                cursor.execute("SELECT account_id FROM demo_accounts WHERE account_id = %s",
+                               (_uuid_text(body["account_id"], "account_id"),))
+            else:
+                cursor.execute("SELECT account_id FROM demo_accounts WHERE handle_lookup = %s",
+                               (_handle_lookup(body["handle"]),))
+            account = cursor.fetchone()
+            if account is None:
+                raise ApiProblem("No such account.", 404, "unknown_account")
+            account_id = str(account[0])
+    if installation is None:
+        raise ApiProblem("No such installation.", 404, "installation_not_found")
+    device_id = str(installation[0])
+    state = _operation_scan(report_id, installation_id, operation)
+    _consume_operation_scan(state, installation_id, caller)
+    # What proved the phone's part: the scan's own challenge and signature,
+    # bound to this operation; and whose question it was.
+    g.protocol = {"challenge": "single_use", "report_signature": "verified",
+                  "operation": "bound", "business_caller": caller}
+    g.client_address = client_address
+    g.operation_path = operation["path"]
+    decision = _evaluate_risk_policy("operation_check", device_id, installation_id,
+                                     account_id=account_id, persist=True,
+                                     integrity_state=state)
+    return jsonify({
+        "report_id": state["report_id"],
+        "installation_id": installation_id,
+        "device_id": device_id,
+        "account_id": account_id,
+        "operation_sha256": state["operation_scan"]["operation_sha256"],
+        "age_seconds": state["age_seconds"],
+        "used_by": caller,
+        "decision": decision,
+    })
+
+
 @app.get("/v1/business/integrity-reports")
 def business_integrity_reports():
     """Every integrity report as stored, measurements included (DESIGN.md 79):
@@ -10290,7 +10600,7 @@ def business_integrity_reports():
             SELECT report_id, installation_id, device_id, platform, collector_version,
                    score, verdict, hard_block, evidence_quality, finding_score,
                    reasons, probe_results, report_sha256, created_at, measurement_status,
-                   policy_version, server_build
+                   policy_version, server_build, operation_sha256
             FROM integrity_reports
             WHERE """ + where + """(created_at > %s OR (created_at = %s AND report_id > %s))
             ORDER BY created_at, report_id
@@ -10307,7 +10617,7 @@ def business_integrity_reports():
          "probe_results": DIALECT.json_value(r[11]), "report_sha256": r[12],
          "created_at": _iso_z(r[13]),
          "measurements": DIALECT.json_value(r[14]) if r[14] is not None else None,
-         "policy_version": r[15], "server_build": r[16]}
+         "policy_version": r[15], "server_build": r[16], "operation_sha256": r[17]}
         for r in rows
     ]
     for report in reports:

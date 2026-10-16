@@ -202,7 +202,7 @@ WHERE installation_id = '<installation_id>';
 ```
 
 <!-- settings-reference:begin (tools/settings_reference.py --write; do not edit by hand) -->
-141 settings, seeded by migrations 003-025 with the owner's defaults; each row's own description.
+143 settings, seeded by migrations 003-027 with the owner's defaults; each row's own description.
 
 **Migration 003** — DBA-tunable risk policy settings
 
@@ -429,6 +429,13 @@ WHERE installation_id = '<installation_id>';
 | `source_hosting_points` | `15` | Points when a request comes from a hosting or data-centre network not known as a VPN: cloud phones and bots, also some company networks. 0 = recorded only. *(Seeded by migration 023 at `0`; this migration's default, set only where it is still `0`.)* |
 | `source_vpn_observed_points` | `10` | Points when a request comes from an address learned as a VPN exit in a hosting network, or of unknown kind. 0 = recorded only. *(Seeded by migration 023 at `0`; this migration's default, set only where it is still `0`.)* |
 | `source_vpn_observed_non_hosting_points` | `10` | Points when a request comes from an address learned as a VPN exit outside hosting networks: a home or office VPN. 0 = recorded only. *(Seeded by migration 023 at `0`; this migration's default, set only where it is still `0`.)* |
+
+**Migration 027** — a scan made for one operation, used once -- the request it approves named in its challenge
+
+| Setting | Default | What it decides |
+|---|---|---|
+| `operation_scan_paths` | *(empty)* | Paths where a request needs a scan made for it alone: the app asks for a challenge naming the request (method, path, query, body SHA-256), scans, and sends the request with the report_id; each scan approves one request. Empty (owner default) = none. |
+| `operation_scan_max_age_seconds` | `120` | How old a scan made for one operation may be when the operation arrives. 10-600. |
 <!-- settings-reference:end -->
 
 **Shared phones and several devices are a business decision.** By default a third account on one
@@ -731,7 +738,9 @@ one complete scan resets the count. Legacy scans never count. `0` turns it off.
 again right before the operation, and to update itself if it reports `legacy`. Listing a path forces
 users of older app versions to update before using it. Complete evidence covers the server's plan,
 not the optional measurements: to require those on a path, your DBA lists them in
-`required_measurements` and the path in `required_measurements_paths` (section 14, review F1).
+`required_measurements` and the path in `required_measurements_paths` (section 14, review F1). A scan
+that is complete and recent can still have been made for something else; to tie a scan to the one
+operation it approves, see section 17.
 
 **Reading the scores.** A report's `score` and `verdict` include collection problems; `finding_score`
 does not. Analytics that look for compromise should read findings and quality separately: three
@@ -767,7 +776,8 @@ the API its own random bearer token, and list them in `BUSINESS_API_TOKENS`, com
 BUSINESS_API_TOKENS=payments:events:<digest>,risk-engine:graph+lapses+reports:<digest>,support-tool:pin_unlock+pin_reset:<digest>
 ```
 
-The roles are `events`, `graph`, `lapses`, `reports`, `pin_unlock` and `pin_reset`; a name is 1–64 of
+The roles are `events`, `graph`, `lapses`, `reports`, `pin_unlock`, `pin_reset` and `operations`
+(section 17); a name is 1–64 of
 `a-z 0-9 _ -`. `printf %s "$TOKEN" | sha256sum` gives a digest. List a caller twice, with two digests,
 to rotate its token without a gap. A malformed entry stops the server at start. Calls carry
 `Authorization: Bearer <token>`: an unknown token answers 401 `business_token_invalid`, a known one
@@ -1314,3 +1324,61 @@ right remedy (`scan` — send a new scan; `step_up`; `limited` — offer the upg
 your backend to log why a request passed, and in observe mode to count what enforce mode would have done:
 every stored decision keeps its answers, and `decision.recommended` against `decision.enforced` says what
 an enforcing server would have refused.
+
+## 17. A scan made for one operation
+
+A fresh challenge stops a scan from being replayed; it does not stop a clean scan made a minute ago, for
+something else, from being presented for a payment the phone was never scanned for. For your most
+sensitive operations a scan can be tied to the operation itself (`DESIGN.md` §84.3):
+
+1. Your app asks for a challenge that names the request it is about to send —
+   `POST /v1/integrity/challenge` with, for example,
+   `{"operation": {"method": "POST", "path": "/v1/account/pay", "query": "", "body_sha256": "<hex>"}}`:
+   the method, the path, the query string as sent (often empty) and the SHA-256 of the exact body, in
+   lower-case hex — the four things that request's access proof signs. The answer repeats them as
+   `operation_sha256`.
+2. It scans and sends the report as usual; the report's answer carries the same `operation_sha256`, and
+   its `report_id`.
+3. It sends the operation with the header `X-Integrity-Report: <report_id>`.
+
+On the paths your DBA lists in `operation_scan_paths` (owner default: none) the server then judges
+**that** scan, not the phone's latest, and only if this installation made it for exactly this request,
+it is at most `operation_scan_max_age_seconds` old (120) and its evidence is `complete`. Everything
+else applies to it as to any scan: the verdict, the eligibility rules, required measurements, step-up
+paths, the device memory. **A scan approves one request**, and is used up as it is presented: a request
+refused for another reason — a missing step-up proof, say — needs a new scan for its retry.
+
+| Answer | When |
+|---|---|
+| 403 `integrity_operation_scan_required` | no `X-Integrity-Report`; `details.operation` is the request to name, `details.max_age_seconds` the limit |
+| 403 `integrity_operation_scan_mismatch` | the scan was made for another request, by another installation, or for no operation |
+| 403 `integrity_operation_scan_stale` | older than `operation_scan_max_age_seconds` |
+| 403 `integrity_complete_evidence_required` | its evidence is not `complete` |
+| 409 `integrity_operation_scan_used` | it has approved a request already |
+
+In observe mode nothing is refused: the decision's `context.operation_scan.problem` names the refusal
+enforce mode would have given, and its four answers call for a scan (`recommended: scan`).
+
+**Operations your own backend performs.** Where the payment goes to your backend, not to this server,
+your app names *that* request in the challenge — your backend's method, path, query and body — and sends
+your backend the `installation_id` and the `report_id` with the request. Your backend asks once, with a
+token holding the role **`operations`**:
+
+```
+POST /v1/business/operation-scans/verify
+{"report_id": "...", "installation_id": "...",
+ "operation": {"method": "POST", "path": "/payments", "query": "", "body_sha256": "..."},
+ "account_id": "...", "client_address": "203.0.113.9"}
+```
+
+`account_id` or `handle` (optional) names the account for the relationship policy. `client_address`
+(optional) is the address your backend saw the request come from; it is classified like a request's own
+— the VPN, Tor and hosting lists, the exits learned from your phones — and stored only where your DBA
+sets `record_source_ip`. The scan is checked as above and used up, and the answer carries `decision`, a
+risk decision like any other, stored with its four answers (section 16): **enforce
+`decision.assessment.decision.recommended` at your operation** — this server cannot refuse a request it
+never sees. A second verification of the same scan answers 409 `integrity_operation_scan_used`.
+
+**Database.** Migration 027 adds `operation_scan_uses`, the record of what each scan approved: grant the
+application principal `SELECT, INSERT`, never `UPDATE` or `DELETE`. The report feed (section 10) names
+each scan's operation (`operation_sha256`).

@@ -369,7 +369,10 @@ account on the phone, with `window_hours` and whether they were `scored`), `requ
 DBA records them (§6), `source_network` (§7), and `business_events_30d` — counts by
 type of the business events of the account, and of every account linked to the phone, over 30 days
 (DESIGN.md 76), where the business API is configured. The stored context also keeps the decision's
-`assessment`, the four answers of §8.
+`assessment`, the four answers of §8. A decision judged on a scan made for its operation (DESIGN.md
+84.3) carries `operation_scan` — `report_id`, `operation_sha256`, `age_seconds` — and one where observe
+mode let such a request through without that scan names the refusal enforce mode would have given
+(`operation_scan.problem`).
 
 **Which settings and which code** (review F4, DESIGN.md 83). `policy_version` is the version of the DBA's
 settings the decision was made under: 16 hex characters, the same for the same settings and different

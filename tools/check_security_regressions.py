@@ -110,6 +110,8 @@ class Rows(object):
         self.password_hash = None
         self.family_started = None
         self.sightings = {}
+        self.operation_reports = {}
+        self.operation_uses = set()
 
     def execute(self, sql, params=None):
         q = " ".join(sql.split())
@@ -125,6 +127,16 @@ class Rows(object):
             self.result = ("ES256", inst.jwk, inst.device_id, "active", "active")
         elif q.startswith("SELECT c.installation_id, c.device_id, c.platform"):
             self.result = self.report_row
+        elif q.startswith("SELECT report_id, score, verdict, hard_block, reasons, created_at, "
+                          "evidence_quality, finding_score, measurement_status, platform, "
+                          "policy_version, installation_id, operation_sha256 FROM integrity_reports "
+                          "WHERE report_id"):
+            self.result = self.operation_reports.get(params[0])
+        elif q.startswith("INSERT INTO operation_scan_uses"):
+            if params[0] in self.operation_uses:
+                raise s.DIALECT._driver.errors.UniqueViolation("used")
+            self.operation_uses.add(params[0])
+            self.writes.append((q, params))
         elif q.startswith("SELECT d.platform, i.status, d.status FROM app_installations i"):
             self.result = ("android", "active", "active")
         elif q.startswith(("INSERT INTO integrity_challenges", "DELETE FROM integrity_challenges")):
@@ -366,14 +378,14 @@ def stepup_headers(method, route, body, nonce, factor="passcode", signer=None,
     return {"X-Step-Up-Proof": raw, "X-Step-Up-Signature": (signer or step).sign_b64(raw)}
 
 
-def send_report(platform, probes, collector_version=None):
+def send_report(platform, probes, collector_version=None, operation_sha256=None):
     if collector_version is None:
         collector_version = s._EVIDENCE_CONTRACT_VERSION.get(platform, 1)
     required = s._integrity_probe_plan(platform)
     nonce = os.urandom(32)
     db.report_row = (inst.installation_id, inst.device_id, platform, c.sha256_hex(nonce),
                      required, s._utc_now() + s.INTEGRITY_CHALLENGE_LIFETIME, None,
-                     "ES256", inst.jwk, "active", "active")
+                     "ES256", inst.jwk, "active", "active", operation_sha256)
     report = {"version": 1, "installation_id": inst.installation_id,
               "challenge_id": str(uuid.uuid4()), "platform": platform,
               "challenge_nonce": c.b64u(nonce), "collected_at": int(time.time()),
@@ -3004,7 +3016,7 @@ CREATE TABLE integrity_reports (report_id TEXT PRIMARY KEY, installation_id TEXT
                                 evidence_quality TEXT, finding_score INTEGER, platform TEXT,
                                 collector_version INTEGER, reasons TEXT, probe_results TEXT,
                                 report_sha256 TEXT, measurement_status TEXT, policy_version TEXT,
-                                server_build TEXT);
+                                server_build TEXT, operation_sha256 TEXT);
 CREATE TABLE business_events (event_id TEXT PRIMARY KEY,
                               account_id TEXT NOT NULL REFERENCES demo_accounts(account_id),
                               event_type TEXT NOT NULL, occurred_at TSZ NOT NULL,
@@ -3540,7 +3552,7 @@ class ObservationStore(object):
                                      self.now - timedelta(hours=1)))
 
     def decide(self, phone, account_id=None, pending=False, scan="fresh", memory=None,
-               persist=False, **settings):
+               persist=False, integrity_state=None, **settings):
         """The real _evaluate_risk_policy, persisted if asked, under these settings,
         with the latest scan fresh and clean (or "missing", or "stale") and
         the device memory given."""
@@ -3561,7 +3573,8 @@ class ObservationStore(object):
         s._device_integrity_memory = lambda did, iid: memory
         try:
             return s._evaluate_risk_policy("account_login", phone[0], phone[1], account_id=account_id,
-                                           account_link_pending=pending, persist=persist)
+                                           account_link_pending=pending, persist=persist,
+                                           integrity_state=integrity_state)
         finally:
             s._cursor, s._latest_integrity_state, s._device_integrity_memory = saved
             s._risk_settings_cache.update(values=dict(db.settings), at=time.monotonic(),
@@ -5323,7 +5336,7 @@ def send_report_with(extra_probes, enabled):
     nonce = os.urandom(32)
     db.report_row = (inst.installation_id, inst.device_id, platform, c.sha256_hex(nonce),
                      required, s._utc_now() + s.INTEGRITY_CHALLENGE_LIFETIME, None,
-                     "ES256", inst.jwk, "active", "active")
+                     "ES256", inst.jwk, "active", "active", None)
     report = {"version": 1, "installation_id": inst.installation_id,
               "challenge_id": str(uuid.uuid4()), "platform": platform,
               "challenge_nonce": c.b64u(nonce), "collected_at": int(time.time()),
@@ -6145,6 +6158,232 @@ def every_scan_and_decision_answers_the_four_questions_apart():
         finally:
             s.DEVICE_POLICY_MODE = saved_mode
         expect(got == wanted, "%s %s %s: granted by %s, not %s" % (integrity, decision, mode, got, wanted))
+
+
+@check
+def a_scan_approves_only_the_operation_it_was_made_for():
+    """DESIGN.md 84.3: item 2 of the eight the owner approved on 2026-10-14. A
+    fresh challenge made a replayed scan useless, not a scan made for something
+    else. On the DBA's operation_scan_paths the app names the request in its
+    challenge -- method, path, query, the body's SHA-256 -- and sends the
+    request with the scan's report_id: the server judges that scan, not the
+    latest, only if it was made by this installation for exactly this request,
+    is recent and complete; it approves one request. Observe mode records what
+    enforce mode would refuse. A business backend verifies such a scan for its
+    own operation once, with a token holding the operations role."""
+    body = encode({"amount": 125, "payee": "p-1"})
+    operation = {"method": "POST", "path": ECHO, "query": "", "body_sha256": c.sha256_hex(body)}
+    digest = s._operation_digest(operation)
+    expect(digest == s._operation_digest(dict(reversed(list(operation.items()))))
+           and all(digest != s._operation_digest(dict(operation, **{key: value})) for key, value in (
+               ("method", "PUT"), ("path", "/v1/account/me"), ("query", "a=1"),
+               ("body_sha256", c.sha256_hex(encode({"amount": 126, "payee": "p-1"}))))),
+           "the digest names the request, every part of it")
+    for bad in (dict(operation, method="TRACE"), dict(operation, path="v1/no-slash"),
+                dict(operation, body_sha256="AB" * 32), dict(operation, extra=1), "POST /x"):
+        try:
+            s._operation_digest(bad)
+            refused = None
+        except s.ApiProblem as problem:
+            refused = (problem.status, problem.code)
+        expect(refused == (400, "invalid_operation"), "%r: %s" % (bad, refused))
+
+    # The challenge names the operation; the scan keeps it and says so.
+    with policy():
+        db.writes = []
+        path = "/v1/integrity/challenge"
+        named = encode({"operation": operation})
+        reply = client.post(path, data=named, headers=access_headers("POST", path, named, device_token))
+        stored = [params for q, params in db.writes if q.startswith("INSERT INTO integrity_challenges")]
+        expect(reply.status_code == 200 and reply.get_json().get("operation_sha256") == digest
+               and stored and stored[-1][7] == digest,
+               "the challenge is bound: %s %s" % (reply.status_code, stored and stored[-1][7:]))
+        reply = client.post(path, data=b"{}", headers=access_headers("POST", path, b"{}", device_token))
+        expect(reply.status_code == 200 and reply.get_json().get("operation_sha256") is None,
+               "a challenge naming nothing binds nothing: %s" % reply.get_json())
+        status, payload = send_report("android", clean("android"), operation_sha256=digest)
+        rows = [params for q, params in db.writes if q.startswith("INSERT INTO integrity_reports")]
+        expect(status == 200 and payload["integrity"].get("operation_sha256") == digest
+               and rows[-1][17] == digest,
+               "the scan keeps its operation: %s %s" % (status, rows and rows[-1][17]))
+
+    measured = {"status": {name: "ok" for name in s._MEASUREMENTS["android"]}}
+
+    def bound_report(verdict="trusted", age=5, quality="complete", bound_to=digest,
+                     installation=None):
+        report_id = str(uuid.uuid4())
+        db.operation_reports[report_id] = (
+            report_id, {"trusted": 0, "elevated": 30, "review": 60, "block": 90}[verdict], verdict,
+            False, [], s._utc_now() - timedelta(seconds=age), quality, 0, measured, "android",
+            None, installation or inst.installation_id, bound_to)
+        return report_id
+
+    seen = []
+
+    def stub_policy(*args, **kwargs):
+        seen.append(kwargs.get("integrity_state"))
+        decision = {"effective_action": "allow", "recommended_action": "allow", "reasons": []}
+        decision["assessment"] = s._assessment(kwargs.get("integrity_state")
+                                               or s._latest_integrity_state(None), decision, None)
+        return decision
+
+    def send(report_id=None, step_up=False):
+        nonce = fresh_nonce()
+        head = access_headers("POST", ECHO, body, nonce=nonce)
+        if report_id:
+            head["X-Integrity-Report"] = report_id
+        if step_up:
+            head.update(stepup_headers("POST", ECHO, body, nonce))
+        reply = client.post(ECHO, data=body, headers=head)
+        payload = reply.get_json() or {}
+        return reply.status_code, error_code(reply), payload
+
+    latest = {"verdict": "elevated"}
+    saved = (s._latest_integrity_state, s._device_integrity_memory, s._evaluate_risk_policy,
+             s.INTEGRITY_MODE)
+    s._latest_integrity_state = lambda iid: {
+        "report_id": "latest", "score": 30 if latest["verdict"] == "elevated" else 0,
+        "verdict": latest["verdict"], "fresh": True, "age_seconds": 1,
+        "evidence_quality": "complete", "reasons": [], "platform": "android",
+        "measurements": measured}
+    s._device_integrity_memory = lambda did, iid: None
+    s._evaluate_risk_policy = stub_policy
+    s.INTEGRITY_MODE = "enforce"
+    try:
+        with policy(operation_scan_paths=ECHO, stepup_required_paths=""):
+            status, code, payload = send()
+            details = (payload.get("error") or {}).get("details") or {}
+            expect((status, code) == (403, "integrity_operation_scan_required")
+                   and details.get("operation") == operation and details.get("max_age_seconds") == 120,
+                   "no scan named: the app is told which request to scan for: %s %s %s"
+                   % (status, code, details))
+            for report_id, wanted in (
+                    (bound_report(bound_to=s._operation_digest(dict(operation, body_sha256="0" * 64))),
+                     (403, "integrity_operation_scan_mismatch")),
+                    (bound_report(bound_to=None), (403, "integrity_operation_scan_mismatch")),
+                    (bound_report(installation=str(uuid.uuid4())), (403, "integrity_operation_scan_mismatch")),
+                    (str(uuid.uuid4()), (403, "integrity_operation_scan_mismatch")),
+                    (bound_report(age=121), (403, "integrity_operation_scan_stale")),
+                    (bound_report(quality="partial"), (403, "integrity_complete_evidence_required"))):
+                got = send(report_id)[:2]
+                expect(got == wanted, "%s: %s, not %s" % (report_id, got, wanted))
+            fresh = bound_report("trusted")
+            status, code, payload = send(fresh)
+            judged = seen[-1] if seen else {}
+            evidence = ((payload.get("trust_policy") or {}).get("assessment") or {}).get("evidence") or {}
+            expect(status == 200 and judged.get("report_id") == fresh
+                   and judged.get("operation_scan", {}).get("operation_sha256") == digest
+                   and evidence.get("report_id") == fresh,
+                   "the scan made for it is the one judged -- a trusted one, though the latest is "
+                   "elevated: %s %s %s" % (status, code, judged))
+            expect(send(fresh)[:2] == (409, "integrity_operation_scan_used")
+                   and fresh in db.operation_uses,
+                   "a scan approves one request")
+            latest["verdict"] = "trusted"
+            elevated = bound_report("elevated")
+            expect(send(elevated)[:2] == (403, "integrity_step_up_required"),
+                   "an elevated scan made for it asks for a step-up, though the latest is trusted")
+            expect(send(elevated, step_up=True)[:2] == (409, "integrity_operation_scan_used"),
+                   "it was used up as it was presented: the retry scans again")
+            expect(send(bound_report("elevated"), step_up=True)[0] == 200,
+                   "a new scan with a step-up proof passes")
+        with policy(operation_scan_paths="/v1/account/pay"):
+            expect(send()[0] == 200, "elsewhere nothing is asked for")
+        s.INTEGRITY_MODE = "observe"
+        with policy(operation_scan_paths=ECHO):
+            seen[:] = []
+            status, code, payload = send()
+            answers = (payload.get("trust_policy") or {}).get("assessment") or {}
+            expect(status == 200 and seen == [None]
+                   and answers.get("decision", {}).get("recommended") == "scan",
+                   "observe mode lets it through, judged on the latest, and says a scan was due: "
+                   "%s %s %s" % (status, code, answers.get("decision")))
+            expect(send(bound_report(), step_up=False)[0] == 200, "observe: a bound scan passes")
+    finally:
+        (s._latest_integrity_state, s._device_integrity_memory, s._evaluate_risk_policy,
+         s.INTEGRITY_MODE) = saved
+
+    # The decision itself names the scan it was judged on, or the refusal observe mode skipped.
+    store = ObservationStore()
+    phone = store.phone()
+    state = {"report_id": "r1", "verdict": "trusted", "score": 0, "fresh": True, "age_seconds": 3,
+             "evidence_quality": "complete", "reasons": [],
+             "operation_scan": {"report_id": "r1", "operation_sha256": digest, "age_seconds": 3}}
+    decided = store.decide(phone, integrity_state=state)
+    expect(decided["context"].get("operation_scan") == state["operation_scan"]
+           and decided["context"]["integrity"]["report_id"] == "r1",
+           "the decision names its scan: %s" % decided["context"].get("operation_scan"))
+    with s.app.test_request_context(ECHO):
+        s.g.operation_scan_problem = "integrity_operation_scan_required"
+        skipped = store.decide(phone)
+    expect(skipped["context"].get("operation_scan") == {"problem": "integrity_operation_scan_required"},
+           "observe mode's skipped refusal is named: %s" % skipped["context"].get("operation_scan"))
+
+    # A business backend's own operation: verified once, by a caller holding operations.
+    verify = "/v1/business/operation-scans/verify"
+    with business_store() as connection, business_policy():
+        connection.executescript(
+            "CREATE TABLE operation_scan_uses (report_id TEXT PRIMARY KEY, installation_id TEXT, "
+            "used_by TEXT, used_at TSZ DEFAULT CURRENT_TIMESTAMP);")
+        phone_id, installation = str(uuid.uuid4()), str(uuid.uuid4())
+        connection.execute("INSERT INTO app_installations VALUES (?, ?, 'new_device', ?, NULL)",
+                           (installation, phone_id, s._utc_now()))
+        acct = business_account(connection, "operations-holder")
+        report_id = str(uuid.uuid4())
+        connection.execute(
+            "INSERT INTO integrity_reports (report_id, installation_id, device_id, score, verdict, "
+            "hard_block, created_at, evidence_quality, finding_score, platform, reasons, "
+            "measurement_status, operation_sha256, collector_version, probe_results, "
+            "report_sha256) VALUES (?, ?, ?, 0, 'trusted', 0, ?, 'complete', 0, 'android', '[]', "
+            "?, ?, 5, '{}', '" + "ab" * 32 + "')",
+            (report_id, installation, phone_id, s._utc_now(), json.dumps(measured), digest))
+        calls = []
+
+        def business_stub(event_type, device_id, installation_id, **kwargs):
+            calls.append((event_type, device_id, installation_id, kwargs.get("account_id"),
+                          (kwargs.get("integrity_state") or {}).get("operation_scan"),
+                          s.g.get("client_address"), s.g.get("operation_path"), s._judged_path()))
+            return {"effective_action": "allow", "recommended_action": "allow", "reasons": []}
+
+        saved_policy = s._evaluate_risk_policy
+        s._evaluate_risk_policy = business_stub
+        try:
+            ask = {"report_id": report_id, "installation_id": installation, "operation": operation,
+                   "handle": "operations-holder", "client_address": "203.0.113.9"}
+            s.BUSINESS_API_CALLERS = {c.sha256_hex(b"events-only"): ("payments", ("events",)),
+                                      c.sha256_hex(BUSINESS_TOKEN.encode()): ("pay-api", ("operations",))}
+            status, payload = business_call("POST", verify, ask, token="events-only")
+            expect((status, payload.get("error", {}).get("code")) == (403, "business_role_missing"),
+                   "without the operations role: %s %s" % (status, payload))
+            status, payload = business_call("POST", verify, dict(ask, extra=1))
+            expect(status == 400, "an unknown field is refused: %s" % status)
+            status, payload = business_call("POST", verify, dict(ask, operation=dict(
+                operation, body_sha256=c.sha256_hex(b"another"))))
+            expect((status, payload.get("error", {}).get("code"))
+                   == (403, "integrity_operation_scan_mismatch"),
+                   "another operation is refused: %s %s" % (status, payload))
+            status, payload = business_call("POST", verify, ask)
+            expect(status == 200 and payload.get("used_by") == "pay-api"
+                   and payload.get("account_id") == acct and payload.get("operation_sha256") == digest
+                   and calls and calls[-1][:4] == ("operation_check", phone_id, installation, acct)
+                   and calls[-1][4]["operation_sha256"] == digest
+                   and calls[-1][5:] == ("203.0.113.9", ECHO, ECHO),
+                   "verified once, judged on the bound scan, for the operation's path and the "
+                   "address the backend saw: %s %s" % (status, calls and calls[-1]))
+            used = connection.execute("SELECT used_by FROM operation_scan_uses WHERE report_id = ?",
+                                      (report_id,)).fetchall()
+            expect(used == [("pay-api",)], "the use names its caller: %s" % used)
+            s.BUSINESS_API_CALLERS = {c.sha256_hex(BUSINESS_TOKEN.encode()): ("suite", ("reports",))}
+            status, feed = business_call("GET", "/v1/business/integrity-reports")
+            expect(status == 200 and [r.get("operation_sha256") for r in feed.get("reports", [])]
+                   == [digest], "the report feed names the operation: %s %s" % (status, feed))
+            s.BUSINESS_API_CALLERS = {c.sha256_hex(BUSINESS_TOKEN.encode()): ("pay-api", ("operations",))}
+            status, payload = business_call("POST", verify, ask)
+            expect((status, payload.get("error", {}).get("code"))
+                   == (409, "integrity_operation_scan_used"),
+                   "a second verification is refused: %s %s" % (status, payload))
+        finally:
+            s._evaluate_risk_policy = saved_policy
 
 
 # The rows people change by hand (DESIGN.md 84): the key, the value, then the

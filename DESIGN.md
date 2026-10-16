@@ -6976,3 +6976,46 @@ end to end through the protected echo. Fourteen breakages caught (a learned exit
 eligibility rule not denying, the policy ignored, the row without answers, a silent refusal, a request or a
 session not granted, observe mode called settings, the scan's or the request's proof unsaid, points
 dropped, a reason unclassified, a missing measurement ignored, the device memory ignored).
+
+### 84.3 Item 2 — a scan made for one operation (migration 027, schema 27)
+
+**Asked for.** Item 2: a fresh, complete scan for payments and similar operations. §76 built
+`complete_evidence_paths` (fresh and complete); its open part was binding a scan to the exact operation it
+approves — the 2026-10-13 review: *"bind any additional authorization to the exact operation and
+session. Fresh challenges make replay harder; they do not independently prove that measurements were
+collected afresh"*; the 2026-10-16 review: *"a valid login, clean earlier scan or app-supplied risk result
+must not authorize arbitrary later actions … it should be a release gate for integrations that need it."*
+
+**Built.**
+- `POST /v1/integrity/challenge` takes an optional `operation` — method, path, query, body SHA-256, the
+  fields that request's access proof signs; `_operation_digest` hashes their canonical JSON and refuses a
+  malformed one (400 `invalid_operation`). The challenge row and then the report row keep
+  `operation_sha256`; both answers return it. Older clients send no operation and change nothing.
+- On `operation_scan_paths` (DBA, default empty) a request names its scan in `X-Integrity-Report`.
+  `_operation_scan` accepts it only if this installation made it for exactly this request
+  (`_this_operation`, compared in constant time), within `operation_scan_max_age_seconds` (120, 10–600)
+  and complete; `_consume_operation_scan` then records its one use in `operation_scan_uses` — the
+  access-proof nonce pattern, a duplicate primary key is the second use, portable to both engines. The
+  integrity gate and the relationship policy judge **that** scan (`state=` / `integrity_state=`), not
+  the latest; the decision's context names it (`operation_scan`).
+- Used up as presented, not when the request succeeds: simpler, with no window between check and use; the
+  price is a new scan for a retry after another refusal, documented.
+- Observe mode refuses nothing: the would-be refusal is recorded (`context.operation_scan.problem`), the
+  request is judged on the latest scan, and the assessment calls for `scan`.
+- `POST /v1/business/operation-scans/verify` (new role `operations`) does the same for an operation the
+  business's own backend performs: the scan checked and used up (`used_by` = the caller), a decision
+  evaluated on it and stored (`event_type operation_check`), for the operation's path (`_judged_path`,
+  so required-measurement and complete-evidence paths apply to the operation, not to the business URL),
+  with the address the backend saw (`client_address`, classified; `_client_address` replaces
+  `request.remote_addr` there, and no User-Agent is recorded). The backend enforces the answer.
+- The report feed names each scan's operation.
+
+Gate: `a_scan_approves_only_the_operation_it_was_made_for` — the digest and its refusals; challenge and
+report bound; six refusals; the bound scan judged though the latest says otherwise, both ways; one use;
+observe mode; the decision naming its scan or the skipped refusal; the business verification with and
+without its role, for another operation, once, with the backend's address and the operation's path; the
+feed. Seventeen breakages caught.
+
+**Not built.** Binding to a *session* as well as an installation: the installation key already signs both
+the scan and the request, and the access proof binds the request to its token. A Flutter harness button
+for an operation scan is in 84.10.
