@@ -23,6 +23,11 @@ import 'package:uuid/uuid.dart';
 //   flutter run --dart-define=API_BASE_URL=https://<host>
 const String apiBaseUrl = String.fromEnvironment('API_BASE_URL');
 
+/// Route 3 (DESIGN.md 84.8): the identity backend that vouches for a user with
+/// one phone -- tools/identity_backend_example.py, or your own. Empty: the
+/// harness offers no route-3 button.
+const String identityBackendUrl = String.fromEnvironment('IDENTITY_BACKEND_URL');
+
 const String injectedStolenRefreshToken = String.fromEnvironment(
   'STOLEN_REFRESH_TOKEN',
   defaultValue: '',
@@ -1559,16 +1564,20 @@ class DeviceApi {
     return DeviceSummary.fromJson(value);
   }
 
+  /// A challenge for a scan; with [operation] -- method, path, query and
+  /// the body's SHA-256 of the one request the scan is to approve -- a scan
+  /// made for that request alone (DESIGN.md 84.3).
   Future<Map<String, dynamic>> integrityChallenge({
     required String deviceToken,
     required InstallationIdentity signingIdentity,
+    Map<String, dynamic>? operation,
   }) {
     return _protectedRequest(
       'POST',
       '/v1/integrity/challenge',
       bearerToken: deviceToken,
       signingIdentity: signingIdentity,
-      body: <String, dynamic>{},
+      body: <String, dynamic>{'operation': ?operation},
     );
   }
 
@@ -1685,6 +1694,7 @@ class DeviceApi {
     String? stepUpFactor,
     Future<String> Function(String payload)? signStepUp,
     String? appPin,
+    String? integrityReportId,
   }) {
     return _postWithStepUp(
       path: '/v1/account/sensitive-echo',
@@ -1694,7 +1704,24 @@ class DeviceApi {
       stepUpFactor: stepUpFactor,
       signStepUp: signStepUp,
       appPin: appPin,
+      integrityReportId: integrityReportId,
     );
+  }
+
+  /// The operation a scan is to approve, described exactly as this client
+  /// will send it: what the challenge names (DESIGN.md 84.3).
+  static Map<String, dynamic> describeOperation(
+    String method,
+    String path,
+    Map<String, dynamic> body,
+  ) {
+    return <String, dynamic>{
+      'method': method.toUpperCase(),
+      'path': path,
+      'query': '',
+      'body_sha256':
+          crypto.sha256.convert(utf8.encode(jsonEncode(body))).toString(),
+    };
   }
 
   /// A protected POST that may also carry a step-up proof v2 over exactly
@@ -1709,6 +1736,7 @@ class DeviceApi {
     String? stepUpFactor,
     Future<String> Function(String payload)? signStepUp,
     String? appPin,
+    String? integrityReportId,
   }) async {
     final List<int> nonceBytes = _freshNonce();
     final String encodedBody = jsonEncode(body);
@@ -1760,6 +1788,7 @@ class DeviceApi {
         'X-Access-Signature': fixture.signature,
         ...stepUp,
         if (appPin != null && appPin.isNotEmpty) 'X-App-PIN': appPin,
+        'X-Integrity-Report': ?integrityReportId,
       },
     );
   }
@@ -1844,6 +1873,7 @@ class DeviceApi {
     String? stepUpFactor,
     Future<String> Function(String payload)? signStepUp,
     String? appPin,
+    String? assertion,
   }) async {
     final Map<String, dynamic> value = await _postWithStepUp(
       path: '/v1/auth/upgrade',
@@ -1852,12 +1882,58 @@ class DeviceApi {
       body: <String, dynamic>{
         'route': route,
         'request_id': ?requestId,
+        'assertion': ?assertion,
       },
       stepUpFactor: stepUpFactor,
       signStepUp: signStepUp,
       appPin: appPin,
     );
     return AccountSession.fromApi(value);
+  }
+
+  /// Route 3 (DESIGN.md 84.8): the identity backend checks the user's
+  /// one-time code and signs the claims this server handed out for the
+  /// request. Returns the signed assertion.
+  Future<String> requestIdentityAssertion({
+    required Map<String, dynamic> claims,
+    required String otp,
+  }) async {
+    if (identityBackendUrl.isEmpty) {
+      throw ApiException(
+        'No IDENTITY_BACKEND_URL was provided at build time.',
+        code: 'identity_backend_missing',
+      );
+    }
+    if (kReleaseMode &&
+        !identityBackendUrl.toLowerCase().startsWith('https://')) {
+      throw ApiException(
+        'IDENTITY_BACKEND_URL must be an https:// URL in a release build.',
+        code: 'identity_backend_insecure',
+      );
+    }
+    final String base = identityBackendUrl.endsWith('/')
+        ? identityBackendUrl.substring(0, identityBackendUrl.length - 1)
+        : identityBackendUrl;
+    final http.Response response = await _client
+        .post(
+          Uri.parse('$base/assertions'),
+          headers: const <String, String>{'Content-Type': 'application/json'},
+          body: jsonEncode(<String, dynamic>{'claims': claims, 'otp': otp}),
+        )
+        .timeout(_networkTimeout);
+    final Object? decoded =
+        response.body.isEmpty ? null : jsonDecode(response.body);
+    if (response.statusCode != 200 ||
+        decoded is! Map ||
+        decoded['assertion'] is! String) {
+      throw ApiException(
+        'The identity backend did not vouch: ${response.statusCode} '
+        '${decoded is Map ? decoded['error'] : response.body}',
+        statusCode: response.statusCode,
+        code: 'identity_backend_refused',
+      );
+    }
+    return decoded['assertion'] as String;
   }
 
   /// Starts an upgrade another party must confirm: `approval` (route 2).
@@ -2454,10 +2530,12 @@ class DeviceRecognitionController extends ChangeNotifier {
     String token,
     InstallationIdentity currentIdentity, {
     String? testFixture,
+    Map<String, dynamic>? operation,
   }) async {
     final Map<String, dynamic> challenge = await _api.integrityChallenge(
       deviceToken: token,
       signingIdentity: currentIdentity,
+      operation: operation,
     );
     final String challengeId = challenge['challenge_id'] as String;
     final String nonce = challenge['nonce'] as String;
@@ -3890,6 +3968,7 @@ class DeviceRecognitionController extends ChangeNotifier {
     String route, {
     bool withStepUp = false,
     String? requestId,
+    String? assertion,
   }) {
     limitedSessionResult = null;
     return _run('Upgrading the session ($route)…', () async {
@@ -3924,6 +4003,7 @@ class DeviceRecognitionController extends ChangeNotifier {
                   )
               : null,
           appPin: withStepUp ? _appPinOrNull : null,
+          assertion: assertion,
         );
         accountSession = upgraded;
         latestPolicy = upgraded.policy ?? latestPolicy;
@@ -3958,6 +4038,119 @@ class DeviceRecognitionController extends ChangeNotifier {
               '${state == null ? '' : ' state=$state'}',
           if (causes != null) 'Still limited by: $causes',
           if (routes != null) 'Routes open: $routes',
+        ]);
+      }
+    });
+  }
+
+  /// Whether this build can ask an identity backend to vouch (route 3).
+  bool get identityBackendConfigured => identityBackendUrl.isNotEmpty;
+
+  /// Route 3 (DESIGN.md 84.8), the way back for a user with one phone: the
+  /// server hands out the claims for this request, the identity backend
+  /// checks the user's one-time code [otp] and signs them, and the session
+  /// upgrades with that signature.
+  Future<void> upgradeWithIdentityBackend(String otp) async {
+    limitedSessionResult = null;
+    final AccountSession? session = accountSession;
+    final InstallationIdentity? currentIdentity = identity;
+    if (session == null || currentIdentity == null) {
+      _recordLimited(<String>['Log in first.']);
+      return;
+    }
+    String? requestId;
+    String? assertion;
+    await _run('Asking your identity provider to vouch…', () async {
+      try {
+        final Map<String, dynamic> value = await _api.requestUpgrade(
+          accessToken: session.accessToken,
+          signingIdentity: currentIdentity,
+          route: 'assertion',
+        );
+        final Object? claims = value['assertion_claims'];
+        if (claims is! Map) {
+          throw ApiException('The server handed out no claims to sign.');
+        }
+        requestId = value['request_id'] as String?;
+        assertion = await _api.requestIdentityAssertion(
+          claims: Map<String, dynamic>.from(claims),
+          otp: otp.trim(),
+        );
+      } on ApiException catch (error) {
+        _recordLimited(<String>[
+          'NOT VOUCHED: ${error.code ?? error.message}',
+          error.message,
+        ]);
+      }
+    });
+    if (requestId != null && assertion != null) {
+      await _upgrade('assertion', requestId: requestId, assertion: assertion);
+    }
+  }
+
+  /// Item 2 of DESIGN.md 84 (84.3): a sensitive operation with a scan made
+  /// for it alone. The challenge names this exact request -- method, path,
+  /// query, body hash -- and the request carries the scan's report_id; on the
+  /// DBA's operation_scan_paths the server judges that scan, once.
+  Future<void> testSensitiveWithOperationScan() {
+    stepUpTestResult = null;
+    return _run('Scanning for one sensitive operation…', () async {
+      final AccountSession? session = accountSession;
+      final InstallationIdentity? currentIdentity = identity;
+      if (session == null || currentIdentity == null) {
+        throw ApiException('Create or log in to an account first.');
+      }
+      final Map<String, dynamic> body = <String, dynamic>{
+        'operation': 'transfer',
+        'amount_minor': 2500,
+        'probe_id': Uuid().v4(),
+      };
+      final Map<String, dynamic> operation = DeviceApi.describeOperation(
+        'POST',
+        '/v1/account/sensitive-echo',
+        body,
+      );
+      final String deviceProofToken = await _freshDeviceToken();
+      deviceToken = deviceProofToken;
+      final IntegrityDecision scan = await _collectIntegrityWithToken(
+        deviceProofToken,
+        currentIdentity,
+        operation: operation,
+      );
+      try {
+        final Map<String, dynamic> value = await _api.sensitiveEcho(
+          accessToken: session.accessToken,
+          signingIdentity: currentIdentity,
+          body: body,
+          integrityReportId: scan.reportId,
+        );
+        final Object? bound = value['operation_scan'];
+        _recordStepUp(<String>[
+          'PASS: the operation passed with the scan made for it',
+          'POST /v1/account/sensitive-echo: 200 report=${scan.reportId}',
+          'operation_scan: ${bound ?? 'not on the DBA\'s operation_scan_paths'}',
+        ]);
+        try {
+          await _api.sensitiveEcho(
+            accessToken: session.accessToken,
+            signingIdentity: currentIdentity,
+            body: body,
+            integrityReportId: scan.reportId,
+          );
+          _recordStepUp(<String>[
+            stepUpTestResult ?? '',
+            'Second use: 200 (observe mode records it, or the path is not listed)',
+          ]);
+        } on ApiException catch (error) {
+          _recordStepUp(<String>[
+            stepUpTestResult ?? '',
+            'Second use: ${error.statusCode} ${error.code}',
+          ]);
+        }
+      } on ApiException catch (error) {
+        _recordStepUp(<String>[
+          'REFUSED: ${error.code}',
+          'POST /v1/account/sensitive-echo: ${error.statusCode} ${error.code}',
         ]);
       }
     });
@@ -4339,6 +4532,7 @@ class _DeviceRecognitionPageState extends State<DeviceRecognitionPage> {
   final TextEditingController _stepUpPasswordController =
       TextEditingController();
   final TextEditingController _appPinController = TextEditingController();
+  final TextEditingController _identityOtpController = TextEditingController();
   final TextEditingController _appPinPasswordController =
       TextEditingController();
   // The app PIN section is protected while either of its fields has focus,
@@ -4400,6 +4594,7 @@ class _DeviceRecognitionPageState extends State<DeviceRecognitionPage> {
     _stolenAccessController.dispose();
     _stepUpPasswordController.dispose();
     _appPinController.dispose();
+    _identityOtpController.dispose();
     _appPinPasswordController.dispose();
     _appPinFocus.dispose();
     _appPinPasswordFocus.dispose();
@@ -5031,6 +5226,13 @@ class _DeviceRecognitionPageState extends State<DeviceRecognitionPage> {
                       : _controller.testSensitiveWithStepUp,
                   child: const Text('Sensitive op with step-up'),
                 ),
+                OutlinedButton(
+                  onPressed: _controller.busy ||
+                          _controller.accountSession == null
+                      ? null
+                      : _controller.testSensitiveWithOperationScan,
+                  child: const Text('Sensitive op with a scan made for it'),
+                ),
               ],
             ),
             if (_controller.accountSession != null) ...<Widget>[
@@ -5265,6 +5467,31 @@ class _DeviceRecognitionPageState extends State<DeviceRecognitionPage> {
                 ),
               ],
             ),
+            if (_controller.identityBackendConfigured) ...<Widget>[
+              const SizedBox(height: 12),
+              const Text(
+                'One phone only? Your identity provider can vouch for you: '
+                'type the code from your authenticator app.',
+              ),
+              const SizedBox(height: 8),
+              TextField(
+                key: const Key('identity_otp'),
+                controller: _identityOtpController,
+                keyboardType: TextInputType.number,
+                decoration: const InputDecoration(
+                  labelText: 'One-time code',
+                  border: OutlineInputBorder(),
+                ),
+              ),
+              const SizedBox(height: 8),
+              FilledButton.tonal(
+                onPressed: busy || !signedIn
+                    ? null
+                    : () => _controller
+                        .upgradeWithIdentityBackend(_identityOtpController.text),
+                child: const Text('Upgrade with my identity provider'),
+              ),
+            ],
             if (_controller.waitingForApproval) ...<Widget>[
               const SizedBox(height: 12),
               Row(
