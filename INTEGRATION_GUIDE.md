@@ -172,7 +172,7 @@ differ, or when the PostgreSQL and SQL Server migrations seed different rows. A 
 switches its rule off; the server holds a value to the bounds its description states.
 
 <!-- settings-reference:begin (tools/settings_reference.py --write; do not edit by hand) -->
-134 settings, seeded by migrations 003-025 with the owner's defaults; each row's own description.
+137 settings, seeded by migrations 003-025 with the owner's defaults; each row's own description.
 
 **Migration 003** — DBA-tunable risk policy settings
 
@@ -361,7 +361,6 @@ switches its rule off; the server holds a value to the bounds its description st
 | `device_admin_sideloaded_refuses` | `0` | Eligibility rule. 1 = in enforce mode a phone with a sideloaded device-administrator app is refused until it is deactivated and a new scan is sent; 0 (owner default) = no refusal. |
 | `device_admin_non_system_refuses` | `0` | Eligibility rule. 1 = the same for any device-administrator app that is not part of the system, store apps included (company phone management among them). 0 (owner default) = no refusal. |
 | `remote_access_app_refuses` | `0` | Eligibility rule. 1 = in enforce mode a phone with a remote-control app installed (AnyDesk, TeamViewer QuickSupport, RustDesk, AirDroid) is refused until it is removed and a new scan is sent; 0 (owner default) = no refusal. |
-| `screen_capture_refuses` | `0` | Eligibility rule. 1 = in enforce mode a phone whose screen was being recorded or mirrored during the scan is refused until that stops and a new scan is sent; 0 (owner default) = no refusal. |
 | `mock_location_refuses` | `0` | Eligibility rule. 1 = in enforce mode a phone whose last location came from a mock-location app is refused until a real location and a new scan are sent; 0 (owner default) = no refusal. |
 | `security_patch_max_age_days` | `365` | Days an Android phone's security patch level may age before android_security_patch_outdated is recorded. Owner default 365; 0 = never. 0-3650. |
 | `security_patch_outdated_refuses` | `0` | Eligibility rule. 1 = in enforce mode a phone whose security patch is older than security_patch_max_age_days is refused until it is updated and a new scan is sent; 0 (owner default) = no refusal. |
@@ -374,7 +373,6 @@ switches its rule off; the server holds a value to the bounds its description st
 | `device_admin_sideloaded_points` | `30` | Points for android_device_admin_sideloaded: malware uses it to resist removal. 0 = recorded only. |
 | `device_admin_non_system_points` | `0` | Points for android_device_admin_non_system: company phone management too. Owner default 0. Added to the sideloaded points. |
 | `remote_access_app_points` | `20` | Points for android_remote_access_app: installed, not necessarily running. With a sideloaded Accessibility service it reaches review. 0 = recorded only. |
-| `screen_capture_points` | `30` | Points for android_screen_captured and ios_screen_captured: recorded, cast or mirrored during the scan, or another display on. 0 = recorded only. |
 | `mock_location_points` | `40` | Points for android_mock_location and ios_mock_location: a location simulated by an app. 0 = recorded only. |
 | `security_patch_outdated_points` | `10` | Points for android_security_patch_outdated: unpatched phones are legitimate users too, so it nudges, never decides. 0 = recorded only. |
 
@@ -387,6 +385,11 @@ switches its rule off; the server holds a value to the bounds its description st
 | `http_proxy_points` | `15` | Points for android_http_proxy and ios_http_proxy: traffic-editing tools set one, so do some company networks. 0 = recorded only. |
 | `accessibility_hidden_points` | `30` | Points for android_accessibility_hidden: a service the system setting names but the Accessibility list omits, as an Android bug allowed malware until the December 2022 patch. |
 | `accessibility_hidden_refuses` | `0` | Eligibility rule. 1 = in enforce mode a phone with a hidden Accessibility service is refused until it is off and a new scan is sent; 0 (owner default) = no refusal. |
+| `external_display_points` | `10` | Points for android_external_display and ios_external_display: a display besides the phone's own was on during the scan -- a cast, a mirror or a monitor, not proof of capture. 0 = recorded only. |
+| `external_display_refuses` | `0` | Eligibility rule. 1 = in enforce mode a phone with another display on is refused until it is disconnected and a new scan is sent; 0 (owner default) = no refusal. |
+| `location_max_age_seconds` | `600` | How recent the phone's last location must be to count: an older fake-GPS fix is kept in the report but not scored, and an older location reads as stale. 30-86400. |
+| `screen_capture_points` | `30` | Points for android_screen_captured and ios_screen_captured: the app's screen recorded or mirrored during the scan. Another display alone is external_display_points. 0 = recorded only. *(Seeded by migration 024; this migration describes it.)* |
+| `screen_capture_refuses` | `0` | Eligibility rule. 1 = in enforce mode a phone whose screen was being recorded or mirrored during the scan is refused until that stops and a new scan is sent; 0 (owner default) = no refusal. *(Seeded by migration 024; this migration describes it.)* |
 | `source_vpn_listed_points` | `10` | Points when a request comes from an address on the public VPN list shipped with the server. 0 = recorded only. *(Seeded by migration 023 at `0`; this migration's default, set only where it is still `0`.)* |
 | `source_tor_exit_points` | `30` | Points when a request comes from a Tor exit: on its own, a step-up. 0 = recorded only. *(Seeded by migration 023 at `0`; this migration's default, set only where it is still `0`.)* |
 | `source_hosting_points` | `15` | Points when a request comes from a hosting or data-centre network not known as a VPN: cloud phones and bots, also some company networks. 0 = recorded only. *(Seeded by migration 023 at `0`; this migration's default, set only where it is still `0`.)* |

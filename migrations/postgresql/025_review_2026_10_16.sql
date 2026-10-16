@@ -24,7 +24,12 @@ INSERT INTO risk_policy_settings (setting_key, setting_value, description) VALUE
     ('vpn_active_points', '10', 'Points for android_vpn_active and ios_vpn_active (iOS infers it): privacy and work VPNs are common, so it nudges. 0 = recorded only.'),
     ('http_proxy_points', '15', 'Points for android_http_proxy and ios_http_proxy: traffic-editing tools set one, so do some company networks. 0 = recorded only.'),
     ('accessibility_hidden_points', '30', 'Points for android_accessibility_hidden: a service the system setting names but the Accessibility list omits, as an Android bug allowed malware until the December 2022 patch.'),
-    ('accessibility_hidden_refuses', '0', 'Eligibility rule. 1 = in enforce mode a phone with a hidden Accessibility service is refused until it is off and a new scan is sent; 0 (owner default) = no refusal.')
+    ('accessibility_hidden_refuses', '0', 'Eligibility rule. 1 = in enforce mode a phone with a hidden Accessibility service is refused until it is off and a new scan is sent; 0 (owner default) = no refusal.'),
+    ('external_display_points', '10', 'Points for android_external_display and ios_external_display: a display besides the phone''s own was on during the scan -- a cast, a mirror or a monitor, not proof of capture. 0 = recorded only.'),
+    ('external_display_refuses', '0', 'Eligibility rule. 1 = in enforce mode a phone with another display on is refused until it is disconnected and a new scan is sent; 0 (owner default) = no refusal.'),
+    ('location_max_age_seconds', '600', 'How recent the phone''s last location must be to count: an older fake-GPS fix is kept in the report but not scored, and an older location reads as stale. 30-86400.'),
+    ('screen_capture_points', '30', 'Points for android_screen_captured and ios_screen_captured: the app''s screen recorded or mirrored during the scan. Another display alone is external_display_points. 0 = recorded only.'),
+    ('screen_capture_refuses', '0', 'Eligibility rule. 1 = in enforce mode a phone whose screen was being recorded or mirrored during the scan is refused until that stops and a new scan is sent; 0 (owner default) = no refusal.')
 ON CONFLICT (setting_key) DO UPDATE SET description = EXCLUDED.description;
 
 UPDATE risk_policy_settings

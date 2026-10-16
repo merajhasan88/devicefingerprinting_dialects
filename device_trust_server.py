@@ -1432,6 +1432,9 @@ _RISK_SETTING_KINDS = {
     "http_proxy_points": "int",
     "accessibility_hidden_points": "int",
     "accessibility_hidden_refuses": "bool",
+    "external_display_points": "int",
+    "external_display_refuses": "bool",
+    "location_max_age_seconds": "int",
     "limited_session_paths": "paths",
     "limited_session_integrity_verdicts": "list:elevated,review",
     "limited_session_policy_actions": "list:step_up,review",
@@ -1513,6 +1516,7 @@ _RISK_SETTING_MINIMUMS = {
     "vpn_exit_min_share_percent": 1,
     "vpn_exit_window_days": 1,
     "conditions_points_cap": 1,
+    "location_max_age_seconds": 30,
 }
 # Upper bounds a value must also meet. The session limits are ours (DESIGN.md
 # 79): a refresh token idle for more than 90 days, or a session older than a
@@ -1527,6 +1531,7 @@ _RISK_SETTING_MAXIMUMS = {
     "vpn_exit_window_days": 365,
     "security_patch_max_age_days": 3650,
     "conditions_points_cap": 100,
+    "location_max_age_seconds": 86400,
 }
 _RISK_SETTING_BOOL_WORDS = ("0", "1", "true", "false", "yes", "no", "on", "off")
 # Rows whose absence would silently weaken a gate instead of restoring the
@@ -2807,13 +2812,16 @@ _MAX_LISTED_APPS = 64
 
 
 def _app_source(entry, stores):
-    """system, store, sideloaded or unknown for one app the phone listed.
+    """Where one app the phone listed came from, by its installer of record:
+    system, store, no_installer, other_installer or unknown.
 
     system: the phone's own (FLAG_SYSTEM, updates included). store: installed by
-    one of the stores. sideloaded: installed by anything else -- a browser, a
-    file manager, adb, another app's installer, as droppers do -- or by nothing.
-    unknown: the phone could not see the app's details; unknown is never
-    evidence, as with SELinux.
+    one of the stores. no_installer: none on record -- adb, some preloads.
+    other_installer: installed by another app -- a browser, a file manager, a
+    malware dropper. The last two are what the _sideloaded findings mean; the
+    installer of record says where an app came from, not whether it is benign
+    (review F7). unknown: Android hid the app's details; never evidence, as
+    with SELinux.
     """
     if not isinstance(entry, dict):
         return "unknown"
@@ -2822,8 +2830,13 @@ def _app_source(entry, stores):
         return "system"
     installer = entry.get("installer")
     if system is False and isinstance(installer, str):
-        return "store" if installer in stores else "sideloaded"
+        if installer in stores:
+            return "store"
+        return "other_installer" if installer else "no_installer"
     return "unknown"
+
+
+_SIDELOADED = ("no_installer", "other_installer")
 
 
 def _listed_apps(entries):
@@ -2832,10 +2845,25 @@ def _listed_apps(entries):
             if isinstance(entry, dict) and isinstance(entry.get("package"), str)]
 
 
-def _package_names(entries):
-    """Package names for a reason's message: plain characters only, five at most."""
-    names = sorted({re.sub(r"[^A-Za-z0-9._]", "", entry["package"])[:100] for entry in entries})
-    names = [name for name in names if name]
+def _plain(text, limit=100):
+    return re.sub(r"[^A-Za-z0-9._/]", "", str(text))[:limit]
+
+
+def _package_names(entries, stores=None):
+    """Package names for a reason's message, plain characters only, five at
+    most; with the stores, each says where it came from (no installer, or the
+    app that installed it)."""
+    named = {}
+    for entry in entries:
+        name = _plain(entry["package"]).replace("/", "")
+        if not name:
+            continue
+        if stores is not None and _app_source(entry, stores) == "no_installer":
+            name += " (no installer)"
+        elif stores is not None and _app_source(entry, stores) == "other_installer":
+            name += " (installed by %s)" % _plain(entry.get("installer"), 64).replace("/", "")
+        named[name] = True
+    names = sorted(named)
     shown = ", ".join(names[:5])
     return shown + (" and %d more" % (len(names) - 5) if len(names) > 5 else "")
 
@@ -2888,12 +2916,12 @@ def _score_access_holders(reasons, probes):
     for probe, field, sideloaded_code, non_system_code, what in _ACCESS_HOLDERS:
         value = _probe(probes, probe).get(field)
         entries = _listed_apps([value] if isinstance(value, dict) else value)
-        sideloaded = [e for e in entries if _app_source(e, stores) == "sideloaded"]
+        sideloaded = [e for e in entries if _app_source(e, stores) in _SIDELOADED]
         not_system = [e for e in entries if e.get("system") is False]
         if sideloaded:
             _integrity_reason(reasons, sideloaded_code, points[sideloaded_code],
                               "%s: %s." % (what % "no app store installed",
-                                           _package_names(sideloaded)))
+                                           _package_names(sideloaded, stores)))
             total += points[sideloaded_code]
         if not_system:
             _integrity_reason(reasons, non_system_code, points[non_system_code],
@@ -2913,33 +2941,46 @@ def _score_access_holders(reasons, probes):
     remote = _listed_apps(_probe(probes, "other_access").get("remote_access_apps"))
     if remote:
         _integrity_reason(reasons, "android_remote_access_app", points["android_remote_access_app"],
-                          "A remote-control app is installed: %s." % _package_names(remote))
+                          "A remote-control app is installed (it may not be running): %s."
+                          % _package_names(remote))
         total += points["android_remote_access_app"]
     return total
 
 
 def _score_capture_and_location(reasons, probes, platform):
-    """Reasons for a screen recorded or mirrored during the scan, and for a
-    location simulated by an app (DESIGN.md 82); returns their points."""
+    """Reasons for a screen recorded during the scan, another display on, and a
+    location simulated by an app (DESIGN.md 82, 83); returns their points.
+
+    Recording and an extra display are separate findings (review F7): Android
+    15's callback and iOS's isCaptured say the app's screen is being captured;
+    an extra display only says one is on -- a cast, a mirror or a monitor.
+    A simulated fix older than location_max_age_seconds is kept in the report
+    but not scored: a cached fix says the app ran, not that it runs now."""
     total = 0
     screen = _probe(probes, "screen_capture")
-    displays = _as_int(screen.get("external_displays"))
-    if _as_bool(screen.get("recording")) or displays > 0:
+    if _as_bool(screen.get("recording")):
         points = _risk_setting_int("screen_capture_points", 30)
         _integrity_reason(reasons,
                           "android_screen_captured" if platform == "android" else "ios_screen_captured",
-                          points,
-                          ("The app's screen was being recorded or mirrored during the scan."
-                           if _as_bool(screen.get("recording")) else
-                           "%d display(s) besides the phone's own were on during the scan: "
-                           "casting, mirroring or an external screen." % displays))
+                          points, "The app's screen was being recorded or mirrored during the scan.")
         total += points
-    if _as_bool(_probe(probes, "mock_location").get("mock")):
+    displays = _as_int(screen.get("external_displays"))
+    if displays > 0:
+        points = _risk_setting_int("external_display_points", 10)
+        _integrity_reason(reasons,
+                          "android_external_display" if platform == "android" else "ios_external_display",
+                          points,
+                          "%d display(s) besides the phone's own were on during the scan: a cast, a "
+                          "mirror or an external screen." % displays)
+        total += points
+    mock = _probe(probes, "mock_location")
+    age = mock.get("age_seconds")
+    fresh = not isinstance(age, int) or age <= _risk_setting_int("location_max_age_seconds", 600)
+    if _as_bool(mock.get("mock")) and fresh:
         points = _risk_setting_int("mock_location_points", 40)
         _integrity_reason(reasons,
                           "android_mock_location" if platform == "android" else "ios_mock_location",
-                          points,
-                          "The phone's last location was simulated by an app.")
+                          points, "The phone's last location was simulated by an app.")
         total += points
     return total
 
@@ -3588,6 +3629,10 @@ _ELIGIBILITY_RULES = (
     # DESIGN.md 83.
     ("accessibility_hidden_refuses", "android_accessibility_hidden",
      "Turn off Accessibility for the service the phone hides, then send a new integrity scan."),
+    ("external_display_refuses", "android_external_display",
+     "Disconnect or stop casting to the other display, then send a new integrity scan."),
+    ("external_display_refuses", "ios_external_display",
+     "Disconnect or stop casting to the other display, then send a new integrity scan."),
 )
 
 

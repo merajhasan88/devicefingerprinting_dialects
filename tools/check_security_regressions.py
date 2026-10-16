@@ -4810,7 +4810,8 @@ def apps_holding_access_are_judged_by_their_source():
             side, wide = found.get(prefix + "_sideloaded"), found.get(prefix + "_non_system")
             expect(side is not None and wide is not None, "%s: both reasons: %s" % (prefix, sorted(found)))
             if prefix != "android_keyboard":
-                expect("com.evil.reader" in side["message"] and "com.test.sideloaded" in side["message"]
+                expect("com.evil.reader (installed by com.cleaner.dropper)" in side["message"]
+                       and "com.test.sideloaded (no installer)" in side["message"]
                        and "com.bitwarden.app" not in side["message"]
                        and "talkback" not in side["message"] and "com.hidden.app" not in side["message"],
                        "%s: sideloaded names the two only: %s" % (prefix, side["message"]))
@@ -4868,33 +4869,45 @@ def apps_holding_access_are_judged_by_their_source():
 
 @check
 def screen_capture_and_mock_locations_score_and_coordinates_are_bounded():
-    """DESIGN.md 82. A screen recorded, cast or mirrored during the scan scores
-    screen_capture_points (owner default 30), a location simulated by an app
-    mock_location_points (40), on both platforms. Coordinates are stored as
-    sent when requested; one outside its range, of the wrong type, or not
-    finite makes the report malformed."""
+    """DESIGN.md 82, 83. The app's screen recorded or mirrored during the scan
+    scores screen_capture_points (owner default 30); another display on --
+    a cast, a mirror or a monitor -- is its own finding, external_display_points
+    (10), review F7; a location simulated by an app mock_location_points (40),
+    but only while the fix is younger than location_max_age_seconds (600). On
+    both platforms. Coordinates are stored as sent when requested; one outside
+    its range, of the wrong type, or not finite makes the report malformed."""
     fix = {"status": "ok", "permission": "precise", "latitude": -33.8688, "longitude": 151.2093,
            "accuracy_m": 12.5, "age_seconds": 40, "provider": "gps"}
     with policy(optional_measurements=_ALL_OPTIONAL):
         for platform in ("android", "ios"):
             status, plain = send_report(platform, clean(platform))
-            for screen, expected in (({"status": "ok", "recording": True, "external_displays": 0}, True),
-                                     ({"status": "ok", "recording": False, "external_displays": 1}, True),
-                                     ({"status": "ok", "recording": False, "external_displays": 0}, False),
-                                     ({"status": "ok", "external_displays": 0}, False)):
+            for screen, recorded, displayed in (
+                    ({"status": "ok", "recording": True, "external_displays": 0}, True, False),
+                    ({"status": "ok", "recording": False, "external_displays": 1}, False, True),
+                    ({"status": "ok", "recording": True, "external_displays": 2}, True, True),
+                    ({"status": "ok", "recording": False, "external_displays": 0}, False, False),
+                    ({"status": "ok", "external_displays": 0}, False, False)):
                 status, payload = send_report(platform, dict(clean(platform), screen_capture=screen))
-                found = _reasons_by_code(payload).get("%s_screen_captured" % platform)
-                expect(status == 200 and bool(found) == expected and (not found or found["points"] == 30)
-                       and payload["integrity"]["score"]
-                       == min(100, plain["integrity"]["score"] + (30 if expected else 0)),
-                       "%s: %s -> captured=%s: %s" % (platform, screen, expected, codes(payload)))
-            for mock, expected in ((True, True), (False, False)):
-                status, payload = send_report(platform, dict(
-                    clean(platform), mock_location={"status": "ok", "permission": "precise", "mock": mock,
-                                                    "age_seconds": 5}))
+                found = _reasons_by_code(payload)
+                captured = found.get("%s_screen_captured" % platform)
+                display = found.get("%s_external_display" % platform)
+                expect(status == 200 and bool(captured) == recorded and bool(display) == displayed
+                       and (not captured or captured["points"] == 30)
+                       and (not display or display["points"] == 10)
+                       and payload["integrity"]["score"] == min(100, plain["integrity"]["score"]
+                                                                + 30 * recorded + 10 * displayed),
+                       "%s: %s -> recorded=%s displayed=%s: %s"
+                       % (platform, screen, recorded, displayed, codes(payload)))
+            for mock, age, expected in ((True, 5, True), (True, 600, True), (True, 601, False),
+                                        (True, 30 * 86400, False), (True, None, True),
+                                        (False, 5, False)):
+                answer = {"status": "ok", "permission": "precise", "mock": mock}
+                if age is not None:
+                    answer["age_seconds"] = age
+                status, payload = send_report(platform, dict(clean(platform), mock_location=answer))
                 found = _reasons_by_code(payload).get("%s_mock_location" % platform)
                 expect(status == 200 and bool(found) == expected and (not found or found["points"] == 40),
-                       "%s: mock=%s: %s" % (platform, mock, codes(payload)))
+                       "%s: mock=%s, %s s old: %s" % (platform, mock, age, codes(payload)))
             status, payload = send_report(platform, dict(
                 clean(platform), mock_location={"status": "ok", "permission": "none"},
                 location={"status": "ok", "permission": "none"}))
@@ -4964,7 +4977,7 @@ def the_new_eligibility_rules_refuse_only_when_set():
     rules = [(rule, code) for rule, code, _ in s._ELIGIBILITY_RULES
              if rule not in ("developer_options_refuses", "adb_enabled_refuses",
                              "vpn_active_refuses", "http_proxy_refuses")]
-    expect(len(rules) == 15, "fifteen new rule-reason pairs: %s" % rules)
+    expect(len(rules) == 17, "seventeen new rule-reason pairs: %s" % rules)
     saved = (s._latest_integrity_state, s._device_integrity_memory, s.INTEGRITY_MODE)
     s._device_integrity_memory = lambda did, iid: None
     s.INTEGRITY_MODE = "enforce"

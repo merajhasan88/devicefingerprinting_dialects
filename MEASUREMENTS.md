@@ -209,9 +209,11 @@ incomplete scans in a row, under either setting.
 | `android_device_admin_sideloaded` | `device_admin_sideloaded_points` 30 |  |  | Android | A device-administrator app no app store installed is active; malware uses it to resist removal. Eligibility rule: `device_admin_sideloaded_refuses`. |
 | `android_device_admin_non_system` | `device_admin_non_system_points` 0 |  |  | Android | A device-administrator app that is not part of the system is active: company phone management too. Eligibility rule: `device_admin_non_system_refuses`. |
 | `android_remote_access_app` | `remote_access_app_points` 20 |  |  | Android | A remote-control app is installed (not necessarily running). Eligibility rule: `remote_access_app_refuses`. |
-| `android_screen_captured` | `screen_capture_points` 30 |  |  | Android | The app's screen was being recorded, or another display was on, during the scan. Eligibility rule: `screen_capture_refuses`. |
-| `ios_screen_captured` | `screen_capture_points` 30 |  |  | iOS | The screen was recorded, mirrored or on AirPlay, or another screen attached, during the scan. Eligibility rule: `screen_capture_refuses`. |
-| `android_mock_location` | `mock_location_points` 40 |  |  | Android | The phone's last location came from a mock-location app. Eligibility rule: `mock_location_refuses`. |
+| `android_screen_captured` | `screen_capture_points` 30 |  |  | Android | The app's screen was being recorded during the scan (Android 15 and later). Another display alone is `android_external_display`. Eligibility rule: `screen_capture_refuses`. |
+| `ios_screen_captured` | `screen_capture_points` 30 |  |  | iOS | The screen was recorded, mirrored or on AirPlay during the scan (`UIScreen.isCaptured`). Eligibility rule: `screen_capture_refuses`. |
+| `android_external_display` | `external_display_points` 10 |  |  | Android | A display besides the phone's own was on during the scan: a cast, a mirror or a monitor — not proof that the app's screen is captured. Eligibility rule: `external_display_refuses`. |
+| `ios_external_display` | `external_display_points` 10 |  |  | iOS | Another screen was attached during the scan. Eligibility rule: `external_display_refuses`. |
+| `android_mock_location` | `mock_location_points` 40 |  |  | Android | The phone's last location came from a mock-location app, and is younger than `location_max_age_seconds` (600; an older fix is kept, not scored). Eligibility rule: `mock_location_refuses`. |
 | `ios_mock_location` | `mock_location_points` 40 |  |  | iOS | The phone's last location was simulated by software. Eligibility rule: `mock_location_refuses`. |
 | `android_security_patch_outdated` | `security_patch_outdated_points` 10 |  |  | Android | The security patch level is older than `security_patch_max_age_days` (owner default 365; 0 = never). Eligibility rule: `security_patch_outdated_refuses`. |
 
