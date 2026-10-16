@@ -673,7 +673,7 @@ the report response, the integrity state and the stored report:
 
 | quality | meaning |
 |---|---|
-| `complete` | every requested probe ran and returned measurements that agree |
+| `complete` | every probe of the server's plan ran and returned measurements that agree. The optional measurements (section 14) do not count: a scan without them is still complete |
 | `partial` | code integrity compared only part of its targets (an advisory; the score is unchanged) |
 | `legacy` | the collector predates its platform's evidence contract (Android 3, iOS 2): scored as before, never complete — update the app |
 | `incomplete` | a requested probe failed, answered without its measurements, or could not measure (an unreadable process map, no thread enumerated) |
@@ -699,7 +699,9 @@ one complete scan resets the count. Legacy scans never count. `0` turns it off.
 `integrity_complete_evidence_required`** (`details.evidence_quality`, `age_seconds`,
 `max_age_seconds`), whatever the verdict, step-up proof or acceptance. Your app's remedy is to scan
 again right before the operation, and to update itself if it reports `legacy`. Listing a path forces
-users of older app versions to update before using it.
+users of older app versions to update before using it. Complete evidence covers the server's plan,
+not the optional measurements: to require those on a path, your DBA lists them in
+`required_measurements` and the path in `required_measurements_paths` (section 14, review F1).
 
 **Reading the scores.** A report's `score` and `verdict` include collection problems; `finding_score`
 does not. Analytics that look for compromise should read findings and quality separately: three
