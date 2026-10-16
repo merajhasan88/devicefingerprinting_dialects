@@ -1925,6 +1925,41 @@ def check_runtime_baseline(api, ctx):
     expect(st == 200, "the profile is retired afterwards: %s" % st)
 
 
+@check("business: observation metrics count decisions, restrictions and scans")
+def check_observation_metrics(api, ctx):
+    """DESIGN.md 84.7, item 7 of the eight of 2026-10-14. With
+    DEVICE_TRUST_BUSINESS_TOKEN holding the metrics role: after a scan and a
+    decision, the last ten minutes' metrics count them, every decision with
+    what it recommended; split by phone the two sets add up to the whole.
+    Skips otherwise."""
+    token = os.environ.get("DEVICE_TRUST_BUSINESS_TOKEN", "")
+    if not token:
+        raise Skip("set DEVICE_TRUST_BUSINESS_TOKEN (role metrics) to run this")
+    integrity_context(ctx)
+    inst, device, _ = integrity_session(api)
+    submit_report(api, inst, device)
+    st, pl = open_account(api, inst, device, "metrics-%s" % secrets.token_hex(4))
+    expect(st in (200, 201), "account open failed: %s %s" % (st, pl))
+    st, _ = protected(api, inst, "GET", "/v1/policy/me", pl["access_token"])
+    expect(st == 200, "policy check: %s" % st)
+    since = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 600))
+    business = {"Authorization": "Bearer " + token}
+    st, whole = api.call("GET", "/v1/business/metrics?since=%s" % since, headers=business)
+    if st == 403 and error_code(whole) == "business_role_missing":
+        raise Skip("DEVICE_TRUST_BUSINESS_TOKEN lacks the metrics role")
+    got = ((whole or {}).get("sets") or {}).get("all") or {}
+    decisions = got.get("decisions") or {}
+    expect(st == 200 and decisions.get("total", 0) >= 1 and got.get("scans", {}).get("total", 0) >= 1
+           and sum(decisions.get("by_recommendation", {}).values()) == decisions.get("total"),
+           "the window's decisions and scans: %s %s" % (st, {k: got.get(k) for k in ("decisions",)}))
+    st, split = api.call("GET", "/v1/business/metrics?since=%s&split=device" % since,
+                         headers=business)
+    sets = (split or {}).get("sets") or {}
+    expect(st == 200 and set(sets) <= {"tuning", "evaluation"}
+           and sum(v["scans"]["total"] for v in sets.values()) >= got["scans"]["total"],
+           "split by phone: %s %s" % (st, sorted(sets)))
+
+
 @check("risk: the source IP and User-Agent are kept only where the DBA says")
 def check_request_metadata(api, ctx):
     """DESIGN.md 80. A decision's context carries source_ip only under
