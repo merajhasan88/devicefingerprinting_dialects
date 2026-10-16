@@ -1889,6 +1889,42 @@ def check_business_event_rules(api, ctx):
            "the rule scores the decision, from the business: %s %s %s" % (st, found, findings))
 
 
+@check("integrity: a scan is held to the release profile published for its build")
+def check_runtime_baseline(api, ctx):
+    """DESIGN.md 84.6, item 6 of the eight of 2026-10-14. With
+    DEVICE_TRUST_BUSINESS_TOKEN holding the baselines role: a profile published
+    for the conformance build allowing no unlabelled executable region makes a
+    scan with one carry android_exec_outside_baseline at the DBA's points, and
+    name the profile; the profile is retired afterwards. Skips otherwise."""
+    token = os.environ.get("DEVICE_TRUST_BUSINESS_TOKEN", "")
+    if not token:
+        raise Skip("set DEVICE_TRUST_BUSINESS_TOKEN (role baselines) to run this")
+    integrity_context(ctx)
+    inst, device, _ = integrity_session(api)
+    business = {"Authorization": "Bearer " + token}
+    build = hashlib.sha256(b"conformance-apk").hexdigest()
+    st, published = api.call("POST", "/v1/business/runtime-baselines", headers=business,
+                             body_text=json.dumps({"platform": "android", "app_build": build,
+                                                   "release_label": "conformance",
+                                                   "anon_exec_max": 0}))
+    if st == 403 and error_code(published) == "business_role_missing":
+        raise Skip("DEVICE_TRUST_BUSINESS_TOKEN lacks the baselines role")
+    expect(st == 201, "publish: %s %s" % (st, published))
+    baseline_id = published["baseline"]["baseline_id"]
+    try:
+        scan = submit_report(api, inst, device,
+                             lambda probes: probes["exec_mappings"].update(anon_exec_unlabeled=1))
+        points = int(str(live_settings(api).get("exec_outside_baseline_points", "30")).strip())
+        found = reason_for(scan, "android_exec_outside_baseline") or {}
+        expect((scan.get("runtime_baseline") or {}).get("baseline_id") == baseline_id
+               and found.get("points") == points,
+               "held to the published profile: %s %s" % (scan.get("runtime_baseline"), found))
+    finally:
+        st, _ = api.call("POST", "/v1/business/runtime-baselines/%s/retire" % baseline_id,
+                         headers=business, body_text="{}")
+    expect(st == 200, "the profile is retired afterwards: %s" % st)
+
+
 @check("risk: the source IP and User-Agent are kept only where the DBA says")
 def check_request_metadata(api, ctx):
     """DESIGN.md 80. A decision's context carries source_ip only under
