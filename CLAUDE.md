@@ -116,7 +116,7 @@ was not measured (DESIGN.md 83).
 ## Commands
 
 ```bash
-# Conformance suite — the gate. 91 checks; needs `cryptography` (harness only).
+# Conformance suite — the gate. 94 checks; needs `cryptography` (harness only).
 python3 conformance_suite.py --base-url https://<endpoint>
 #   Scoring checks need the server started with INTEGRITY_ANDROID_CERT_SHA256 set to the
 #   certificate the suite prints, or empty to disable the allow-list.

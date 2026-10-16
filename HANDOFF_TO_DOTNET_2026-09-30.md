@@ -650,6 +650,8 @@ the rest is new fields to send or tolerate.
 - **Business API**, only if the SDK ships a backend helper: one token per caller with its roles
   (`BUSINESS_API_TOKENS`), 403 `business_role_missing`; PIN support needs a token with `pin_unlock` or
   `pin_reset`; an event may come back `rejected` with `event_id_conflict`.
-- **Suite:** still 91 checks; the PIN support checks skip when the business token lacks the role.
+- **Suite:** 94 checks — `check_measurement_status`, `check_required_measurements` (skips unless the
+  DBA requires measurements), `check_conditions_cap`; reports send `enabled_measurements`; the PIN
+  support checks skip when the business token lacks the role.
 
 **Verified on our side:** gate 118/118, offline. Schema 25 has not run live yet.

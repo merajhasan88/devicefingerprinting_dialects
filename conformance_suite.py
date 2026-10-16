@@ -953,6 +953,8 @@ def submit_report(api, installation, token, mutate=None, cert=None, enabled=()):
         "collector_version": {"android": 5, "ios": 4}.get(challenge["platform"], 1),
         "collected_at": int(time.time()),
         "probe_results": probes,
+        # Which optional measurements this app enabled (DESIGN.md 83).
+        "enabled_measurements": [name for name in OPTIONAL_NAMES if name in enabled],
         "version": 1,
     }
     payload_b64 = b64u(json.dumps(report).encode("utf-8"))
@@ -1544,6 +1546,145 @@ def check_access_holders(api, ctx):
     st, pl = protected(api, inst, "GET", "/v1/account/me", access)
     expect(st == 200 and not (pl.get("integrity") or {}).get("eligibility"),
            "a scan without it must clear it, got %s %s" % (st, error_code(pl)))
+
+
+@check("integrity: every scan reports each measurement's status and its settings version")
+def check_measurement_status(api, ctx):
+    """Review F1 and F4 (DESIGN.md 83). Every scan's answer gives the status of
+    every measurement the platform's collectors answer -- ok where measured,
+    not_enabled where the server asked and the app had not enabled it,
+    not_requested where the server did not ask -- with the app's
+    enabled_measurements, and the version of the settings it was scored
+    under, which the latest scan repeats as current."""
+    installation, token, _ = integrity_context(ctx)
+    sent = {}
+    decision = submit_report(api, installation, token, lambda probes: sent.update(
+        {name: (value or {}).get("status") for name, value in probes.items()}))
+    measured = decision.get("measurements") or {}
+    status = measured.get("status") or {}
+    expected = {"ok": "ok", "not_enabled": "not_enabled", None: "not_requested"}
+    wrong = {name: (state, sent.get(name)) for name, state in status.items()
+             if state != expected.get(sent.get(name), "?")}
+    expect(status and not wrong and set(sent) <= set(status),
+           "each measurement's status: wrong %s, unreported %s" % (wrong, set(sent) - set(status)))
+    expect(measured.get("enabled_by_app") == [], "enabled_by_app: %s" % measured.get("enabled_by_app"))
+    version = decision.get("policy_version") or ""
+    expect(len(version) == 16 and all(ch in "0123456789abcdef" for ch in version),
+           "policy_version: %r" % version)
+    st, me = protected(api, installation, "GET", "/v1/integrity/me", token)
+    latest = (me or {}).get("integrity") or {}
+    expect(st == 200 and latest.get("report_id") == decision.get("report_id")
+           and latest.get("policy_version") == version and latest.get("policy_current") is True
+           and latest.get("measurements") == measured,
+           "the latest scan repeats them: %s %s" % (st, {k: latest.get(k) for k in (
+               "report_id", "policy_version", "policy_current")}))
+
+
+@check("integrity: a path's required measurements are met only by measuring them")
+def check_required_measurements(api, ctx):
+    """Review F1 (DESIGN.md 83). Where the DBA lists required_measurements, a
+    scan without one -- the app did not enable it -- says requirements_satisfied
+    false and names it in missing_requirements; a scan measuring them satisfies
+    them. In enforce mode a request on a guarded path is refused
+    (integrity_measurements_missing, or a step-up request under
+    missing_measurement_action limit) until a scan has them. Skips unless the
+    DBA requires measurements it also requests."""
+    settings = live_settings(api)
+    required = [name for name in OPTIONAL_NAMES
+                if name in _setting_words(settings, "required_measurements", "")]
+    if not required or not set(required) <= set(_setting_words(settings, "optional_measurements", "")):
+        raise Skip("set required_measurements to optional measurements the DBA also requests "
+                   "in optional_measurements to run this check")
+    integrity_context(ctx)
+    inst = Installation()
+    st, pl = enrol(api, inst, fresh_hint())
+    expect(st in (200, 201), "enrol failed: %s %s" % (st, pl))
+    token = device_token(api, inst)
+    full = submit_report(api, inst, token, enabled=tuple(required))
+    expect(full.get("requirements_satisfied") is True and full.get("missing_requirements") == [],
+           "measured, they are satisfied: %s" % full.get("missing_requirements"))
+    st, pl = open_account(api, inst, token, "req-%s" % secrets.token_hex(4))
+    expect(st in (200, 201), "account open failed: %s %s" % (st, pl))
+    access = pl["access_token"]
+    bare = submit_report(api, inst, token)
+    missing = {m.get("measurement"): m.get("status") for m in bare.get("missing_requirements") or []}
+    expect(bare.get("requirements_satisfied") is False
+           and missing == {name: "not_enabled" for name in required},
+           "not enabled, each is missing: %s" % bare.get("missing_requirements"))
+    st, pl = protected(api, inst, "GET", "/v1/account/me", access)
+    paths = _setting_words(settings, "required_measurements_paths", "")
+    guarded = not paths or "/v1/account/me" in paths
+    if ctx["mode"] == "enforce" and guarded:
+        allowed = (("integrity_measurements_missing",)
+                   if settings.get("missing_measurement_action") == "refuse"
+                   else ("integrity_measurements_missing", "integrity_step_up_required"))
+        expect(st == 403 and error_code(pl) in allowed,
+               "a guarded path waits for the measurements: %s %s" % (st, error_code(pl)))
+    else:
+        state = (pl or {}).get("integrity") or {}
+        expect(st == 200 and (state.get("requirements_satisfied") is False) == guarded,
+               "observe reports, never refuses: %s %s" % (st, state.get("missing_requirements")))
+    submit_report(api, inst, token, enabled=tuple(required))
+    st, pl = protected(api, inst, "GET", "/v1/account/me", access)
+    expect(st == 200, "a scan with them passes again: %s %s" % (st, error_code(pl)))
+
+
+@check("integrity: conditions never block alone, and a clean scan restores access")
+def check_conditions_cap(api, ctx):
+    """Review F2 (DESIGN.md 83). A sideloaded Accessibility service, a remote-
+    control app and a screen recording -- a support session -- scored 45 + 20
+    + 30 = 95, a block the device memory kept for 24 hours. Conditions now add
+    at most conditions_points_cap (owner default 60) together, a reduced one
+    says points_before_cap, and only integrity findings are remembered: with
+    SELinux permissive besides (45, an integrity finding) the scan may block,
+    yet after a clean scan the device memory holds no block. Skips unless the
+    DBA requests accessibility, other_access and screen_capture."""
+    settings = live_settings(api)
+    needed = ("accessibility", "other_access", "screen_capture")
+    if not set(needed) <= set(_setting_words(settings, "optional_measurements", "")):
+        raise Skip("the DBA does not request accessibility, other_access and screen_capture; add "
+                   "them to optional_measurements to run this check")
+    integrity_context(ctx)
+
+    def points(key, default):
+        return int(str(settings.get(key, default)).strip() or default)
+
+    cap = points("conditions_points_cap", "60")
+    raw = (points("accessibility_sideloaded_points", "45")
+           + points("accessibility_non_system_points", "0")
+           + points("remote_access_app_points", "20") + points("screen_capture_points", "30"))
+    inst = Installation()
+    st, pl = enrol(api, inst, fresh_hint())
+    expect(st in (200, 201), "enrol failed: %s %s" % (st, pl))
+    token = device_token(api, inst)
+    submit_report(api, inst, token, enabled=needed)
+    st, pl = open_account(api, inst, token, "cap-%s" % secrets.token_hex(4))
+    expect(st in (200, 201), "account open failed: %s %s" % (st, pl))
+    access = pl["access_token"]
+
+    def support_session(probes):
+        probes["accessibility"]["services"].append(copy.deepcopy(SIDELOADED_SERVICE))
+        probes["other_access"]["remote_access_apps"].append(
+            {"package": "com.teamviewer.quicksupport.market", "system": False,
+             "installer": "com.android.vending"})
+        probes["screen_capture"]["recording"] = True
+        probes["selinux"].update({"mode": "permissive", "getenforce": "Permissive",
+                                  "enforce_value": "0"})
+
+    scan = submit_report(api, inst, token, support_session, enabled=needed)
+    conditions = [r for r in scan.get("reasons", []) if r.get("category") == "condition"]
+    capped = sum(r.get("points", 0) for r in conditions)
+    expect(capped == min(cap, raw) and scan.get("finding_score") == 45
+           and any("points_before_cap" in r for r in conditions) == (raw > cap),
+           "conditions add %d of %d, the cap %d; finding_score %s: %s"
+           % (capped, raw, cap, scan.get("finding_score"),
+              [(r["code"], r.get("points"), r.get("points_before_cap")) for r in conditions]))
+    submit_report(api, inst, token, enabled=needed)
+    st, pl = protected(api, inst, "GET", "/v1/policy/me", access)
+    memory = (((pl or {}).get("policy") or {}).get("context") or {}).get("device_integrity_memory") or {}
+    expect(st == 200 and memory.get("finding_verdict") != "block",
+           "after a clean scan nothing holds the phone: %s %s %s"
+           % (st, error_code(pl), memory.get("finding_verdict")))
 
 
 @check("risk: the source IP and User-Agent are kept only where the DBA says")
