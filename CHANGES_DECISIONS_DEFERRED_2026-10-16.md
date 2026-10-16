@@ -167,7 +167,7 @@ updates can be mapped … complete all 8 security points I had highlighted on Oc
   `tools/runtime_baseline.py`, `tools/identity_backend_example.py`.
 - Schema **31**, **157** DBA settings, offline gate **126/126**, suite **100** checks.
 
-### Documents and tests
+### Documents and tests, at the review archive (schema 24; today's figures are in the section above)
 
 - New: `MEASUREMENTS.md`, `WHO_CONFIGURES_WHAT.md`, `GAME_THREATS.md`, `data/network_lists/`.
 - The integration guide grew from §7 to §15.
