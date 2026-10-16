@@ -7122,3 +7122,31 @@ Gate: `runtime_baselines_come_from_the_release_pipeline` — seven selection cas
 in force, unlabelled regions above, at and without a profile, the DBA's points, publishing by role,
 validation, retirement of the same key only, the lookup ignoring retired profiles, the tool keeping clean
 complete scans and adding its margin. Twelve server breakages and three tool breakages caught.
+
+### 84.7 Item 7 — observation metrics (migration 031, schema 31)
+
+**Asked for.** Item 7: measure how often legitimate users are wrongly restricted, how long they take to
+recover, and how much each check covers. The 2026-10-13 review: *"Roll out in observation mode: measure
+false restrictions, recovery success/time, detector coverage, and performance by platform/build. Use
+time-separated and device-separated evaluation sets; do not tune and evaluate against the same
+reports."*
+
+**The limit, stated where it is used.** The server cannot know that a restriction was wrong. It counts
+restrictions — what each decision's four answers recommended beyond allow, so observe mode measures what
+enforce mode would do — how they end, and the business's own labels: events `verified_legitimate` and
+`confirmed_fraud` after a restriction began. The guide says so (§20).
+
+**Built.** `GET /v1/business/metrics` (role `metrics`), a window of at most 31 days: decisions by
+recommendation and event; restriction episodes per installation, recoveries by a clean decision or an
+approval with minutes p50/p90, restricted installations, labelled restrictions; limited sessions, upgrades
+by route and minutes; per platform scans, collectors, evidence quality, verdicts, challenge-to-report
+latency p50/p95; per measurement its statuses; per reason fired and scored; per build scans and verdicts.
+`split=device` (a keyed hash of the phone, stable) or `split=time` (halves). Bounded reads: 100,000
+decisions or 20,000 scans, else `truncated`. Migration 031 stores what this needs without parsing JSON
+on either engine: `risk_policy_decisions.assessed` and `integrity_report_id`, `integrity_reports.app_build`,
+and an index on decisions by time.
+
+Gate: `observation_metrics_count_restrictions_recoveries_and_coverage` — eight decisions across four
+installations (a recovery, an approval, a block that never recovers, decisions from before 031), labels
+before and after, limited sessions with an upgrade and an earlier approval that is not one, three scans;
+both splits; the window and role; the stored columns. Thirteen breakages caught.

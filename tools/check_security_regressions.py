@@ -3024,7 +3024,8 @@ CREATE TABLE integrity_reports (report_id TEXT PRIMARY KEY, installation_id TEXT
                                 evidence_quality TEXT, finding_score INTEGER, platform TEXT,
                                 collector_version INTEGER, reasons TEXT, probe_results TEXT,
                                 report_sha256 TEXT, measurement_status TEXT, policy_version TEXT,
-                                server_build TEXT, operation_sha256 TEXT, runtime_baseline_id TEXT);
+                                server_build TEXT, operation_sha256 TEXT, runtime_baseline_id TEXT,
+                                challenge_id TEXT, app_build TEXT);
 CREATE TABLE business_events (event_id TEXT PRIMARY KEY,
                               account_id TEXT NOT NULL REFERENCES demo_accounts(account_id),
                               event_type TEXT NOT NULL, occurred_at TSZ NOT NULL,
@@ -6835,6 +6836,151 @@ def runtime_baselines_come_from_the_release_pipeline():
 
 def error_of(reply):
     return (reply.get("error") or {}).get("code")
+
+
+@check
+def observation_metrics_count_restrictions_recoveries_and_coverage():
+    """DESIGN.md 84.7: item 7 of the eight the owner approved on 2026-10-14 --
+    measure in observe mode how often legitimate users would be restricted,
+    how they recover and how long it takes, and what each check covers and
+    finds, by platform and build, in sets kept apart for tuning and checking.
+    A restriction is a decision whose four answers recommended more than
+    allow; it recovers at the installation's next allow or approval; the
+    business's labels (verified_legitimate, confirmed_fraud) say which were
+    wrong. Every decision now stores what it recommended and its scan; every
+    scan its build."""
+    now = s._utc_now().replace(microsecond=0)
+    t = lambda minutes: now - timedelta(minutes=minutes)
+    with business_store() as connection, business_policy():
+        connection.executescript(
+            "CREATE TABLE risk_policy_decisions (decision_id TEXT PRIMARY KEY, created_at TSZ, "
+            "device_id TEXT, installation_id TEXT, account_id TEXT, event_type TEXT, assessed TEXT, "
+            "acceptance_id TEXT);"
+            "CREATE TABLE refresh_sessions (family_id TEXT, device_id TEXT, created_at TSZ, scope TEXT);"
+            "CREATE TABLE session_acceptances (family_id TEXT, route TEXT, created_at TSZ);"
+            "CREATE TABLE integrity_challenges (challenge_id TEXT PRIMARY KEY, created_at TSZ);")
+
+        def decide(minutes, phone, installation, account, assessed, acceptance=None):
+            connection.execute("INSERT INTO risk_policy_decisions VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                               (str(uuid.uuid4()), t(minutes), phone, installation, account,
+                                "protected_request", assessed, acceptance))
+
+        phones = [str(uuid.uuid4()) for _ in range(4)]
+        decide(300, phones[0], "inst-a", "acct-x", "allow")
+        decide(240, phones[0], "inst-a", "acct-x", "review")
+        decide(230, phones[0], "inst-a", "acct-x", "review")
+        decide(180, phones[0], "inst-a", "acct-x", "allow")
+        decide(240, phones[1], "inst-b", "acct-y", "step_up")
+        decide(220, phones[1], "inst-b", "acct-y", "step_up", acceptance="acc-1")
+        decide(240, phones[2], "inst-c", "acct-z", "deny")
+        decide(200, phones[3], "inst-d", "acct-w", None)
+        connection.executemany(
+            "INSERT INTO business_events (event_id, account_id, event_type, occurred_at) "
+            "VALUES (?, ?, ?, ?)",
+            [("l1", "acct-x", "verified_legitimate", t(100)),
+             ("l2", "acct-z", "confirmed_fraud", t(100)),
+             ("l3", "acct-x", "confirmed_fraud", t(500))])
+        connection.executemany("INSERT INTO refresh_sessions VALUES (?, ?, ?, 'limited')",
+                               [("fam-1", phones[1], t(240)), ("fam-2", phones[2], t(240))])
+        connection.execute("INSERT INTO session_acceptances VALUES ('fam-1', 'approval', ?)",
+                           (t(230),))
+        # An approval before a family's limited session is not its upgrade.
+        connection.execute("INSERT INTO session_acceptances VALUES ('fam-2', 'assertion', ?)",
+                           (t(250),))
+        statuses = json.dumps({"status": {"device": "ok", "accessibility": "not_enabled"}})
+        for minutes, collector, verdict, quality, reasons, build in (
+                (60, 5, "trusted", "complete", [{"code": "android_vpn_active", "points": 0}], "ab" * 32),
+                (50, 6, "elevated", "complete", [{"code": "android_test_keys", "points": 25},
+                                                  {"code": "android_vpn_active", "points": 10}],
+                 "ab" * 32),
+                (40, 6, "elevated", "incomplete", [], "cd" * 32)):
+            challenge = str(uuid.uuid4())
+            connection.execute("INSERT INTO integrity_challenges VALUES (?, ?)",
+                               (challenge, t(minutes) - timedelta(seconds=2)))
+            connection.execute(
+                "INSERT INTO integrity_reports (report_id, installation_id, device_id, platform, "
+                "collector_version, score, verdict, hard_block, created_at, evidence_quality, "
+                "reasons, measurement_status, app_build, challenge_id) "
+                "VALUES (?, 'inst-a', ?, 'android', ?, 0, ?, 0, ?, ?, ?, ?, ?, ?)",
+                (str(uuid.uuid4()), phones[0], collector, verdict, t(minutes), quality,
+                 json.dumps(reasons), statuses, build, challenge))
+        s.BUSINESS_API_CALLERS = {c.sha256_hex(b"reports-only"): ("analytics", ("reports",)),
+                                  c.sha256_hex(BUSINESS_TOKEN.encode()): ("analytics", ("metrics",))}
+        window = {"since": s._iso_z(t(600)), "until": s._iso_z(now + timedelta(minutes=1))}
+        status, reply = business_call("GET", "/v1/business/metrics", query=window, token="reports-only")
+        expect(status == 403, "without the metrics role: %s" % status)
+        status, reply = business_call("GET", "/v1/business/metrics", query=window)
+        expect(status == 200 and set(reply.get("sets", {})) == {"all"} and reply["truncated"] is False,
+               "one set: %s %s" % (status, reply))
+        got = reply["sets"]["all"]
+        decisions, restrictions = got["decisions"], got["restrictions"]
+        expect(decisions["total"] == 8 and decisions["would_restrict"] == 5
+               and decisions["by_recommendation"] == {"allow": 2, "review": 2, "step_up": 2,
+                                                      "deny": 1, "unknown": 1},
+               "decisions by what they recommended: %s" % decisions)
+        expect(restrictions["episodes"] == 3 and restrictions["installations"] == 3
+               and restrictions["recovered"] == 2 and restrictions["recovered_by_approval"] == 1
+               and restrictions["minutes_to_recover"] == {"p50": 60.0, "p90": 60.0}
+               and restrictions["labelled_verified_legitimate"] == 1
+               and restrictions["labelled_confirmed_fraud"] == 1,
+               "restrictions, recoveries and the business's labels after them: %s" % restrictions)
+        limited = got["limited_sessions"]
+        expect(limited == {"issued": 2, "upgraded": 1, "by_route": {"approval": 1},
+                           "minutes_to_upgrade": {"p50": 10.0, "p90": 10.0}},
+               "limited sessions and their upgrades: %s" % limited)
+        android = got["scans"]["by_platform"]["android"]
+        expect(got["scans"]["total"] == 3 and android["collectors"] == {"5": 1, "6": 2}
+               and android["evidence_quality"] == {"complete": 2, "incomplete": 1}
+               and android["latency_ms"] == {"p50": 2000, "p95": 2000}
+               and got["scans"]["measurements"]["accessibility"] == {"not_enabled": 3}
+               and got["scans"]["reasons"]["android_vpn_active"] == {"fired": 2, "scored": 1}
+               and got["scans"]["by_build"]["ab" * 32]["verdicts"] == {"trusted": 1, "elevated": 1},
+               "coverage, yield, latency and builds: %s" % got["scans"])
+        status, split = business_call("GET", "/v1/business/metrics", query=dict(window, split="device"))
+        sets = split.get("sets", {})
+        expect(status == 200 and set(sets) <= {"tuning", "evaluation"}
+               and sum(v["decisions"]["total"] for v in sets.values()) == 8
+               and sum(v["scans"]["total"] for v in sets.values()) == 3,
+               "two sets by phone, together the whole: %s" % {k: v["decisions"]["total"]
+                                                              for k, v in sets.items()})
+        status, again = business_call("GET", "/v1/business/metrics", query=dict(window, split="device"))
+        expect(again == split, "a phone always lands in the same set")
+        status, halves = business_call("GET", "/v1/business/metrics", query=dict(window, split="time"))
+        expect(status == 200 and halves["sets"]["earlier"]["decisions"]["total"] == 1
+               and halves["sets"]["later"]["decisions"]["total"] == 7
+               and halves["sets"]["later"]["scans"]["total"] == 3,
+               "two halves of the window: %s" % {k: v["decisions"]["total"]
+                                                for k, v in halves.get("sets", {}).items()})
+        for bad in (dict(window, split="random"), {"since": s._iso_z(t(60 * 24 * 40))},
+                    {"since": window["until"], "until": window["since"]}):
+            status, reply = business_call("GET", "/v1/business/metrics", query=bad)
+            expect(status == 400, "%s: %s" % (bad, status))
+    store = ObservationStore()
+    captured, real_execute = [], LiteCursor.execute
+
+    def execute(cursor, sql, params=()):
+        if sql.lstrip().startswith("INSERT INTO risk_policy_decisions"):
+            captured.append(params)
+            return
+        real_execute(cursor, sql, params)
+
+    LiteCursor.execute = execute
+    try:
+        decided = store.decide(store.phone(), persist=True, integrity_state={
+            "report_id": "r-7", "verdict": "elevated", "score": 30, "fresh": True, "age_seconds": 1,
+            "evidence_quality": "complete", "reasons": []})
+    finally:
+        LiteCursor.execute = real_execute
+    expect(captured and captured[0][11] == decided["assessment"]["decision"]["recommended"]
+           == "step_up" and captured[0][12] == "r-7",
+           "a decision stores what it recommended and its scan: %s %s"
+           % ((captured and captured[0][11:]), decided["assessment"]["decision"]))
+    with policy():
+        db.writes = []
+        send_report("android", clean("android"))
+    stored = [p for q, p in db.writes if q.startswith("INSERT INTO integrity_reports")]
+    expect(stored and stored[-1][19] == clean("android")["app_identity"]["apk_sha256"],
+           "a scan stores its build: %s" % (stored and stored[-1][19]))
 
 
 # The rows people change by hand (DESIGN.md 84): the key, the value, then the

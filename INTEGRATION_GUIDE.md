@@ -806,7 +806,7 @@ BUSINESS_API_TOKENS=payments:events:<digest>,risk-engine:graph+lapses+reports:<d
 ```
 
 The roles are `events`, `graph`, `lapses`, `reports`, `pin_unlock`, `pin_reset`, `operations`
-(section 17) and `baselines` (section 19); a name is 1–64 of
+(section 17), `baselines` (section 19) and `metrics` (section 20); a name is 1–64 of
 `a-z 0-9 _ -`. `printf %s "$TOKEN" | sha256sum` gives a digest. List a caller twice, with two digests,
 to rotate its token without a gap. A malformed entry stops the server at start. Calls carry
 `Authorization: Bearer <token>`: an unknown token answers 401 `business_token_invalid`, a known one
@@ -1506,3 +1506,33 @@ saw; a fully compromised OS can make up a clean profile.
 
 **Database.** Migration 030 adds `runtime_baselines` — grant the application principal `SELECT, INSERT,
 UPDATE` (a retirement is an update), never `DELETE` — and `integrity_reports.runtime_baseline_id`.
+
+## 20. Measuring before you enforce
+
+Run in observe mode first and measure what enforce mode would do to your real users (`DESIGN.md` §84.7).
+`GET /v1/business/metrics?since=<ISO time>&until=<ISO time>` (default the last 7 days, at most 31; a token
+with the role **`metrics`**) answers, for the window:
+
+| Part | What it counts |
+|---|---|
+| `decisions` | every risk decision, by what its four answers recommended (section 16) — `allow`, `step_up`, `scan`, `review`, `deny`, or `unknown` for decisions from before migration 031 — and by event; `would_restrict` is everything beyond allow, whatever the mode enforced |
+| `restrictions` | restriction episodes: from an installation's first decision recommending more than allow to its next one recommending allow or passing by an approval (`recovered`, `recovered_by_approval`, `minutes_to_recover` p50 and p90); how many installations were restricted; and how many restrictions your business later **labelled** |
+| `limited_sessions` | limited sessions issued, how many were upgraded, by which route, and how long it took |
+| `scans` | per platform: scans, collector versions, evidence quality, verdicts and the time from challenge to report (p50, p95 ms); per measurement, its statuses (what each check covers); per reason, how often it fired and how often it scored; per app build, scans and verdicts |
+
+**The server cannot know a restriction was wrong.** Tell it: send business events of type
+**`verified_legitimate`** (your support or fraud team confirmed the user) or **`confirmed_fraud`** for the
+account (section 10). `labelled_verified_legitimate` counts restrictions whose account was labelled
+legitimate after the restriction began — your false restrictions — and `labelled_confirmed_fraud` the ones
+that were right. A restriction that simply recovered — the user scanned again, or approved from another
+phone — is a cost to the user either way.
+
+**Tune on one set, check on the other.** `split=device` puts each phone in one of two sets (`tuning`,
+`evaluation`) by a keyed hash, so the same phone always lands in the same set; `split=time` splits the
+window into its two halves (`earlier`, `later`). Change settings looking at one set; confirm on the other
+before you enforce. With more than 100,000 decisions or 20,000 scans in the window the answer says
+`truncated`: narrow the window.
+
+**Database.** Migration 031 adds what this reads: each decision's recommendation (`assessed`) and the scan
+it was judged on (`integrity_report_id`), each scan's build (`app_build`), and an index to read decisions
+by time; on a large table a DBA may build the index first with `CREATE INDEX CONCURRENTLY`.

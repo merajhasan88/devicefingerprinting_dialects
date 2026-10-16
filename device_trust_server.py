@@ -121,7 +121,7 @@ _POLICY_VERSION_KEY = hmac.new(_ROOT_SECRET, b"policy-version-v1", hashlib.sha25
 # token carries only its own roles, and the caller's name is recorded with what
 # it does.
 _BUSINESS_ROLES = ("events", "graph", "lapses", "reports", "pin_unlock", "pin_reset",
-                   "operations", "baselines")
+                   "operations", "baselines", "metrics")
 # A token from BUSINESS_API_TOKEN_SHA256 (DESIGN.md 76) keeps what it did
 # before -- except PIN support, which now needs a token that names it.
 _DEFAULT_BUSINESS_ROLES = ("events", "graph", "lapses", "reports")
@@ -1248,7 +1248,7 @@ def _get_backend_identity():
 # against a schema it does not understand. /health/* still answers so operators
 # can see why.
 
-REQUIRED_SCHEMA_VERSION = 30
+REQUIRED_SCHEMA_VERSION = 31
 
 
 def _server_build():
@@ -5707,8 +5707,9 @@ def _evaluate_risk_policy(
                 INSERT INTO risk_policy_decisions
                     (decision_id, event_type, account_id, device_id,
                      installation_id, policy_mode, recommended_action,
-                     effective_action, score, reasons, context)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                     effective_action, score, reasons, context, assessed,
+                     integrity_report_id)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     decision_id,
@@ -5723,6 +5724,9 @@ def _evaluate_risk_policy(
                     DIALECT.json_param(reasons),
                     DIALECT.json_param(dict(context, server_build=SERVER_BUILD,
                                             assessment=decision["assessment"])),
+                    # For the observation metrics (DESIGN.md 84.7).
+                    decision["assessment"]["decision"]["recommended"],
+                    (integrity_state or {}).get("report_id"),
                 ),
             )
 
@@ -8501,6 +8505,9 @@ def integrity_report():
         if platform == "android" and _risk_setting_bool("vpn_exit_learning", False):
             _record_vpn_sighting(cursor, device_id, probes.get("network"))
         policy_version = _policy_version()
+        # The build the scan came from, for metrics by build (DESIGN.md 84.7).
+        app_build = str(_app_facts(platform, probes)[0] or "").lower()
+        app_build = app_build if re.fullmatch(r"[0-9a-f]{64}", app_build) else None
         cursor.execute(
             """
             INSERT INTO integrity_reports
@@ -8508,8 +8515,8 @@ def integrity_report():
                  collector_version, score, verdict, hard_block, reasons,
                  probe_results, report_sha256, evidence_quality, finding_score,
                  measurement_status, policy_version, server_build, operation_sha256,
-                 runtime_baseline_id)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                 runtime_baseline_id, app_build)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """,
             (
                 report_id,
@@ -8531,6 +8538,7 @@ def integrity_report():
                 SERVER_BUILD,
                 operation_sha256,
                 published["baseline_id"] if published else None,
+                app_build,
             ),
         )
 
@@ -11059,6 +11067,232 @@ def business_operation_scan_verify():
         "age_seconds": state["age_seconds"],
         "used_by": caller,
         "decision": decision,
+    })
+
+
+# Observation-mode metrics (DESIGN.md 84.7, item 7 of the eight the owner
+# approved on 2026-10-14; the 2026-10-13 review: "measure false restrictions,
+# recovery success/time, detector coverage, and performance by platform/build.
+# Use time-separated and device-separated evaluation sets"). The server cannot
+# know on its own that a restriction was wrong: it counts restrictions -- what
+# enforce mode would refuse or limit, from every decision's four answers -- and
+# how they end (a clean decision, an approval), and it counts the labels your
+# business sends as events: verified_legitimate and confirmed_fraud.
+_METRIC_LABELS = ("verified_legitimate", "confirmed_fraud")
+_METRICS_MAX_DECISIONS = 100000
+_METRICS_MAX_SCANS = 20000
+_METRICS_SPLIT_PEPPER = hmac.new(_ROOT_SECRET, b"metrics-split-v1", hashlib.sha256).digest()
+
+
+def _percentile(values, fraction):
+    if not values:
+        return None
+    ordered = sorted(values)
+    return ordered[min(len(ordered) - 1, int(fraction * len(ordered)))]
+
+
+def _metrics_group(device_id, at, split, middle):
+    """Which evaluation set a row falls in: by a keyed hash of its phone, so a
+    phone is always in the same one; or by the half of the window."""
+    if split == "device":
+        digest = hmac.new(_METRICS_SPLIT_PEPPER, str(device_id).encode("utf-8"),
+                          hashlib.sha256).digest()
+        return "tuning" if digest[0] % 2 == 0 else "evaluation"
+    if split == "time":
+        return "earlier" if at < middle else "later"
+    return "all"
+
+
+def _metrics_of(decisions, labels, limited, acceptances, scans):
+    """The measures of one evaluation set."""
+    episodes, by_installation = [], {}
+    assessed_counts, by_event = {}, {}
+    for row in decisions:
+        _, at, _, installation, account, event_type, assessed, acceptance = row
+        assessed_counts[assessed or "unknown"] = assessed_counts.get(assessed or "unknown", 0) + 1
+        by_event[event_type] = by_event.get(event_type, 0) + 1
+        by_installation.setdefault(str(installation), []).append((at, assessed, acceptance, account))
+    for rows in by_installation.values():
+        open_at, accounts = None, set()
+        for at, assessed, acceptance, account in sorted(rows, key=lambda r: r[0]):
+            if assessed is None:
+                continue
+            if open_at is None and assessed != "allow" and not acceptance:
+                open_at, accounts = at, {account} if account else set()
+            elif open_at is not None and (assessed == "allow" or acceptance):
+                episodes.append((open_at, at, bool(acceptance), accounts))
+                open_at = None
+            elif open_at is not None and account:
+                accounts.add(account)
+        if open_at is not None:
+            episodes.append((open_at, None, False, accounts))
+    recovered = [(end - start).total_seconds() / 60.0 for start, end, _, _ in episodes
+                 if end is not None]
+    label_times = {}
+    for account, label, at in labels:
+        label_times.setdefault((str(account), label), []).append(at)
+
+    def labelled(label):
+        return sum(1 for start, _, _, accounts in episodes
+                   if any(t >= start for account in accounts
+                          for t in label_times.get((str(account), label), [])))
+
+    families = {}
+    for family, route, at in acceptances:
+        families.setdefault(str(family), []).append((at, route))
+    upgraded, routes = [], {}
+    for family, at in limited:
+        later = sorted(item for item in families.get(str(family), []) if item[0] >= at)
+        if later:
+            upgraded.append((later[0][0] - at).total_seconds() / 60.0)
+            routes[later[0][1]] = routes.get(later[0][1], 0) + 1
+    platforms, measurements, reasons, builds = {}, {}, {}, {}
+    for (_, at, _, platform, collector, verdict, quality, found, statuses, build,
+         challenged) in scans:
+        entry = platforms.setdefault(platform, {"scans": 0, "collectors": {}, "evidence_quality": {},
+                                                "verdicts": {}, "latency_ms": []})
+        entry["scans"] += 1
+        entry["collectors"][str(collector)] = entry["collectors"].get(str(collector), 0) + 1
+        entry["evidence_quality"][quality or "unknown"] = (
+            entry["evidence_quality"].get(quality or "unknown", 0) + 1)
+        entry["verdicts"][verdict] = entry["verdicts"].get(verdict, 0) + 1
+        if challenged is not None:
+            entry["latency_ms"].append(max(0, int((at - challenged).total_seconds() * 1000)))
+        for name, status in ((DIALECT.json_value(statuses) or {}).get("status") or {}).items():
+            counted = measurements.setdefault(name, {})
+            counted[status] = counted.get(status, 0) + 1
+        for reason in _as_list(DIALECT.json_value(found)):
+            if isinstance(reason, dict) and reason.get("code"):
+                counted = reasons.setdefault(str(reason["code"]), {"fired": 0, "scored": 0})
+                counted["fired"] += 1
+                counted["scored"] += 1 if _as_int(reason.get("points")) > 0 else 0
+        if build:
+            counted = builds.setdefault(str(build), {"scans": 0, "verdicts": {}})
+            counted["scans"] += 1
+            counted["verdicts"][verdict] = counted["verdicts"].get(verdict, 0) + 1
+    for entry in platforms.values():
+        latency = entry.pop("latency_ms")
+        entry["latency_ms"] = {"p50": _percentile(latency, 0.5), "p95": _percentile(latency, 0.95)}
+    return {
+        "decisions": {"total": len(decisions), "by_recommendation": assessed_counts,
+                      "would_restrict": sum(n for key, n in assessed_counts.items()
+                                            if key not in ("allow", "unknown")),
+                      "by_event_type": by_event},
+        "restrictions": {
+            "episodes": len(episodes),
+            "installations": sum(1 for rows in by_installation.values()
+                                 if any(a not in (None, "allow") for _, a, _, _ in rows)),
+            "recovered": len(recovered),
+            "recovered_by_approval": sum(1 for _, end, approval, _ in episodes
+                                         if end is not None and approval),
+            "minutes_to_recover": {"p50": _percentile(recovered, 0.5),
+                                   "p90": _percentile(recovered, 0.9)},
+            "labelled_verified_legitimate": labelled("verified_legitimate"),
+            "labelled_confirmed_fraud": labelled("confirmed_fraud"),
+        },
+        "limited_sessions": {"issued": len(limited), "upgraded": len(upgraded),
+                             "by_route": routes,
+                             "minutes_to_upgrade": {"p50": _percentile(upgraded, 0.5),
+                                                    "p90": _percentile(upgraded, 0.9)}},
+        "scans": {"total": len(scans), "by_platform": platforms, "measurements": measurements,
+                  "reasons": reasons, "by_build": builds},
+    }
+
+
+@app.get("/v1/business/metrics")
+def business_metrics():
+    """Observation-mode metrics over ?since= .. ?until= (default the last 7
+    days; at most 31), for every decision and scan, or split into two
+    evaluation sets: ?split=device (by phone, the same phone always in the
+    same set) or ?split=time (the two halves) -- tune on one, check on the
+    other. Role metrics. Restrictions are what the four answers recommended
+    beyond allow, whatever the mode enforced; a restriction recovers at the
+    installation's next decision that recommends allow or passed by an
+    approval. labelled_* count restrictions whose account your business later
+    labelled with an event of that type."""
+    _require_business_caller("metrics")
+    until = (_parse_business_time(request.args.get("until"), 0, "until")
+             if request.args.get("until") else _utc_now())
+    since = (_parse_business_time(request.args.get("since"), 0, "since")
+             if request.args.get("since") else until - timedelta(days=7))
+    if not timedelta(0) < until - since <= timedelta(days=31):
+        raise ApiProblem("since must come before until, at most 31 days before.", 400,
+                         "invalid_metrics_window")
+    split = request.args.get("split", "none")
+    if split not in ("none", "device", "time"):
+        raise ApiProblem("split is none, device or time.", 400, "invalid_metrics_split")
+    middle = since + (until - since) / 2
+    with _cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT decision_id, created_at, device_id, installation_id, account_id, event_type,
+                   assessed, acceptance_id
+            FROM risk_policy_decisions
+            WHERE created_at >= %s AND created_at < %s
+            ORDER BY created_at, decision_id
+            LIMIT """ + str(_METRICS_MAX_DECISIONS + 1),
+            (since, until),
+        )
+        decisions = cursor.fetchall() or []
+        cursor.execute(
+            "SELECT account_id, event_type, occurred_at FROM business_events "
+            "WHERE event_type IN ('verified_legitimate', 'confirmed_fraud') AND occurred_at >= %s",
+            (since,),
+        )
+        labels = cursor.fetchall() or []
+        cursor.execute(
+            """
+            SELECT family_id, device_id, created_at FROM refresh_sessions
+            WHERE scope = 'limited' AND created_at >= %s AND created_at < %s
+            ORDER BY created_at
+            LIMIT """ + str(_METRICS_MAX_DECISIONS + 1),
+            (since, until),
+        )
+        limited = cursor.fetchall() or []
+        cursor.execute(
+            """
+            SELECT family_id, route, created_at FROM session_acceptances
+            WHERE created_at >= %s
+            ORDER BY created_at
+            LIMIT """ + str(_METRICS_MAX_DECISIONS + 1),
+            (since,),
+        )
+        acceptances = cursor.fetchall() or []
+        cursor.execute(
+            """
+            SELECT r.report_id, r.created_at, r.device_id, r.platform, r.collector_version,
+                   r.verdict, r.evidence_quality, r.reasons, r.measurement_status, r.app_build,
+                   c.created_at
+            FROM integrity_reports r
+            LEFT JOIN integrity_challenges c ON c.challenge_id = r.challenge_id
+            WHERE r.created_at >= %s AND r.created_at < %s
+            ORDER BY r.created_at, r.report_id
+            LIMIT """ + str(_METRICS_MAX_SCANS + 1),
+            (since, until),
+        )
+        scans = cursor.fetchall() or []
+    truncated = (len(decisions) > _METRICS_MAX_DECISIONS or len(limited) > _METRICS_MAX_DECISIONS
+                 or len(acceptances) > _METRICS_MAX_DECISIONS or len(scans) > _METRICS_MAX_SCANS)
+    decisions, limited = decisions[:_METRICS_MAX_DECISIONS], limited[:_METRICS_MAX_DECISIONS]
+    acceptances, scans = acceptances[:_METRICS_MAX_DECISIONS], scans[:_METRICS_MAX_SCANS]
+    groups = {}
+
+    def into(name):
+        return groups.setdefault(name, {"decisions": [], "limited": [], "scans": []})
+
+    for row in decisions:
+        into(_metrics_group(row[2], row[1], split, middle))["decisions"].append(row)
+    for family, device_id, at in limited:
+        into(_metrics_group(device_id, at, split, middle))["limited"].append((family, at))
+    for row in scans:
+        into(_metrics_group(row[2], row[1], split, middle))["scans"].append(row)
+    if not groups:
+        into("all" if split == "none" else ("tuning" if split == "device" else "earlier"))
+    return jsonify({
+        "since": _iso_z(since), "until": _iso_z(until), "split": split, "truncated": truncated,
+        "sets": {name: _metrics_of(rows["decisions"], labels, rows["limited"],
+                                   [(a[0], a[1], a[2]) for a in acceptances], rows["scans"])
+                 for name, rows in sorted(groups.items())},
     })
 
 

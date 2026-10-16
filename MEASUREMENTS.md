@@ -531,3 +531,17 @@ scan its answers as judged when it arrived (`as_scored`: its verdict, its reason
 decision still says what enforce mode would have done: compare `decision.recommended` with
 `decision.enforced`.
 
+
+---
+
+## 9. Observation metrics (`GET /v1/business/metrics`)
+
+What enforce mode would do, measured in any mode over a window (DESIGN.md 84.7; the guide's section 20
+explains each part): decisions by what their four answers recommended; restriction episodes, their
+recoveries (by a clean decision or an approval) and the minutes they took; restrictions your business
+labelled afterwards with a `verified_legitimate` or `confirmed_fraud` event; limited sessions and their
+upgrades by route; and per platform the scans, collector versions, evidence quality, verdicts and
+challenge-to-report time, per measurement its statuses, per reason how often it fired and scored, per app
+build its scans and verdicts. `split=device` and `split=time` give two sets to tune on one and check on
+the other. Each decision row stores `assessed` (its recommendation) and `integrity_report_id`; each scan
+`app_build` (migration 031).
