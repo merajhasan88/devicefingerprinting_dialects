@@ -4779,7 +4779,7 @@ def apps_holding_access_are_judged_by_their_source():
     dropped = _app("com.evil.reader", False, "com.cleaner.dropper", "c.Svc")
     by_adb = _app("com.test.sideloaded", False, "", "d.Svc")
     hidden = _app("com.hidden.app", service="e.Svc")
-    lists = [system, store, dropped, by_adb, hidden, "not an app", {"package": 7}]
+    lists = [system, store, dropped, by_adb, hidden]
     probes = dict(clean("android"),
                   accessibility={"status": "ok", "services": lists, "keyboard": by_adb,
                                  "settings_only": []},
@@ -5126,6 +5126,35 @@ def a_reused_event_id_with_other_content_is_a_conflict():
         rows = conn.execute("SELECT account_id, event_type, amount_minor FROM business_events "
                             "WHERE event_id = 'ev-9'").fetchall()
         expect([tuple(r) for r in rows] == [(alice, "purchase", 999)], "the first event stands: %s" % rows)
+
+
+@check
+def malformed_list_entries_are_refused_not_dropped():
+    """Review F1. A malformed entry in a measurement's list -- {"package": 17}
+    among the Accessibility services -- used to be dropped silently, leaving
+    the report clean. Every entry is now checked and a malformed one, or a
+    list longer than any collector sends, refuses the report (400); a
+    collector that had more apps than it sends says truncated."""
+    good = _app("com.ok.app", False, "com.android.vending", "a.Svc")
+    with policy(optional_measurements=_ALL_OPTIONAL):
+        status, _ = send_report("android", dict(clean("android"), accessibility={
+            "status": "ok", "services": [good], "settings_only": [], "truncated": True}))
+        expect(status == 200, "a well-formed, truncated list is accepted: %s" % status)
+        for probe, answer in (
+                ("accessibility", {"status": "ok", "services": [{"package": 17}]}),
+                ("accessibility", {"status": "ok", "services": ["not an app"]}),
+                ("accessibility", {"status": "ok", "services": [dict(good, extra=1)]}),
+                ("accessibility", {"status": "ok", "services": [dict(good, system="yes")]}),
+                ("accessibility", {"status": "ok", "services": [good] * 65}),
+                ("accessibility", {"status": "ok", "keyboard": {"package": "not a package!"}}),
+                ("accessibility", {"status": "ok", "settings_only": [5]}),
+                ("accessibility", {"status": "ok", "services": [], "truncated": "yes"}),
+                ("notification_access", {"status": "ok", "listeners": [{"service": "a.B"}]}),
+                ("other_access", {"status": "ok", "device_admins": [], "remote_access_apps": [{}]}),
+                ("local_addresses", {"status": "ok", "addresses": [{"interface": 1, "address": "x"}]})):
+            status, payload = send_report("android", dict(clean("android"), **{probe: answer}))
+            expect(status == 400 and payload["error"]["code"] == "invalid_integrity_probe",
+                   "%s %s must be refused: %s %s" % (probe, answer, status, payload))
 
 
 @check

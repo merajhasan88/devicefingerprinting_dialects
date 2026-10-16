@@ -2236,9 +2236,10 @@ _PROBE_OPTIONAL_FIELDS = {
         "local_addresses": {"addresses": list},
         # The same two keys (DESIGN.md 82). The apps in each list are judged
         # by _app_source, which reads only well-formed entries.
-        "accessibility": {"services": list, "keyboard": dict, "settings_only": list},
-        "notification_access": {"listeners": list},
-        "other_access": {"device_admins": list, "remote_access_apps": list},
+        "accessibility": {"services": list, "keyboard": dict, "settings_only": list,
+                          "truncated": bool},
+        "notification_access": {"listeners": list, "truncated": bool},
+        "other_access": {"device_admins": list, "remote_access_apps": list, "truncated": bool},
         "screen_capture": {"recording": bool, "external_displays": int},
         "location": {"permission": str, "latitude": _LATITUDE, "longitude": _LONGITUDE,
                      "accuracy_m": _METRES, "age_seconds": int, "provider": str},
@@ -2317,6 +2318,78 @@ def _probe_field_ok(value, kind):
     return isinstance(value, kind)
 
 
+# The lists inside the optional measurements (DESIGN.md 82, 83): every entry is
+# checked, none silently dropped (review F1). A collector sends at most 32
+# apps per list and says truncated when there were more.
+_MAX_PROBE_LIST = 64
+_PACKAGE_NAME = re.compile(r"[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z0-9_]+)*")
+_APP_LISTS = {
+    "accessibility": ("services",),
+    "notification_access": ("listeners",),
+    "other_access": ("device_admins", "remote_access_apps"),
+}
+
+
+def _app_entry_problem(entry):
+    """Why one listed app is malformed, or None."""
+    if not isinstance(entry, dict):
+        return "an entry is not an object"
+    package = entry.get("package")
+    if not isinstance(package, str) or len(package) > 128 or not _PACKAGE_NAME.fullmatch(package):
+        return "package must be an Android package name"
+    for field, limit in (("service", 200), ("installer", 128)):
+        value = entry.get(field)
+        if value is not None and (not isinstance(value, str) or len(value) > limit):
+            return "%s must be text of at most %d characters" % (field, limit)
+    if entry.get("system") is not None and not isinstance(entry.get("system"), bool):
+        return "system must be true or false"
+    unknown = set(entry) - {"package", "service", "system", "installer"}
+    if unknown:
+        return "unknown fields %s" % sorted(unknown)
+    return None
+
+
+def _check_listed_entries(probes):
+    """400 for a malformed app or address entry, or a list longer than any
+    collector sends, instead of reading past it."""
+    def refuse(name, field, why):
+        raise ApiProblem("Integrity probe field %s.%s: %s." % (name, field, why), 400,
+                         "invalid_integrity_probe", details={"probe": name, "field": field})
+
+    for name, fields in _APP_LISTS.items():
+        value = probes.get(name)
+        if not isinstance(value, dict):
+            continue
+        for field in fields:
+            entries = value.get(field)
+            if entries is None:
+                continue
+            if len(entries) > _MAX_PROBE_LIST:
+                refuse(name, field, "more than %d entries" % _MAX_PROBE_LIST)
+            for entry in entries:
+                why = _app_entry_problem(entry)
+                if why:
+                    refuse(name, field, why)
+        if name == "accessibility":
+            keyboard = value.get("keyboard")
+            if keyboard is not None and _app_entry_problem(keyboard):
+                refuse(name, "keyboard", _app_entry_problem(keyboard))
+            hidden = value.get("settings_only")
+            if hidden is not None and (
+                    len(hidden) > _MAX_PROBE_LIST
+                    or any(not isinstance(item, str) or not 0 < len(item) <= 200 for item in hidden)):
+                refuse(name, "settings_only", "must be component names of at most 200 characters")
+    addresses = probes.get("local_addresses")
+    if isinstance(addresses, dict) and addresses.get("addresses") is not None:
+        entries = addresses["addresses"]
+        if len(entries) > _MAX_PROBE_LIST or any(
+                not isinstance(entry, dict) or set(entry) - {"interface", "address"}
+                or not all(isinstance(entry.get(k), str) and len(entry[k]) <= 64
+                           for k in ("interface", "address"))
+                for entry in entries):
+            refuse("local_addresses", "addresses", "each entry is an interface and an address")
+
+
 def _check_probe_evidence(platform, probes, required_probes):
     """Reject wrongly typed fields; return the required probes lacking evidence.
 
@@ -2343,6 +2416,7 @@ def _check_probe_evidence(platform, probes, required_probes):
                         "invalid_integrity_probe",
                         details={"probe": name, "field": field},
                     )
+    _check_listed_entries(probes)
     incomplete = []
     for name in required_probes:
         value = probes.get(name)
