@@ -94,8 +94,8 @@ processes** from the systemd drop-in, with a per-process connection pool (`DB_PO
 `DB_POOL_RECHECK_SECONDS`) and, on SQL Server, a 15 s statement timeout (`DB_QUERY_TIMEOUT`) —
 DESIGN.md 55 and 60. Serve SQL Server with processes, never threads.
 
-**Schema is migrations, DBA-applied.** `migrations/<dialect>/001…025`, applied in order; the server
-refuses to serve unless `schema_migrations` holds the version it requires (currently **25**). A new
+**Schema is migrations, DBA-applied.** `migrations/<dialect>/001…031`, applied in order; the server
+refuses to serve unless `schema_migrations` holds the version it requires (currently **31**). A new
 table needs its grant (`GRANT`/`ALTER DEFAULT PRIVILEGES` on PostgreSQL). Risk and step-up policy
 values live in `risk_policy_settings`, seeded by the migrations with the owner's defaults, which a DBA
 may change — never hard-code a policy value; the gate fails when the server reads a setting no
@@ -116,7 +116,7 @@ was not measured (DESIGN.md 83).
 ## Commands
 
 ```bash
-# Conformance suite — the gate. 94 checks; needs `cryptography` (harness only).
+# Conformance suite — the gate. 100 checks; needs `cryptography` (harness only).
 python3 conformance_suite.py --base-url https://<endpoint>
 #   Scoring checks need the server started with INTEGRITY_ANDROID_CERT_SHA256 set to the
 #   certificate the suite prints, or empty to disable the allow-list.
@@ -130,12 +130,18 @@ python3 conformance_suite.py --base-url https://<endpoint>
 #   check_parallel_clients (4 concurrent flows) must pass on any new backend BEFORE handset
 #   or paid-database time is spent on it.
 
-# Offline security regression gate (118 checks; DESIGN.md 63, 76-83): no database needed
+# Offline security regression gate (126 checks; DESIGN.md 63, 76-84): no database needed
 python3 tools/check_security_regressions.py
 # The generated settings reference (G7): print, or rewrite it in the two documents
 python3 tools/settings_reference.py [--write]
 # Refresh the public VPN, data-centre and Tor lists in data/network_lists (DevOps, daily)
 python3 tools/fetch_network_lists.py
+# Runtime profiles from a reference run of a release build (DESIGN.md 84.6)
+python3 tools/runtime_baseline.py --base-url https://<endpoint> --installation <id> [--publish]
+# Route 3's customer half, a working example (DESIGN.md 84.8)
+python3 tools/identity_backend_example.py --state ./idp --jwks | --enrol <account> | --serve 127.0.0.1:8710
+# SQL Server translation of the server's statements (static)
+python3 tools/check_sqlserver_translation.py
 # Native scanner on the host (from a scratch dir; clang++ or g++)
 clang++ -std=c++17 -O1 -Wall -Wextra -Itools/native -Iandroid/app/src/main/cpp \
     tools/native/check_code_integrity.cpp -o check_code_integrity && ./check_code_integrity
@@ -161,7 +167,13 @@ not jailbroken). The emulator AVD `integrity_root_lab` is the disposable root la
 
 ## Current point of work
 
-See the end of DESIGN.md: section 83 records the critical review of 2026-10-16 and what was built from
+See the end of DESIGN.md: section 84 records change reasons — a reason, the login and the time with every
+hand-made change of a DBA setting or a revocation status, enforced by triggers (schema 26) — and the eight
+security improvements of 2026-10-14 finished: the four answers in every scan and decision, a scan made for
+one operation, each installation against its own past (observe first), events from other services with
+the DBA's rules, runtime baselines from the release pipeline with Android collector 6, observation
+metrics, and route 3 end to end with a reference identity backend (schema 31; SQL Server not yet run);
+section 83 records the critical review of 2026-10-16 and what was built from
 it — conditions capped at 60 together and kept out of the device memory, each measurement's status
 with the measurements a path requires, malformed app lists refused, business API tokens per caller with
 roles, every scan and decision stamped with its settings version and server build, VPN learning by

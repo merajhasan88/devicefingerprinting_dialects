@@ -7176,3 +7176,58 @@ Gate: `the_reference_identity_backend_signs_what_route_3_accepts` — RFC 6238's
 and enrolments readable by their owner only; the server's verifier accepting the example's assertion from
 its JWKS and refusing it for another account, installation or request; another audience, extra or missing
 claims, another account's code and the lock refused. Seven breakages of the example caught.
+
+### 84.9 Live, and what is not verified
+
+**EC2 PostgreSQL 16.15, 2026-10-16, 13:04:47–13:46:24 UTC (42 minutes).** Migrations 026–031 applied in
+order (schema 31, 157 settings; the new tables granted to the application role as the migrations say),
+server md5 `5f534ac3…`, build `464e72452c6d`; one business token holding all nine roles and an
+events-only one; the suite's and the example backend's keys in `UPGRADE_ASSERTION_JWKS_FILE`.
+
+| Run | Result |
+|---|---|
+| The triggers, in a transaction rolled back | a value change without a reason refused with the message; with one, `changed_by` = the login and `updated_at` now; the same reason twice refused; a description alone accepted; a status change without a reason refused on both tables, with one stamped; the server's `last_seen_at` update untouched; the five 025 values carry 025's reason |
+| observe / observe, owner defaults, the seven optional measurements requested, the full suite (100) | **77 / 0 / 23** |
+| observe, with `operation_scan_paths` = the protected echo, a chargeback rule, history scored | `check_operation_scan`, `check_business_event_rules`, `check_installation_history`, `check_four_answers` pass |
+| enforce / enforce, a step-up path, the same-phone upgrade, cross-checks, support reset, route 3 on | **92 / 0 / 8**, `check_upgrade_route_assertion` among the passes |
+| enforce, the same opt-ins | the same four pass: a second use 409, no scan 403 naming the operation |
+| the emulator (API 36, the release harness, collector 6) | its stored scan says collector 6, `abi` x86_64, the size fields present; `installation_app_changed` recorded for the new build at 0 points |
+| route 3 on the emulator, enforce | a sign-in under relationship review got a limited session (`risk_review`, routes approval and assertion); the one-time code typed into the harness, the example backend behind the test host's TLS signed, the session upgraded: `PASS: session upgraded (assertion)`, accepting `risk_review` for 30 days |
+| a scan made for one operation on the emulator | `operation_scan_paths` = the sensitive echo: 200 with the bound scan, the same scan again 409 `integrity_operation_scan_used` |
+
+In the database for the window: 223 decisions, every one with its recommendation, its scan and its four
+answers, one server build; 255 scans, every one with its app build, five bound to an operation, two held
+to a published profile; history reasons fired on live traffic — the suite's shared installation flipped
+between its compromise fixtures and clean scans (`installation_verdict_flips`, 16 times at 0 points),
+the cert-mismatch fixture read as a re-signed app (`installation_signer_changed`, 4 at 0), and the moved
+phone of `check_installation_history` (60 when scored); five operation-scan uses (three by the app, two by
+the business caller); two published profiles, both retired by the check that made them; two events with
+a source; two rule reasons; eleven settings changed during the round, each with its reason and the login.
+The flips are why history scoring stays off by default: a test installation that alternates fixtures is
+exactly what the rule describes.
+
+**For the emulator runs** the lab switches `INTEGRITY_ALLOW_EMULATOR` and `INTEGRITY_ALLOW_USERDEBUG` were
+on (without them the AOSP image scores a block), the device memory window was 0 (the first scan, before
+the switches, had blocked), and `security_patch_max_age_days` was raised so that the new phone's sign-in
+landed in review rather than block. All three were put back.
+
+**State:** EC2 stopped; schema 31; observe / observe; all 157 settings at the owner's defaults, checked
+against the migrations; the business tokens, the assertion keys, the lab switches, the example backend and
+its Caddy route removed; the emulator stopped. EIP 0, snapshots 0, RDS 0, NAT 0.
+
+**Not verified:** SQL Server (026–031 and the T-SQL triggers join G10; the static translation check
+passes, 160 statements); collector 6 on a real phone; a runtime profile from a real release pipeline;
+route 3 against a real identity system rather than the example; the iOS side (nothing changed there).
+
+**Summary of §84** — the eight security improvements of 2026-10-14:
+
+| # | Improvement | State | Where |
+|---|---|---|---|
+| 1 | Cross-checks from what the server sees | done before (§77) | — |
+| 2 | A scan made for one operation | done, live | 84.3, guide 17 |
+| 3 | A way back for users with one phone | done, live on the emulator | 84.8, guide 7 |
+| 4 | Events from other services | done, live | 84.5, guide 10 |
+| 5 | Each installation against its own past | done, observe first, live | 84.4, guide 18 |
+| 6 | Runtime baselines from the release pipeline | done for Android, live | 84.6, guide 19 |
+| 7 | Observation metrics | done, live | 84.7, guide 20 |
+| 8 | The four answers | done, live | 84.2, guide 16 |

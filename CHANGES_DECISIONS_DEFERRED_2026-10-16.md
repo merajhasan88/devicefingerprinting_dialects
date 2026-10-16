@@ -146,6 +146,27 @@ window while the screen is captured.
 
 All of these are DBA settings.
 
+### After the archive: the review of 2026-10-16 (§83, migration 025) and the eight improvements (§84, migrations 026–031)
+
+**§83** fixed the seven findings of the 2026-10-16 review: conditions capped at 60 together and kept out
+of the device memory; each measurement's status stored, and measurements a path can require; malformed
+app lists refused; one business API token per caller with its roles; every scan and decision stamped with
+its settings version and server build; VPN learning by each phone's latest sighting and age; event-ID
+conflicts; owner defaults for the signals that scored 0.
+
+**§84**, on 2026-10-16 after the owner's *"Then add change reason column in relevant database tables so
+updates can be mapped … complete all 8 security points I had highlighted on Oct 14th"*:
+- **Change reasons** (migration 026): a setting's value, and the status that revokes a phone or an
+  installation, change only with a reason; the database stamps the login and the time.
+- **The eight improvements**, each in section 3 below: the four answers in every scan and decision
+  (item 8), a scan made for one operation (item 2, migration 027), each installation against its own
+  past (item 5, 028), events from other services with the DBA's rules over them (item 4, 029), runtime
+  baselines from the release pipeline with Android collector 6 (item 6, 030), observation metrics
+  (item 7, 031), and route 3 end to end with a reference identity backend (item 3).
+- New business API roles: `operations`, `baselines`, `metrics`. New tools:
+  `tools/runtime_baseline.py`, `tools/identity_backend_example.py`.
+- Schema **31**, **157** DBA settings, offline gate **126/126**, suite **100** checks.
+
 ### Documents and tests
 
 - New: `MEASUREMENTS.md`, `WHO_CONFIGURES_WHAT.md`, `GAME_THREATS.md`, `data/network_lists/`.
@@ -231,7 +252,7 @@ All of these are DBA settings.
 | **G2 — a Flutter package** | *"defer it to later after we have finished testing. It will be done. Note it down. Just not now."* (2026-10-14) | A Flutter plugin with the Dart API, the models and the Android and iOS native code; the harness then depends on it. The package's name, versioning and where it is published are the owner's call. |
 | **G3 — a guide for app developers** | *"do after G2"* | Today an app developer reads the guide and copies code out of the harness. |
 | **G6 — the front page** | *"after G3"*; and the open-source project *"which I will eventually host on a website called necessary.com or necessary.io"* (2026-10-15) | `README.md` is still Flutter's template. |
-| **G10 — SQL Server** | *"fill the gaps, we will do that afterwards"* (2026-10-14) | One RDS round. It covers the suite for migrations 015–025, the guide's T-SQL deletion of VPN sightings, and binding ID parameters as `varchar(36)` in the SQL Server dialect (§74). Nothing ships without the suite on both engines. |
+| **G10 — SQL Server** | *"fill the gaps, we will do that afterwards"* (2026-10-14) | One RDS round. It covers the suite for migrations 015–031 — the change-reason triggers of 026 among them — the guide's T-SQL deletion of VPN sightings, and binding ID parameters as `varchar(36)` in the SQL Server dialect (§74). Nothing ships without the suite on both engines. |
 | **The other client SDKs (G9)** | *"I will note this down and have separate claude's build each."* | Native Android (Kotlin), native iOS (Swift) and React Native, each built in a Claude session of its own. .NET exists; Flutter is this repository. |
 | **The iPhone round** | *"Run iphone after the review work. Would need another codemagic build or we could go with gitlab actions."* (2026-10-13) | It needs a new iOS build: iOS collectors 3 and 4, the location request and the PIN protection have never been compiled. |
 
@@ -240,29 +261,29 @@ breach in our defenses"*), in the owner's order:
 
 | # | Item | State |
 |---|---|---|
-| 1 | Cross-checks from what the server already sees | **Done** (§77) |
-| 2 | Per-operation "fresh and complete scan required" | **Partly.** The per-path requirement exists (`complete_evidence_paths`), and since the review of 2026-10-16 a path can require optional measurements (`required_measurements_paths`, §83). Binding a scan to the exact operation it approves is not built. |
-| 3 | Recovery for single-phone users (route 3) before any customer turns enforcement on | **Server side built** (identity-system assertions, guide §7). It needs each customer's identity backend; the harness has none. |
-| 4 | Events from other services: credential changes, recovery, networks, payees | **Largely covered.** The business events API takes them, with payees stored only as keyed hashes (§76), and §80–§81 record source networks. Anything that carries personal data is the owner's call. |
-| 5 | Per-installation history: coverage disappearing, flips between suspicious and clean, build changes | **Not built.** Observe-only at first, because OS updates will trigger it. |
-| 6 | Runtime baselines per build, OS and CPU type, from the release pipeline | **Not built.** This is also the open part of review finding R5: the runtime allowances rest on name and shape heuristics. |
-| 7 | Observation-mode metrics: false restrictions, recoveries, detector coverage | **Not built.** |
-| 8 | The review's four-question verdict (protocol, evidence, findings, decision) | **Labels exist** (evidence quality; since §83 each reason's category: integrity, condition or collection). The structured response belongs in the next API version. |
+| 1 | Cross-checks from what the server already sees | **Done** (§77). |
+| 2 | Per-operation "fresh and complete scan required" | **Done** (§84.3, guide §17). On the DBA's `operation_scan_paths` a request needs a scan made for it alone — its challenge names the exact request — recent and complete, used once; a business backend verifies such a scan for its own operation (role `operations`). Verified live, the emulator included. |
+| 3 | Recovery for single-phone users (route 3) before any customer turns enforcement on | **Done** (§84.8, guide §7): `tools/identity_backend_example.py` is a working example of the customer's half, and the harness uses it. Verified live: a limited session on the emulator upgraded through it. It is an example, not an MFA product: each customer still connects its own identity system. |
+| 4 | Events from other services: credential changes, recovery, networks, payees | **Done** (§84.5, guide §10): types per caller, the address each event came from (kept as its kinds and a keyed hash), and the DBA's own rules over events — none by default. |
+| 5 | Per-installation history: coverage disappearing, flips between suspicious and clean, build changes | **Done** (§84.4, guide §18), observe first: always recorded, scored only where the DBA sets `history_checks_enabled`. |
+| 6 | Runtime baselines per build, OS and CPU type, from the release pipeline | **Done for Android** (§84.6, guide §19): profiles published by the release pipeline (role `baselines`, `tools/runtime_baseline.py`), Android collector 6 sends the sizes and the ABI. iOS profiles are stored, not scored. |
+| 7 | Observation-mode metrics: false restrictions, recoveries, detector coverage | **Done** (§84.7, guide §20), with its limit stated: the server counts restrictions and recoveries; which were wrong comes from the business's `verified_legitimate` / `confirmed_fraud` events. |
+| 8 | The review's four-question verdict (protocol, evidence, findings, decision) | **Done** (§84.2, guide §16): an `assessment` in every scan, decision and refusal; additive, so in this API version. |
 
 ---
 
 ## 4. Waiting on the owner
 
-**Defaults for the older 0-point signals.** These were left at 0 by earlier decisions and asked
-about on 2026-10-15:
-- VPN, HTTP proxy, developer options and ADB;
-- the five address-based `source_*_points`.
-
-**Defaults chosen on the owner's instruction** (§82.1), to confirm or retune:
-- the points;
-- the 365-day patch age;
-- the store list, which leaves out vivo's and Honor's stores because their package names could not be
-  verified.
+**Defaults chosen on the owner's instruction**, to confirm or retune:
+- §82.1: the points; the 365-day patch age; the store list, which leaves out vivo's and Honor's stores
+  because their package names could not be verified.
+- §83: a VPN 10, an HTTP proxy 15, the five address-based points (public-list VPN 10, Tor exit 30,
+  hosting network 15, learned VPN exit 10, learned home or office VPN 10); developer options and ADB
+  kept at 0.
+- §84: the installation-history points, scored only once `history_checks_enabled` is 1 — signer changed
+  60, phone changed 60, OS went back 40, collector went back 30, app went back 30, measurements dropped
+  30, flips 30 (4 in 24 hours), app updated 0; more unlabelled executable memory than the release
+  profile 30; a scan made for an operation at most 120 seconds old.
 
 **A shared VPN-exit list across deployments.** It was costed (S3 plus CloudFront's free plan) and not
 built. It is needed only if customers are to share what they learn.
@@ -286,17 +307,25 @@ built. It is needed only if customers are to share what they learn.
 - **An app from Google Play counted as a store app.** The emulator has no Play Store.
 - **A screen recording made by a recorder app.** A command-line recording was tried and was not
   detected.
-- **SQL Server:** migrations 015–025, and the guide's T-SQL deletion.
+- **SQL Server:** migrations 015–031 — including the change-reason triggers of 026, written in T-SQL
+  that has never run — and the guide's T-SQL deletion. The static translation check passes (160
+  statements).
+- **Collector 6 on a real phone.** Only the emulator ran it (x86_64; no W^X memory there to size).
+- **A runtime profile from a real release pipeline**, on real phones.
 
 ---
 
 ## 6. State on 2026-10-16
 
-- **Test server:** the EC2 server is stopped. PostgreSQL 16.15 is at schema 24, in observe mode for
-  both integrity and policy, with every setting at the owner's default, including §82.1.
+- **Test server:** the EC2 server is stopped. PostgreSQL 16.15 is at schema 31, in observe mode for
+  both integrity and policy, with all 157 settings at the owner's defaults (those the live rounds
+  changed say so in their `change_reason`). No business token, assertion key or identity backend is
+  left configured.
 - **Test data in the database:**
   - the emulator's reports, including a mock Paris location;
   - the test accounts;
-  - four VPN sightings of the test machine's address.
+  - four VPN sightings of the test machine's address;
+  - the live round of §84: its accounts, scans, decisions, two retired runtime profiles and five
+    operation-scan uses.
 - **Billing:** nothing but the stopped instance's disk. No RDS, no snapshots, no Elastic IPs, no NAT.
 - **Emulator:** `integrity_root_lab` (API 36) keeps the harness. The test-only apps were removed.

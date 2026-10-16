@@ -657,3 +657,50 @@ the rest is new fields to send or tolerate.
 **Verified on our side** (DESIGN.md §83): gate 118/118; schema 25 live on the EC2 PostgreSQL 16.15
 on 2026-10-16 — suite 73/0/21 in observe, 87/0/7 in enforce; the business roles and event conflicts
 checked live; the Android emulator's own scan stored `enabled_by_app` and every status.
+
+## 27. Added 2026-10-16 (later) — change reasons and the eight security improvements (DESIGN.md §84, schema 31)
+
+The server requires **schema 31**. Nothing breaks an SDK that sends what it sent before; the new
+behaviour is opt-in for the DBA and the app, and new response fields are to be tolerated.
+
+- **Tolerate `assessment`** — the four answers (`protocol`, `evidence`, `findings`, `decision`) — in the
+  scan response, in every decision (`policy`, `trust_policy`) and in the details of refusals that carry a
+  scan or a decision (MEASUREMENTS.md §8). An SDK may show `decision.allowed` and the remedy it implies
+  (`scan`, `step_up`, `limited`).
+- **A scan made for one operation (opt-in, guide §17).** The integrity challenge may carry
+  `{"operation": {"method", "path", "query", "body_sha256"}}` — the request the SDK is about to send,
+  exactly as its access proof will sign it; the scan answer then has `operation_sha256`. The request
+  carries `X-Integrity-Report: <report_id>`. Refusals on the DBA's `operation_scan_paths`: 403
+  `integrity_operation_scan_required` (`details.operation` is the request to name),
+  `integrity_operation_scan_mismatch`, `integrity_operation_scan_stale`,
+  `integrity_complete_evidence_required`, 409 `integrity_operation_scan_used`; a malformed operation is
+  400 `invalid_operation`. A scan is used up as it is presented: a retry after another refusal scans
+  again.
+- **Route 3 (guide §7):** unchanged on the wire — `{"route": "assertion"}` returns `assertion_claims`; the
+  upgrade sends `{"route": "assertion", "request_id", "assertion"}`. `tools/identity_backend_example.py`
+  is a working signer to test against.
+- **Collector fields for runtime baselines (guide §19):** the Android reference collector 6 sends in
+  `exec_mappings` `wx_bytes`, `wx_size_classes` (every class, `<bytes>:<count>` largest first, never cut
+  short), `wx_smallest_bytes`, `wx_largest_bytes` and `anon_exec_unlabeled_bytes`, and in `device` the
+  process `abi`. The .NET collector already sends the W^X sizes; add `abi` and
+  `anon_exec_unlabeled_bytes` so a published profile per ABI can match it. The scan answer may name
+  `runtime_baseline`; a new reason `android_exec_outside_baseline` (30).
+- **New reasons, tolerate:** category `history` — `installation_signer_changed`,
+  `installation_device_changed`, `installation_os_downgraded`, `installation_collector_downgraded`,
+  `installation_app_downgraded`, `installation_coverage_dropped`, `installation_verdict_flips`,
+  `installation_app_changed` (0 points unless the DBA scores history); `business_event_rule:<rule>` in
+  decisions where the DBA wrote rules. An SDK that sends a lower collector version than an installation
+  sent before is recorded as `installation_collector_downgraded`.
+- **Business API**, only if the SDK ships a backend helper: roles `operations`
+  (`POST /v1/business/operation-scans/verify`), `baselines` (`/v1/business/runtime-baselines`) and
+  `metrics` (`GET /v1/business/metrics`); events may carry `source_address`; a caller may be held to its
+  own event types (400 `invalid_business_event`, field `type`).
+- **Suite:** 100 checks — `check_four_answers`, `check_operation_scan` (skips unless the protected echo is
+  in `operation_scan_paths`), `check_installation_history`, `check_business_event_rules` (skips without a
+  chargeback rule), `check_runtime_baseline` and `check_observation_metrics` (need a business token with
+  those roles).
+
+**Verified on our side** (DESIGN.md §84.9): gate 126/126; schema 31 live on the EC2 PostgreSQL 16.15 on
+2026-10-16 — suite 77/0/23 in observe, 92/0/8 in enforce, the opt-in checks passing in both modes; the
+Android emulator ran collector 6, a scan made for one operation (second use 409) and route 3 through the
+example backend.
