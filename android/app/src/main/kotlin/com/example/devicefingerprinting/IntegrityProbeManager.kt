@@ -443,18 +443,18 @@ class IntegrityProbeManager(
                 services.add(appEntry(service.packageName, service.name, service.applicationInfo))
             }
         }
-        val settingsOnly = mutableListOf<String>()
-        Settings.Secure.getString(context.contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES)
+        val hidden = Settings.Secure.getString(context.contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES)
             ?.split(':')
             ?.mapNotNull { ComponentName.unflattenFromString(it.trim())?.flattenToString() }
             ?.filter { it !in reported }
             ?.distinct()
-            ?.take(MAX_APPS)
-            ?.forEach { settingsOnly.add(it.take(200)) }
+            ?: emptyList()
         val result = linkedMapOf<String, Any>(
             "status" to "ok",
             "services" to services,
-            "settings_only" to settingsOnly
+            "settings_only" to hidden.take(MAX_APPS).map { it.take(200) },
+            // More than this collector sends: the server says so, never guesses.
+            "truncated" to (reported.size > MAX_APPS || hidden.size > MAX_APPS)
         )
         Settings.Secure.getString(context.contentResolver, Settings.Secure.DEFAULT_INPUT_METHOD)
             ?.let { ComponentName.unflattenFromString(it.trim()) }
@@ -466,23 +466,23 @@ class IntegrityProbeManager(
     private fun probeNotificationAccess(): Map<String, Any> {
         // Not a public constant; AndroidX's NotificationManagerCompat reads the
         // same setting. Unreadable, it throws, and the probe answers error.
-        val listeners = Settings.Secure.getString(context.contentResolver, "enabled_notification_listeners")
+        val all = Settings.Secure.getString(context.contentResolver, "enabled_notification_listeners")
             ?.split(':')
             ?.mapNotNull { ComponentName.unflattenFromString(it.trim()) }
             ?.distinctBy { it.flattenToString() }
-            ?.take(MAX_APPS)
-            ?.map { appEntry(it.packageName, it.className) }
             ?: emptyList()
-        return ok("listeners" to listeners)
+        return ok(
+            "listeners" to all.take(MAX_APPS).map { appEntry(it.packageName, it.className) },
+            "truncated" to (all.size > MAX_APPS)
+        )
     }
 
     /** The active device administrators, and the known remote-control apps installed. */
     private fun probeOtherAccess(): Map<String, Any> {
         val policy = context.getSystemService(Context.DEVICE_POLICY_SERVICE) as? DevicePolicyManager
             ?: return unavailable("DevicePolicyManager is not available")
-        val admins = (policy.activeAdmins ?: emptyList())
-            .take(MAX_APPS)
-            .map { appEntry(it.packageName, it.className) }
+        val active = policy.activeAdmins ?: emptyList()
+        val admins = active.take(MAX_APPS).map { appEntry(it.packageName, it.className) }
         val pm = context.packageManager
         val remote = remoteAccessPackages.filter { name ->
             try {
@@ -492,7 +492,11 @@ class IntegrityProbeManager(
                 false
             }
         }.map { appEntry(it) }
-        return ok("device_admins" to admins, "remote_access_apps" to remote)
+        return ok(
+            "device_admins" to admins,
+            "remote_access_apps" to remote,
+            "truncated" to (active.size > MAX_APPS)
+        )
     }
 
     /**
