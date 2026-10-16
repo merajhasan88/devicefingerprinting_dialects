@@ -171,8 +171,8 @@ All of these are DBA settings.
   re-confirm.
 
 **2026-10-14**
-- The long-term list: *"You can get started on these long-term items. I want to fix any hole and
-  breach in our defenses."* Section 3 has the list and the state of each item.
+- The eight security improvements: *"You can get started on these long-term items. I want to fix any
+  hole and breach in our defenses."* Section 3 has them and the state of each.
 - **Step-up method:** *"build every option but make the screenlock and app PIN checked by server as DBA
   configurable"*. The default was then set to the app PIN.
 - **Denied approvals:** *"Lower the denial points and keep it at limited but make the setting DBA
@@ -235,19 +235,19 @@ All of these are DBA settings.
 | **The other client SDKs (G9)** | *"I will note this down and have separate claude's build each."* | Native Android (Kotlin), native iOS (Swift) and React Native, each built in a Claude session of its own. .NET exists; Flutter is this repository. |
 | **The iPhone round** | *"Run iphone after the review work. Would need another codemagic build or we could go with gitlab actions."* (2026-10-13) | It needs a new iOS build: iOS collectors 3 and 4, the location request and the PIN protection have never been compiled. |
 
-**The long-term defence list** (2026-10-14, *"I want to fix any hole and breach in our defenses"*), in
-the owner's order:
+**The eight security improvements the owner approved on 2026-10-14** (*"I want to fix any hole and
+breach in our defenses"*), in the owner's order:
 
 | # | Item | State |
 |---|---|---|
 | 1 | Cross-checks from what the server already sees | **Done** (§77) |
-| 2 | Per-operation "fresh and complete scan required" | **Partly.** The per-path requirement exists (`complete_evidence_paths`). Binding a scan to the exact operation it approves is not built. |
+| 2 | Per-operation "fresh and complete scan required" | **Partly.** The per-path requirement exists (`complete_evidence_paths`), and since the review of 2026-10-16 a path can require optional measurements (`required_measurements_paths`, §83). Binding a scan to the exact operation it approves is not built. |
 | 3 | Recovery for single-phone users (route 3) before any customer turns enforcement on | **Server side built** (identity-system assertions, guide §7). It needs each customer's identity backend; the harness has none. |
 | 4 | Events from other services: credential changes, recovery, networks, payees | **Largely covered.** The business events API takes them, with payees stored only as keyed hashes (§76), and §80–§81 record source networks. Anything that carries personal data is the owner's call. |
 | 5 | Per-installation history: coverage disappearing, flips between suspicious and clean, build changes | **Not built.** Observe-only at first, because OS updates will trigger it. |
 | 6 | Runtime baselines per build, OS and CPU type, from the release pipeline | **Not built.** This is also the open part of review finding R5: the runtime allowances rest on name and shape heuristics. |
 | 7 | Observation-mode metrics: false restrictions, recoveries, detector coverage | **Not built.** |
-| 8 | The review's four-question verdict (protocol, evidence, findings, decision) | **Labels exist** (evidence quality). The structured response belongs in the next API version. |
+| 8 | The review's four-question verdict (protocol, evidence, findings, decision) | **Labels exist** (evidence quality; since §83 each reason's category: integrity, condition or collection). The structured response belongs in the next API version. |
 
 ---
 

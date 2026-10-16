@@ -654,4 +654,6 @@ the rest is new fields to send or tolerate.
   DBA requires measurements), `check_conditions_cap`; reports send `enabled_measurements`; the PIN
   support checks skip when the business token lacks the role.
 
-**Verified on our side:** gate 118/118, offline. Schema 25 has not run live yet.
+**Verified on our side** (DESIGN.md §83): gate 118/118; schema 25 live on the EC2 PostgreSQL 16.15
+on 2026-10-16 — suite 73/0/21 in observe, 87/0/7 in enforce; the business roles and event conflicts
+checked live; the Android emulator's own scan stored `enabled_by_app` and every status.
