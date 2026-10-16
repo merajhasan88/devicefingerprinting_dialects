@@ -1435,6 +1435,7 @@ _RISK_SETTING_KINDS = {
     "external_display_points": "int",
     "external_display_refuses": "bool",
     "location_max_age_seconds": "int",
+    "vpn_exit_min_device_age_days": "int",
     "limited_session_paths": "paths",
     "limited_session_integrity_verdicts": "list:elevated,review",
     "limited_session_policy_actions": "list:step_up,review",
@@ -1532,6 +1533,7 @@ _RISK_SETTING_MAXIMUMS = {
     "security_patch_max_age_days": 3650,
     "conditions_points_cap": 100,
     "location_max_age_seconds": 86400,
+    "vpn_exit_min_device_age_days": 365,
 }
 _RISK_SETTING_BOOL_WORDS = ("0", "1", "true", "false", "yes", "no", "on", "off")
 # Rows whose absence would silently weaken a gate instead of restoring the
@@ -4147,21 +4149,32 @@ def _in_ranges(ranges, value):
 
 def _learned_vpn_exit(address):
     """Whether this server's own Android phones show `address` to be a VPN
-    exit (DESIGN.md 81): at least vpn_exit_min_phones of them came through a
-    VPN from it within vpn_exit_window_days, and they are at least
+    exit (DESIGN.md 81, 83): at least vpn_exit_min_phones of them came through
+    a VPN from it within vpn_exit_window_days, and they are at least
     vpn_exit_min_share_percent of the phones seen from it then. A phone's own
     address -- a home line, a carrier's shared pool -- carries mostly direct
-    traffic, even where an ad blocker uses Android's VPN interface."""
-    since = _utc_now() - timedelta(days=_risk_setting_int("vpn_exit_window_days", 30))
+    traffic, even where an ad blocker uses Android's VPN interface.
+
+    Each phone counts by its latest sighting there: one that came through a VPN
+    once and direct since is a direct phone (review F5). Only phones the server
+    has known for vpn_exit_min_device_age_days count at all, so freshly made-up
+    identities cannot label an address. Whether a scan went through a VPN is
+    the phone's own claim: the result is an inference from client reports."""
+    now = _utc_now()
+    since = now - timedelta(days=_risk_setting_int("vpn_exit_window_days", 30))
+    mature = now - timedelta(days=_risk_setting_int("vpn_exit_min_device_age_days", 7))
     with _cursor() as cursor:
         cursor.execute(
             """
-            SELECT COUNT(CASE WHEN last_via_vpn_at >= %s THEN 1 END),
-                   COUNT(CASE WHEN last_via_vpn_at >= %s OR last_direct_at >= %s THEN 1 END)
-            FROM vpn_exit_sightings
-            WHERE address = %s
+            SELECT COUNT(CASE WHEN s.last_via_vpn_at >= %s
+                              AND (s.last_direct_at IS NULL
+                                   OR s.last_via_vpn_at >= s.last_direct_at) THEN 1 END),
+                   COUNT(CASE WHEN s.last_via_vpn_at >= %s OR s.last_direct_at >= %s THEN 1 END)
+            FROM vpn_exit_sightings s
+            JOIN recognized_devices d ON d.device_id = s.device_id
+            WHERE s.address = %s AND d.created_at <= %s
             """,
-            (since, since, since, address),
+            (since, since, since, address, mature),
         )
         row = cursor.fetchone()
     via_vpn, seen = (int(row[0] or 0), int(row[1] or 0)) if row else (0, 0)
@@ -9268,7 +9281,14 @@ def business_events():
                     raise
                 if savepoint:
                     cursor.execute(savepoint[1])
-                results.append({"event_id": event["event_id"], "status": "duplicate"})
+                # The same event sent again is a duplicate; a different event
+                # under the same ID is a conflict the producer must see (review
+                # F6): it was not stored, and the earlier event stands.
+                if _same_business_event(cursor, event, str(row[0])):
+                    results.append({"event_id": event["event_id"], "status": "duplicate"})
+                else:
+                    results.append({"event_id": event["event_id"], "status": "rejected",
+                                    "code": "event_id_conflict"})
             else:
                 if savepoint:
                     cursor.execute(savepoint[2])
@@ -9276,6 +9296,39 @@ def business_events():
     counts = {state: sum(1 for r in results if r["status"] == state)
               for state in ("accepted", "duplicate", "rejected")}
     return jsonify(dict(counts, results=results))
+
+
+def _same_business_event(cursor, event, account_id):
+    """Whether the event already stored under this event_id is this one: the
+    same account, type, time, amount, currency, outcome and subject."""
+    cursor.execute(
+        """
+        SELECT account_id, event_type, occurred_at, amount_minor, currency, outcome, subject_hash
+        FROM business_events WHERE event_id = %s
+        """,
+        (event["event_id"],),
+    )
+    stored = cursor.fetchone()
+    if stored is None:
+        return False
+    occurred = stored[2]
+    if isinstance(occurred, str):
+        try:
+            occurred = datetime.fromisoformat(occurred.replace("Z", "+00:00"))
+        except ValueError:
+            return False
+    if occurred is not None and occurred.tzinfo is None:
+        occurred = occurred.replace(tzinfo=timezone.utc)
+    incoming = event["occurred_at"]
+    if isinstance(incoming, str):
+        incoming = datetime.fromisoformat(incoming.replace("Z", "+00:00"))
+    # SQL Server keeps milliseconds: compare to the millisecond.
+    return (str(stored[0]) == account_id and stored[1] == event["type"]
+            and occurred is not None and abs(occurred - incoming) < timedelta(milliseconds=1)
+            and (None if stored[3] is None else int(stored[3])) == event["amount_minor"]
+            and (stored[4] or None) == event["currency"]
+            and (stored[5] or None) == event["outcome"]
+            and (stored[6] or None) == event["subject_hash"])
 
 
 def _business_event_counts(device_id, account_id):

@@ -39,6 +39,7 @@ USING (VALUES
     ('external_display_points', '10', 'Points for android_external_display and ios_external_display: a display besides the phone''s own was on during the scan -- a cast, a mirror or a monitor, not proof of capture. 0 = recorded only.'),
     ('external_display_refuses', '0', 'Eligibility rule. 1 = in enforce mode a phone with another display on is refused until it is disconnected and a new scan is sent; 0 (owner default) = no refusal.'),
     ('location_max_age_seconds', '600', 'How recent the phone''s last location must be to count: an older fake-GPS fix is kept in the report but not scored, and an older location reads as stale. 30-86400.'),
+    ('vpn_exit_min_device_age_days', '7', 'Days the server must have known a phone before its sightings count towards learning a VPN exit: freshly made-up phone identities cannot label an address. 0-365.'),
     ('screen_capture_points', '30', 'Points for android_screen_captured and ios_screen_captured: the app''s screen recorded or mirrored during the scan. Another display alone is external_display_points. 0 = recorded only.'),
     ('screen_capture_refuses', '0', 'Eligibility rule. 1 = in enforce mode a phone whose screen was being recorded or mirrored during the scan is refused until that stops and a new scan is sent; 0 (owner default) = no refusal.')
 ) AS s(setting_key, setting_value, description)

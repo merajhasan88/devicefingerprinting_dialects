@@ -5064,6 +5064,71 @@ def conditions_never_block_alone_and_a_clean_rescan_restores_access():
 
 
 @check
+def vpn_exits_count_each_phone_by_its_latest_sighting_and_age():
+    """Review F5. A phone that came through a VPN once and direct since is a
+    direct phone: three phones through a VPN 20 days ago and direct now used to
+    label the address a VPN exit. Only phones the server has known for
+    vpn_exit_min_device_age_days (owner default 7) count, so freshly made-up
+    identities cannot label an address."""
+    store = ObservationStore()
+
+    def sight(phone, address, via_vpn, days_ago=0):
+        network = {"status": "ok", "vpn_active": via_vpn,
+                   "transports": ["wifi", "vpn"] if via_vpn else ["wifi"]}
+        with s.app.test_request_context("/", environ_base={"REMOTE_ADDR": address}):
+            s._record_vpn_sighting(LiteCursor(store.connection), phone[0], network)
+        if days_ago:
+            column = "last_via_vpn_at" if via_vpn else "last_direct_at"
+            store.connection.execute(
+                "UPDATE vpn_exit_sightings SET %s = ? WHERE address = ? AND device_id = ?" % column,
+                (s._utc_now() - timedelta(days=days_ago), address, phone[0]))
+        store.connection.commit()
+
+    def learned(address, **settings):
+        with s.app.test_request_context("/", environ_base={"REMOTE_ADDR": address}):
+            decision = store.decide(store.phone(), **dict({"vpn_exit_learning": 1}, **settings))
+        return decision["context"]["source_network"]["vpn_observed"]
+
+    mixed, fresh, young = "192.0.2.70", "192.0.2.75", "192.0.2.80"
+    for phone in [store.phone() for _ in range(3)]:
+        sight(phone, mixed, True, days_ago=20)
+        sight(phone, mixed, False)
+    expect(learned(mixed) is False, "through a VPN 20 days ago, direct now: three direct phones")
+    for phone in [store.phone() for _ in range(3)]:
+        sight(phone, fresh, False, days_ago=20)
+        sight(phone, fresh, True)
+    expect(learned(fresh) is True, "direct 20 days ago, through a VPN now: three VPN witnesses")
+    for _ in range(3):
+        sight(store.phone(age_days=1), young, True)
+    expect(learned(young) is False, "phones the server met yesterday do not count")
+    expect(learned(young, vpn_exit_min_device_age_days=0) is True, "the DBA's minimum age applies")
+
+
+@check
+def a_reused_event_id_with_other_content_is_a_conflict():
+    """Review F6. An event sent again is a duplicate; a different event under
+    an event_id already used -- another account's chargeback after a purchase
+    -- used to be called a duplicate and dropped. It is now rejected as
+    event_id_conflict, and the first event stands."""
+    with business_store() as conn:
+        alice = business_account(conn, "alice")
+        bob = business_account(conn, "bob")
+        purchase = {"event_id": "ev-9", "account_id": alice, "type": "purchase",
+                    "occurred_at": "2026-10-12T10:00:00Z", "amount_minor": 999, "currency": "USD"}
+        status, payload = business_call("POST", "/v1/business/events", {"events": [
+            purchase, dict(purchase), dict(purchase, account_id=bob, type="chargeback"),
+            dict(purchase, amount_minor=1000)]})
+        results = payload.get("results", [])
+        expect(status == 200 and [r["status"] for r in results]
+               == ["accepted", "duplicate", "rejected", "rejected"]
+               and [r.get("code") for r in results[2:]] == ["event_id_conflict"] * 2,
+               "a retry is a duplicate, other content a conflict: %s %s" % (status, payload))
+        rows = conn.execute("SELECT account_id, event_type, amount_minor FROM business_events "
+                            "WHERE event_id = 'ev-9'").fetchall()
+        expect([tuple(r) for r in rows] == [(alice, "purchase", 999)], "the first event stands: %s" % rows)
+
+
+@check
 def request_metadata_is_kept_only_where_the_dba_says():
     """DESIGN.md 80. The address a request came from and its User-Agent are
     personal data: a decision's context carries them only where the DBA sets
