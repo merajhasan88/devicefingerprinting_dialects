@@ -202,7 +202,7 @@ WHERE installation_id = '<installation_id>';
 ```
 
 <!-- settings-reference:begin (tools/settings_reference.py --write; do not edit by hand) -->
-156 settings, seeded by migrations 003-029 with the owner's defaults; each row's own description.
+157 settings, seeded by migrations 003-030 with the owner's defaults; each row's own description.
 
 **Migration 003** — DBA-tunable risk policy settings
 
@@ -459,6 +459,12 @@ WHERE installation_id = '<installation_id>';
 |---|---|---|
 | `business_event_types_by_producer` | *(empty)* | Which event types each business API caller may send: caller:type+type, comma-separated. A caller not listed is held only to business_event_types. Empty (owner default) = no per-caller limit. |
 | `business_event_rules` | *(empty)* | Your rules over business events, each type[/outcome][@source kind]:count:hours:points[:account\|device\|newcomer] -- e.g. chargeback:1:720:40. Each adds its points to a decision when it matches. Empty (owner default) = none: the business decides. |
+
+**Migration 030** — runtime baselines published by the release pipeline -- the memory profile each app build shows, per OS level and process ABI
+
+| Setting | Default | What it decides |
+|---|---|---|
+| `exec_outside_baseline_points` | `30` | Points for android_exec_outside_baseline: more unlabelled executable memory than the release profile published for this build, OS level and ABI allows. Applies only where the release pipeline published one. |
 <!-- settings-reference:end -->
 
 **Shared phones and several devices are a business decision.** By default a third account on one
@@ -799,8 +805,8 @@ the API its own random bearer token, and list them in `BUSINESS_API_TOKENS`, com
 BUSINESS_API_TOKENS=payments:events:<digest>,risk-engine:graph+lapses+reports:<digest>,support-tool:pin_unlock+pin_reset:<digest>
 ```
 
-The roles are `events`, `graph`, `lapses`, `reports`, `pin_unlock`, `pin_reset` and `operations`
-(section 17); a name is 1–64 of
+The roles are `events`, `graph`, `lapses`, `reports`, `pin_unlock`, `pin_reset`, `operations`
+(section 17) and `baselines` (section 19); a name is 1–64 of
 `a-z 0-9 _ -`. `printf %s "$TOKEN" | sha256sum` gives a digest. List a caller twice, with two digests,
 to rotate its token without a gap. A malformed entry stops the server at start. Calls carry
 `Authorization: Bearer <token>`: an unknown token answers 401 `business_token_invalid`, a known one
@@ -1454,3 +1460,49 @@ a VPN switched on and off, say — never count as a flip.
 A client that forges its reports can forge a consistent history as well. These catch copied
 installations, simulators that cannot keep their story straight and clients that stop measuring, not a
 careful forger.
+
+## 19. Runtime baselines from your release pipeline
+
+Writable-and-executable memory and unlabelled executable regions are how injected code shows — and how
+some genuine runtimes work. The server can tell the two apart only against what **your own release
+build** shows on phones you control; it must never learn "clean" from the field, where the first clients
+could be the attackers (review R5, `DESIGN.md` §84.6).
+
+**Publish each release's profile.** Run the release build on your reference phones and emulators — each
+OS level and ABI you support, cold start, a long session, every major feature — against a server you
+control, so they send clean scans. Then:
+
+```
+DEVICE_TRUST_REPORTS_TOKEN=... DEVICE_TRUST_BASELINES_TOKEN=... python3 tools/runtime_baseline.py \
+    --base-url https://<server> --installation <reference installation> [--installation ...] \
+    --release-label "2.4.1 (241)" --publish
+```
+
+The tool reads those installations' scans through the report feed, keeps only complete, trusted ones, and
+publishes one profile per build, OS level and ABI through `POST /v1/business/runtime-baselines` (a token
+with the role **`baselines`**): the most writable-executable memory seen (`wx_bytes_max`), the allocation
+size all of it divides into (`wx_granularity`), and the most unlabelled executable regions seen plus a
+margin (`anon_exec_max`, `--anon-margin`, 2). You may post a profile yourself — `platform`, `app_build`
+(the APK's SHA-256, or the iOS executable's), `os_level` and `abi` (each null for any), `release_label` and
+the three figures. A new profile retires the active one of exactly that build, level and ABI; nothing is
+deleted. `GET /v1/business/runtime-baselines?app_build=…` lists them;
+`POST /v1/business/runtime-baselines/<id>/retire` retires one.
+
+**What a scan is held to.** The most specific active profile for its build: OS level and ABI both, then
+the ABI, then the OS level, then the build alone. Its writable-executable memory is judged against the
+profile's envelope exactly as against a pinned `INTEGRITY_ANDROID_WX_BASELINES` entry (growth up to
+`wx_far_above_baseline_percent` advisory, beyond it +40, an allocation size the build never makes +45),
+and more unlabelled executable regions than the profile allows add `exec_outside_baseline_points` (30,
+`android_exec_outside_baseline`). The scan names the profile (`runtime_baseline`). Without one,
+`INTEGRITY_ANDROID_WX_BASELINES` still applies, then today's rule (+60 for any writable-executable
+memory).
+
+**What it needs, and what it does not prove.** The sizes come from the Android collector 6 of this
+repository (the .NET collector always sent them); an app on an older collector is judged as before. The
+profile is keyed on the build hash the phone reports: a client claiming another build's hash claims that
+build's profile, so pin your builds (`INTEGRITY_ANDROID_APK_SHA256`, section 3). iOS profiles are stored
+but nothing is scored against them yet. Like every measurement here it describes what a cooperating app
+saw; a fully compromised OS can make up a clean profile.
+
+**Database.** Migration 030 adds `runtime_baselines` — grant the application principal `SELECT, INSERT,
+UPDATE` (a retirement is an update), never `DELETE` — and `integrity_reports.runtime_baseline_id`.

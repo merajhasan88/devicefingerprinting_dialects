@@ -113,6 +113,7 @@ class Rows(object):
         self.operation_reports = {}
         self.operation_uses = set()
         self.history_rows = []
+        self.baselines = []
 
     def execute(self, sql, params=None):
         q = " ".join(sql.split())
@@ -133,6 +134,9 @@ class Rows(object):
                           "policy_version, installation_id, operation_sha256 FROM integrity_reports "
                           "WHERE report_id"):
             self.result = self.operation_reports.get(params[0])
+        elif q.startswith("SELECT baseline_id, os_level, abi, wx_bytes_max, wx_granularity, "
+                          "anon_exec_max, release_label FROM runtime_baselines"):
+            self.result = [row[1:] for row in self.baselines if row[0] == params[1]]
         elif q.startswith("SELECT created_at, collector_version, probe_results, measurement_status, "
                           "reasons FROM integrity_reports WHERE installation_id"):
             self.result = list(self.history_rows)
@@ -3020,7 +3024,7 @@ CREATE TABLE integrity_reports (report_id TEXT PRIMARY KEY, installation_id TEXT
                                 evidence_quality TEXT, finding_score INTEGER, platform TEXT,
                                 collector_version INTEGER, reasons TEXT, probe_results TEXT,
                                 report_sha256 TEXT, measurement_status TEXT, policy_version TEXT,
-                                server_build TEXT, operation_sha256 TEXT);
+                                server_build TEXT, operation_sha256 TEXT, runtime_baseline_id TEXT);
 CREATE TABLE business_events (event_id TEXT PRIMARY KEY,
                               account_id TEXT NOT NULL REFERENCES demo_accounts(account_id),
                               event_type TEXT NOT NULL, occurred_at TSZ NOT NULL,
@@ -6659,6 +6663,178 @@ def business_events_from_other_services_follow_the_dbas_rules():
     expect(rules(joining) == {"business_event_rule:credential_changed:newcomer": (30, 1)}
            and joining["score"] >= 30,
            "a phone joining the account just after its password changed: %s" % rules(joining))
+
+
+@check
+def runtime_baselines_come_from_the_release_pipeline():
+    """DESIGN.md 84.6: item 6 of the eight the owner approved on 2026-10-14;
+    review R5: "Use build artifacts produced by your own release pipeline to
+    approve baseline profiles." The pipeline publishes each build's profile per
+    OS level and ABI (role baselines); a scan of that build is held to the most
+    specific active one -- its W^X envelope and its unlabelled executable
+    regions -- and names it; without one, INTEGRITY_ANDROID_WX_BASELINES, then
+    today's rule. Publishing replaces the same key's profile, which is retired,
+    never deleted. tools/runtime_baseline.py derives profiles from clean,
+    complete scans of a reference run only."""
+    probes = clean("android")
+    build = probes["app_identity"]["apk_sha256"]
+
+    def scan(classes=None, anon=None, sdk=34, abi="arm64-v8a", baselines=(), env=None):
+        current = clean("android")
+        current["device"] = dict(c.VOLUNTEERED_CLEAN["android"]["device"], sdk_int=sdk, abi=abi)
+        if classes:
+            pairs = [tuple(int(part) for part in item.split(":")) for item in classes.split(",")]
+            current["exec_mappings"].update(
+                wx_mappings=sum(n for _, n in pairs), wx_bytes=sum(size * n for size, n in pairs),
+                wx_size_classes=classes, wx_smallest_bytes=min(size for size, _ in pairs),
+                wx_largest_bytes=max(size for size, _ in pairs))
+        if anon is not None:
+            current["exec_mappings"]["anon_exec_unlabeled"] = anon
+        db.baselines = list(baselines)
+        saved = dict(s.ANDROID_WX_BASELINES)
+        if env:
+            s.ANDROID_WX_BASELINES[build] = env
+        db.writes = []
+        try:
+            with policy():
+                status, payload = send_report("android", current)
+        finally:
+            db.baselines = []
+            s.ANDROID_WX_BASELINES.clear()
+            s.ANDROID_WX_BASELINES.update(saved)
+        expect(status == 200, "report failed: %s %s" % (status, payload))
+        stored = [p for q, p in db.writes if q.startswith("INSERT INTO integrity_reports")]
+        return payload["integrity"], stored[-1][18] if stored else "unstored"
+
+    def profile(baseline_id, level=None, abi=None, wx=(3735552, 65536), anon=None, label="2.4.1"):
+        return (build, baseline_id, level, abi, wx and wx[0], wx and wx[1], anon, label)
+
+    any_phone = profile("b-any", wx=(1048576, 65536), anon=4)
+    by_abi = profile("b-abi", abi="arm64-v8a", anon=6)
+    by_level = profile("b-level", level=34, anon=8)
+    exact = profile("b-exact", level=34, abi="arm64-v8a", anon=10)
+    other_abi = profile("b-x86", abi="x86_64", anon=1)
+    for baselines, sdk, wanted in (
+            ([any_phone], 34, "b-any"), ([any_phone, by_level], 34, "b-level"),
+            ([any_phone, by_level, by_abi], 34, "b-abi"),
+            ([any_phone, by_level, by_abi, exact], 34, "b-exact"),
+            ([any_phone, by_level, by_abi, exact], 33, "b-abi"),
+            ([other_abi], 34, None), ([by_level], 33, None)):
+        result, stored = scan(baselines=baselines, sdk=sdk)
+        named = (result.get("runtime_baseline") or {}).get("baseline_id")
+        expect(named == wanted and stored == wanted,
+               "%s at API %d: %s (stored %s), not %s"
+               % ([b[1] for b in baselines], sdk, named, stored, wanted))
+    result, _ = scan(classes="65536:57", baselines=[exact])
+    expect(not {r["code"] for r in result["reasons"]} & {"android_wx_memory", "android_wx_far_above_baseline"},
+           "inside the published envelope: %s" % points_of(result))
+    for classes, wanted in (("65536:144", "android_wx_far_above_baseline"),
+                            ("65536:57,4096:1", "android_wx_foreign_allocator")):
+        result, _ = scan(classes=classes, baselines=[exact])
+        expect(wanted in points_of(result), "%s: %s" % (classes, points_of(result)))
+    result, _ = scan(classes="65536:57")
+    expect(points_of(result).get("android_wx_memory") == 60, "no profile, no pin: +60 as before")
+    result, _ = scan(classes="65536:57", env=R1_ENVELOPE)
+    expect("android_wx_memory" not in points_of(result), "no profile: the pinned envelope still")
+    result, _ = scan(classes="65536:57", baselines=[profile("b-anon", wx=None, anon=3)],
+                     env=R1_ENVELOPE)
+    expect("android_wx_memory" not in points_of(result),
+           "a profile without W^X figures leaves the pin in force: %s" % points_of(result))
+    result, _ = scan(anon=11, baselines=[exact])
+    expect(points_of(result).get("android_exec_outside_baseline") == 30
+           and result["score"] == 30 and result["verdict"] == "elevated",
+           "more unlabelled executable regions than the profile: %s" % points_of(result))
+    result, _ = scan(anon=10, baselines=[exact])
+    expect("android_exec_outside_baseline" not in points_of(result), "at the profile: nothing")
+    with policy(exec_outside_baseline_points=15):
+        db.baselines = [exact]
+        current = clean("android")
+        current["device"] = dict(c.VOLUNTEERED_CLEAN["android"]["device"], abi="arm64-v8a")
+        current["exec_mappings"]["anon_exec_unlabeled"] = 11
+        try:
+            status, payload = send_report("android", current)
+        finally:
+            db.baselines = []
+    expect(points_of(payload["integrity"]).get("android_exec_outside_baseline") == 15,
+           "the DBA's points: %s" % points_of(payload["integrity"]))
+    result, _ = scan(anon=50)
+    expect("android_exec_outside_baseline" not in points_of(result),
+           "no profile, no judgment of unlabelled regions: %s" % points_of(result))
+
+    # Publishing: role baselines; the same key's profile retired, never deleted.
+    with business_store() as connection, business_policy():
+        connection.executescript(
+            "CREATE TABLE runtime_baselines (baseline_id TEXT PRIMARY KEY, platform TEXT, "
+            "app_build TEXT, os_level INTEGER, abi TEXT, release_label TEXT, wx_bytes_max INTEGER, "
+            "wx_granularity INTEGER, anon_exec_max INTEGER, published_by TEXT, "
+            "published_at TSZ DEFAULT CURRENT_TIMESTAMP, retired_at TSZ);")
+        s.BUSINESS_API_CALLERS = {c.sha256_hex(b"reports-only"): ("analytics", ("reports",)),
+                                  c.sha256_hex(BUSINESS_TOKEN.encode()): ("release", ("baselines",))}
+        publish = "/v1/business/runtime-baselines"
+        body = {"platform": "android", "app_build": build, "os_level": 34, "abi": "arm64-v8a",
+                "release_label": "2.4.1 (241)", "wx_bytes_max": 3735552, "wx_granularity": 65536,
+                "anon_exec_max": 10}
+        status, reply = business_call("POST", publish, body, token="reports-only")
+        expect(status == 403, "without the baselines role: %s" % status)
+        for bad in (dict(body, app_build="XYZ"), dict(body, os_level=0), dict(body, abi="ARM 64"),
+                    dict(body, wx_granularity=None), dict(body, wx_bytes_max=None,
+                                                          wx_granularity=None, anon_exec_max=None),
+                    dict(body, platform="windows"), dict(body, extra=1)):
+            status, reply = business_call("POST", publish, bad)
+            expect(status == 400 and error_of(reply) == "invalid_runtime_baseline",
+                   "%s: %s %s" % (bad, status, reply))
+        status, first = business_call("POST", publish, body)
+        status2, second = business_call("POST", publish, dict(body, anon_exec_max=12))
+        status3, wide = business_call("POST", publish, dict(body, os_level=None, abi=None))
+        rows = connection.execute(
+            "SELECT baseline_id, anon_exec_max, retired_at IS NOT NULL, published_by "
+            "FROM runtime_baselines ORDER BY published_at, baseline_id").fetchall()
+        first_id, second_id = first["baseline"]["baseline_id"], second["baseline"]["baseline_id"]
+        expect(status == status2 == status3 == 201 and len(rows) == 3
+               and {r[0]: r[2] for r in rows} == {first_id: 1, second_id: 0,
+                                                  wide["baseline"]["baseline_id"]: 0}
+               and {r[3] for r in rows} == {"release"},
+               "a new profile retires the same key's, not another's: %s" % rows)
+        status, listing = business_call("GET", publish, query={"app_build": build})
+        expect(status == 200 and len(listing.get("baselines", [])) == 3, "listed: %s" % listing)
+        status, reply = business_call("POST", "%s/%s/retire" % (publish, second_id))
+        status_again, _ = business_call("POST", "%s/%s/retire" % (publish, second_id))
+        expect(status == 200 and status_again == 404, "retired once: %s %s" % (status, status_again))
+        phone = dict(probes, device=dict(c.VOLUNTEERED_CLEAN["android"]["device"], abi="arm64-v8a"))
+        found = s._runtime_baseline(LiteCursor(connection), "android", phone)
+        expect(found and found["baseline_id"] == wide["baseline"]["baseline_id"],
+               "retired profiles are never used; the wide one remains: %s" % found)
+
+    sys.path.insert(0, str(DOCS / "tools"))
+    try:
+        import runtime_baseline as tool
+    finally:
+        sys.path.pop(0)
+
+    def report(quality="complete", verdict="trusted", wx=None, sizes="", anon=3, sdk=34):
+        return {"report_id": str(uuid.uuid4()), "platform": "android", "evidence_quality": quality,
+                "verdict": verdict, "probe_results": {
+                    "app_identity": {"apk_sha256": build},
+                    "device": {"sdk_int": sdk, "abi": "arm64-v8a"},
+                    "exec_mappings": {"wx_bytes": wx, "wx_size_classes": sizes,
+                                      "anon_exec_unlabeled": anon}}}
+
+    profiles, skipped = tool.derive_profiles(
+        [report(wx=196608, sizes="131072:1,65536:1", anon=4),
+         report(wx=262144, sizes="196608:1,65536:1", anon=6),
+         report(wx=0, anon=5, sdk=33),
+         report(verdict="elevated", wx=9999999, anon=99),
+         report(quality="incomplete", anon=99)], release_label="2.4.1", anon_margin=2)
+    by_level = {p["os_level"]: p for p in profiles}
+    expect(len(skipped) == 2 and set(by_level) == {33, 34}
+           and by_level[34]["wx_bytes_max"] == 262144 and by_level[34]["wx_granularity"] == 65536
+           and by_level[34]["anon_exec_max"] == 8 and by_level[34]["scans"] == 2
+           and by_level[33]["wx_bytes_max"] == 0 and by_level[33]["anon_exec_max"] == 7,
+           "the tool takes clean, complete scans only: %s %s" % (profiles, skipped))
+
+
+def error_of(reply):
+    return (reply.get("error") or {}).get("code")
 
 
 # The rows people change by hand (DESIGN.md 84): the key, the value, then the

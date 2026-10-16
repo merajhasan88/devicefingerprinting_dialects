@@ -121,7 +121,7 @@ _POLICY_VERSION_KEY = hmac.new(_ROOT_SECRET, b"policy-version-v1", hashlib.sha25
 # token carries only its own roles, and the caller's name is recorded with what
 # it does.
 _BUSINESS_ROLES = ("events", "graph", "lapses", "reports", "pin_unlock", "pin_reset",
-                   "operations")
+                   "operations", "baselines")
 # A token from BUSINESS_API_TOKEN_SHA256 (DESIGN.md 76) keeps what it did
 # before -- except PIN support, which now needs a token that names it.
 _DEFAULT_BUSINESS_ROLES = ("events", "graph", "lapses", "reports")
@@ -1248,7 +1248,7 @@ def _get_backend_identity():
 # against a schema it does not understand. /health/* still answers so operators
 # can see why.
 
-REQUIRED_SCHEMA_VERSION = 29
+REQUIRED_SCHEMA_VERSION = 30
 
 
 def _server_build():
@@ -1587,6 +1587,7 @@ _RISK_SETTING_KINDS = {
     "installation_verdict_flips_count": "int",
     "business_event_types_by_producer": "producer_codes",
     "business_event_rules": "event_rules",
+    "exec_outside_baseline_points": "int",
 }
 _RISK_SETTING_KINDS.update(
     ("%s_%s" % (rule[0], part), "int")
@@ -2354,7 +2355,7 @@ _PROBE_OPTIONAL_FIELDS = {
         # plan, so older clients lose nothing (DESIGN.md 80).
         "device": {"release": str, "sdk_int": int, "security_patch": str, "manufacturer": str,
                    "brand": str, "model": str, "device": str, "build_id": str,
-                   "fingerprint": str},
+                   "fingerprint": str, "abi": str},
         "network": {"vpn_active": bool, "http_proxy_configured": bool, "transports": list,
                     "interfaces": list},
         # Only where the DBA requests it and the app's developers enabled it.
@@ -2373,7 +2374,7 @@ _PROBE_OPTIONAL_FIELDS = {
                           "wx_smallest_bytes": int, "wx_largest_bytes": int,
                           "deleted_exec_own_code": int, "deleted_exec_jit": int,
                           "anon_exec_labeled": int, "anon_exec_unlabeled": int,
-                          "maps_lines": int, "samples": list},
+                          "anon_exec_unlabeled_bytes": int, "maps_lines": int, "samples": list},
         "runtime_maps": {"maps_lines": int, "suspicious_line_count": int},
         "instrumentation_threads": {"thread_count": int},
         # Coverage, reported by the native scanner since DESIGN.md 63.
@@ -3140,8 +3141,53 @@ def _wx_shape_consistent(exec_maps, wx_count, wx_bytes, classes):
     return True
 
 
-def _score_wx_memory(reasons, exec_maps, apk_hash):
-    """Writable-and-executable memory, scored against the build's baseline.
+def _runtime_baseline(cursor, platform, probes):
+    """The release profile published for this scan's app build (DESIGN.md
+    84.6), the most specific that matches its OS level and process ABI: both,
+    then the ABI, then the OS level, then the build alone; None without one.
+    Keyed on the build's hash, never on a runtime name the client reports. A
+    client claiming another build's hash claims that build's profile, which is
+    why a deployment pins its builds (INTEGRITY_ANDROID_APK_SHA256)."""
+    ident, device = _probe(probes, "app_identity"), _probe(probes, "device")
+    build = _as_text(ident.get("apk_sha256" if platform == "android"
+                               else "executable_sha256")).lower()
+    if re.fullmatch(r"[0-9a-f]{64}", build) is None:
+        return None
+    if platform == "android":
+        level = device.get("sdk_int")
+    else:
+        version = _version_tuple(device.get("os_version"))
+        level = version[0] if version else None
+    level = level if isinstance(level, int) and not isinstance(level, bool) else None
+    abi = _as_text(device.get("abi")) or None
+    cursor.execute(
+        """
+        SELECT baseline_id, os_level, abi, wx_bytes_max, wx_granularity, anon_exec_max,
+               release_label
+        FROM runtime_baselines
+        WHERE platform = %s AND app_build = %s AND retired_at IS NULL
+        """,
+        (platform, build),
+    )
+    best = None
+    for row in cursor.fetchall() or []:
+        if (row[1] is not None and row[1] != level) or (row[2] is not None and row[2] != abi):
+            continue
+        rank = (row[2] is not None, row[1] is not None)
+        if best is None or rank > best[0]:
+            best = (rank, row)
+    if best is None:
+        return None
+    row = best[1]
+    return {"baseline_id": str(row[0]), "os_level": row[1], "abi": row[2],
+            "wx_bytes_max": row[3], "wx_granularity": row[4], "anon_exec_max": row[5],
+            "release_label": row[6]}
+
+
+def _score_wx_memory(reasons, exec_maps, apk_hash, published=None):
+    """Writable-and-executable memory, scored against the build's baseline:
+    the release pipeline's published profile (DESIGN.md 84.6) where one
+    matches, else INTEGRITY_ANDROID_WX_BASELINES.
 
     Today's rule -- +60 whenever such memory is mapped -- stays for every build
     without a pinned baseline and for every report that does not carry
@@ -3158,6 +3204,9 @@ def _score_wx_memory(reasons, exec_maps, apk_hash):
     if wx_count <= 0 and not wx_bytes:
         return 0
     baseline = ANDROID_WX_BASELINES.get(apk_hash)
+    if published is not None and published.get("wx_bytes_max") is not None \
+            and published.get("wx_granularity"):
+        baseline = (int(published["wx_bytes_max"]), int(published["wx_granularity"]))
     classes = _wx_size_classes(exec_maps)
     if (
         baseline is None
@@ -3429,7 +3478,7 @@ def _score_security_patch(reasons, probes):
     return 0
 
 
-def _score_android_integrity(probes):
+def _score_android_integrity(probes, published=None):
     reasons = []
     score = 0
     hard_block = False
@@ -3652,7 +3701,19 @@ def _score_android_integrity(probes):
                               "protection after reading it.", report_only=True)
 
     exec_maps = _probe(probes, "exec_mappings")
-    score += _score_wx_memory(reasons, exec_maps, apk_hash)
+    score += _score_wx_memory(reasons, exec_maps, apk_hash, published)
+    # Unlabelled anonymous executable memory beyond what the release pipeline
+    # measured for this build, OS level and ABI (DESIGN.md 84.6; review R5:
+    # "executable regions outside the ordinary profile").
+    anon = exec_maps.get("anon_exec_unlabeled")
+    if (published is not None and published.get("anon_exec_max") is not None
+            and isinstance(anon, int) and not isinstance(anon, bool)
+            and anon > int(published["anon_exec_max"])):
+        points = _risk_setting_int("exec_outside_baseline_points", 30)
+        _integrity_reason(reasons, "android_exec_outside_baseline", points,
+                          "%d unlabelled executable regions are mapped; the release profile of this "
+                          "build allows %d." % (anon, int(published["anon_exec_max"])))
+        score += points
     if _as_int(exec_maps.get("deleted_exec_mappings")) > 0:
         # The ART JIT cache is excluded client-side; what remains is an
         # executable region backed by a deleted file, a classic injection shape.
@@ -3872,9 +3933,9 @@ def _score_ios_integrity(probes):
     return score, hard_block, reasons
 
 
-def _score_integrity(platform, probes):
+def _score_integrity(platform, probes, published=None):
     if platform == "android":
-        score, hard_block, reasons = _score_android_integrity(probes)
+        score, hard_block, reasons = _score_android_integrity(probes, published)
     elif platform == "ios":
         score, hard_block, reasons = _score_ios_integrity(probes)
     else:
@@ -8412,7 +8473,8 @@ def integrity_report():
             report_signature,
         )
 
-        scored = _score_integrity(platform, probes)
+        published = _runtime_baseline(cursor, platform, probes)
+        scored = _score_integrity(platform, probes, published)
         failed_required = []
         for probe_name in required_probes:
             probe_value = probes.get(probe_name)
@@ -8445,8 +8507,9 @@ def integrity_report():
                 (report_id, challenge_id, installation_id, device_id, platform,
                  collector_version, score, verdict, hard_block, reasons,
                  probe_results, report_sha256, evidence_quality, finding_score,
-                 measurement_status, policy_version, server_build, operation_sha256)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                 measurement_status, policy_version, server_build, operation_sha256,
+                 runtime_baseline_id)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """,
             (
                 report_id,
@@ -8467,6 +8530,7 @@ def integrity_report():
                 policy_version,
                 SERVER_BUILD,
                 operation_sha256,
+                published["baseline_id"] if published else None,
             ),
         )
 
@@ -8487,6 +8551,10 @@ def integrity_report():
         "policy_version": policy_version,
         # The one operation this scan may approve, if its challenge named one.
         "operation_sha256": operation_sha256,
+        # The release profile this scan was held to (DESIGN.md 84.6), if any.
+        "runtime_baseline": ({"baseline_id": published["baseline_id"],
+                              "release_label": published["release_label"]}
+                             if published else None),
         "mode": INTEGRITY_MODE,
         "fresh_for_seconds": _integrity_freshness_seconds(),
         "remote_attestation": "not_used",
@@ -10795,6 +10863,128 @@ def business_acceptance_lapses():
 _REPORT_FILTERS = ("device_id", "installation_id", "account_id")
 
 
+_BASELINE_FIELDS = ("platform", "app_build", "os_level", "abi", "release_label", "wx_bytes_max",
+                    "wx_granularity", "anon_exec_max")
+
+
+def _baseline_problem(field, message):
+    return ApiProblem(message, 400, "invalid_runtime_baseline", details={"field": field})
+
+
+def _whole(body, field, low, high):
+    value = body.get(field)
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or not low <= value <= high:
+        raise _baseline_problem(field, "%s must be a whole number from %d to %d, or null."
+                                % (field, low, high))
+    return value
+
+
+def _baseline_row(row):
+    return {"baseline_id": str(row[0]), "platform": row[1], "app_build": row[2],
+            "os_level": row[3], "abi": row[4], "release_label": row[5],
+            "wx_bytes_max": row[6], "wx_granularity": row[7], "anon_exec_max": row[8],
+            "published_by": row[9], "published_at": _iso_z(row[10]),
+            "retired_at": _iso_z(row[11]) if row[11] is not None else None}
+
+
+_BASELINE_COLUMNS = ("baseline_id, platform, app_build, os_level, abi, release_label, "
+                     "wx_bytes_max, wx_granularity, anon_exec_max, published_by, published_at, "
+                     "retired_at")
+
+
+@app.post("/v1/business/runtime-baselines")
+def business_runtime_baseline_publish():
+    """Publish one app build's runtime profile (DESIGN.md 84.6): what the
+    release pipeline measured running that build on its reference phones --
+    the most writable-executable memory, its allocation size, the most
+    unlabelled executable regions -- for one OS level and process ABI, or for
+    any (null). It replaces the active profile of exactly that build, level
+    and ABI, which is retired, never deleted. Role baselines."""
+    caller = _require_business_caller("baselines")
+    body = _json_body()
+    unknown = sorted(set(body) - set(_BASELINE_FIELDS))
+    if unknown:
+        raise _baseline_problem(unknown[0], "%s is not a known field." % unknown[0])
+    platform = body.get("platform")
+    if platform not in ("android", "ios"):
+        raise _baseline_problem("platform", "platform must be android or ios.")
+    app_build = body.get("app_build")
+    if not isinstance(app_build, str) or re.fullmatch(r"[0-9a-f]{64}", app_build) is None:
+        raise _baseline_problem("app_build", "app_build is the build's SHA-256 (the APK's, or the "
+                                "iOS executable's), lower-case hex.")
+    os_level = _whole(body, "os_level", 1, 100)
+    abi = body.get("abi")
+    if abi is not None and (not isinstance(abi, str) or re.fullmatch(r"[a-z0-9_-]{1,32}", abi) is None):
+        raise _baseline_problem("abi", "abi is an ABI name such as arm64-v8a, or null.")
+    label = body.get("release_label")
+    if label is not None and (not isinstance(label, str) or not 1 <= len(label) <= 64):
+        raise _baseline_problem("release_label", "release_label is 1-64 characters, or null.")
+    wx_max = _whole(body, "wx_bytes_max", 0, 1 << 40)
+    granularity = _whole(body, "wx_granularity", 1, 1 << 30)
+    anon_max = _whole(body, "anon_exec_max", 0, 100000)
+    if (wx_max is None) != (granularity is None):
+        raise _baseline_problem("wx_granularity", "wx_bytes_max and wx_granularity go together.")
+    if wx_max is None and anon_max is None:
+        raise _baseline_problem("wx_bytes_max", "a profile needs wx_bytes_max and wx_granularity, "
+                                "anon_exec_max, or both.")
+    baseline_id = str(uuid.uuid4())
+    same = ("platform = %s AND app_build = %s AND retired_at IS NULL AND "
+            + ("os_level IS NULL" if os_level is None else "os_level = %s") + " AND "
+            + ("abi IS NULL" if abi is None else "abi = %s"))
+    key = tuple(v for v in (platform, app_build, os_level, abi) if v is not None)
+    with _cursor(commit=True) as cursor:
+        cursor.execute("UPDATE runtime_baselines SET retired_at = NOW() WHERE " + same, key)
+        cursor.execute(
+            """
+            INSERT INTO runtime_baselines
+                (baseline_id, platform, app_build, os_level, abi, release_label, wx_bytes_max,
+                 wx_granularity, anon_exec_max, published_by)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """,
+            (baseline_id, platform, app_build, os_level, abi, label, wx_max, granularity,
+             anon_max, caller),
+        )
+        cursor.execute("SELECT " + _BASELINE_COLUMNS + " FROM runtime_baselines "
+                       "WHERE baseline_id = %s", (baseline_id,))
+        row = cursor.fetchone()
+    return jsonify({"baseline": _baseline_row(row)}), 201
+
+
+@app.get("/v1/business/runtime-baselines")
+def business_runtime_baselines():
+    """The published runtime profiles, newest first, at most 200; ?app_build=
+    for one build's, retired ones included."""
+    _require_business_caller("baselines")
+    where, values = "", ()
+    if request.args.get("app_build"):
+        build = request.args.get("app_build")
+        if re.fullmatch(r"[0-9a-f]{64}", build) is None:
+            raise _baseline_problem("app_build", "app_build is lower-case hex SHA-256.")
+        where, values = "WHERE app_build = %s ", (build,)
+    with _cursor() as cursor:
+        cursor.execute("SELECT " + _BASELINE_COLUMNS + " FROM runtime_baselines " + where
+                       + "ORDER BY published_at DESC, baseline_id DESC LIMIT 200", values)
+        rows = cursor.fetchall() or []
+    return jsonify({"baselines": [_baseline_row(row) for row in rows]})
+
+
+@app.post("/v1/business/runtime-baselines/<baseline_id>/retire")
+def business_runtime_baseline_retire(baseline_id):
+    """Retire one profile: scans of its build fall back to a less specific
+    profile, or to none."""
+    _require_business_caller("baselines")
+    baseline_id = _uuid_text(baseline_id, "baseline_id")
+    with _cursor(commit=True) as cursor:
+        cursor.execute("UPDATE runtime_baselines SET retired_at = NOW() "
+                       "WHERE baseline_id = %s AND retired_at IS NULL", (baseline_id,))
+        retired = cursor.rowcount == 1
+    if not retired:
+        raise ApiProblem("No active profile with that ID.", 404, "runtime_baseline_not_found")
+    return jsonify({"baseline_id": baseline_id, "retired": True})
+
+
 @app.post("/v1/business/operation-scans/verify")
 def business_operation_scan_verify():
     """A scan made for an operation the business's own backend performs
@@ -10916,7 +11106,7 @@ def business_integrity_reports():
             SELECT report_id, installation_id, device_id, platform, collector_version,
                    score, verdict, hard_block, evidence_quality, finding_score,
                    reasons, probe_results, report_sha256, created_at, measurement_status,
-                   policy_version, server_build, operation_sha256
+                   policy_version, server_build, operation_sha256, runtime_baseline_id
             FROM integrity_reports
             WHERE """ + where + """(created_at > %s OR (created_at = %s AND report_id > %s))
             ORDER BY created_at, report_id
@@ -10933,7 +11123,8 @@ def business_integrity_reports():
          "probe_results": DIALECT.json_value(r[11]), "report_sha256": r[12],
          "created_at": _iso_z(r[13]),
          "measurements": DIALECT.json_value(r[14]) if r[14] is not None else None,
-         "policy_version": r[15], "server_build": r[16], "operation_sha256": r[17]}
+         "policy_version": r[15], "server_build": r[16], "operation_sha256": r[17],
+         "runtime_baseline_id": str(r[18]) if r[18] is not None else None}
         for r in rows
     ]
     for report in reports:

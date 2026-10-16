@@ -18,9 +18,9 @@ even if the same people wear two hats.
 | Party | Decides | Where it lives | Documented today |
 |---|---|---|---|
 | **Us**, the product | how phones are measured and how much each finding weighs; the protocol | code | `DESIGN.md` (internal) |
-| **DBA and business analysts** | what is refused, limited, counted, for how long; what support staff may do to a PIN | `risk_policy_settings`, 156 rows | `INTEGRATION_GUIDE.md` §5 (every row, generated), §7–§13; the rows' own descriptions |
+| **DBA and business analysts** | what is refused, limited, counted, for how long; what support staff may do to a PIN | `risk_policy_settings`, 157 rows | `INTEGRATION_GUIDE.md` §5 (every row, generated), §7–§13; the rows' own descriptions |
 | **DevOps** | running the server: database, Redis, TLS, secrets, rollout modes, the app's identity pins | about 60 environment variables | guide §2–§4, §6 |
-| **App developers** | the app: native keys and collector, SDK calls, the screens users see, release values handed to DevOps | build settings, native modules, UI | scattered through the guide — **no app-developer guide** (gap G3) |
+| **App developers** | the app: native keys and collector, SDK calls, the screens users see, release values handed to DevOps; each release's runtime profile, measured on reference phones and published (`tools/runtime_baseline.py`, role `baselines`, guide §19) | build settings, native modules, UI | scattered through the guide — **no app-developer guide** (gap G3) |
 | **Backend developers** | business events in — from every service: credential changes, recovery, payees, each with the address it came from; the graph, the lapse feed and every integrity report out; the support tool's PIN unlock and reset; route-3 assertions from their identity system; verifying the scan made for an operation their backend performs, and enforcing its decision there | business API (one token per caller, each with only the roles it needs), JWKS file | guide §10, §12, §7, §17; [MEASUREMENTS.md](MEASUREMENTS.md) |
 
 ## 1. What we fix — measurement and protocol
@@ -46,7 +46,7 @@ missing row. Every change of a value carries its reason, and the database record
 (migration 026; the statement is in the guide's section 5).
 
 <!-- settings-reference:begin (tools/settings_reference.py --write; do not edit by hand) -->
-156 settings, seeded by migrations 003-029 with the owner's defaults; each row's own description.
+157 settings, seeded by migrations 003-030 with the owner's defaults; each row's own description.
 
 **Migration 003** — DBA-tunable risk policy settings
 
@@ -303,6 +303,12 @@ missing row. Every change of a value carries its reason, and the database record
 |---|---|---|
 | `business_event_types_by_producer` | *(empty)* | Which event types each business API caller may send: caller:type+type, comma-separated. A caller not listed is held only to business_event_types. Empty (owner default) = no per-caller limit. |
 | `business_event_rules` | *(empty)* | Your rules over business events, each type[/outcome][@source kind]:count:hours:points[:account\|device\|newcomer] -- e.g. chargeback:1:720:40. Each adds its points to a decision when it matches. Empty (owner default) = none: the business decides. |
+
+**Migration 030** — runtime baselines published by the release pipeline -- the memory profile each app build shows, per OS level and process ABI
+
+| Setting | Default | What it decides |
+|---|---|---|
+| `exec_outside_baseline_points` | `30` | Points for android_exec_outside_baseline: more unlabelled executable memory than the release profile published for this build, OS level and ABI allows. Applies only where the release pipeline published one. |
 <!-- settings-reference:end -->
 
 ## 3. DevOps — running the server
@@ -389,7 +395,7 @@ and its W^X baseline (DESIGN.md 62), the iOS team, bundle and signing identifier
 1. **What we fix** — the integrity weights and bands, measurement rules, the protocol and its token
    lifetimes, the invariants. The relationship rules and how long a session lives moved to the DBA in
    migration 021 (G1, G8).
-2. **The DBA's and business analysts' domain** — 156 settings, each with the owner's default and a
+2. **The DBA's and business analysts' domain** — 157 settings, each with the owner's default and a
    description in the row, all of them in the guide, generated from the migrations (G7).
 3. **The app developers' domain** — the native code and a working reference client exist, and the
    client now follows the server's step-up policy (G4); there is still no package to depend on (G2) and

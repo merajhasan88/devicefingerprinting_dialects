@@ -7086,3 +7086,39 @@ Gate: `business_events_from_other_services_follow_the_dbas_rules` — both setti
 reading, per-caller types, the source kept as kinds and hash only, duplicate versus conflict by source,
 nine rule cases (hours, count, device, outcome, source, newcomer), points added, the business as the
 source. Thirteen breakages caught.
+
+### 84.6 Item 6 — runtime baselines from the release pipeline (migration 030, schema 30; collector 6)
+
+**Asked for.** Item 6: expected memory profiles per app release, OS and CPU type, produced by the
+customer's release pipeline — the open part of review R5 (*"Use build artifacts produced by your own
+release pipeline to approve baseline profiles. Do not let the first client — or an automatically learned
+untrusted population — establish the clean baseline"*). Until now a W^X envelope came only from
+`INTEGRITY_ANDROID_WX_BASELINES` (DevOps, per APK hash, a restart to change), and **the Kotlin collector
+sent no sizes at all**: the baseline path was reachable only from the .NET collector.
+
+**Built.**
+- **Collector 6 (Android, Kotlin):** `exec_mappings` now sends `wx_bytes`, every size class
+  (`wx_size_classes`, largest first, never cut short), the extremes, and `anon_exec_unlabeled_bytes`;
+  `device` sends `abi`, the process's own ABI (a 32-bit app on a 64-bit phone maps different code). Sizes
+  come from each maps range. Volunteered fields: older collectors lose nothing.
+- **`runtime_baselines`**, published by the release pipeline through the business API (new role
+  `baselines`): per build hash, optional OS level and ABI, `wx_bytes_max` + `wx_granularity` (together),
+  `anon_exec_max`; a new profile retires the same key's in the same transaction; retire endpoint; list.
+  Nothing is deleted.
+- **Scoring:** `_runtime_baseline` picks the most specific active profile (level and ABI, ABI, level,
+  build) inside the report's own unit of work; `_score_wx_memory` uses its envelope ahead of the
+  environment pin, with the same rules (§62, §69); `android_exec_outside_baseline`
+  (`exec_outside_baseline_points`, 30) when unlabelled executable regions exceed the profile. The report
+  stores `runtime_baseline_id`; the answer and the feed name it.
+- **`tools/runtime_baseline.py`** derives profiles from a reference run's scans via the report feed —
+  complete and trusted only — and publishes them. Standard library only.
+
+**Not done.** iOS profiles are stored, not scored: iOS sends no comparable memory figures. Module
+identity per mapping (which library owns a region) — the review's further step — is not collected. The
+profile is keyed on a reported hash: pinning builds is what makes the key trustworthy (guide §19).
+
+Gate: `runtime_baselines_come_from_the_release_pipeline` — seven selection cases, the envelope
+(inside, far above, foreign size), the fallbacks (pin, +60), a profile without W^X figures leaving the pin
+in force, unlabelled regions above, at and without a profile, the DBA's points, publishing by role,
+validation, retirement of the same key only, the lookup ignoring retired profiles, the tool keeping clean
+complete scans and adding its margin. Twelve server breakages and three tool breakages caught.
