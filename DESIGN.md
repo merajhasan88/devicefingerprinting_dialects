@@ -7019,3 +7019,41 @@ feed. Seventeen breakages caught.
 **Not built.** Binding to a *session* as well as an installation: the installation key already signs both
 the scan and the request, and the access proof binds the request to its token. A Flutter harness button
 for an operation scan is in 84.10.
+
+### 84.4 Item 5 — each installation against its own past (migration 028, schema 28)
+
+**Asked for.** Item 5: history per app installation — checks suddenly stopping, flipping between
+suspicious and clean, app build changes; observe-only at first, because OS updates will trigger it. The
+2026-10-13 review: *"Compare each installation with its own prior reports … disappearing coverage, changed
+collector capabilities, unexplained build/runtime changes, incompatible measurements, and repeated
+transitions between suspicious and clean reports. These can expose crude suppression and inconsistent
+simulators, though a sophisticated client can fabricate a consistent sequence too."*
+
+**The principle.** An installation key is made in one phone's keystore and deleted with the app. Changes
+that a real phone produces under one installation are app updates and OS updates, forward; everything else
+is a copied installation, a repackaged app or made-up reports.
+
+**Built.** `_history_reasons`, in the report's own unit of work after scoring and before the collection
+rules, reads the installation's last 20 reports (one query) and compares the new scan with the latest:
+
+| Reason | Owner's proposed points | Rule |
+|---|---|---|
+| `installation_signer_changed` | 60 | Android signing certificates (as a set) or package; iOS bundle ID |
+| `installation_device_changed` | 60 | Android manufacturer, model, device; iOS model identifier — both scans having the volunteered `device` probe |
+| `installation_os_downgraded` | 40 | Android (API level, security patch) compared as a pair; iOS version as numbers |
+| `installation_collector_downgraded` | 30 | collector version lower |
+| `installation_app_downgraded` | 30 | Android version code; iOS version as numbers |
+| `installation_coverage_dropped` | 30 | `ok` before, now `absent`, `unsupported` (same OS) or `not_enabled` (same build); failures are collection problems already, a permission or the GPS the user's |
+| `installation_verdict_flips` | 30 | switches between integrity findings ≥ 30 and below, counting this scan, in `history_window_hours` (24), at least `installation_verdict_flips_count` (4) — conditions and collection problems never flip |
+| `installation_app_changed` | 0 | the build hash changed: an update, recorded for analysis and for item 6 |
+
+**Observe first, the §77 pattern** — the reconciliation of the owner's two instructions, "observe-only at
+first" (2026-10-14, for this item) and "put reasonable default scores" (2026-10-15): the reasons are
+always recorded, category `history` and kind `history` in the four answers; `history_checks_enabled`
+(default 0) makes them add their points, which are proposals seeded by 028, each `<code>_points`. When
+scored they are findings (`finding_score`, the device memory).
+
+Gate: `each_installation_is_compared_with_its_own_past` — first scan; unchanged; off and on; the DBA's
+points; fourteen cases from a re-signed app to an OS update excusing an unsupported measurement; flips by
+count, window and category; iOS. Sixteen breakages caught. GAME_THREATS names the two that matter to
+games (a copied installation, a mod installed over the genuine app).

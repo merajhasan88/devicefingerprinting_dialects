@@ -1248,7 +1248,7 @@ def _get_backend_identity():
 # against a schema it does not understand. /health/* still answers so operators
 # can see why.
 
-REQUIRED_SCHEMA_VERSION = 27
+REQUIRED_SCHEMA_VERSION = 28
 
 
 def _server_build():
@@ -1582,6 +1582,9 @@ _RISK_SETTING_KINDS = {
     "session_max_days": "int",
     "app_pin_support": ("off", "unlock", "unlock_and_reset"),
     "app_pin_support_reset_minutes": "int",
+    "history_checks_enabled": "bool",
+    "history_window_hours": "int",
+    "installation_verdict_flips_count": "int",
 }
 _RISK_SETTING_KINDS.update(
     ("%s_%s" % (rule[0], part), "int")
@@ -1596,6 +1599,7 @@ _RISK_SETTING_MINIMUMS = {
     "policy_step_up_score": 1,
     "complete_evidence_max_age_seconds": 30,
     "operation_scan_max_age_seconds": 10,
+    "history_window_hours": 1,
     "business_graph_depth": 1,
     "business_graph_max_nodes": 1,
     "cross_check_window_hours": 1,
@@ -1628,6 +1632,7 @@ _RISK_SETTING_MAXIMUMS = {
     "location_max_age_seconds": 86400,
     "vpn_exit_min_device_age_days": 365,
     "operation_scan_max_age_seconds": 600,
+    "history_window_hours": 720,
 }
 _RISK_SETTING_BOOL_WORDS = ("0", "1", "true", "false", "yes", "no", "on", "off")
 # Rows whose absence would silently weaken a gate instead of restoring the
@@ -2726,10 +2731,176 @@ def _cap_conditions(reasons):
 def _categorize(reasons):
     """Each integrity reason says what kind of evidence it is: integrity (the
     phone or the app compromised or not genuine), condition (what the phone
-    allows or is doing) or collection (a check that measured nothing usable)."""
+    allows or is doing), collection (a check that measured nothing usable) or
+    history (this scan against the installation's earlier ones, DESIGN.md 84.4)."""
     for reason in reasons:
         reason["category"] = ("collection" if _is_quality_reason(reason) else
-                              "condition" if _is_condition_reason(reason) else "integrity")
+                              "condition" if _is_condition_reason(reason) else
+                              "history" if reason.get("code") in _HISTORY_CODES else "integrity")
+
+
+# Each installation against its own past (DESIGN.md 84.4, item 5 of the eight
+# the owner approved on 2026-10-14; the 2026-10-13 review: "Compare each
+# installation with its own prior reports: disappearing coverage, changed
+# collector capabilities, unexplained build/runtime changes, incompatible
+# measurements, and repeated transitions between suspicious and clean
+# reports"). An installation's key lives in one phone's keystore and dies with
+# the app: the same installation cannot legitimately move to another phone,
+# change its signer, go back to an older OS or app, or stop measuring what it
+# measured. Measured into every scan; scored only where the DBA sets
+# history_checks_enabled -- observe first, as the cross-checks (DESIGN.md 77).
+# A client that forges its reports can forge a consistent history too: these
+# catch cloned or copied installations, simulators that cannot keep their
+# story, and clients that stop measuring.
+_HISTORY_RULES = (
+    # (code, the owner's default points, what it means)
+    ("installation_signer_changed", 60,
+     "The app's signing certificates or package changed under the same installation: a "
+     "repackaged app, since a genuine update keeps them."),
+    ("installation_device_changed", 60,
+     "The phone model changed under the same installation: its key cannot leave the phone it "
+     "was made on, so the installation was copied or the reports are made up."),
+    ("installation_os_downgraded", 40,
+     "The operating system or its security patch went back to an older one under the same "
+     "installation: going back wipes the phone, and the installation with it."),
+    ("installation_collector_downgraded", 30,
+     "The scan came from an older collector than this installation used before."),
+    ("installation_app_downgraded", 30,
+     "The app went back to an older version under the same installation, which a store "
+     "update never does."),
+    ("installation_coverage_dropped", 30,
+     "Measurements this installation took before are now missing, unsupported or switched "
+     "off, with no app or OS update to explain it."),
+    ("installation_verdict_flips", 30,
+     "This installation's scans keep switching between suspicious and clean."),
+    ("installation_app_changed", 0,
+     "The app build changed since this installation's last scan: an update, normally."),
+)
+_HISTORY_CODES = frozenset(rule[0] for rule in _HISTORY_RULES)
+_RISK_SETTING_KINDS.update((rule[0] + "_points", "int") for rule in _HISTORY_RULES)
+# Statuses that mean the client stopped measuring something it measured
+# before, rather than the user's choice (a permission, the GPS off) or the
+# server's (not_requested); a failure is a collection problem already.
+_COVERAGE_LOST = ("absent", "unsupported", "not_enabled")
+
+
+def _version_tuple(text):
+    """'15.8.5' -> (15, 8, 5); None when not dotted numbers."""
+    if not isinstance(text, str) or not re.fullmatch(r"\d+(\.\d+){0,3}", text.strip()):
+        return None
+    return tuple(int(part) for part in text.strip().split("."))
+
+
+def _app_facts(platform, probes):
+    """(build hash, signers, package, version) of the app as one scan saw it."""
+    ident = probes.get("app_identity") if isinstance(probes, dict) else None
+    if not isinstance(ident, dict) or ident.get("status") != "ok":
+        return None, None, None, None
+    if platform == "android":
+        signers = ident.get("cert_sha256")
+        signers = (tuple(sorted(str(s).lower() for s in signers))
+                   if isinstance(signers, list) and signers else None)
+        version = ident.get("version_code")
+        return (ident.get("apk_sha256"), signers, ident.get("package_name"),
+                (version,) if isinstance(version, int) and not isinstance(version, bool) else None)
+    return (ident.get("executable_sha256"), None, ident.get("bundle_id"),
+            _version_tuple(ident.get("version_code")) or _version_tuple(ident.get("version_name")))
+
+
+def _device_facts(platform, probes):
+    """(hardware, OS) of the phone as one scan saw it; None where not measured."""
+    device = probes.get("device") if isinstance(probes, dict) else None
+    if not isinstance(device, dict) or device.get("status") != "ok":
+        return None, None
+    if platform == "android":
+        hardware = tuple(str(device.get(key) or "").strip().lower()
+                         for key in ("manufacturer", "model", "device"))
+        sdk, patch = device.get("sdk_int"), device.get("security_patch")
+        os_level = ((sdk, patch if isinstance(patch, str) else "")
+                    if isinstance(sdk, int) and not isinstance(sdk, bool) else None)
+        return (hardware if any(hardware) else None), os_level
+    model = str(device.get("model_identifier") or "").strip()
+    return (model or None), _version_tuple(device.get("os_version"))
+
+
+def _integrity_points(reasons):
+    """The points of one scan's integrity findings alone: no condition, no
+    collection problem, no history -- what says compromised or clean."""
+    total = 0
+    for reason in _as_list(reasons):
+        if not isinstance(reason, dict):
+            continue
+        if (_is_quality_reason(reason) or _is_condition_reason(reason)
+                or reason.get("code") in _HISTORY_CODES):
+            continue
+        total += max(0, _as_int(reason.get("points")))
+    return total
+
+
+def _history_reasons(cursor, installation_id, platform, probes, collector_version,
+                     measurements, scored):
+    """Add to scored's reasons what this scan says against the installation's
+    earlier ones (the rules above), at the DBA's points where
+    history_checks_enabled is 1, at 0 otherwise. The first scan has no past."""
+    cursor.execute(
+        """
+        SELECT created_at, collector_version, probe_results, measurement_status, reasons
+        FROM integrity_reports
+        WHERE installation_id = %s
+        ORDER BY created_at DESC
+        LIMIT 20""",
+        (installation_id,),
+    )
+    rows = cursor.fetchall() or []
+    if not rows:
+        return
+    _, old_collector, old_probes, old_measurements, _ = rows[0]
+    old_probes = DIALECT.json_value(old_probes) or {}
+    found = {}
+    old_build, old_signers, old_package, old_version = _app_facts(platform, old_probes)
+    build, signers, package, version = _app_facts(platform, probes)
+    if (old_signers and signers and old_signers != signers) or (
+            old_package and package and old_package != package):
+        found["installation_signer_changed"] = ""
+    app_changed = bool(old_build and build and old_build != build)
+    if app_changed:
+        found["installation_app_changed"] = ""
+    if old_version and version and version < old_version:
+        found["installation_app_downgraded"] = ""
+    if isinstance(old_collector, int) and collector_version < old_collector:
+        found["installation_collector_downgraded"] = " (%d after %d)" % (collector_version,
+                                                                          old_collector)
+    old_hardware, old_os = _device_facts(platform, old_probes)
+    hardware, os_level = _device_facts(platform, probes)
+    if old_hardware and hardware and old_hardware != hardware:
+        found["installation_device_changed"] = ""
+    if old_os and os_level and os_level < old_os:
+        found["installation_os_downgraded"] = ""
+    os_changed = bool(old_os and os_level and old_os != os_level)
+    before = (DIALECT.json_value(old_measurements) or {}).get("status") or {}
+    now = (measurements or {}).get("status") or {}
+    lost = sorted(
+        name for name, status in before.items()
+        if status == "ok" and now.get(name) in _COVERAGE_LOST
+        and not (now.get(name) == "not_enabled" and app_changed)
+        and not (now.get(name) == "unsupported" and os_changed))
+    if lost:
+        found["installation_coverage_dropped"] = ": %s" % ", ".join(
+            "%s now %s" % (name, now[name]) for name in lost)
+    window = _utc_now() - timedelta(hours=max(1, _risk_setting_int("history_window_hours", 24)))
+    suspicious = [_integrity_points(DIALECT.json_value(row[4])) >= 30
+                  for row in reversed(rows) if row[0] >= window]
+    suspicious.append(_integrity_points(scored["reasons"]) >= 30)
+    flips = sum(1 for earlier, later in zip(suspicious, suspicious[1:]) if earlier != later)
+    count = _risk_setting_int("installation_verdict_flips_count", 4)
+    if count > 0 and flips >= count:
+        found["installation_verdict_flips"] = " (%d times in %d scans)" % (flips, len(suspicious))
+    scoring = _risk_setting_bool("history_checks_enabled", False)
+    for code, default, message in _HISTORY_RULES:
+        if code in found:
+            points = _risk_setting_int(code + "_points", default) if scoring else 0
+            _integrity_reason(scored["reasons"], code, points, message.rstrip(".") + found[code]
+                              + "." + ("" if scoring else " Recorded only: history checks are off."))
 
 
 def _incomplete_streak(cursor, installation_id):
@@ -8220,6 +8391,10 @@ def integrity_report():
                 failed_required.append(probe_name)
 
         _apply_hardware_backing_policy(cursor, installation_id, scored)
+        measurements = _measurement_status(platform, probes, required_probes, requested,
+                                           enabled_by_app)
+        _history_reasons(cursor, installation_id, platform, probes, collector_version,
+                         measurements, scored)
         _apply_collection_problems(
             scored,
             failed_required,
@@ -8234,8 +8409,6 @@ def integrity_report():
         )
         if platform == "android" and _risk_setting_bool("vpn_exit_learning", False):
             _record_vpn_sighting(cursor, device_id, probes.get("network"))
-        measurements = _measurement_status(platform, probes, required_probes, requested,
-                                           enabled_by_app)
         policy_version = _policy_version()
         cursor.execute(
             """

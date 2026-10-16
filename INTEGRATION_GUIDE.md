@@ -202,7 +202,7 @@ WHERE installation_id = '<installation_id>';
 ```
 
 <!-- settings-reference:begin (tools/settings_reference.py --write; do not edit by hand) -->
-143 settings, seeded by migrations 003-027 with the owner's defaults; each row's own description.
+154 settings, seeded by migrations 003-028 with the owner's defaults; each row's own description.
 
 **Migration 003** — DBA-tunable risk policy settings
 
@@ -436,6 +436,22 @@ WHERE installation_id = '<installation_id>';
 |---|---|---|
 | `operation_scan_paths` | *(empty)* | Paths where a request needs a scan made for it alone: the app asks for a challenge naming the request (method, path, query, body SHA-256), scans, and sends the request with the report_id; each scan approves one request. Empty (owner default) = none. |
 | `operation_scan_max_age_seconds` | `120` | How old a scan made for one operation may be when the operation arrives. 10-600. |
+
+**Migration 028** — each installation compared with its own earlier scans
+
+| Setting | Default | What it decides |
+|---|---|---|
+| `history_checks_enabled` | `0` | 1 = the installation history reasons add their points; 0 (owner default) = each scan is still compared with the installation's earlier ones and the reasons recorded at 0 -- observe first. |
+| `history_window_hours` | `24` | Hours of an installation's scans that installation_verdict_flips counts. 1-720. |
+| `installation_verdict_flips_count` | `4` | Switches between suspicious (integrity findings of 30 or more) and clean scans within history_window_hours that make installation_verdict_flips. 0 = off. |
+| `installation_signer_changed_points` | `60` | Points for installation_signer_changed: the app's signing certificates or package changed under the same installation -- a repackaged app. |
+| `installation_device_changed_points` | `60` | Points for installation_device_changed: the phone model changed under the same installation, whose key cannot leave its phone. |
+| `installation_os_downgraded_points` | `40` | Points for installation_os_downgraded: the OS or its security patch went back under the same installation. |
+| `installation_collector_downgraded_points` | `30` | Points for installation_collector_downgraded: a scan from an older collector than the installation used before. |
+| `installation_app_downgraded_points` | `30` | Points for installation_app_downgraded: the app went back to an older version under the same installation. |
+| `installation_coverage_dropped_points` | `30` | Points for installation_coverage_dropped: measurements taken before now missing, unsupported or switched off with no app or OS update to explain it. |
+| `installation_verdict_flips_points` | `30` | Points for installation_verdict_flips: scans that keep switching between suspicious and clean. |
+| `installation_app_changed_points` | `0` | Points for installation_app_changed: the app build changed since the last scan, normally an update. Owner default 0 = recorded only. |
 <!-- settings-reference:end -->
 
 **Shared phones and several devices are a business decision.** By default a third account on one
@@ -1382,3 +1398,26 @@ never sees. A second verification of the same scan answers 409 `integrity_operat
 **Database.** Migration 027 adds `operation_scan_uses`, the record of what each scan approved: grant the
 application principal `SELECT, INSERT`, never `UPDATE` or `DELETE`. The report feed (section 10) names
 each scan's operation (`operation_sha256`).
+
+## 18. Each installation against its own past
+
+An installation's key lives in one phone's keystore and dies with the app. So the same installation
+never legitimately moves to another phone, changes the app's signer, goes back to an older OS, app or
+collector, or stops measuring what it measured — and a genuine phone's scans do not keep switching
+between suspicious and clean. Every scan is compared with the installation's earlier ones
+(`DESIGN.md` §84.4; the reasons and when each fires are in [MEASUREMENTS.md](MEASUREMENTS.md) §2):
+`installation_signer_changed`, `installation_device_changed`, `installation_os_downgraded`,
+`installation_collector_downgraded`, `installation_app_downgraded`, `installation_coverage_dropped`,
+`installation_verdict_flips`, and `installation_app_changed` (an update; never scored by default).
+
+**Observe first.** The reasons are always recorded, with category `history`; they add their points only
+where your DBA sets `history_checks_enabled` to 1, at the owner's proposed points (60, 60, 40, 30, 30,
+30, 30 and 0) or your DBA's. Before you turn it on, read how often each fires on your real traffic in the
+report feed: an OEM update that changes what the phone reports, or a test team's phones, will show there
+first. Explained changes are not counted: a measurement switched off by an app update, or newly
+unsupported after an OS update, and a failure, which is a collection problem already. Conditions —
+a VPN switched on and off, say — never count as a flip.
+
+A client that forges its reports can forge a consistent history as well. These catch copied
+installations, simulators that cannot keep their story straight and clients that stop measuring, not a
+careful forger.

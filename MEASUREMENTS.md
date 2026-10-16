@@ -163,6 +163,7 @@ The `category` says what kind of evidence a reason is (review F2, DESIGN.md 83):
   (Accessibility, the keyboard, notification access, device administrators, remote-control apps,
   screen recording, another display, a simulated location).
 - **`collection`** — a check that measured nothing usable (below).
+- **`history`** — this scan against the installation's earlier ones (below; DESIGN.md 84.4).
 
 Conditions add at most `conditions_points_cap` (owner default 60) together, so on their own they reach
 review, never a block. A reason the cap reduced keeps what it would have scored in `points_before_cap`.
@@ -176,6 +177,28 @@ default (`collection_problems_block` 0) each scores 0 and one `integrity_evidenc
 30 for all of them; where the DBA sets it to 1, each scores 30 and that summary row does not appear.
 `integrity_evidence_persistently_incomplete` adds 30 more after `incomplete_evidence_review_after` (3)
 incomplete scans in a row, under either setting.
+
+**History: each installation against its own past** (DESIGN.md 84.4). An installation's key lives in one
+phone's keystore and dies with the app, so the same installation cannot legitimately move to another
+phone, change its signer, go back to an older OS or app, or stop measuring what it measured. Each scan is
+compared with the installation's previous one (and, for the flips, with its scans in
+`history_window_hours`, 24). The reasons are always recorded; they add their points only where the DBA
+sets `history_checks_enabled` (owner default 0: observe first), each at its `<code>_points`:
+
+| Code | Points when on | Fires when |
+|---|---|---|
+| `installation_signer_changed` | 60 | the signing certificates (Android) or the package or bundle ID changed — a repackaged app |
+| `installation_device_changed` | 60 | the phone model changed (Android manufacturer, model, device; iOS model identifier) |
+| `installation_os_downgraded` | 40 | the OS level went back (Android API level, or the security patch at one level; iOS version) |
+| `installation_collector_downgraded` | 30 | the collector version went back |
+| `installation_app_downgraded` | 30 | the app version went back (Android version code; iOS build or version) |
+| `installation_coverage_dropped` | 30 | a measurement that was `ok` is now `absent`, `unsupported` (with the same OS) or `not_enabled` (with the same app build); the message names them. A failure is a collection problem already; a permission or the GPS is the user's choice |
+| `installation_verdict_flips` | 30 | the installation's scans switched between suspicious (integrity findings of 30 or more) and clean at least `installation_verdict_flips_count` (4) times in the window |
+| `installation_app_changed` | 0 | the app build changed: an update, normally; recorded for analysis |
+
+They count as findings (`finding_score`) when scored. A client that forges its reports can forge a
+consistent history as well: these catch copied installations, simulators that cannot keep their story
+straight and clients that stop measuring, not a careful forger.
 
 | Code | Points | Hard | Report-only | Platform | Meaning |
 |---|---|---|---|---|---|

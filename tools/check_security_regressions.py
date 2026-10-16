@@ -112,6 +112,7 @@ class Rows(object):
         self.sightings = {}
         self.operation_reports = {}
         self.operation_uses = set()
+        self.history_rows = []
 
     def execute(self, sql, params=None):
         q = " ".join(sql.split())
@@ -132,6 +133,9 @@ class Rows(object):
                           "policy_version, installation_id, operation_sha256 FROM integrity_reports "
                           "WHERE report_id"):
             self.result = self.operation_reports.get(params[0])
+        elif q.startswith("SELECT created_at, collector_version, probe_results, measurement_status, "
+                          "reasons FROM integrity_reports WHERE installation_id"):
+            self.result = list(self.history_rows)
         elif q.startswith("INSERT INTO operation_scan_uses"):
             if params[0] in self.operation_uses:
                 raise s.DIALECT._driver.errors.UniqueViolation("used")
@@ -4459,6 +4463,7 @@ def _source_measurements():
     found["cross-check rule"] = {rule[0] for rule in s._CROSS_CHECK_RULES}
     found["relationship reason"] |= {rule[0] for rule in s._SOURCE_NETWORK_RULES}
     found["integrity reason"] |= {code for rule in s._ACCESS_HOLDERS for code in rule[2:4]}
+    found["integrity reason"] |= {rule[0] for rule in s._HISTORY_RULES}
     found["observation kind"] = set(s._OBSERVATION_KINDS)
     fields = set()
     for contract in (s._PROBE_REQUIRED_FIELDS, s._PROBE_OPTIONAL_FIELDS):
@@ -4570,8 +4575,10 @@ def the_settings_reference_matches_the_migrations():
              for part in ("count", "points")}
     read |= {rule[0] for rule in s._ELIGIBILITY_RULES}
     read |= {rule[2] for rule in s._SOURCE_NETWORK_RULES}
+    read |= {rule[0] + "_points" for rule in s._HISTORY_RULES}
     # A table's default is a fallback too (migration 025 re-defaulted these).
     fallbacks += [(rule[2], rule[3]) for rule in s._SOURCE_NETWORK_RULES]
+    fallbacks += [(rule[0] + "_points", rule[1]) for rule in s._HISTORY_RULES]
     expect(not read - set(seeded), "read by the server but seeded by no migration: %s"
            % sorted(read - set(seeded)))
     expect(not set(seeded) - read, "seeded but never read: %s" % sorted(set(seeded) - read))
@@ -6384,6 +6391,130 @@ def a_scan_approves_only_the_operation_it_was_made_for():
                    "a second verification is refused: %s %s" % (status, payload))
         finally:
             s._evaluate_risk_policy = saved_policy
+
+
+@check
+def each_installation_is_compared_with_its_own_past():
+    """DESIGN.md 84.4: item 5 of the eight the owner approved on 2026-10-14. An
+    installation's key cannot leave its phone and dies with the app, so the
+    same installation never legitimately changes its signer or phone, goes back
+    to an older OS, app or collector, or stops measuring what it measured; nor
+    do a genuine phone's scans keep switching between suspicious and clean.
+    Every scan is compared with the installation's earlier ones; the reasons
+    are recorded always (category history) and score only where the DBA sets
+    history_checks_enabled. An update explains a new build, a new OS an
+    unsupported measurement."""
+    android = c.VOLUNTEERED_CLEAN["android"]
+    measured = {name: "ok" for name in s._MEASUREMENTS["android"]}
+
+    def probes(**changes):
+        current = dict(clean("android"), device=dict(android["device"]),
+                       network=dict(android["network"]))
+        for probe, fields in changes.items():
+            current[probe] = None if fields is None else dict(current[probe], **fields)
+        return {name: value for name, value in current.items() if value is not None}
+
+    def previous(age_hours=1, collector=3, statuses=None, reasons=(), **changes):
+        return (s._utc_now() - timedelta(hours=age_hours), collector, probes(**changes),
+                {"status": dict(measured, **(statuses or {}))}, list(reasons))
+
+    def history(rows, now=None, collector=None, **settings):
+        db.history_rows = rows
+        try:
+            with policy(**settings):
+                status, payload = send_report("android", now or probes(), collector_version=collector)
+        finally:
+            db.history_rows = []
+        expect(status == 200, "report failed: %s %s" % (status, payload))
+        return {r["code"]: r for r in payload["integrity"]["reasons"]
+                if r["code"] in s._HISTORY_CODES}, payload["integrity"]
+
+    found, _ = history([])
+    expect(not found, "a first scan has no past: %s" % found)
+    found, _ = history([previous()])
+    expect(not found, "the same app, phone and OS: nothing: %s" % found)
+    resigned = {"cert_sha256": ["ab" * 32]}
+    found, scan = history([previous(app_identity=resigned)])
+    recorded = found.get("installation_signer_changed") or {}
+    expect(recorded.get("points") == 0 and recorded.get("category") == "history"
+           and "Recorded only" in recorded.get("message", "") and scan["score"] == 0,
+           "off: measured, recorded at 0: %s" % recorded)
+    found, scan = history([previous(app_identity=resigned)], history_checks_enabled=1)
+    expect(found.get("installation_signer_changed", {}).get("points") == 60
+           and scan["score"] == 60 and scan["finding_score"] == 60,
+           "on: the owner's 60, a finding: %s %s" % (found, scan["score"]))
+    found, _ = history([previous(app_identity=resigned)], history_checks_enabled=1,
+                       installation_signer_changed_points=15)
+    expect(found["installation_signer_changed"]["points"] == 15, "the DBA's points")
+    for label, rows, now, collector, wanted in (
+            ("package", [previous(app_identity={"package_name": "com.other.app"})], None, None,
+             {"installation_signer_changed"}),
+            ("phone", [previous(device={"model": "Other"})], None, None,
+             {"installation_device_changed"}),
+            ("API level back", [previous(device={"sdk_int": 35})], None, None,
+             {"installation_os_downgraded"}),
+            ("patch back", [previous(device={"security_patch": "2099-01-01"})], None, None,
+             {"installation_os_downgraded"}),
+            ("patch forward", [previous(device={"security_patch": "2000-01-01"})], None, None,
+             set()),
+            ("collector back", [previous(collector=5)], None, 4,
+             {"installation_collector_downgraded"}),
+            ("app back", [previous(app_identity={"version_code": 7})], None, None,
+             {"installation_app_downgraded"}),
+            ("update", [previous(app_identity={"apk_sha256": "cd" * 32, "version_code": 0})],
+             None, None, {"installation_app_changed"}),
+            ("device probe gone", [previous()], probes(device=None), None,
+             {"installation_coverage_dropped"}),
+            ("switched off, same build", [previous()],
+             probes(network={"status": "not_enabled"}), None, {"installation_coverage_dropped"}),
+            ("switched off by an update",
+             [previous(app_identity={"apk_sha256": "cd" * 32, "version_code": 0})],
+             probes(network={"status": "not_enabled"}), None, {"installation_app_changed"}),
+            ("unsupported, same OS", [previous()], probes(network={"status": "unsupported"}), None,
+             {"installation_coverage_dropped"}),
+            ("unsupported after an OS update", [previous(device={"sdk_int": 33})],
+             probes(network={"status": "unsupported"}), None, set()),
+            ("a failure is a collection problem", [previous()],
+             probes(network={"status": "error"}), None, set())):
+        found, _ = history(rows, now, collector, history_checks_enabled=1)
+        expect(set(found) == wanted, "%s: %s, not %s" % (label, sorted(found), sorted(wanted)))
+    dropped = history([previous()], probes(device=None))[0]["installation_coverage_dropped"]
+    expect("device now absent" in dropped["message"], "it names them: %s" % dropped["message"])
+
+    frida = [{"code": "android_frida_runtime_artifact", "points": 90, "category": "integrity"}]
+    condition = [{"code": "android_vpn_active", "points": 50, "category": "condition"}]
+    flapping = [previous(age_hours=hours, reasons=frida if hours % 2 else [])
+                for hours in (1, 2, 3, 4, 5)]
+    found, _ = history(flapping, history_checks_enabled=1)
+    expect(found.get("installation_verdict_flips", {}).get("points") == 30
+           and "5 times in 6 scans" in found["installation_verdict_flips"]["message"],
+           "suspicious and clean by turns: %s" % found)
+    found, _ = history(flapping, history_checks_enabled=1, installation_verdict_flips_count=6)
+    expect("installation_verdict_flips" not in found, "the DBA's count: %s" % found)
+    found, _ = history(flapping, history_checks_enabled=1, history_window_hours=2)
+    expect("installation_verdict_flips" not in found, "only the window counts: %s" % found)
+    found, _ = history([previous(age_hours=h, reasons=condition if h % 2 else [])
+                        for h in (1, 2, 3, 4, 5)], history_checks_enabled=1)
+    expect("installation_verdict_flips" not in found,
+           "a VPN on and off is the user's, not a flip: %s" % found)
+
+    ios = c.VOLUNTEERED_CLEAN["ios"]
+    ios_measured = {name: "ok" for name in s._MEASUREMENTS["ios"]}
+    db.history_rows = [(s._utc_now() - timedelta(hours=1), 2,
+                        dict(c.clean_probes(s._integrity_probe_plan("ios"), platform="ios"),
+                             device=dict(ios["device"], model_identifier="iPhone9,3",
+                                         os_version="18.0")),
+                        {"status": ios_measured}, [])]
+    try:
+        with policy(history_checks_enabled=1):
+            status, payload = send_report("ios", dict(
+                c.clean_probes(s._integrity_probe_plan("ios"), platform="ios"),
+                device=dict(ios["device"]), network=dict(ios["network"])))
+    finally:
+        db.history_rows = []
+    found = {r["code"] for r in payload["integrity"]["reasons"] if r["code"] in s._HISTORY_CODES}
+    expect(status == 200 and found == {"installation_device_changed", "installation_os_downgraded"},
+           "iOS: another model, an older iOS: %s %s" % (status, found))
 
 
 # The rows people change by hand (DESIGN.md 84): the key, the value, then the
