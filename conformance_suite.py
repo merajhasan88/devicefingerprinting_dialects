@@ -920,14 +920,17 @@ def clean_probes(required, cert=None, platform="android"):
     return {name: everything[name] for name in required if name in everything}
 
 
-def submit_report(api, installation, token, mutate=None, cert=None, enabled=()):
+def submit_report(api, installation, token, mutate=None, cert=None, enabled=(), operation=None):
     """Run one full integrity round trip and return the server's decision.
 
     Answers like a current collector: the plan, the volunteered device and
     network probes, and each optional measurement the challenge asks for --
-    measured where `enabled` lists it, else not_enabled (DESIGN.md 80)."""
+    measured where `enabled` lists it, else not_enabled (DESIGN.md 80). With
+    operation, the challenge names the one request the scan is to approve
+    (DESIGN.md 84.3)."""
     status, challenge = protected(
-        api, installation, "POST", "/v1/integrity/challenge", token, {}
+        api, installation, "POST", "/v1/integrity/challenge", token,
+        {"operation": operation} if operation else {}
     )
     if status != 200:
         raise AssertionError("integrity challenge failed: %s %s" % (status, challenge))
@@ -1733,6 +1736,82 @@ def check_four_answers(api, ctx):
            and decision.get("relationship") in ("allow", "step_up", "review", "deny")
            and {r.get("code") for r in trust.get("reasons") or []} <= found,
            "a request's decision adds the policy and what was granted: %s %s" % (st, answers))
+
+
+@check("integrity: a scan made for one operation approves that request once")
+def check_operation_scan(api, ctx):
+    """DESIGN.md 84.3, item 2 of the eight of 2026-10-14. On a path the DBA
+    lists in operation_scan_paths, a request names the scan made for it
+    (X-Integrity-Report): the server judges that scan, once. In enforce mode a
+    request without one, or a second use, is refused; in observe mode the
+    decision names the refusal. With DEVICE_TRUST_BUSINESS_TOKEN holding the
+    operations role, a backend verifies a scan for its own operation once.
+    Skips unless the protected echo is in operation_scan_paths."""
+    path = "/v1/account/protected-echo"
+    if path not in _setting_words(live_settings(api), "operation_scan_paths", ""):
+        raise Skip("add %s to operation_scan_paths to run this check" % path)
+    enforce = ctx.get("mode") == "enforce"
+    integrity_context(ctx)
+    inst = Installation()
+    st, pl = enrol(api, inst, fresh_hint())
+    expect(st in (200, 201), "enrol failed: %s %s" % (st, pl))
+    device = device_token(api, inst)
+    submit_report(api, inst, device)
+    st, pl = open_account(api, inst, device, "op-%s" % secrets.token_hex(4))
+    expect(st in (200, 201), "account open failed: %s %s" % (st, pl))
+    access = pl["access_token"]
+    body = {"amount": 125, "payee": "p-%s" % secrets.token_hex(3)}
+    body_text = json.dumps(body)
+    operation = {"method": "POST", "path": path, "query": "",
+                 "body_sha256": sha256_hex(body_text.encode("utf-8"))}
+
+    def send(report_id=None):
+        headers, text = build_proof(inst, "POST", path, access, body)
+        if report_id:
+            headers["X-Integrity-Report"] = report_id
+        return api.call("POST", path, body_text=text, bearer=access, headers=headers)
+
+    scan = submit_report(api, inst, access, operation=operation)
+    expect(len(scan.get("operation_sha256") or "") == 64, "the scan names its operation: %s"
+           % scan.get("operation_sha256"))
+    st, pl = send(scan["report_id"])
+    bound = ((pl or {}).get("trust_policy") or {}).get("context", {}).get("operation_scan") or {}
+    expect(st == 200 and bound.get("report_id") == scan["report_id"],
+           "the request is judged on the scan made for it: %s %s %s" % (st, error_code(pl), bound))
+    st, pl = send(scan["report_id"])
+    if enforce:
+        expect(st == 409 and error_code(pl) == "integrity_operation_scan_used",
+               "a second use is refused: %s %s" % (st, error_code(pl)))
+        st, pl = send()
+        expect(st == 403 and error_code(pl) == "integrity_operation_scan_required"
+               and ((pl.get("error") or {}).get("details") or {}).get("operation") == operation,
+               "without a scan the app is told what to scan for: %s %s" % (st, pl))
+    else:
+        named = ((pl or {}).get("trust_policy") or {}).get("context", {}).get("operation_scan") or {}
+        expect(st == 200 and named.get("problem") == "integrity_operation_scan_used",
+               "observe mode lets a second use through and names it: %s %s" % (st, named))
+    token = os.environ.get("DEVICE_TRUST_BUSINESS_TOKEN", "")
+    if not token:
+        return
+    theirs = {"method": "POST", "path": "/payments", "query": "",
+              "body_sha256": sha256_hex(b'{"amount":125}')}
+    scan = submit_report(api, inst, access, operation=theirs)
+    ask = json.dumps({"report_id": scan["report_id"], "installation_id": inst.installation_id,
+                      "operation": theirs})
+    business = {"Authorization": "Bearer " + token}
+    st, answer = api.call("POST", "/v1/business/operation-scans/verify", headers=business,
+                          body_text=ask)
+    if st == 403 and error_code(answer) == "business_role_missing":
+        return
+    decision = (answer or {}).get("decision") or {}
+    expect(st == 200 and answer.get("report_id") == scan["report_id"]
+           and decision.get("event_type") == "operation_check"
+           and (decision.get("assessment") or {}).get("decision", {}).get("recommended"),
+           "a backend verifies a scan for its own operation: %s %s" % (st, answer))
+    st, again = api.call("POST", "/v1/business/operation-scans/verify", headers=business,
+                         body_text=ask)
+    expect(st == 409 and error_code(again) == "integrity_operation_scan_used",
+           "once: %s %s" % (st, again))
 
 
 @check("risk: the source IP and User-Agent are kept only where the DBA says")
